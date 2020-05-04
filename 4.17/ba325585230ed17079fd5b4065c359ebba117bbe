@@ -1,0 +1,147 @@
+mm/memory_hotplug: enforce block size aligned range check
+
+Patch series "optimize memory hotplug", v3.
+
+This patchset:
+
+ - Improves hotplug performance by eliminating a number of struct page
+   traverses during memory hotplug.
+
+ - Fixes some issues with hotplugging, where boundaries were not
+   properly checked. And on x86 block size was not properly aligned with
+   end of memory
+
+ - Also, potentially improves boot performance by eliminating condition
+   from __init_single_page().
+
+ - Adds robustness by verifying that that struct pages are correctly
+   poisoned when flags are accessed.
+
+The following experiments were performed on Xeon(R) CPU E7-8895 v3 @
+2.60GHz with 1T RAM:
+
+booting in qemu with 960G of memory, time to initialize struct pages:
+
+no-kvm:
+	TRY1		TRY2
+BEFORE:	39.433668	39.39705
+AFTER:	36.903781	36.989329
+
+with-kvm:
+BEFORE:	10.977447	11.103164
+AFTER:	10.929072	10.751885
+
+Hotplug 896G memory:
+no-kvm:
+	TRY1		TRY2
+BEFORE: 848.740000	846.910000
+AFTER:  783.070000	786.560000
+
+with-kvm:
+	TRY1		TRY2
+BEFORE: 34.410000	33.57
+AFTER:	29.810000	29.580000
+
+This patch (of 6):
+
+Start qemu with the following arguments:
+
+  -m 64G,slots=2,maxmem=66G -object memory-backend-ram,id=mem1,size=2G
+
+Which: boots machine with 64G, and adds a device mem1 with 2G which can
+be hotplugged later.
+
+Also make sure that config has the following turned on:
+  CONFIG_MEMORY_HOTPLUG
+  CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE
+  CONFIG_ACPI_HOTPLUG_MEMORY
+
+Using the qemu monitor hotplug the memory (make sure config has (qemu)
+device_add pc-dimm,id=dimm1,memdev=mem1
+
+The operation will fail with the following trace:
+
+    WARNING: CPU: 0 PID: 91 at drivers/base/memory.c:205
+    pages_correctly_reserved+0xe6/0x110
+    Modules linked in:
+    CPU: 0 PID: 91 Comm: systemd-udevd Not tainted 4.16.0-rc1_pt_master #29
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996),
+    BIOS rel-1.11.0-0-g63451fca13-prebuilt.qemu-project.org 04/01/2014
+    RIP: 0010:pages_correctly_reserved+0xe6/0x110
+    Call Trace:
+     memory_subsys_online+0x44/0xa0
+     device_online+0x51/0x80
+     store_mem_state+0x5e/0xe0
+     kernfs_fop_write+0xfa/0x170
+     __vfs_write+0x2e/0x150
+     vfs_write+0xa8/0x1a0
+     SyS_write+0x4d/0xb0
+     do_syscall_64+0x5d/0x110
+     entry_SYSCALL_64_after_hwframe+0x21/0x86
+    ---[ end trace 6203bc4f1a5d30e8 ]---
+
+The problem is detected in: drivers/base/memory.c
+
+   static bool pages_correctly_reserved(unsigned long start_pfn)
+   205                 if (WARN_ON_ONCE(!pfn_valid(pfn)))
+
+This function loops through every section in the newly added memory
+block and verifies that the first pfn is valid, meaning section exists,
+has mapping (struct page array), and is online.
+
+The block size on x86 is usually 128M, but when machine is booted with
+more than 64G of memory, the block size is changed to 2G: $ cat
+/sys/devices/system/memory/block_size_bytes 80000000
+
+or
+
+   $ dmesg | grep "block size"
+   [    0.086469] x86/mm: Memory block size: 2048MB
+
+During memory hotplug, and hotremove we verify that the range is section
+size aligned, but we actually must verify that it is block size aligned,
+because that is the proper unit for hotplug operations.  See:
+Documentation/memory-hotplug.txt
+
+So, when the start_pfn of newly added memory is not block size aligned,
+we can get a memory block that has only part of it with properly
+populated sections.
+
+In our case the start_pfn starts from the last_pfn (end of physical
+memory).
+
+   $ dmesg | grep last_pfn
+   [    0.000000] e820: last_pfn = 0x1040000 max_arch_pfn = 0x400000000
+
+0x1040000 == 65G, and so is not 2G aligned!
+
+The fix is to enforce that memory that is hotplugged and hotremoved is
+block size aligned.
+
+With this fix, running the above sequence yield to the following result:
+
+   (qemu) device_add pc-dimm,id=dimm1,memdev=mem1
+   Block size [0x80000000] unaligned hotplug range: start 0x1040000000,
+   							size 0x80000000
+   acpi PNP0C80:00: add_memory failed
+   acpi PNP0C80:00: acpi_memory_enable_device() error
+   acpi PNP0C80:00: Enumeration failure
+
+Link: http://lkml.kernel.org/r/20180213193159.14606-2-pasha.tatashin@oracle.com
+Signed-off-by: Pavel Tatashin <pasha.tatashin@oracle.com>
+Reviewed-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Bharata B Rao <bharata@linux.vnet.ibm.com>
+Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Steven Sistare <steven.sistare@oracle.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

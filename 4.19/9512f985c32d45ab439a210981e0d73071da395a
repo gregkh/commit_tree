@@ -1,0 +1,110 @@
+drm/i915/execlists: Direct submission of new requests (avoid tasklet/ksoftirqd)
+
+Back in commit 27af5eea54d1 ("drm/i915: Move execlists irq handler to a
+bottom half"), we came to the conclusion that running our CSB processing
+and ELSP submission from inside the irq handler was a bad idea. A really
+bad idea as we could impose nearly 1s latency on other users of the
+system, on average! Deferring our work to a tasklet allowed us to do the
+processing with irqs enabled, reducing the impact to an average of about
+50us.
+
+We have since eradicated the use of forcewaked mmio from inside the CSB
+processing and ELSP submission, bringing the impact down to around 5us
+(on Kabylake); an order of magnitude better than our measurements 2
+years ago on Broadwell and only about 2x worse on average than the
+gem_syslatency on an unladen system.
+
+In this iteration of the tasklet-vs-direct submission debate, we seek a
+compromise where by we submit new requests immediately to the HW but
+defer processing the CS interrupt onto a tasklet. We gain the advantage
+of low-latency and ksoftirqd avoidance when waking up the HW, while
+avoiding the system-wide starvation of our CS irq-storms.
+
+Comparing the impact on the maximum latency observed (that is the time
+stolen from an RT process) over a 120s interval, repeated several times
+(using gem_syslatency, similar to RT's cyclictest) while the system is
+fully laden with i915 nops, we see that direct submission an actually
+improve the worse case.
+
+Maximum latency in microseconds of a third party RT thread
+(gem_syslatency -t 120 -f 2)
+  x Always using tasklets (a couple of >1000us outliers removed)
+  + Only using tasklets from CS irq, direct submission of requests
++------------------------------------------------------------------------+
+|          +                                                             |
+|          +                                                             |
+|          +                                                             |
+|          +       +                                                     |
+|          + +     +                                                     |
+|       +  + +     +  x     x     x                                      |
+|      +++ + +     +  x  x  x  x  x  x                                   |
+|      +++ + ++  + +  *x x  x  x  x  x                                   |
+|      +++ + ++  + *  *x x  *  x  x  x                                   |
+|    + +++ + ++  * * +*xxx  *  x  x  xx                                  |
+|    * +++ + ++++* *x+**xx+ *  x  x xxxx x                               |
+|   **x++++*++**+*x*x****x+ * +x xx xxxx x          x                    |
+|x* ******+***************++*+***xxxxxx* xx*x     xxx +                x+|
+|             |__________MA___________|                                  |
+|      |______M__A________|                                              |
++------------------------------------------------------------------------+
+    N           Min           Max        Median           Avg        Stddev
+x 118            91           186           124     125.28814     16.279137
++ 120            92           187           109     112.00833     13.458617
+Difference at 95.0% confidence
+	-13.2798 +/- 3.79219
+	-10.5994% +/- 3.02677%
+	(Student's t, pooled s = 14.9237)
+
+However the mean latency is adversely affected:
+
+Mean latency in microseconds of a third party RT thread
+(gem_syslatency -t 120 -f 1)
+  x Always using tasklets
+  + Only using tasklets from CS irq, direct submission of requests
++------------------------------------------------------------------------+
+|           xxxxxx                                        +   ++         |
+|           xxxxxx                                        +   ++         |
+|           xxxxxx                                      + +++ ++         |
+|           xxxxxxx                                     +++++ ++         |
+|           xxxxxxx                                     +++++ ++         |
+|           xxxxxxx                                     +++++ +++        |
+|           xxxxxxx                                   + ++++++++++       |
+|           xxxxxxxx                                 ++ ++++++++++       |
+|           xxxxxxxx                                 ++ ++++++++++       |
+|          xxxxxxxxxx                                +++++++++++++++     |
+|         xxxxxxxxxxx    x                           +++++++++++++++     |
+|x       xxxxxxxxxxxxx   x           +            + ++++++++++++++++++  +|
+|           |__A__|                                                      |
+|                                                      |____A___|        |
++------------------------------------------------------------------------+
+    N           Min           Max        Median           Avg        Stddev
+x 120         3.506         3.727         3.631     3.6321417    0.02773109
++ 120         3.834         4.149         4.039     4.0375167   0.041221676
+Difference at 95.0% confidence
+	0.405375 +/- 0.00888913
+	11.1608% +/- 0.244735%
+	(Student's t, pooled s = 0.03513)
+
+However, since the mean latency corresponds to the amount of irqsoff
+processing we have to do for a CS interrupt, we only need to speed that
+up to benefit not just system latency but our own throughput.
+
+v2: Remember to defer submissions when under reset.
+v4: Only use direct submission for new requests
+v5: Be aware that with mixing direct tasklet evaluation and deferred
+tasklets, we may end up idling before running the deferred tasklet.
+v6: Remove the redudant likely() from tasklet_is_enabled(), restrict the
+annotation to reset_in_progress().
+v7: Take the full timeline.lock when enabling perf_pmu stats as the
+tasklet is no longer a valid guard. A consequence is that the stats are
+now only valid for engines also using the timeline.lock to process
+state.
+
+Testcase: igt/gem_exec_latency/*rthog*
+References: 27af5eea54d1 ("drm/i915: Move execlists irq handler to a bottom half")
+Suggested-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180628201211.13837-9-chris@chris-wilson.co.uk
+

@@ -1,0 +1,61 @@
+ohci-hcd: Fix race condition caused by ohci_urb_enqueue() and io_watchdog_func()
+
+Running io_watchdog_func() while ohci_urb_enqueue() is running can
+cause a race condition where ohci->prev_frame_no is corrupted and the
+watchdog can mis-detect following error:
+
+  ohci-platform 664a0800.usb: frame counter not updating; disabled
+  ohci-platform 664a0800.usb: HC died; cleaning up
+
+Specifically, following scenario causes a race condition:
+
+  1. ohci_urb_enqueue() calls spin_lock_irqsave(&ohci->lock, flags)
+     and enters the critical section
+  2. ohci_urb_enqueue() calls timer_pending(&ohci->io_watchdog) and it
+     returns false
+  3. ohci_urb_enqueue() sets ohci->prev_frame_no to a frame number
+     read by ohci_frame_no(ohci)
+  4. ohci_urb_enqueue() schedules io_watchdog_func() with mod_timer()
+  5. ohci_urb_enqueue() calls spin_unlock_irqrestore(&ohci->lock,
+     flags) and exits the critical section
+  6. Later, ohci_urb_enqueue() is called
+  7. ohci_urb_enqueue() calls spin_lock_irqsave(&ohci->lock, flags)
+     and enters the critical section
+  8. The timer scheduled on step 4 expires and io_watchdog_func() runs
+  9. io_watchdog_func() calls spin_lock_irqsave(&ohci->lock, flags)
+     and waits on it because ohci_urb_enqueue() is already in the
+     critical section on step 7
+ 10. ohci_urb_enqueue() calls timer_pending(&ohci->io_watchdog) and it
+     returns false
+ 11. ohci_urb_enqueue() sets ohci->prev_frame_no to new frame number
+     read by ohci_frame_no(ohci) because the frame number proceeded
+     between step 3 and 6
+ 12. ohci_urb_enqueue() schedules io_watchdog_func() with mod_timer()
+ 13. ohci_urb_enqueue() calls spin_unlock_irqrestore(&ohci->lock,
+     flags) and exits the critical section, then wake up
+     io_watchdog_func() which is waiting on step 9
+ 14. io_watchdog_func() enters the critical section
+ 15. io_watchdog_func() calls ohci_frame_no(ohci) and set frame_no
+     variable to the frame number
+ 16. io_watchdog_func() compares frame_no and ohci->prev_frame_no
+
+On step 16, because this calling of io_watchdog_func() is scheduled on
+step 4, the frame number set in ohci->prev_frame_no is expected to the
+number set on step 3.  However, ohci->prev_frame_no is overwritten on
+step 11.  Because step 16 is executed soon after step 11, the frame
+number might not proceed, so ohci->prev_frame_no must equals to
+frame_no.
+
+To address above scenario, this patch introduces a special sentinel
+value IO_WATCHDOG_OFF and set this value to ohci->prev_frame_no when
+the watchdog is not pending or running.  When ohci_urb_enqueue()
+schedules the watchdog (step 4 and 12 above), it compares
+ohci->prev_frame_no to IO_WATCHDOG_OFF so that ohci->prev_frame_no is
+not overwritten while io_watchdog_func() is running.
+
+Signed-off-by: Shigeru Yoshida <Shigeru.Yoshida@windriver.com>
+Signed-off-by: Haiqing Bai <Haiqing.Bai@windriver.com>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Cc: stable <stable@vger.kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

@@ -1,0 +1,126 @@
+mm, memory_hotplug: do not associate hotadded memory to zones until online
+
+The current memory hotplug implementation relies on having all the
+struct pages associate with a zone/node during the physical hotplug
+phase (arch_add_memory->__add_pages->__add_section->__add_zone).  In the
+vast majority of cases this means that they are added to ZONE_NORMAL.
+This has been so since 9d99aaa31f59 ("[PATCH] x86_64: Support memory
+hotadd without sparsemem") and it wasn't a big deal back then because
+movable onlining didn't exist yet.
+
+Much later memory hotplug wanted to (ab)use ZONE_MOVABLE for movable
+onlining 511c2aba8f07 ("mm, memory-hotplug: dynamic configure movable
+memory and portion memory") and then things got more complicated.
+Rather than reconsidering the zone association which was no longer
+needed (because the memory hotplug already depended on SPARSEMEM) a
+convoluted semantic of zone shifting has been developed.  Only the
+currently last memblock or the one adjacent to the zone_movable can be
+onlined movable.  This essentially means that the online type changes as
+the new memblocks are added.
+
+Let's simulate memory hot online manually
+  $ echo 0x100000000 > /sys/devices/system/memory/probe
+  $ grep . /sys/devices/system/memory/memory32/valid_zones
+  Normal Movable
+
+  $ echo $((0x100000000+(128<<20))) > /sys/devices/system/memory/probe
+  $ grep . /sys/devices/system/memory/memory3?/valid_zones
+  /sys/devices/system/memory/memory32/valid_zones:Normal
+  /sys/devices/system/memory/memory33/valid_zones:Normal Movable
+
+  $ echo $((0x100000000+2*(128<<20))) > /sys/devices/system/memory/probe
+  $ grep . /sys/devices/system/memory/memory3?/valid_zones
+  /sys/devices/system/memory/memory32/valid_zones:Normal
+  /sys/devices/system/memory/memory33/valid_zones:Normal
+  /sys/devices/system/memory/memory34/valid_zones:Normal Movable
+
+  $ echo online_movable > /sys/devices/system/memory/memory34/state
+  $ grep . /sys/devices/system/memory/memory3?/valid_zones
+  /sys/devices/system/memory/memory32/valid_zones:Normal
+  /sys/devices/system/memory/memory33/valid_zones:Normal Movable
+  /sys/devices/system/memory/memory34/valid_zones:Movable Normal
+
+This is an awkward semantic because an udev event is sent as soon as the
+block is onlined and an udev handler might want to online it based on
+some policy (e.g.  association with a node) but it will inherently race
+with new blocks showing up.
+
+This patch changes the physical online phase to not associate pages with
+any zone at all.  All the pages are just marked reserved and wait for
+the onlining phase to be associated with the zone as per the online
+request.  There are only two requirements
+
+	- existing ZONE_NORMAL and ZONE_MOVABLE cannot overlap
+
+	- ZONE_NORMAL precedes ZONE_MOVABLE in physical addresses
+
+the latter one is not an inherent requirement and can be changed in the
+future.  It preserves the current behavior and made the code slightly
+simpler.  This is subject to change in future.
+
+This means that the same physical online steps as above will lead to the
+following state: Normal Movable
+
+  /sys/devices/system/memory/memory32/valid_zones:Normal Movable
+  /sys/devices/system/memory/memory33/valid_zones:Normal Movable
+
+  /sys/devices/system/memory/memory32/valid_zones:Normal Movable
+  /sys/devices/system/memory/memory33/valid_zones:Normal Movable
+  /sys/devices/system/memory/memory34/valid_zones:Normal Movable
+
+  /sys/devices/system/memory/memory32/valid_zones:Normal Movable
+  /sys/devices/system/memory/memory33/valid_zones:Normal Movable
+  /sys/devices/system/memory/memory34/valid_zones:Movable
+
+Implementation:
+The current move_pfn_range is reimplemented to check the above
+requirements (allow_online_pfn_range) and then updates the respective
+zone (move_pfn_range_to_zone), the pgdat and links all the pages in the
+pfn range with the zone/node.  __add_pages is updated to not require the
+zone and only initializes sections in the range.  This allowed to
+simplify the arch_add_memory code (s390 could get rid of quite some of
+code).
+
+devm_memremap_pages is the only user of arch_add_memory which relies on
+the zone association because it only hooks into the memory hotplug only
+half way.  It uses it to associate the new memory with ZONE_DEVICE but
+doesn't allow it to be {on,off}lined via sysfs.  This means that this
+particular code path has to call move_pfn_range_to_zone explicitly.
+
+The original zone shifting code is kept in place and will be removed in
+the follow up patch for an easier review.
+
+Please note that this patch also changes the original behavior when
+offlining a memory block adjacent to another zone (Normal vs.  Movable)
+used to allow to change its movable type.  This will be handled later.
+
+[richard.weiyang@gmail.com: simplify zone_intersects()]
+  Link: http://lkml.kernel.org/r/20170616092335.5177-1-richard.weiyang@gmail.com
+[richard.weiyang@gmail.com: remove duplicate call for set_page_links]
+  Link: http://lkml.kernel.org/r/20170616092335.5177-2-richard.weiyang@gmail.com
+[akpm@linux-foundation.org: remove unused local `i']
+Link: http://lkml.kernel.org/r/20170515085827.16474-12-mhocko@kernel.org
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Wei Yang <richard.weiyang@gmail.com>
+Tested-by: Dan Williams <dan.j.williams@intel.com>
+Tested-by: Reza Arbab <arbab@linux.vnet.ibm.com>
+Acked-by: Heiko Carstens <heiko.carstens@de.ibm.com> # For s390 bits
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Balbir Singh <bsingharora@gmail.com>
+Cc: Daniel Kiper <daniel.kiper@oracle.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Igor Mammedov <imammedo@redhat.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: Joonsoo Kim <js1304@gmail.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Tobias Regnery <tobias.regnery@gmail.com>
+Cc: Toshi Kani <toshi.kani@hpe.com>
+Cc: Vitaly Kuznetsov <vkuznets@redhat.com>
+Cc: Xishi Qiu <qiuxishi@huawei.com>
+Cc: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

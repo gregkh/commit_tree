@@ -1,0 +1,54 @@
+Btrfs: rework outstanding_extents
+
+Right now we do a lot of weird hoops around outstanding_extents in order
+to keep the extent count consistent.  This is because we logically
+transfer the outstanding_extent count from the initial reservation
+through the set_delalloc_bits.  This makes it pretty difficult to get a
+handle on how and when we need to mess with outstanding_extents.
+
+Fix this by revamping the rules of how we deal with outstanding_extents.
+Now instead everybody that is holding on to a delalloc extent is
+required to increase the outstanding extents count for itself.  This
+means we'll have something like this
+
+btrfs_delalloc_reserve_metadata	- outstanding_extents = 1
+ btrfs_set_extent_delalloc	- outstanding_extents = 2
+btrfs_release_delalloc_extents	- outstanding_extents = 1
+
+for an initial file write.  Now take the append write where we extend an
+existing delalloc range but still under the maximum extent size
+
+btrfs_delalloc_reserve_metadata - outstanding_extents = 2
+  btrfs_set_extent_delalloc
+    btrfs_set_bit_hook		- outstanding_extents = 3
+    btrfs_merge_extent_hook	- outstanding_extents = 2
+btrfs_delalloc_release_extents	- outstanding_extnets = 1
+
+In order to make the ordered extent transition we of course must now
+make ordered extents carry their own outstanding_extent reservation, so
+for cow_file_range we end up with
+
+btrfs_add_ordered_extent	- outstanding_extents = 2
+clear_extent_bit		- outstanding_extents = 1
+btrfs_remove_ordered_extent	- outstanding_extents = 0
+
+This makes all manipulations of outstanding_extents much more explicit.
+Every successful call to btrfs_delalloc_reserve_metadata _must_ now be
+combined with btrfs_release_delalloc_extents, even in the error case, as
+that is the only function that actually modifies the
+outstanding_extents counter.
+
+The drawback to this is now we are much more likely to have transient
+cases where outstanding_extents is much larger than it actually should
+be.  This could happen before as we manipulated the delalloc bits, but
+now it happens basically at every write.  This may put more pressure on
+the ENOSPC flushing code, but I think making this code simpler is worth
+the cost.  I have another change coming to mitigate this side-effect
+somewhat.
+
+I also added trace points for the counter manipulation.  These were used
+by a bpf script I wrote to help track down leak issues.
+
+Signed-off-by: Josef Bacik <jbacik@fb.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

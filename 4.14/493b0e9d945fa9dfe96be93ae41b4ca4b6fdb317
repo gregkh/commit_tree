@@ -1,0 +1,131 @@
+mm: add /proc/pid/smaps_rollup
+
+/proc/pid/smaps_rollup is a new proc file that improves the performance
+of user programs that determine aggregate memory statistics (e.g., total
+PSS) of a process.
+
+Android regularly "samples" the memory usage of various processes in
+order to balance its memory pool sizes.  This sampling process involves
+opening /proc/pid/smaps and summing certain fields.  For very large
+processes, sampling memory use this way can take several hundred
+milliseconds, due mostly to the overhead of the seq_printf calls in
+task_mmu.c.
+
+smaps_rollup improves the situation.  It contains most of the fields of
+/proc/pid/smaps, but instead of a set of fields for each VMA,
+smaps_rollup instead contains one synthetic smaps-format entry
+representing the whole process.  In the single smaps_rollup synthetic
+entry, each field is the summation of the corresponding field in all of
+the real-smaps VMAs.  Using a common format for smaps_rollup and smaps
+allows userspace parsers to repurpose parsers meant for use with
+non-rollup smaps for smaps_rollup, and it allows userspace to switch
+between smaps_rollup and smaps at runtime (say, based on the
+availability of smaps_rollup in a given kernel) with minimal fuss.
+
+By using smaps_rollup instead of smaps, a caller can avoid the
+significant overhead of formatting, reading, and parsing each of a large
+process's potentially very numerous memory mappings.  For sampling
+system_server's PSS in Android, we measured a 12x speedup, representing
+a savings of several hundred milliseconds.
+
+One alternative to a new per-process proc file would have been including
+PSS information in /proc/pid/status.  We considered this option but
+thought that PSS would be too expensive (by a few orders of magnitude)
+to collect relative to what's already emitted as part of
+/proc/pid/status, and slowing every user of /proc/pid/status for the
+sake of readers that happen to want PSS feels wrong.
+
+The code itself works by reusing the existing VMA-walking framework we
+use for regular smaps generation and keeping the mem_size_stats
+structure around between VMA walks instead of using a fresh one for each
+VMA.  In this way, summation happens automatically.  We let seq_file
+walk over the VMAs just as it does for regular smaps and just emit
+nothing to the seq_file until we hit the last VMA.
+
+Benchmarks:
+
+    using smaps:
+    iterations:1000 pid:1163 pss:220023808
+    0m29.46s real 0m08.28s user 0m20.98s system
+
+    using smaps_rollup:
+    iterations:1000 pid:1163 pss:220702720
+    0m04.39s real 0m00.03s user 0m04.31s system
+
+We're using the PSS samples we collect asynchronously for
+system-management tasks like fine-tuning oom_adj_score, memory use
+tracking for debugging, application-level memory-use attribution, and
+deciding whether we want to kill large processes during system idle
+maintenance windows.  Android has been using PSS for these purposes for
+a long time; as the average process VMA count has increased and and
+devices become more efficiency-conscious, PSS-collection inefficiency
+has started to matter more.  IMHO, it'd be a lot safer to optimize the
+existing PSS-collection model, which has been fine-tuned over the years,
+instead of changing the memory tracking approach entirely to work around
+smaps-generation inefficiency.
+
+Tim said:
+
+: There are two main reasons why Android gathers PSS information:
+:
+: 1. Android devices can show the user the amount of memory used per
+:    application via the settings app.  This is a less important use case.
+:
+: 2. We log PSS to help identify leaks in applications.  We have found
+:    an enormous number of bugs (in the Android platform, in Google's own
+:    apps, and in third-party applications) using this data.
+:
+: To do this, system_server (the main process in Android userspace) will
+: sample the PSS of a process three seconds after it changes state (for
+: example, app is launched and becomes the foreground application) and about
+: every ten minutes after that.  The net result is that PSS collection is
+: regularly running on at least one process in the system (usually a few
+: times a minute while the screen is on, less when screen is off due to
+: suspend).  PSS of a process is an incredibly useful stat to track, and we
+: aren't going to get rid of it.  We've looked at some very hacky approaches
+: using RSS ("take the RSS of the target process, subtract the RSS of the
+: zygote process that is the parent of all Android apps") to reduce the
+: accounting time, but it regularly overestimated the memory used by 20+
+: percent.  Accordingly, I don't think that there's a good alternative to
+: using PSS.
+:
+: We started looking into PSS collection performance after we noticed random
+: frequency spikes while a phone's screen was off; occasionally, one of the
+: CPU clusters would ramp to a high frequency because there was 200-300ms of
+: constant CPU work from a single thread in the main Android userspace
+: process.  The work causing the spike (which is reasonable governor
+: behavior given the amount of CPU time needed) was always PSS collection.
+: As a result, Android is burning more power than we should be on PSS
+: collection.
+:
+: The other issue (and why I'm less sure about improving smaps as a
+: long-term solution) is that the number of VMAs per process has increased
+: significantly from release to release.  After trying to figure out why we
+: were seeing these 200-300ms PSS collection times on Android O but had not
+: noticed it in previous versions, we found that the number of VMAs in the
+: main system process increased by 50% from Android N to Android O (from
+: ~1800 to ~2700) and varying increases in every userspace process.  Android
+: M to N also had an increase in the number of VMAs, although not as much.
+: I'm not sure why this is increasing so much over time, but thinking about
+: ASLR and ways to make ASLR better, I expect that this will continue to
+: increase going forward.  I would not be surprised if we hit 5000 VMAs on
+: the main Android process (system_server) by 2020.
+:
+: If we assume that the number of VMAs is going to increase over time, then
+: doing anything we can do to reduce the overhead of each VMA during PSS
+: collection seems like the right way to go, and that means outputting an
+: aggregate statistic (to avoid whatever overhead there is per line in
+: writing smaps and in reading each line from userspace).
+
+Link: http://lkml.kernel.org/r/20170812022148.178293-1-dancol@google.com
+Signed-off-by: Daniel Colascione <dancol@google.com>
+Cc: Tim Murray <timmurray@google.com>
+Cc: Joel Fernandes <joelaf@google.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Sonny Rao <sonnyrao@chromium.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

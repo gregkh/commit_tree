@@ -1,0 +1,134 @@
+drm/i915: Call i915_gem_init_userptr() before taking struct_mutex
+
+We don't need struct_mutex to initialise userptr (it just allocates a
+workqueue for itself etc), but we do need struct_mutex later on in
+i915_gem_init() in order to feed requests onto the HW.
+
+This should break the chain
+
+[  385.697902] ======================================================
+[  385.697907] WARNING: possible circular locking dependency detected
+[  385.697913] 4.14.0-CI-Patchwork_7234+ #1 Tainted: G     U
+[  385.697917] ------------------------------------------------------
+[  385.697922] perf_pmu/2631 is trying to acquire lock:
+[  385.697927]  (&mm->mmap_sem){++++}, at: [<ffffffff811bfe1e>] __might_fault+0x3e/0x90
+[  385.697941]
+               but task is already holding lock:
+[  385.697946]  (&cpuctx_mutex){+.+.}, at: [<ffffffff8116fe8c>] perf_event_ctx_lock_nested+0xbc/0x1d0
+[  385.697957]
+               which lock already depends on the new lock.
+
+[  385.697963]
+               the existing dependency chain (in reverse order) is:
+[  385.697970]
+               -> #4 (&cpuctx_mutex){+.+.}:
+[  385.697980]        __mutex_lock+0x86/0x9b0
+[  385.697985]        perf_event_init_cpu+0x5a/0x90
+[  385.697991]        perf_event_init+0x178/0x1a4
+[  385.697997]        start_kernel+0x27f/0x3f1
+[  385.698003]        verify_cpu+0x0/0xfb
+[  385.698006]
+               -> #3 (pmus_lock){+.+.}:
+[  385.698015]        __mutex_lock+0x86/0x9b0
+[  385.698020]        perf_event_init_cpu+0x21/0x90
+[  385.698025]        cpuhp_invoke_callback+0xca/0xc00
+[  385.698030]        _cpu_up+0xa7/0x170
+[  385.698035]        do_cpu_up+0x57/0x70
+[  385.698039]        smp_init+0x62/0xa6
+[  385.698044]        kernel_init_freeable+0x97/0x193
+[  385.698050]        kernel_init+0xa/0x100
+[  385.698055]        ret_from_fork+0x27/0x40
+[  385.698058]
+               -> #2 (cpu_hotplug_lock.rw_sem){++++}:
+[  385.698068]        cpus_read_lock+0x39/0xa0
+[  385.698073]        apply_workqueue_attrs+0x12/0x50
+[  385.698078]        __alloc_workqueue_key+0x1d8/0x4d8
+[  385.698134]        i915_gem_init_userptr+0x5f/0x80 [i915]
+[  385.698176]        i915_gem_init+0x7c/0x390 [i915]
+[  385.698213]        i915_driver_load+0x99e/0x15c0 [i915]
+[  385.698250]        i915_pci_probe+0x33/0x90 [i915]
+[  385.698256]        pci_device_probe+0xa1/0x130
+[  385.698262]        driver_probe_device+0x293/0x440
+[  385.698267]        __driver_attach+0xde/0xe0
+[  385.698272]        bus_for_each_dev+0x5c/0x90
+[  385.698277]        bus_add_driver+0x16d/0x260
+[  385.698282]        driver_register+0x57/0xc0
+[  385.698287]        do_one_initcall+0x3e/0x160
+[  385.698292]        do_init_module+0x5b/0x1fa
+[  385.698297]        load_module+0x2374/0x2dc0
+[  385.698302]        SyS_finit_module+0xaa/0xe0
+[  385.698307]        entry_SYSCALL_64_fastpath+0x1c/0xb1
+[  385.698311]
+               -> #1 (&dev->struct_mutex){+.+.}:
+[  385.698320]        __mutex_lock+0x86/0x9b0
+[  385.698361]        i915_mutex_lock_interruptible+0x4c/0x130 [i915]
+[  385.698403]        i915_gem_fault+0x206/0x760 [i915]
+[  385.698409]        __do_fault+0x1a/0x70
+[  385.698413]        __handle_mm_fault+0x7c4/0xdb0
+[  385.698417]        handle_mm_fault+0x154/0x300
+[  385.698440]        __do_page_fault+0x2d6/0x570
+[  385.698445]        page_fault+0x22/0x30
+[  385.698449]
+               -> #0 (&mm->mmap_sem){++++}:
+[  385.698459]        lock_acquire+0xaf/0x200
+[  385.698464]        __might_fault+0x68/0x90
+[  385.698470]        _copy_to_user+0x1e/0x70
+[  385.698475]        perf_read+0x1aa/0x290
+[  385.698480]        __vfs_read+0x23/0x120
+[  385.698484]        vfs_read+0xa3/0x150
+[  385.698488]        SyS_read+0x45/0xb0
+[  385.698493]        entry_SYSCALL_64_fastpath+0x1c/0xb1
+[  385.698497]
+               other info that might help us debug this:
+
+[  385.698505] Chain exists of:
+                 &mm->mmap_sem --> pmus_lock --> &cpuctx_mutex
+
+[  385.698517]  Possible unsafe locking scenario:
+
+[  385.698522]        CPU0                    CPU1
+[  385.698526]        ----                    ----
+[  385.698529]   lock(&cpuctx_mutex);
+[  385.698553]                                lock(pmus_lock);
+[  385.698558]                                lock(&cpuctx_mutex);
+[  385.698564]   lock(&mm->mmap_sem);
+[  385.698568]
+                *** DEADLOCK ***
+
+[  385.698574] 1 lock held by perf_pmu/2631:
+[  385.698578]  #0:  (&cpuctx_mutex){+.+.}, at: [<ffffffff8116fe8c>] perf_event_ctx_lock_nested+0xbc/0x1d0
+[  385.698589]
+               stack backtrace:
+[  385.698595] CPU: 3 PID: 2631 Comm: perf_pmu Tainted: G     U          4.14.0-CI-Patchwork_7234+ #1
+[  385.698602] Hardware name:                  /NUC6CAYB, BIOS AYAPLCEL.86A.0040.2017.0619.1722 06/19/2017
+[  385.698609] Call Trace:
+[  385.698615]  dump_stack+0x5f/0x86
+[  385.698621]  print_circular_bug.isra.18+0x1d0/0x2c0
+[  385.698627]  __lock_acquire+0x19c3/0x1b60
+[  385.698634]  ? generic_exec_single+0x77/0xe0
+[  385.698640]  ? lock_acquire+0xaf/0x200
+[  385.698644]  lock_acquire+0xaf/0x200
+[  385.698650]  ? __might_fault+0x3e/0x90
+[  385.698655]  __might_fault+0x68/0x90
+[  385.698660]  ? __might_fault+0x3e/0x90
+[  385.698665]  _copy_to_user+0x1e/0x70
+[  385.698670]  perf_read+0x1aa/0x290
+[  385.698675]  __vfs_read+0x23/0x120
+[  385.698682]  ? __fget+0x101/0x1f0
+[  385.698686]  vfs_read+0xa3/0x150
+[  385.698691]  SyS_read+0x45/0xb0
+[  385.698696]  entry_SYSCALL_64_fastpath+0x1c/0xb1
+[  385.698701] RIP: 0033:0x7ff1c46876ed
+[  385.698705] RSP: 002b:00007fff13552f90 EFLAGS: 00000293 ORIG_RAX: 0000000000000000
+[  385.698712] RAX: ffffffffffffffda RBX: ffffc90000647ff0 RCX: 00007ff1c46876ed
+[  385.698718] RDX: 0000000000000010 RSI: 00007fff13552fa0 RDI: 0000000000000005
+[  385.698723] RBP: 000056063d300580 R08: 0000000000000000 R09: 0000000000000060
+[  385.698729] R10: 0000000000000000 R11: 0000000000000293 R12: 0000000000000046
+[  385.698734] R13: 00007fff13552c6f R14: 00007ff1c6279d00 R15: 00007ff1c6279a40
+
+Testcase: igt/perf_pmu
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171122172621.16158-1-chris@chris-wilson.co.uk
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+

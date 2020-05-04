@@ -1,0 +1,54 @@
+net/tls: Add support for async encryption of records for performance
+
+In current implementation, tls records are encrypted & transmitted
+serially. Till the time the previously submitted user data is encrypted,
+the implementation waits and on finish starts transmitting the record.
+This approach of encrypt-one record at a time is inefficient when
+asynchronous crypto accelerators are used. For each record, there are
+overheads of interrupts, driver softIRQ scheduling etc. Also the crypto
+accelerator sits idle most of time while an encrypted record's pages are
+handed over to tcp stack for transmission.
+
+This patch enables encryption of multiple records in parallel when an
+async capable crypto accelerator is present in system. This is achieved
+by allowing the user space application to send more data using sendmsg()
+even while previously issued data is being processed by crypto
+accelerator. This requires returning the control back to user space
+application after submitting encryption request to accelerator. This
+also means that zero-copy mode of encryption cannot be used with async
+accelerator as we must be done with user space application buffer before
+returning from sendmsg().
+
+There can be multiple records in flight to/from the accelerator. Each of
+the record is represented by 'struct tls_rec'. This is used to store the
+memory pages for the record.
+
+After the records are encrypted, they are added in a linked list called
+tx_ready_list which contains encrypted tls records sorted as per tls
+sequence number. The records from tx_ready_list are transmitted using a
+newly introduced function called tls_tx_records(). The tx_ready_list is
+polled for any record ready to be transmitted in sendmsg(), sendpage()
+after initiating encryption of new tls records. This achieves parallel
+encryption and transmission of records when async accelerator is
+present.
+
+There could be situation when crypto accelerator completes encryption
+later than polling of tx_ready_list by sendmsg()/sendpage(). Therefore
+we need a deferred work context to be able to transmit records from
+tx_ready_list. The deferred work context gets scheduled if applications
+are not sending much data through the socket. If the applications issue
+sendmsg()/sendpage() in quick succession, then the scheduling of
+tx_work_handler gets cancelled as the tx_ready_list would be polled from
+application's context itself. This saves scheduling overhead of deferred
+work.
+
+The patch also brings some side benefit. We are able to get rid of the
+concept of CLOSED record. This is because the records once closed are
+either encrypted and then placed into tx_ready_list or if encryption
+fails, the socket error is set. This simplifies the kernel tls
+sendpath. However since tls_device.c is still using macros, accessory
+functions for CLOSED records have been retained.
+
+Signed-off-by: Vakul Garg <vakul.garg@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

@@ -1,0 +1,165 @@
+rseq: Introduce restartable sequences system call
+
+Expose a new system call allowing each thread to register one userspace
+memory area to be used as an ABI between kernel and user-space for two
+purposes: user-space restartable sequences and quick access to read the
+current CPU number value from user-space.
+
+* Restartable sequences (per-cpu atomics)
+
+Restartables sequences allow user-space to perform update operations on
+per-cpu data without requiring heavy-weight atomic operations.
+
+The restartable critical sections (percpu atomics) work has been started
+by Paul Turner and Andrew Hunter. It lets the kernel handle restart of
+critical sections. [1] [2] The re-implementation proposed here brings a
+few simplifications to the ABI which facilitates porting to other
+architectures and speeds up the user-space fast path.
+
+Here are benchmarks of various rseq use-cases.
+
+Test hardware:
+
+arm32: ARMv7 Processor rev 4 (v7l) "Cubietruck", 2-core
+x86-64: Intel E5-2630 v3@2.40GHz, 16-core, hyperthreading
+
+The following benchmarks were all performed on a single thread.
+
+* Per-CPU statistic counter increment
+
+                getcpu+atomic (ns/op)    rseq (ns/op)    speedup
+arm32:                344.0                 31.4          11.0
+x86-64:                15.3                  2.0           7.7
+
+* LTTng-UST: write event 32-bit header, 32-bit payload into tracer
+             per-cpu buffer
+
+                getcpu+atomic (ns/op)    rseq (ns/op)    speedup
+arm32:               2502.0                 2250.0         1.1
+x86-64:               117.4                   98.0         1.2
+
+* liburcu percpu: lock-unlock pair, dereference, read/compare word
+
+                getcpu+atomic (ns/op)    rseq (ns/op)    speedup
+arm32:                751.0                 128.5          5.8
+x86-64:                53.4                  28.6          1.9
+
+* jemalloc memory allocator adapted to use rseq
+
+Using rseq with per-cpu memory pools in jemalloc at Facebook (based on
+rseq 2016 implementation):
+
+The production workload response-time has 1-2% gain avg. latency, and
+the P99 overall latency drops by 2-3%.
+
+* Reading the current CPU number
+
+Speeding up reading the current CPU number on which the caller thread is
+running is done by keeping the current CPU number up do date within the
+cpu_id field of the memory area registered by the thread. This is done
+by making scheduler preemption set the TIF_NOTIFY_RESUME flag on the
+current thread. Upon return to user-space, a notify-resume handler
+updates the current CPU value within the registered user-space memory
+area. User-space can then read the current CPU number directly from
+memory.
+
+Keeping the current cpu id in a memory area shared between kernel and
+user-space is an improvement over current mechanisms available to read
+the current CPU number, which has the following benefits over
+alternative approaches:
+
+- 35x speedup on ARM vs system call through glibc
+- 20x speedup on x86 compared to calling glibc, which calls vdso
+  executing a "lsl" instruction,
+- 14x speedup on x86 compared to inlined "lsl" instruction,
+- Unlike vdso approaches, this cpu_id value can be read from an inline
+  assembly, which makes it a useful building block for restartable
+  sequences.
+- The approach of reading the cpu id through memory mapping shared
+  between kernel and user-space is portable (e.g. ARM), which is not the
+  case for the lsl-based x86 vdso.
+
+On x86, yet another possible approach would be to use the gs segment
+selector to point to user-space per-cpu data. This approach performs
+similarly to the cpu id cache, but it has two disadvantages: it is
+not portable, and it is incompatible with existing applications already
+using the gs segment selector for other purposes.
+
+Benchmarking various approaches for reading the current CPU number:
+
+ARMv7 Processor rev 4 (v7l)
+Machine model: Cubietruck
+- Baseline (empty loop):                                    8.4 ns
+- Read CPU from rseq cpu_id:                               16.7 ns
+- Read CPU from rseq cpu_id (lazy register):               19.8 ns
+- glibc 2.19-0ubuntu6.6 getcpu:                           301.8 ns
+- getcpu system call:                                     234.9 ns
+
+x86-64 Intel(R) Xeon(R) CPU E5-2630 v3 @ 2.40GHz:
+- Baseline (empty loop):                                    0.8 ns
+- Read CPU from rseq cpu_id:                                0.8 ns
+- Read CPU from rseq cpu_id (lazy register):                0.8 ns
+- Read using gs segment selector:                           0.8 ns
+- "lsl" inline assembly:                                   13.0 ns
+- glibc 2.19-0ubuntu6 getcpu:                              16.6 ns
+- getcpu system call:                                      53.9 ns
+
+- Speed (benchmark taken on v8 of patchset)
+
+Running 10 runs of hackbench -l 100000 seems to indicate, contrary to
+expectations, that enabling CONFIG_RSEQ slightly accelerates the
+scheduler:
+
+Configuration: 2 sockets * 8-core Intel(R) Xeon(R) CPU E5-2630 v3 @
+2.40GHz (directly on hardware, hyperthreading disabled in BIOS, energy
+saving disabled in BIOS, turboboost disabled in BIOS, cpuidle.off=1
+kernel parameter), with a Linux v4.6 defconfig+localyesconfig,
+restartable sequences series applied.
+
+* CONFIG_RSEQ=n
+
+avg.:      41.37 s
+std.dev.:   0.36 s
+
+* CONFIG_RSEQ=y
+
+avg.:      40.46 s
+std.dev.:   0.33 s
+
+- Size
+
+On x86-64, between CONFIG_RSEQ=n/y, the text size increase of vmlinux is
+567 bytes, and the data size increase of vmlinux is 5696 bytes.
+
+[1] https://lwn.net/Articles/650333/
+[2] http://www.linuxplumbersconf.org/2013/ocw/system/presentations/1695/original/LPC%20-%20PerCpu%20Atomics.pdf
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Joel Fernandes <joelaf@google.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Watson <davejwatson@fb.com>
+Cc: Will Deacon <will.deacon@arm.com>
+Cc: Andi Kleen <andi@firstfloor.org>
+Cc: "H . Peter Anvin" <hpa@zytor.com>
+Cc: Chris Lameter <cl@linux.com>
+Cc: Russell King <linux@arm.linux.org.uk>
+Cc: Andrew Hunter <ahh@google.com>
+Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+Cc: "Paul E . McKenney" <paulmck@linux.vnet.ibm.com>
+Cc: Paul Turner <pjt@google.com>
+Cc: Boqun Feng <boqun.feng@gmail.com>
+Cc: Josh Triplett <josh@joshtriplett.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Ben Maurer <bmaurer@fb.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: linux-api@vger.kernel.org
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/20151027235635.16059.11630.stgit@pjt-glaptop.roam.corp.google.com
+Link: http://lkml.kernel.org/r/20150624222609.6116.86035.stgit@kitami.mtv.corp.google.com
+Link: https://lkml.kernel.org/r/20180602124408.8430-3-mathieu.desnoyers@efficios.com
+
+

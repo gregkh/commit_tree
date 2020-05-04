@@ -1,0 +1,244 @@
+drm/i915: Use rcu instead of stop_machine in set_wedged
+
+stop_machine is not really a locking primitive we should use, except
+when the hw folks tell us the hw is broken and that's the only way to
+work around it.
+
+This patch tries to address the locking abuse of stop_machine() from
+
+commit 20e4933c478a1ca694b38fa4ac44d99e659941f5
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue Nov 22 14:41:21 2016 +0000
+
+    drm/i915: Stop the machine as we install the wedged submit_request handler
+
+Chris said parts of the reasons for going with stop_machine() was that
+it's no overhead for the fast-path. But these callbacks use irqsave
+spinlocks and do a bunch of MMIO, and rcu_read_lock is _real_ fast.
+
+To stay as close as possible to the stop_machine semantics we first
+update all the submit function pointers to the nop handler, then call
+synchronize_rcu() to make sure no new requests can be submitted. This
+should give us exactly the huge barrier we want.
+
+I pondered whether we should annotate engine->submit_request as __rcu
+and use rcu_assign_pointer and rcu_dereference on it. But the reason
+behind those is to make sure the compiler/cpu barriers are there for
+when you have an actual data structure you point at, to make sure all
+the writes are seen correctly on the read side. But we just have a
+function pointer, and .text isn't changed, so no need for these
+barriers and hence no need for annotations.
+
+Unfortunately there's a complication with the call to
+intel_engine_init_global_seqno:
+
+- Without stop_machine we must hold the corresponding spinlock.
+
+- Without stop_machine we must ensure that all requests are marked as
+  having failed with dma_fence_set_error() before we call it. That
+  means we need to split the nop request submission into two phases,
+  both synchronized with rcu:
+
+  1. Only stop submitting the requests to hw and mark them as failed.
+
+  2. After all pending requests in the scheduler/ring are suitably
+  marked up as failed and we can force complete them all, also force
+  complete by calling intel_engine_init_global_seqno().
+
+This should fix the followwing lockdep splat:
+
+======================================================
+WARNING: possible circular locking dependency detected
+4.14.0-rc3-CI-CI_DRM_3179+ #1 Tainted: G     U
+------------------------------------------------------
+kworker/3:4/562 is trying to acquire lock:
+ (cpu_hotplug_lock.rw_sem){++++}, at: [<ffffffff8113d4bc>] stop_machine+0x1c/0x40
+
+but task is already holding lock:
+ (&dev->struct_mutex){+.+.}, at: [<ffffffffa0136588>] i915_reset_device+0x1e8/0x260 [i915]
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #6 (&dev->struct_mutex){+.+.}:
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       __mutex_lock+0x86/0x9b0
+       mutex_lock_interruptible_nested+0x1b/0x20
+       i915_mutex_lock_interruptible+0x51/0x130 [i915]
+       i915_gem_fault+0x209/0x650 [i915]
+       __do_fault+0x1e/0x80
+       __handle_mm_fault+0xa08/0xed0
+       handle_mm_fault+0x156/0x300
+       __do_page_fault+0x2c5/0x570
+       do_page_fault+0x28/0x250
+       page_fault+0x22/0x30
+
+-> #5 (&mm->mmap_sem){++++}:
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       __might_fault+0x68/0x90
+       _copy_to_user+0x23/0x70
+       filldir+0xa5/0x120
+       dcache_readdir+0xf9/0x170
+       iterate_dir+0x69/0x1a0
+       SyS_getdents+0xa5/0x140
+       entry_SYSCALL_64_fastpath+0x1c/0xb1
+
+-> #4 (&sb->s_type->i_mutex_key#5){++++}:
+       down_write+0x3b/0x70
+       handle_create+0xcb/0x1e0
+       devtmpfsd+0x139/0x180
+       kthread+0x152/0x190
+       ret_from_fork+0x27/0x40
+
+-> #3 ((complete)&req.done){+.+.}:
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       wait_for_common+0x58/0x210
+       wait_for_completion+0x1d/0x20
+       devtmpfs_create_node+0x13d/0x160
+       device_add+0x5eb/0x620
+       device_create_groups_vargs+0xe0/0xf0
+       device_create+0x3a/0x40
+       msr_device_create+0x2b/0x40
+       cpuhp_invoke_callback+0xc9/0xbf0
+       cpuhp_thread_fun+0x17b/0x240
+       smpboot_thread_fn+0x18a/0x280
+       kthread+0x152/0x190
+       ret_from_fork+0x27/0x40
+
+-> #2 (cpuhp_state-up){+.+.}:
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       cpuhp_issue_call+0x133/0x1c0
+       __cpuhp_setup_state_cpuslocked+0x139/0x2a0
+       __cpuhp_setup_state+0x46/0x60
+       page_writeback_init+0x43/0x67
+       pagecache_init+0x3d/0x42
+       start_kernel+0x3a8/0x3fc
+       x86_64_start_reservations+0x2a/0x2c
+       x86_64_start_kernel+0x6d/0x70
+       verify_cpu+0x0/0xfb
+
+-> #1 (cpuhp_state_mutex){+.+.}:
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       __mutex_lock+0x86/0x9b0
+       mutex_lock_nested+0x1b/0x20
+       __cpuhp_setup_state_cpuslocked+0x53/0x2a0
+       __cpuhp_setup_state+0x46/0x60
+       page_alloc_init+0x28/0x30
+       start_kernel+0x145/0x3fc
+       x86_64_start_reservations+0x2a/0x2c
+       x86_64_start_kernel+0x6d/0x70
+       verify_cpu+0x0/0xfb
+
+-> #0 (cpu_hotplug_lock.rw_sem){++++}:
+       check_prev_add+0x430/0x840
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       cpus_read_lock+0x3d/0xb0
+       stop_machine+0x1c/0x40
+       i915_gem_set_wedged+0x1a/0x20 [i915]
+       i915_reset+0xb9/0x230 [i915]
+       i915_reset_device+0x1f6/0x260 [i915]
+       i915_handle_error+0x2d8/0x430 [i915]
+       hangcheck_declare_hang+0xd3/0xf0 [i915]
+       i915_hangcheck_elapsed+0x262/0x2d0 [i915]
+       process_one_work+0x233/0x660
+       worker_thread+0x4e/0x3b0
+       kthread+0x152/0x190
+       ret_from_fork+0x27/0x40
+
+other info that might help us debug this:
+
+Chain exists of:
+  cpu_hotplug_lock.rw_sem --> &mm->mmap_sem --> &dev->struct_mutex
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&dev->struct_mutex);
+                               lock(&mm->mmap_sem);
+                               lock(&dev->struct_mutex);
+  lock(cpu_hotplug_lock.rw_sem);
+
+ *** DEADLOCK ***
+
+3 locks held by kworker/3:4/562:
+ #0:  ("events_long"){+.+.}, at: [<ffffffff8109c64a>] process_one_work+0x1aa/0x660
+ #1:  ((&(&i915->gpu_error.hangcheck_work)->work)){+.+.}, at: [<ffffffff8109c64a>] process_one_work+0x1aa/0x660
+ #2:  (&dev->struct_mutex){+.+.}, at: [<ffffffffa0136588>] i915_reset_device+0x1e8/0x260 [i915]
+
+stack backtrace:
+CPU: 3 PID: 562 Comm: kworker/3:4 Tainted: G     U          4.14.0-rc3-CI-CI_DRM_3179+ #1
+Hardware name:                  /NUC7i5BNB, BIOS BNKBL357.86A.0048.2017.0704.1415 07/04/2017
+Workqueue: events_long i915_hangcheck_elapsed [i915]
+Call Trace:
+ dump_stack+0x68/0x9f
+ print_circular_bug+0x235/0x3c0
+ ? lockdep_init_map_crosslock+0x20/0x20
+ check_prev_add+0x430/0x840
+ ? irq_work_queue+0x86/0xe0
+ ? wake_up_klogd+0x53/0x70
+ __lock_acquire+0x1420/0x15e0
+ ? __lock_acquire+0x1420/0x15e0
+ ? lockdep_init_map_crosslock+0x20/0x20
+ lock_acquire+0xb0/0x200
+ ? stop_machine+0x1c/0x40
+ ? i915_gem_object_truncate+0x50/0x50 [i915]
+ cpus_read_lock+0x3d/0xb0
+ ? stop_machine+0x1c/0x40
+ stop_machine+0x1c/0x40
+ i915_gem_set_wedged+0x1a/0x20 [i915]
+ i915_reset+0xb9/0x230 [i915]
+ i915_reset_device+0x1f6/0x260 [i915]
+ ? gen8_gt_irq_ack+0x170/0x170 [i915]
+ ? work_on_cpu_safe+0x60/0x60
+ i915_handle_error+0x2d8/0x430 [i915]
+ ? vsnprintf+0xd1/0x4b0
+ ? scnprintf+0x3a/0x70
+ hangcheck_declare_hang+0xd3/0xf0 [i915]
+ ? intel_runtime_pm_put+0x56/0xa0 [i915]
+ i915_hangcheck_elapsed+0x262/0x2d0 [i915]
+ process_one_work+0x233/0x660
+ worker_thread+0x4e/0x3b0
+ kthread+0x152/0x190
+ ? process_one_work+0x660/0x660
+ ? kthread_create_on_node+0x40/0x40
+ ret_from_fork+0x27/0x40
+Setting dangerous option reset - tainting kernel
+i915 0000:00:02.0: Resetting chip after gpu hang
+Setting dangerous option reset - tainting kernel
+i915 0000:00:02.0: Resetting chip after gpu hang
+
+v2: Have 1 global synchronize_rcu() barrier across all engines, and
+improve commit message.
+
+v3: We need to protect the seqno update with the timeline spinlock (in
+set_wedged) to avoid racing with other updates of the seqno, like we
+already do in nop_submit_request (Chris).
+
+v4: Use two-phase sequence to plug the race Chris spotted where we can
+complete requests before they're marked up with -EIO.
+
+v5: Review from Chris:
+- simplify nop_submit_request.
+- Add comment to rcu_read_lock section.
+- Align comments with the new style.
+
+v6: Remove unused variable to appease CI.
+
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=102886
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=103096
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Marta Lofstedt <marta.lofstedt@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171011091019.1425-1-daniel.vetter@ffwll.ch
+

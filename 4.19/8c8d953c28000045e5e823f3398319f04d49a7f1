@@ -1,0 +1,169 @@
+MIPS: Schedule on CPUs we need to lose FPU for a mode switch
+
+Commit 6b8322576e9d ("MIPS: Force CPUs to lose FP context during mode
+switches") ensures that we react to PR_SET_FP_MODE prctl syscalls
+quickly by broadcasting an IPI in order to cause CPUs to lose FPU access
+when necessary. Whilst it achieves that, unfortunately it causes all
+sorts of strange race conditions because:
+
+ 1) The IPI may arrive at a point where the FPU is in the process of
+    being enabled, but that process is not yet complete leading to a
+    state we aren't prepared to handle. For example:
+
+    [  370.215903] do_cpu invoked from kernel context![#1]:
+    [  370.221064] CPU: 0 PID: 963 Comm: fp-prctl Not tainted 4.9.0-rc5-00323-g210db32-dirty #226
+    [  370.229420] task: a8000000fd672e00 task.stack: a8000000fd630000
+    [  370.235399] $ 0   : 0000000000000000 0000000000000001 0000000000000001 a8000000fd630000
+    [  370.243882] $ 4   : a8000000fd672e00 0000000000000000 0000000000000453 0000000000000000
+    [  370.252317] $ 8   : 0000000000000000 a8000000fd637c28 1000000000000000 0000000000000010
+    [  370.260753] $12   : 00000000140084e0 ffffffff80109c00 0000000000000000 0000000000000002
+    [  370.269179] $16   : ffffffff8092f080 a8000000fd672e00 ffffffff80107fe8 a8000000fd485000
+    [  370.277612] $20   : ffffffff8084d328 ffffffff80940000 0000000000000009 ffffffff80930000
+    [  370.286038] $24   : 0000000000000000 900000001612048c
+    [  370.294476] $28   : a8000000fd630000 a8000000fd637ac0 ffffffff80937300 ffffffff8010807c
+    [  370.302909] Hi    : 0000000000000000
+    [  370.306595] Lo    : 0000000000000200
+    [  370.310376] epc   : ffffffff80115d38 _save_fp+0x10/0xa0
+    [  370.315784] ra    : ffffffff8010807c prepare_for_fp_mode_switch+0x94/0x1b0
+    [  370.322707] Status: 140084e2 KX SX UX KERNEL EXL
+    [  370.327980] Cause : 1080002c (ExcCode 0b)
+    [  370.332091] PrId  : 0001a428 (MIPS P6600)
+    [  370.336179] Modules linked in:
+    [  370.339486] Process fp-prctl (pid: 963, threadinfo=a8000000fd630000, task=a8000000fd672e00, tls=00000000756e67d0)
+    [  370.349724] Stack : 0000000000000000 a8000000fd557dc0 0000000000000000 ffffffff801ca8e0
+    [  370.358161]         0000000000000000 a8000000fd637b9c 0000000000000009 ffffffff80923780
+    [  370.366575]         ffffffff80850000 ffffffff8011610c 00000000000000b8 ffffffff801a5084
+    [  370.374989]         ffffffff8084a370 ffffffff8084a388 ffffffff80923780 ffffffff80923828
+    [  370.383395]         0000000000010000 ffffffff809237a8 0000000000020000 ffffffff80a40000
+    [  370.391817]         000000000000007c 00000000004a0000 00000000756dedd0 ffffffff801a5188
+    [  370.400230]         a800000002014900 0000000000000001 ffffffff80923780 0000000080923828
+    [  370.408644]         ffffffff80923780 ffffffff80923780 ffffffff80923828 ffffffff801a521c
+    [  370.417066]         ffffffff80923780 ffffffff80923828 0000000000010000 ffffffff801a8f84
+    [  370.425472]         ffffffff80a40000 a8000000fd637c20 ffffffff80a39240 0000000000000001
+    [  370.433885]         ...
+    [  370.436562] Call Trace:
+    [  370.439222] [<ffffffff80115d38>] _save_fp+0x10/0xa0
+    [  370.444305] [<ffffffff8010807c>] prepare_for_fp_mode_switch+0x94/0x1b0
+    [  370.451035] [<ffffffff801ca8e0>] flush_smp_call_function_queue+0xf8/0x230
+    [  370.457991] [<ffffffff8011610c>] ipi_call_interrupt+0xc/0x20
+    [  370.463814] [<ffffffff801a5084>] __handle_irq_event_percpu+0xc4/0x1a8
+    [  370.470404] [<ffffffff801a5188>] handle_irq_event_percpu+0x20/0x68
+    [  370.476734] [<ffffffff801a521c>] handle_irq_event+0x4c/0x88
+    [  370.482486] [<ffffffff801a8f84>] handle_edge_irq+0x12c/0x210
+    [  370.488316] [<ffffffff801a47a0>] generic_handle_irq+0x38/0x48
+    [  370.494280] [<ffffffff804a2dbc>] gic_handle_shared_int+0x194/0x268
+    [  370.500616] [<ffffffff801a47a0>] generic_handle_irq+0x38/0x48
+    [  370.506529] [<ffffffff80107e60>] do_IRQ+0x18/0x28
+    [  370.511445] [<ffffffff804a1524>] plat_irq_dispatch+0xc4/0x140
+    [  370.517339] [<ffffffff80106230>] ret_from_irq+0x0/0x4
+    [  370.522583] [<ffffffff8010fad4>] do_ri+0x4fc/0x7e8
+    [  370.527546] [<ffffffff80106220>] ret_from_exception+0x0/0x10
+
+ 2) The IPI may arrive during kernel use of the FPU, since we generally
+    only disable preemption around use of the FPU & leave interrupts
+    enabled. This can lead to us unexpectedly losing access to the FPU
+    in places where it previously had not been possible. For example:
+
+    do_cpu invoked from kernel context![#2]:
+    CPU: 2 PID: 7338 Comm: fp-prctl Tainted: G      D         4.7.0-00424-g49b0c82
+    #2
+    task: 838e4000 ti: 88d38000 task.ti: 88d38000
+    $ 0   : 00000000 00000001 ffffffff 88d3fef8
+    $ 4   : 838e4000 88d38004 00000000 00000001
+    $ 8   : 3400fc01 801f8020 808e9100 24000000
+    $12   : dbffffff 807b69d8 807b0000 00000000
+    $16   : 00000000 80786150 00400fc4 809c0398
+    $20   : 809c0338 0040273c 88d3ff28 808e9d30
+    $24   : 808e9d30 00400fb4
+    $28   : 88d38000 88d3fe88 00000000 8011a2ac
+    Hi    : 0040273c
+    Lo    : 88d3ff28
+    epc   : 80114178 _restore_fp+0x10/0xa0
+    ra    : 8011a2ac mipsr2_decoder+0xd5c/0x1660
+    Status: 1400fc03    KERNEL EXL IE
+    Cause : 1080002c (ExcCode 0b)
+    PrId  : 0001a920 (MIPS I6400)
+    Modules linked in:
+    Process fp-prctl (pid: 7338, threadinfo=88d38000, task=838e4000, tls=766527d0)
+    Stack : 00000000 00000000 00000000 88d3fe98 00000000 00000000 809c0398 809c0338
+          808e9100 00000000 88d3ff28 00400fc4 00400fc4 0040273c 7fb69e18 004a0000
+          004a0000 004a0000 7664add0 8010de18 00000000 00000000 88d3fef8 88d3ff28
+          808e9100 00000000 766527d0 8010e534 000c0000 85755000 8181d580 00000000
+          00000000 00000000 004a0000 00000000 766527d0 7fb69e18 004a0000 80105c20
+          ...
+    Call Trace:
+    [<80114178>] _restore_fp+0x10/0xa0
+    [<8011a2ac>] mipsr2_decoder+0xd5c/0x1660
+    [<8010de18>] do_ri+0x90/0x6b8
+    [<80105c20>] ret_from_exception+0x0/0x10
+
+At first glance a simple fix may seem to be to disable interrupts around
+kernel use of the FPU rather than merely preemption, however this would
+introduce further overhead outside of the mode switch path & doesn't
+solve the third problem:
+
+ 3) The IPI may arrive whilst the kernel is running code that will lead
+    to a preempt_disable() call & FPU usage soon. If this happens then
+    the IPI will be serviced & we'll proceed to enable an FPU whilst the
+    mode switch is in progress, leading to strange & inconsistent
+    behaviour.
+
+Further to all of this is a separate but related problem:
+
+ 4) There are various paths through which we may enable the FPU without
+    the user having triggered a coprocessor 1 disabled exception. These
+    paths are those in which we emulate instructions & then enable the
+    FPU with the expectation that the user might execute an FP
+    instruction shortly afterwards. However these paths have not
+    previously checked whether an FP mode switch is underway for the
+    task, and therefore could enable the FPU whilst such a mode switch
+    is in progress leading to strange & inconsistent behaviour for user
+    code.
+
+This patch fixes all of the above by taking a step back & re-examining
+our approach to FP mode switches. Up until now we have taken these basic
+steps:
+
+ a) Prevent any threads that are part of the affected process from being
+    able to obtain ownership of the FPU.
+
+ b) Cause any threads that are part of the affected process and already
+    have ownership of an FPU to lose it.
+
+ c) Set the thread flags for each thread that is part of the affected
+    process to reflect the new FP mode.
+
+ d) Allow threads to obtain ownership of the FPU again.
+
+This approach is however more complex than necessary. All that we really
+require is that the mode switch has occurred for all threads that are
+part of the affected process before mips_set_process_fp_mode(), and thus
+the PR_SET_FP_MODE prctl() syscall, returns. This doesn't require that
+we stop threads from owning or using an FPU whilst a mode switch occurs,
+only that we force them to relinquish it after the mode switch has
+occurred such that they next own an FPU with the correct mode
+configured. Our basic steps therefore simplify to:
+
+ A) Set the thread flags for each thread that is part of the affected
+    process to reflect the new FP mode.
+
+ B) Cause any threads that are part of the affected process and already
+    have ownership of an FPU to lose it.
+
+We implement B) by forcing each CPU which might be running a thread
+which is part of the affected process to schedule a no-op function,
+which causes the affected thread to lose its FPU ownership when it is
+descheduled.
+
+The end result is simpler FP mode switching with less overhead in the
+FPU enable path (ie. enable_restore_fp_context()) and fewer moving
+parts.
+
+Signed-off-by: Paul Burton <paul.burton@mips.com>
+Fixes: 9791554b45a2 ("MIPS,prctl: add PR_[GS]ET_FP_MODE prctl options for MIPS")
+Fixes: 6b8322576e9d ("MIPS: Force CPUs to lose FP context during mode switches")
+Cc: James Hogan <jhogan@kernel.org>
+Cc: Ralf Baechle <ralf@linux-mips.org>
+Cc: linux-mips@linux-mips.org
+Cc: stable <stable@vger.kernel.org> # v4.0+
+

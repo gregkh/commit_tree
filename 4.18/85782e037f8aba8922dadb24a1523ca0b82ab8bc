@@ -1,0 +1,55 @@
+bpf: undo prog rejection on read-only lock failure
+
+Partially undo commit 9facc336876f ("bpf: reject any prog that failed
+read-only lock") since it caused a regression, that is, syzkaller was
+able to manage to cause a panic via fault injection deep in set_memory_ro()
+path by letting an allocation fail: In x86's __change_page_attr_set_clr()
+it was able to change the attributes of the primary mapping but not in
+the alias mapping via cpa_process_alias(), so the second, inner call
+to the __change_page_attr() via __change_page_attr_set_clr() had to split
+a larger page and failed in the alloc_pages() with the artifically triggered
+allocation error which is then propagated down to the call site.
+
+Thus, for set_memory_ro() this means that it returned with an error, but
+from debugging a probe_kernel_write() revealed EFAULT on that memory since
+the primary mapping succeeded to get changed. Therefore the subsequent
+hdr->locked = 0 reset triggered the panic as it was performed on read-only
+memory, so call-site assumptions were infact wrong to assume that it would
+either succeed /or/ not succeed at all since there's no such rollback in
+set_memory_*() calls from partial change of mappings, in other words, we're
+left in a state that is "half done". A later undo via set_memory_rw() is
+succeeding though due to matching permissions on that part (aka due to the
+try_preserve_large_page() succeeding). While reproducing locally with
+explicitly triggering this error, the initial splitting only happens on
+rare occasions and in real world it would additionally need oom conditions,
+but that said, it could partially fail. Therefore, it is definitely wrong
+to bail out on set_memory_ro() error and reject the program with the
+set_memory_*() semantics we have today. Shouldn't have gone the extra mile
+since no other user in tree today infact checks for any set_memory_*()
+errors, e.g. neither module_enable_ro() / module_disable_ro() for module
+RO/NX handling which is mostly default these days nor kprobes core with
+alloc_insn_page() / free_insn_page() as examples that could be invoked long
+after bootup and original 314beb9bcabf ("x86: bpf_jit_comp: secure bpf jit
+against spraying attacks") did neither when it got first introduced to BPF
+so "improving" with bailing out was clearly not right when set_memory_*()
+cannot handle it today.
+
+Kees suggested that if set_memory_*() can fail, we should annotate it with
+__must_check, and all callers need to deal with it gracefully given those
+set_memory_*() markings aren't "advisory", but they're expected to actually
+do what they say. This might be an option worth to move forward in future
+but would at the same time require that set_memory_*() calls from supporting
+archs are guaranteed to be "atomic" in that they provide rollback if part
+of the range fails, once that happened, the transition from RW -> RO could
+be made more robust that way, while subsequent RO -> RW transition /must/
+continue guaranteeing to always succeed the undo part.
+
+Reported-by: syzbot+a4eb8c7766952a1ca872@syzkaller.appspotmail.com
+Reported-by: syzbot+d866d1925855328eac3b@syzkaller.appspotmail.com
+Fixes: 9facc336876f ("bpf: reject any prog that failed read-only lock")
+Cc: Laura Abbott <labbott@redhat.com>
+Cc: Kees Cook <keescook@chromium.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

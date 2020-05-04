@@ -1,0 +1,82 @@
+tcp: internal implementation for pacing
+
+BBR congestion control depends on pacing, and pacing is
+currently handled by sch_fq packet scheduler for performance reasons,
+and also because implemening pacing with FQ was convenient to truly
+avoid bursts.
+
+However there are many cases where this packet scheduler constraint
+is not practical.
+- Many linux hosts are not focusing on handling thousands of TCP
+  flows in the most efficient way.
+- Some routers use fq_codel or other AQM, but still would like
+  to use BBR for the few TCP flows they initiate/terminate.
+
+This patch implements an automatic fallback to internal pacing.
+
+Pacing is requested either by BBR or use of SO_MAX_PACING_RATE option.
+
+If sch_fq happens to be in the egress path, pacing is delegated to
+the qdisc, otherwise pacing is done by TCP itself.
+
+One advantage of pacing from TCP stack is to get more precise rtt
+estimations, and less work done from TX completion, since TCP Small
+queue limits are not generally hit. Setups with single TX queue but
+many cpus might even benefit from this.
+
+Note that unlike sch_fq, we do not take into account header sizes.
+Taking care of these headers would add additional complexity for
+no practical differences in behavior.
+
+Some performance numbers using 800 TCP_STREAM flows rate limited to
+~48 Mbit per second on 40Gbit NIC.
+
+If MQ+pfifo_fast is used on the NIC :
+
+$ sar -n DEV 1 5 | grep eth
+14:48:44         eth0 725743.00 2932134.00  46776.76 4335184.68      0.00      0.00      1.00
+14:48:45         eth0 725349.00 2932112.00  46751.86 4335158.90      0.00      0.00      0.00
+14:48:46         eth0 725101.00 2931153.00  46735.07 4333748.63      0.00      0.00      0.00
+14:48:47         eth0 725099.00 2931161.00  46735.11 4333760.44      0.00      0.00      1.00
+14:48:48         eth0 725160.00 2931731.00  46738.88 4334606.07      0.00      0.00      0.00
+Average:         eth0 725290.40 2931658.20  46747.54 4334491.74      0.00      0.00      0.40
+$ vmstat 1 5
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 4  0      0 259825920  45644 2708324    0    0    21     2  247   98  0  0 100  0  0
+ 4  0      0 259823744  45644 2708356    0    0     0     0 2400825 159843  0 19 81  0  0
+ 0  0      0 259824208  45644 2708072    0    0     0     0 2407351 159929  0 19 81  0  0
+ 1  0      0 259824592  45644 2708128    0    0     0     0 2405183 160386  0 19 80  0  0
+ 1  0      0 259824272  45644 2707868    0    0     0    32 2396361 158037  0 19 81  0  0
+
+Now use MQ+FQ :
+
+lpaa23:~# echo fq >/proc/sys/net/core/default_qdisc
+lpaa23:~# tc qdisc replace dev eth0 root mq
+
+$ sar -n DEV 1 5 | grep eth
+14:49:57         eth0 678614.00 2727930.00  43739.13 4033279.14      0.00      0.00      0.00
+14:49:58         eth0 677620.00 2723971.00  43674.69 4027429.62      0.00      0.00      1.00
+14:49:59         eth0 676396.00 2719050.00  43596.83 4020125.02      0.00      0.00      0.00
+14:50:00         eth0 675197.00 2714173.00  43518.62 4012938.90      0.00      0.00      1.00
+14:50:01         eth0 676388.00 2719063.00  43595.47 4020171.64      0.00      0.00      0.00
+Average:         eth0 676843.00 2720837.40  43624.95 4022788.86      0.00      0.00      0.40
+$ vmstat 1 5
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0 259832240  46008 2710912    0    0    21     2  223  192  0  1 99  0  0
+ 1  0      0 259832896  46008 2710744    0    0     0     0 1702206 198078  0 17 82  0  0
+ 0  0      0 259830272  46008 2710596    0    0     0     0 1696340 197756  1 17 83  0  0
+ 4  0      0 259829168  46024 2710584    0    0    16     0 1688472 197158  1 17 82  0  0
+ 3  0      0 259830224  46024 2710408    0    0     0     0 1692450 197212  0 18 82  0  0
+
+As expected, number of interrupts per second is very different.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+Cc: Neal Cardwell <ncardwell@google.com>
+Cc: Yuchung Cheng <ycheng@google.com>
+Cc: Van Jacobson <vanj@google.com>
+Cc: Jerry Chu <hkchu@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

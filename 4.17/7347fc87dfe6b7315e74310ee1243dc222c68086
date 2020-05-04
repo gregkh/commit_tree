@@ -1,0 +1,145 @@
+sched/numa: Delay retrying placement for automatic NUMA balance after wake_affine()
+
+If wake_affine() pulls a task to another node for any reason and the node is
+no longer preferred then temporarily stop automatic NUMA balancing pulling
+the task back. Otherwise, tasks with a strong waker/wakee relationship
+may constantly fight automatic NUMA balancing over where a task should
+be placed.
+
+Once again netperf is interesting here. The performance barely changes
+but automatic NUMA balancing is interesting:
+
+ Hmean     send-64         354.67 (   0.00%)      352.15 (  -0.71%)
+ Hmean     send-128        702.91 (   0.00%)      693.84 (  -1.29%)
+ Hmean     send-256       1350.07 (   0.00%)     1344.19 (  -0.44%)
+ Hmean     send-1024      5124.38 (   0.00%)     4941.24 (  -3.57%)
+ Hmean     send-2048      9687.44 (   0.00%)     9624.45 (  -0.65%)
+ Hmean     send-3312     14577.64 (   0.00%)    14514.35 (  -0.43%)
+ Hmean     send-4096     16393.62 (   0.00%)    16488.30 (   0.58%)
+ Hmean     send-8192     26877.26 (   0.00%)    26431.63 (  -1.66%)
+ Hmean     send-16384    38683.43 (   0.00%)    38264.91 (  -1.08%)
+ Hmean     recv-64         354.67 (   0.00%)      352.15 (  -0.71%)
+ Hmean     recv-128        702.91 (   0.00%)      693.84 (  -1.29%)
+ Hmean     recv-256       1350.07 (   0.00%)     1344.19 (  -0.44%)
+ Hmean     recv-1024      5124.38 (   0.00%)     4941.24 (  -3.57%)
+ Hmean     recv-2048      9687.43 (   0.00%)     9624.45 (  -0.65%)
+ Hmean     recv-3312     14577.59 (   0.00%)    14514.35 (  -0.43%)
+ Hmean     recv-4096     16393.55 (   0.00%)    16488.20 (   0.58%)
+ Hmean     recv-8192     26876.96 (   0.00%)    26431.29 (  -1.66%)
+ Hmean     recv-16384    38682.41 (   0.00%)    38263.94 (  -1.08%)
+
+ NUMA alloc hit                 1465986     1423090
+ NUMA alloc miss                      0           0
+ NUMA interleave hit                  0           0
+ NUMA alloc local               1465897     1423003
+ NUMA base PTE updates             1473        1420
+ NUMA huge PMD updates                0           0
+ NUMA page range updates           1473        1420
+ NUMA hint faults                  1383        1312
+ NUMA hint local faults             451         124
+ NUMA hint local percent             32           9
+
+There is a slight degrading in performance but there are slightly fewer
+NUMA faults. There is a large drop in the percentage of local faults but
+the bulk of migrations for netperf are in small shared libraries so it's
+reflecting the fact that automatic NUMA balancing has backed off. This is
+a case where despite wake_affine() and automatic NUMA balancing fighting
+for placement that there is a marginal benefit to rescheduling to local
+data quickly. However, it should be noted that wake_affine() and automatic
+NUMA balancing fighting each other constantly is undesirable.
+
+However, the benefit in other cases is large. This is the result for NAS
+with the D class sizing on a 4-socket machine:
+
+ nas-mpi
+                           4.15.0                 4.15.0
+                     sdnuma-v1r23       delayretry-v1r23
+ Time cg.D      557.00 (   0.00%)      431.82 (  22.47%)
+ Time ep.D       77.83 (   0.00%)       79.01 (  -1.52%)
+ Time is.D       26.46 (   0.00%)       26.64 (  -0.68%)
+ Time lu.D      727.14 (   0.00%)      597.94 (  17.77%)
+ Time mg.D      191.35 (   0.00%)      146.85 (  23.26%)
+
+               4.15.0      4.15.0
+         sdnuma-v1r23delayretry-v1r23
+ User        75665.20    70413.30
+ System      20321.59     8861.67
+ Elapsed       766.13      634.92
+
+ Minor Faults                  16528502     7127941
+ Major Faults                      4553        5068
+ NUMA alloc local               6963197     6749135
+ NUMA base PTE updates        366409093   107491434
+ NUMA huge PMD updates           687556      198880
+ NUMA page range updates      718437765   209317994
+ NUMA hint faults              13643410     4601187
+ NUMA hint local faults         9212593     3063996
+ NUMA hint local percent             67          66
+
+Note the massive reduction in system CPU usage even though the percentage
+of local faults is barely affected. There is a massive reduction in the
+number of PTE updates showing that automatic NUMA balancing has backed off.
+A critical observation is also that there is a massive reduction in minor
+faults which is due to far fewer NUMA hinting faults being trapped.
+
+There were questions on NAS OMP and how it behaved related to threads
+being bound to CPUs. First, there are more gains than losses with this
+patch applied and a reduction in system CPU usage:
+
+nas-omp
+                      4.16.0-rc1             4.16.0-rc1
+                     sdnuma-v2r1        delayretry-v2r1
+Time bt.D      436.71 (   0.00%)      430.05 (   1.53%)
+Time cg.D      201.02 (   0.00%)      180.87 (  10.02%)
+Time ep.D       32.84 (   0.00%)       32.68 (   0.49%)
+Time is.D        9.63 (   0.00%)        9.64 (  -0.10%)
+Time lu.D      331.20 (   0.00%)      304.80 (   7.97%)
+Time mg.D       54.87 (   0.00%)       52.72 (   3.92%)
+Time sp.D     1108.78 (   0.00%)      917.10 (  17.29%)
+Time ua.D      378.81 (   0.00%)      398.83 (  -5.28%)
+
+          4.16.0-rc1  4.16.0-rc1
+         sdnuma-v2r1delayretry-v2r1
+User       305633.08   296751.91
+System        451.75      357.80
+Elapsed      2595.73     2368.13
+
+However, it does not close the gap between binding and being unbound. There
+is negligible difference between the performance of the baseline and a
+patched kernel when threads are bound so it is not presented here:
+
+                      4.16.0-rc1             4.16.0-rc1
+                 delayretry-bind     delayretry-unbound
+Time bt.D      385.02 (   0.00%)      430.05 ( -11.70%)
+Time cg.D      144.02 (   0.00%)      180.87 ( -25.59%)
+Time ep.D       32.85 (   0.00%)       32.68 (   0.52%)
+Time is.D       10.52 (   0.00%)        9.64 (   8.37%)
+Time lu.D      285.31 (   0.00%)      304.80 (  -6.83%)
+Time mg.D       43.21 (   0.00%)       52.72 ( -22.01%)
+Time sp.D      820.24 (   0.00%)      917.10 ( -11.81%)
+Time ua.D      337.09 (   0.00%)      398.83 ( -18.32%)
+
+          4.16.0-rc1  4.16.0-rc1
+        delayretry-binddelayretry-unbound
+User       277731.25   296751.91
+System        261.29      357.80
+Elapsed      2100.55     2368.13
+
+Unfortunately, while performance is improved by the patch, there is still
+quite a long way to go before it's equivalent to hard binding.
+
+Other workloads like hackbench, tbench, dbench and schbench are barely
+affected. dbench shows a mix of gains and losses depending on the machine
+although in general, the results are more stable.
+
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Giovanni Gherdovich <ggherdovich@suse.cz>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Matt Fleming <matt@codeblueprint.co.uk>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20180213133730.24064-7-mgorman@techsingularity.net
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

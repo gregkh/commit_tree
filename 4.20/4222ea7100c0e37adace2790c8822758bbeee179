@@ -1,0 +1,63 @@
+Btrfs: fix deadlock on tree root leaf when finding free extent
+
+When we are writing out a free space cache, during the transaction commit
+phase, we can end up in a deadlock which results in a stack trace like the
+following:
+
+ schedule+0x28/0x80
+ btrfs_tree_read_lock+0x8e/0x120 [btrfs]
+ ? finish_wait+0x80/0x80
+ btrfs_read_lock_root_node+0x2f/0x40 [btrfs]
+ btrfs_search_slot+0xf6/0x9f0 [btrfs]
+ ? evict_refill_and_join+0xd0/0xd0 [btrfs]
+ ? inode_insert5+0x119/0x190
+ btrfs_lookup_inode+0x3a/0xc0 [btrfs]
+ ? kmem_cache_alloc+0x166/0x1d0
+ btrfs_iget+0x113/0x690 [btrfs]
+ __lookup_free_space_inode+0xd8/0x150 [btrfs]
+ lookup_free_space_inode+0x5b/0xb0 [btrfs]
+ load_free_space_cache+0x7c/0x170 [btrfs]
+ ? cache_block_group+0x72/0x3b0 [btrfs]
+ cache_block_group+0x1b3/0x3b0 [btrfs]
+ ? finish_wait+0x80/0x80
+ find_free_extent+0x799/0x1010 [btrfs]
+ btrfs_reserve_extent+0x9b/0x180 [btrfs]
+ btrfs_alloc_tree_block+0x1b3/0x4f0 [btrfs]
+ __btrfs_cow_block+0x11d/0x500 [btrfs]
+ btrfs_cow_block+0xdc/0x180 [btrfs]
+ btrfs_search_slot+0x3bd/0x9f0 [btrfs]
+ btrfs_lookup_inode+0x3a/0xc0 [btrfs]
+ ? kmem_cache_alloc+0x166/0x1d0
+ btrfs_update_inode_item+0x46/0x100 [btrfs]
+ cache_save_setup+0xe4/0x3a0 [btrfs]
+ btrfs_start_dirty_block_groups+0x1be/0x480 [btrfs]
+ btrfs_commit_transaction+0xcb/0x8b0 [btrfs]
+
+At cache_save_setup() we need to update the inode item of a block group's
+cache which is located in the tree root (fs_info->tree_root), which means
+that it may result in COWing a leaf from that tree. If that happens we
+need to find a free metadata extent and while looking for one, if we find
+a block group which was not cached yet we attempt to load its cache by
+calling cache_block_group(). However this function will try to load the
+inode of the free space cache, which requires finding the matching inode
+item in the tree root - if that inode item is located in the same leaf as
+the inode item of the space cache we are updating at cache_save_setup(),
+we end up in a deadlock, since we try to obtain a read lock on the same
+extent buffer that we previously write locked.
+
+So fix this by using the tree root's commit root when searching for a
+block group's free space cache inode item when we are attempting to load
+a free space cache. This is safe since block groups once loaded stay in
+memory forever, as well as their caches, so after they are first loaded
+we will never need to read their inode items again. For new block groups,
+once they are created they get their ->cached field set to
+BTRFS_CACHE_FINISHED meaning we will not need to read their inode item.
+
+Reported-by: Andrew Nelson <andrew.s.nelson@gmail.com>
+Link: https://lore.kernel.org/linux-btrfs/CAPTELenq9x5KOWuQ+fa7h1r3nsJG8vyiTH8+ifjURc_duHh2Wg@mail.gmail.com/
+Fixes: 9d66e233c704 ("Btrfs: load free space cache if it exists")
+Tested-by: Andrew Nelson <andrew.s.nelson@gmail.com>
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

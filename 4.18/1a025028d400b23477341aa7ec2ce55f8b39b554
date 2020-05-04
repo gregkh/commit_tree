@@ -1,0 +1,90 @@
+rxrpc: Fix handling of call quietly cancelled out on server
+
+Sometimes an in-progress call will stop responding on the fileserver when
+the fileserver quietly cancels the call with an internally marked abort
+(RX_CALL_DEAD), without sending an ABORT to the client.
+
+This causes the client's call to eventually expire from lack of incoming
+packets directed its way, which currently leads to it being cancelled
+locally with ETIME.  Note that it's not currently clear as to why this
+happens as it's really hard to reproduce.
+
+The rotation policy implement by kAFS, however, doesn't differentiate
+between ETIME meaning we didn't get any response from the server and ETIME
+meaning the call got cancelled mid-flow.  The latter leads to an oops when
+fetching data as the rotation partially resets the afs_read descriptor,
+which can result in a cleared page pointer being dereferenced because that
+page has already been filled.
+
+Handle this by the following means:
+
+ (1) Set a flag on a call when we receive a packet for it.
+
+ (2) Store the highest packet serial number so far received for a call
+     (bearing in mind this may wrap).
+
+ (3) If, when the "not received anything recently" timeout expires on a
+     call, we've received at least one packet for a call and the connection
+     as a whole has received packets more recently than that call, then
+     cancel the call locally with ECONNRESET rather than ETIME.
+
+     This indicates that the call was definitely in progress on the server.
+
+ (4) In kAFS, if the rotation algorithm sees ECONNRESET rather than ETIME,
+     don't try the next server, but rather abort the call.
+
+     This avoids the oops as we don't try to reuse the afs_read struct.
+     Rather, as-yet ungotten pages will be reread at a later data.
+
+Also:
+
+ (5) Add an rxrpc tracepoint to log detection of the call being reset.
+
+Without this, I occasionally see an oops like the following:
+
+    general protection fault: 0000 [#1] SMP PTI
+    ...
+    RIP: 0010:_copy_to_iter+0x204/0x310
+    RSP: 0018:ffff8800cae0f828 EFLAGS: 00010206
+    RAX: 0000000000000560 RBX: 0000000000000560 RCX: 0000000000000560
+    RDX: ffff8800cae0f968 RSI: ffff8800d58b3312 RDI: 0005080000000000
+    RBP: ffff8800cae0f968 R08: 0000000000000560 R09: ffff8800ca00f400
+    R10: ffff8800c36f28d4 R11: 00000000000008c4 R12: ffff8800cae0f958
+    R13: 0000000000000560 R14: ffff8800d58b3312 R15: 0000000000000560
+    FS:  00007fdaef108080(0000) GS:ffff8800ca680000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: 00007fb28a8fa000 CR3: 00000000d2a76002 CR4: 00000000001606e0
+    Call Trace:
+     skb_copy_datagram_iter+0x14e/0x289
+     rxrpc_recvmsg_data.isra.0+0x6f3/0xf68
+     ? trace_buffer_unlock_commit_regs+0x4f/0x89
+     rxrpc_kernel_recv_data+0x149/0x421
+     afs_extract_data+0x1e0/0x798
+     ? afs_wait_for_call_to_complete+0xc9/0x52e
+     afs_deliver_fs_fetch_data+0x33a/0x5ab
+     afs_deliver_to_call+0x1ee/0x5e0
+     ? afs_wait_for_call_to_complete+0xc9/0x52e
+     afs_wait_for_call_to_complete+0x12b/0x52e
+     ? wake_up_q+0x54/0x54
+     afs_make_call+0x287/0x462
+     ? afs_fs_fetch_data+0x3e6/0x3ed
+     ? rcu_read_lock_sched_held+0x5d/0x63
+     afs_fs_fetch_data+0x3e6/0x3ed
+     afs_fetch_data+0xbb/0x14a
+     afs_readpages+0x317/0x40d
+     __do_page_cache_readahead+0x203/0x2ba
+     ? ondemand_readahead+0x3a7/0x3c1
+     ondemand_readahead+0x3a7/0x3c1
+     generic_file_buffered_read+0x18b/0x62f
+     __vfs_read+0xdb/0xfe
+     vfs_read+0xb2/0x137
+     ksys_read+0x50/0x8c
+     do_syscall_64+0x7d/0x1a0
+     entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+Note the weird value in RDI which is a result of trying to kmap() a NULL
+page pointer.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

@@ -1,0 +1,88 @@
+mm, page_alloc: do not depend on cpu hotplug locks inside the allocator
+
+Dmitry has reported the following lockdep splat
+  lock_acquire+0x2a1/0x630 kernel/locking/lockdep.c:3753
+  __mutex_lock_common kernel/locking/mutex.c:521 [inline]
+  mutex_lock_nested+0x24e/0xff0 kernel/locking/mutex.c:621
+  pcpu_alloc+0xbda/0x1280 mm/percpu.c:896
+  __alloc_percpu+0x24/0x30 mm/percpu.c:1075
+  smpcfd_prepare_cpu+0x73/0xd0 kernel/smp.c:44
+  cpuhp_invoke_callback+0x254/0x1480 kernel/cpu.c:136
+  cpuhp_up_callbacks+0x81/0x2a0 kernel/cpu.c:493
+  _cpu_up+0x1e3/0x2a0 kernel/cpu.c:1057
+  do_cpu_up+0x73/0xa0 kernel/cpu.c:1087
+  cpu_up+0x18/0x20 kernel/cpu.c:1095
+  smp_init+0xe9/0xee kernel/smp.c:564
+  kernel_init_freeable+0x439/0x690 init/main.c:1010
+  kernel_init+0x13/0x180 init/main.c:941
+  ret_from_fork+0x2a/0x40 arch/x86/entry/entry_64.S:433
+
+cpu_hotplug_begin
+  cpu_hotplug.lock
+pcpu_alloc
+  pcpu_alloc_mutex
+
+  get_online_cpus+0x62/0x90 kernel/cpu.c:248
+  drain_all_pages+0xf8/0x710 mm/page_alloc.c:2385
+  __alloc_pages_direct_reclaim mm/page_alloc.c:3440 [inline]
+  __alloc_pages_slowpath+0x8fd/0x2370 mm/page_alloc.c:3778
+  __alloc_pages_nodemask+0x8f5/0xc60 mm/page_alloc.c:3980
+  __alloc_pages include/linux/gfp.h:426 [inline]
+  __alloc_pages_node include/linux/gfp.h:439 [inline]
+  alloc_pages_node include/linux/gfp.h:453 [inline]
+  pcpu_alloc_pages mm/percpu-vm.c:93 [inline]
+  pcpu_populate_chunk+0x1e1/0x900 mm/percpu-vm.c:282
+  pcpu_alloc+0xe01/0x1280 mm/percpu.c:998
+  __alloc_percpu_gfp+0x27/0x30 mm/percpu.c:1062
+  bpf_array_alloc_percpu kernel/bpf/arraymap.c:34 [inline]
+  array_map_alloc+0x532/0x710 kernel/bpf/arraymap.c:99
+  find_and_alloc_map kernel/bpf/syscall.c:34 [inline]
+  map_create kernel/bpf/syscall.c:188 [inline]
+  SYSC_bpf kernel/bpf/syscall.c:870 [inline]
+  SyS_bpf+0xd64/0x2500 kernel/bpf/syscall.c:827
+  entry_SYSCALL_64_fastpath+0x1f/0xc2
+
+pcpu_alloc
+  pcpu_alloc_mutex
+drain_all_pages
+  get_online_cpus
+    cpu_hotplug.lock
+
+  cpu_hotplug_begin+0x206/0x2e0 kernel/cpu.c:304
+  _cpu_up+0xca/0x2a0 kernel/cpu.c:1011
+  do_cpu_up+0x73/0xa0 kernel/cpu.c:1087
+  cpu_up+0x18/0x20 kernel/cpu.c:1095
+  smp_init+0xe9/0xee kernel/smp.c:564
+  kernel_init_freeable+0x439/0x690 init/main.c:1010
+  kernel_init+0x13/0x180 init/main.c:941
+  ret_from_fork+0x2a/0x40 arch/x86/entry/entry_64.S:433
+
+cpu_hotplug_begin
+  cpu_hotplug.lock
+
+Pulling cpu hotplug locks inside the page allocator is just too
+dangerous.  Let's remove the dependency by dropping get_online_cpus()
+from drain_all_pages.  This is not so simple though because now we do
+not have a protection against cpu hotplug which means 2 things:
+
+  - the work item might be executed on a different cpu in worker from
+    unbound pool so it doesn't run on pinned on the cpu
+
+  - we have to make sure that we do not race with page_alloc_cpu_dead
+    calling drain_pages_zone
+
+Disabling preemption in drain_local_pages_wq will solve the first
+problem drain_local_pages will determine its local CPU from the WQ
+context which will be stable after that point, page_alloc_cpu_dead is
+pinned to the CPU already.  The later condition is achieved by disabling
+IRQs in drain_pages_zone.
+
+Fixes: mm, page_alloc: drain per-cpu pages from workqueue context
+Link: http://lkml.kernel.org/r/20170207201950.20482-1-mhocko@kernel.org
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Acked-by: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

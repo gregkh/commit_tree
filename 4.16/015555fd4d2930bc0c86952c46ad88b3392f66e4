@@ -1,0 +1,47 @@
+fs: dcache: Avoid livelock between d_alloc_parallel and __d_add
+
+If d_alloc_parallel runs concurrently with __d_add, it is possible for
+d_alloc_parallel to continuously retry whilst i_dir_seq has been
+incremented to an odd value by __d_add:
+
+CPU0:
+__d_add
+	n = start_dir_add(dir);
+		cmpxchg(&dir->i_dir_seq, n, n + 1) == n
+
+CPU1:
+d_alloc_parallel
+retry:
+	seq = smp_load_acquire(&parent->d_inode->i_dir_seq) & ~1;
+	hlist_bl_lock(b);
+		bit_spin_lock(0, (unsigned long *)b); // Always succeeds
+
+CPU0:
+	__d_lookup_done(dentry)
+		hlist_bl_lock
+			bit_spin_lock(0, (unsigned long *)b); // Never succeeds
+
+CPU1:
+	if (unlikely(parent->d_inode->i_dir_seq != seq)) {
+		hlist_bl_unlock(b);
+		goto retry;
+	}
+
+Since the simple bit_spin_lock used to implement hlist_bl_lock does not
+provide any fairness guarantees, then CPU1 can starve CPU0 of the lock
+and prevent it from reaching end_dir_add(dir), therefore CPU1 cannot
+exit its retry loop because the sequence number always has the bottom
+bit set.
+
+This patch resolves the livelock by not taking hlist_bl_lock in
+d_alloc_parallel if the sequence counter is odd, since any subsequent
+masked comparison with i_dir_seq will fail anyway.
+
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Reported-by: Naresh Madhusudana <naresh.madhusudana@arm.com>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Matthew Wilcox <mawilcox@microsoft.com>
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

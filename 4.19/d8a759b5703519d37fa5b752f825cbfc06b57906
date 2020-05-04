@@ -1,0 +1,564 @@
+mm, page_alloc: double zone's batchsize
+
+To improve page allocator's performance for order-0 pages, each CPU has
+a Per-CPU-Pageset(PCP) per zone.  Whenever an order-0 page is needed,
+PCP will be checked first before asking pages from Buddy.  When PCP is
+used up, a batch of pages will be fetched from Buddy to improve
+performance and the size of batch can affect performance.
+
+zone's batch size gets doubled last time by commit ba56e91c9401("mm:
+page_alloc: increase size of per-cpu-pages") over ten years ago.  Since
+then, CPU has envolved a lot and CPU's cache sizes also increased.
+
+Dave Hansen is concerned the current batch size doesn't fit well with
+modern hardware and suggested me to do two things: first, use a page
+allocator intensive benchmark, e.g.  will-it-scale/page_fault1 to find
+out how performance changes with different batch sizes on various
+machines and then choose a new default batch size; second, see how this
+new batch size work with other workloads.
+
+In the first test, we saw performance gains on high-core-count systems
+and little to no effect on older systems with more modest core counts.
+In this phase's test data, two candidates: 63 and 127 are chosen.
+
+In the second step, ebizzy, oltp, kbuild, pigz, netperf, vm-scalability
+and more will-it-scale sub-tests are tested to see how these two
+candidates work with these workloads and decides a new default according
+to their results.
+
+Most test results are flat.  will-it-scale/page_fault2 process mode has
+10%-18% performance increase on 4-sockets Skylake and Broadwell.
+vm-scalability/lru-file-mmap-read has 17%-47% performance increase for
+4-sockets servers while for 2-sockets servers, it caused 3%-8% performance
+drop.  Further analysis showed that, with a larger pcp->batch and thus
+larger pcp->high(the relationship of pcp->high=6 * pcp->batch is
+maintained in this patch), zone lock contention shifted to LRU add side
+lock contention and that caused performance drop.  This performance drop
+might be mitigated by others' work on optimizing LRU lock.
+
+Another downside of increasing pcp->batch is, when PCP is used up and need
+to fetch a batch of pages from Buddy, since batch is increased, that time
+can be longer than before.  My understanding is, this doesn't affect
+slowpath where direct reclaim and compaction dominates.  For fastpath,
+throughput is a win(according to will-it-scale/page_fault1) but worst
+latency can be larger now.
+
+Overall, I think double the batch size from 31 to 63 is relatively safe
+and provide good performance boost for high-core-count systems.
+
+The two phase's test results are listed below(all tests are done with THP
+disabled).
+
+Phase one(will-it-scale/page_fault1) test results:
+
+Skylake-EX: increased batch size has a good effect on zone->lock
+contention, though LRU contention will rise at the same time and
+limited the final performance increase.
+
+batch   score     change   zone_contention   lru_contention   total_contention
+ 31   15345900    +0.00%       64%                 8%           72%
+ 53   17903847   +16.67%       32%                38%           70%
+ 63   17992886   +17.25%       24%                45%           69%
+ 73   18022825   +17.44%       10%                61%           71%
+119   18023401   +17.45%        4%                66%           70%
+127   18029012   +17.48%        3%                66%           69%
+137   18036075   +17.53%        4%                66%           70%
+165   18035964   +17.53%        2%                67%           69%
+188   18101105   +17.95%        2%                67%           69%
+223   18130951   +18.15%        2%                67%           69%
+255   18118898   +18.07%        2%                67%           69%
+267   18101559   +17.96%        2%                67%           69%
+299   18160468   +18.34%        2%                68%           70%
+320   18139845   +18.21%        2%                67%           69%
+393   18160869   +18.34%        2%                68%           70%
+424   18170999   +18.41%        2%                68%           70%
+458   18144868   +18.24%        2%                68%           70%
+467   18142366   +18.22%        2%                68%           70%
+498   18154549   +18.30%        1%                68%           69%
+511   18134525   +18.17%        1%                69%           70%
+
+Broadwell-EX: similar pattern as Skylake-EX.
+
+batch   score     change   zone_contention   lru_contention   total_contention
+ 31   16703983    +0.00%       67%                 7%           74%
+ 53   18195393    +8.93%       43%                28%           71%
+ 63   18288885    +9.49%       38%                33%           71%
+ 73   18344329    +9.82%       35%                37%           72%
+119   18535529   +10.96%       24%                46%           70%
+127   18513596   +10.83%       23%                48%           71%
+137   18514327   +10.84%       23%                48%           71%
+165   18511840   +10.82%       22%                49%           71%
+188   18593478   +11.31%       17%                53%           70%
+223   18601667   +11.36%       17%                52%           69%
+255   18774825   +12.40%       12%                58%           70%
+267   18754781   +12.28%        9%                60%           69%
+299   18892265   +13.10%        7%                63%           70%
+320   18873812   +12.99%        8%                62%           70%
+393   18891174   +13.09%        6%                64%           70%
+424   18975108   +13.60%        6%                64%           70%
+458   18932364   +13.34%        8%                62%           70%
+467   18960891   +13.51%        5%                65%           70%
+498   18944526   +13.41%        5%                64%           69%
+511   18960839   +13.51%        5%                64%           69%
+
+Skylake-EP: although increased batch reduced zone->lock contention, but
+the effect is not as good as EX: zone->lock contention is still as high as
+20% with a very high batch value instead of 1% on Skylake-EX or 5% on
+Broadwell-EX.  Also, total_contention actually decreased with a higher
+batch but that doesn't translate to performance increase.
+
+batch   score    change   zone_contention   lru_contention   total_contention
+ 31   9554867    +0.00%       66%                 3%           69%
+ 53   9855486    +3.15%       63%                 3%           66%
+ 63   9980145    +4.45%       62%                 4%           66%
+ 73   10092774   +5.63%       62%                 5%           67%
+119   10310061   +7.90%       45%                19%           64%
+127   10342019   +8.24%       42%                19%           61%
+137   10358182   +8.41%       42%                21%           63%
+165   10397060   +8.81%       37%                24%           61%
+188   10341808   +8.24%       34%                26%           60%
+223   10349135   +8.31%       31%                27%           58%
+255   10327189   +8.08%       28%                29%           57%
+267   10344204   +8.26%       27%                29%           56%
+299   10325043   +8.06%       25%                30%           55%
+320   10310325   +7.91%       25%                31%           56%
+393   10293274   +7.73%       21%                31%           52%
+424   10311099   +7.91%       21%                32%           53%
+458   10321375   +8.02%       21%                32%           53%
+467   10303881   +7.84%       21%                32%           53%
+498   10332462   +8.14%       20%                33%           53%
+511   10325016   +8.06%       20%                32%           52%
+
+Broadwell-EP: zone->lock and lru lock had an agreement to make sure
+performance doesn't increase and they successfully managed to keep total
+contention at 70%.
+
+batch   score    change   zone_contention   lru_contention   total_contention
+ 31   10121178   +0.00%       19%                50%           69%
+ 53   10142366   +0.21%        6%                63%           69%
+ 63   10117984   -0.03%       11%                58%           69%
+ 73   10123330   +0.02%        7%                63%           70%
+119   10108791   -0.12%        2%                67%           69%
+127   10166074   +0.44%        3%                66%           69%
+137   10141574   +0.20%        3%                66%           69%
+165   10154499   +0.33%        2%                68%           70%
+188   10124921   +0.04%        2%                67%           69%
+223   10137399   +0.16%        2%                67%           69%
+255   10143289   +0.22%        0%                68%           68%
+267   10123535   +0.02%        1%                68%           69%
+299   10140952   +0.20%        0%                68%           68%
+320   10163170   +0.41%        0%                68%           68%
+393   10000633   -1.19%        0%                69%           69%
+424   10087998   -0.33%        0%                69%           69%
+458   10187116   +0.65%        0%                69%           69%
+467   10146790   +0.25%        0%                69%           69%
+498   10197958   +0.76%        0%                69%           69%
+511   10152326   +0.31%        0%                69%           69%
+
+Haswell-EP: similar to Broadwell-EP.
+
+batch   score   change   zone_contention   lru_contention   total_contention
+ 31   10442205   +0.00%       14%                48%           62%
+ 53   10442255   +0.00%        5%                57%           62%
+ 63   10452059   +0.09%        6%                57%           63%
+ 73   10482349   +0.38%        5%                59%           64%
+119   10454644   +0.12%        3%                60%           63%
+127   10431514   -0.10%        3%                59%           62%
+137   10423785   -0.18%        3%                60%           63%
+165   10481216   +0.37%        2%                61%           63%
+188   10448755   +0.06%        2%                61%           63%
+223   10467144   +0.24%        2%                61%           63%
+255   10480215   +0.36%        2%                61%           63%
+267   10484279   +0.40%        2%                61%           63%
+299   10466450   +0.23%        2%                61%           63%
+320   10452578   +0.10%        2%                61%           63%
+393   10499678   +0.55%        1%                62%           63%
+424   10481454   +0.38%        1%                62%           63%
+458   10473562   +0.30%        1%                62%           63%
+467   10484269   +0.40%        0%                62%           62%
+498   10505599   +0.61%        0%                62%           62%
+511   10483395   +0.39%        0%                62%           62%
+
+Westmere-EP: contention is pretty small so not interesting.  Note too high
+a batch value could hurt performance.
+
+batch   score   change   zone_contention   lru_contention   total_contention
+ 31   4831523   +0.00%        2%                 3%            5%
+ 53   4834086   +0.05%        2%                 4%            6%
+ 63   4834262   +0.06%        2%                 3%            5%
+ 73   4832851   +0.03%        2%                 4%            6%
+119   4830534   -0.02%        1%                 3%            4%
+127   4827461   -0.08%        1%                 4%            5%
+137   4827459   -0.08%        1%                 3%            4%
+165   4820534   -0.23%        0%                 4%            4%
+188   4817947   -0.28%        0%                 3%            3%
+223   4809671   -0.45%        0%                 3%            3%
+255   4802463   -0.60%        0%                 4%            4%
+267   4801634   -0.62%        0%                 3%            3%
+299   4798047   -0.69%        0%                 3%            3%
+320   4793084   -0.80%        0%                 3%            3%
+393   4785877   -0.94%        0%                 3%            3%
+424   4782911   -1.01%        0%                 3%            3%
+458   4779346   -1.08%        0%                 3%            3%
+467   4780306   -1.06%        0%                 3%            3%
+498   4780589   -1.05%        0%                 3%            3%
+511   4773724   -1.20%        0%                 3%            3%
+
+Skylake-Desktop: similar to Westmere-EP, nothing interesting.
+
+batch   score   change   zone_contention   lru_contention   total_contention
+ 31   3906608   +0.00%        2%                 3%            5%
+ 53   3940164   +0.86%        2%                 3%            5%
+ 63   3937289   +0.79%        2%                 3%            5%
+ 73   3940201   +0.86%        2%                 3%            5%
+119   3933240   +0.68%        2%                 3%            5%
+127   3930514   +0.61%        2%                 4%            6%
+137   3938639   +0.82%        0%                 3%            3%
+165   3908755   +0.05%        0%                 3%            3%
+188   3905621   -0.03%        0%                 3%            3%
+223   3903015   -0.09%        0%                 4%            4%
+255   3889480   -0.44%        0%                 3%            3%
+267   3891669   -0.38%        0%                 4%            4%
+299   3898728   -0.20%        0%                 4%            4%
+320   3894547   -0.31%        0%                 4%            4%
+393   3875137   -0.81%        0%                 4%            4%
+424   3874521   -0.82%        0%                 3%            3%
+458   3880432   -0.67%        0%                 4%            4%
+467   3888715   -0.46%        0%                 3%            3%
+498   3888633   -0.46%        0%                 4%            4%
+511   3875305   -0.80%        0%                 5%            5%
+
+Haswell-Desktop: zone->lock is pretty low as other desktops, though lru
+contention is higher than other desktops.
+
+batch   score   change   zone_contention   lru_contention   total_contention
+ 31   3511158   +0.00%        2%                 5%            7%
+ 53   3555445   +1.26%        2%                 6%            8%
+ 63   3561082   +1.42%        2%                 6%            8%
+ 73   3547218   +1.03%        2%                 6%            8%
+119   3571319   +1.71%        1%                 7%            8%
+127   3549375   +1.09%        0%                 6%            6%
+137   3560233   +1.40%        0%                 6%            6%
+165   3555176   +1.25%        2%                 6%            8%
+188   3551501   +1.15%        0%                 8%            8%
+223   3531462   +0.58%        0%                 7%            7%
+255   3570400   +1.69%        0%                 7%            7%
+267   3532235   +0.60%        1%                 8%            9%
+299   3562326   +1.46%        0%                 6%            6%
+320   3553569   +1.21%        0%                 8%            8%
+393   3539519   +0.81%        0%                 7%            7%
+424   3549271   +1.09%        0%                 8%            8%
+458   3528885   +0.50%        0%                 8%            8%
+467   3526554   +0.44%        0%                 7%            7%
+498   3525302   +0.40%        0%                 9%            9%
+511   3527556   +0.47%        0%                 8%            8%
+
+Sandybridge-Desktop: the 0% contention isn't accurate but caused by
+dropped fractional part. Since multiple contention path's contentions
+are all under 1% here, with some arithmetic operations like add, the
+final deviation could be as large as 3%.
+
+batch   score   change   zone_contention   lru_contention   total_contention
+ 31   1744495   +0.00%        0%                 0%            0%
+ 53   1755341   +0.62%        0%                 0%            0%
+ 63   1758469   +0.80%        0%                 0%            0%
+ 73   1759626   +0.87%        0%                 0%            0%
+119   1770417   +1.49%        0%                 0%            0%
+127   1768252   +1.36%        0%                 0%            0%
+137   1767848   +1.34%        0%                 0%            0%
+165   1765088   +1.18%        0%                 0%            0%
+188   1766918   +1.29%        0%                 0%            0%
+223   1767866   +1.34%        0%                 0%            0%
+255   1768074   +1.35%        0%                 0%            0%
+267   1763187   +1.07%        0%                 0%            0%
+299   1765620   +1.21%        0%                 0%            0%
+320   1767603   +1.32%        0%                 0%            0%
+393   1764612   +1.15%        0%                 0%            0%
+424   1758476   +0.80%        0%                 0%            0%
+458   1758593   +0.81%        0%                 0%            0%
+467   1757915   +0.77%        0%                 0%            0%
+498   1753363   +0.51%        0%                 0%            0%
+511   1755548   +0.63%        0%                 0%            0%
+
+Phase two test results:
+Note: all percent change is against base(batch=31).
+
+ebizzy.throughput (higer is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    2410037±7%     2600451±2% +7.9%     2602878 +8.0%
+lkp-bdw-ex1     1493328        1489243    -0.3%     1492145 -0.1%
+lkp-skl-2sp2    1329674        1345891    +1.2%     1351056 +1.6%
+lkp-bdw-ep2      711511         711511     0.0%      710708 -0.1%
+lkp-wsm-ep2       75750          75528    -0.3%       75441 -0.4%
+lkp-skl-d01      264126         262791    -0.5%      264113 +0.0%
+lkp-hsw-d01      176601         176328    -0.2%      176368 -0.1%
+lkp-sb02          98937          98937    +0.0%       99030 +0.1%
+
+kbuild.buildtime (less is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1     107.00        107.67  +0.6%        107.11  +0.1%
+lkp-bdw-ex1       97.33         97.33  +0.0%         97.42  +0.1%
+lkp-skl-2sp2     180.00        179.83  -0.1%        179.83  -0.1%
+lkp-bdw-ep2      178.17        179.17  +0.6%        177.50  -0.4%
+lkp-wsm-ep2      737.00        738.00  +0.1%        738.00  +0.1%
+lkp-skl-d01      642.00        653.00  +1.7%        653.00  +1.7%
+lkp-hsw-d01     1310.00       1316.00  +0.5%       1311.00  +0.1%
+
+netperf/TCP_STREAM.Throughput_total_Mbps (higher is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1     948790        947144  -0.2%        948333 -0.0%
+lkp-bdw-ex1      904224        904366  +0.0%        904926 +0.1%
+lkp-skl-2sp2     239731        239607  -0.1%        239565 -0.1%
+lk-bdw-ep2       365764        365933  +0.0%        365951 +0.1%
+lkp-wsm-ep2       93736         93803  +0.1%         93808 +0.1%
+lkp-skl-d01       77314         77303  -0.0%         77375 +0.1%
+lkp-hsw-d01       58617         60387  +3.0%         60208 +2.7%
+lkp-sb02          29990         30137  +0.5%         30103 +0.4%
+
+oltp.transactions (higer is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-bdw-ex1      9073276       9100377     +0.3%    9036344     -0.4%
+lkp-skl-2sp2     8898717       8852054     -0.5%    8894459     -0.0%
+lkp-bdw-ep2     13426155      13384654     -0.3%   13333637     -0.7%
+lkp-hsw-ep2     13146314      13232784     +0.7%   13193163     +0.4%
+lkp-wsm-ep2      5035355       5019348     -0.3%    5033418     -0.0%
+lkp-skl-d01       418485       4413339     -0.1%    4419039     +0.0%
+lkp-hsw-d01      3517817±5%    3396120±3%  -3.5%    3455138±3%  -1.8%
+
+pigz.throughput (higer is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    1.513e+08     1.507e+08 -0.4%      1.511e+08 -0.2%
+lkp-bdw-ex1     2.060e+08     2.052e+08 -0.4%      2.044e+08 -0.8%
+lkp-skl-2sp2    8.836e+08     8.845e+08 +0.1%      8.836e+08 -0.0%
+lkp-bdw-ep2     8.275e+08     8.464e+08 +2.3%      8.330e+08 +0.7%
+lkp-wsm-ep2     2.224e+08     2.221e+08 -0.2%      2.218e+08 -0.3%
+lkp-skl-d01     1.177e+08     1.177e+08 -0.0%      1.176e+08 -0.1%
+lkp-hsw-d01     1.154e+08     1.154e+08 +0.1%      1.154e+08 -0.0%
+lkp-sb02        0.633e+08     0.633e+08 +0.1%      0.633e+08 +0.0%
+
+will-it-scale.malloc1.processes (higher is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1      620181       620484 +0.0%         620240 +0.0%
+lkp-bdw-ex1      1403610      1401201 -0.2%        1417900 +1.0%
+lkp-skl-2sp2     1288097      1284145 -0.3%        1283907 -0.3%
+lkp-bdw-ep2      1427879      1427675 -0.0%        1428266 +0.0%
+lkp-hsw-ep2      1362546      1353965 -0.6%        1354759 -0.6%
+lkp-wsm-ep2      2099657      2107576 +0.4%        2100226 +0.0%
+lkp-skl-d01      1476835      1476358 -0.0%        1474487 -0.2%
+lkp-hsw-d01      1308810      1303429 -0.4%        1301299 -0.6%
+lkp-sb02          589286       589284 -0.0%         588101 -0.2%
+
+will-it-scale.malloc1.threads (higher is better)
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1     21289         21125     -0.8%      21241     -0.2%
+lkp-bdw-ex1      28114         28089     -0.1%      28007     -0.4%
+lkp-skl-2sp2     91866         91946     +0.1%      92723     +0.9%
+lkp-bdw-ep2      37637         37501     -0.4%      37317     -0.9%
+lkp-hsw-ep2      43673         43590     -0.2%      43754     +0.2%
+lkp-wsm-ep2      28577         28298     -1.0%      28545     -0.1%
+lkp-skl-d01     175277        173343     -1.1%     173082     -1.3%
+lkp-hsw-d01     130303        129566     -0.6%     129250     -0.8%
+lkp-sb02        113742±3%     116911     +2.8%     116417±3%  +2.4%
+
+will-it-scale.malloc2.processes (higer is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    1.206e+09     1.206e+09 -0.0%      1.206e+09 +0.0%
+lkp-bdw-ex1     1.319e+09     1.319e+09 -0.0%      1.319e+09 +0.0%
+lkp-skl-2sp2    8.000e+08     8.021e+08 +0.3%      7.995e+08 -0.1%
+lkp-bdw-ep2     6.582e+08     6.634e+08 +0.8%      6.513e+08 -1.1%
+lkp-hsw-ep2     6.671e+08     6.669e+08 -0.0%      6.665e+08 -0.1%
+lkp-wsm-ep2     1.805e+08     1.806e+08 +0.0%      1.804e+08 -0.1%
+lkp-skl-d01     1.611e+08     1.611e+08 -0.0%      1.610e+08 -0.0%
+lkp-hsw-d01     1.333e+08     1.332e+08 -0.0%      1.332e+08 -0.0%
+lkp-sb02         82485104      82478206 -0.0%       82473546 -0.0%
+
+will-it-scale.malloc2.threads (higer is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    1.574e+09     1.574e+09 -0.0%      1.574e+09 -0.0%
+lkp-bdw-ex1     1.737e+09     1.737e+09 +0.0%      1.737e+09 -0.0%
+lkp-skl-2sp2    9.161e+08     9.162e+08 +0.0%      9.181e+08 +0.2%
+lkp-bdw-ep2     7.856e+08     8.015e+08 +2.0%      8.113e+08 +3.3%
+lkp-hsw-ep2     6.908e+08     6.904e+08 -0.1%      6.907e+08 -0.0%
+lkp-wsm-ep2     2.409e+08     2.409e+08 +0.0%      2.409e+08 -0.0%
+lkp-skl-d01     1.199e+08     1.199e+08 -0.0%      1.199e+08 -0.0%
+lkp-hsw-d01     1.029e+08     1.029e+08 -0.0%      1.029e+08 +0.0%
+lkp-sb02         68081213      68061423 -0.0%       68076037 -0.0%
+
+will-it-scale.page_fault2.processes (higer is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    14509125±4%   16472364 +13.5%       17123117 +18.0%
+lkp-bdw-ex1     14736381      16196588  +9.9%       16364011 +11.0%
+lkp-skl-2sp2     6354925       6435444  +1.3%        6436644  +1.3%
+lkp-bdw-ep2      8749584       8834422  +1.0%        8827179  +0.9%
+lkp-hsw-ep2      8762591       8845920  +1.0%        8825697  +0.7%
+lkp-wsm-ep2      3036083       3030428  -0.2%        3021741  -0.5%
+lkp-skl-d01      2307834       2304731  -0.1%        2286142  -0.9%
+lkp-hsw-d01      1806237       1800786  -0.3%        1795943  -0.6%
+lkp-sb02          842616        837844  -0.6%         833921  -1.0%
+
+will-it-scale.page_fault2.threads
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1     1623294       1615132±2% -0.5%     1656777    +2.1%
+lkp-bdw-ex1      1995714       2025948    +1.5%     2113753±3% +5.9%
+lkp-skl-2sp2     2346708       2415591    +2.9%     2416919    +3.0%
+lkp-bdw-ep2      2342564       2344882    +0.1%     2300206    -1.8%
+lkp-hsw-ep2      1820658       1831681    +0.6%     1844057    +1.3%
+lkp-wsm-ep2      1725482       1733774    +0.5%     1740517    +0.9%
+lkp-skl-d01      1832833       1823628    -0.5%     1806489    -1.4%
+lkp-hsw-d01      1427913       1427287    -0.0%     1420226    -0.5%
+lkp-sb02          750626        748615    -0.3%      746621    -0.5%
+
+will-it-scale.page_fault3.processes (higher is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    24382726      24400317 +0.1%       24668774 +1.2%
+lkp-bdw-ex1     35399750      35683124 +0.8%       35829492 +1.2%
+lkp-skl-2sp2    28136820      28068248 -0.2%       28147989 +0.0%
+lkp-bdw-ep2     37269077      37459490 +0.5%       37373073 +0.3%
+lkp-hsw-ep2     36224967      36114085 -0.3%       36104908 -0.3%
+lkp-wsm-ep2     16820457      16911005 +0.5%       16968596 +0.9%
+lkp-skl-d01      7721138       7725904 +0.1%        7756740 +0.5%
+lkp-hsw-d01      7611979       7650928 +0.5%        7651323 +0.5%
+lkp-sb02         3781546       3796502 +0.4%        3796827 +0.4%
+
+will-it-scale.page_fault3.threads (higer is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1     1865820±3%   1900917±2%  +1.9%     1826245±4%  -2.1%
+lkp-bdw-ex1      3094060      3148326     +1.8%     3150036     +1.8%
+lkp-skl-2sp2     3952940      3953898     +0.0%     3989360     +0.9%
+lkp-bdw-ep2      3420373±3%   3643964     +6.5%     3644910±5%  +6.6%
+lkp-hsw-ep2      2609635±2%   2582310±3%  -1.0%     2780459     +6.5%
+lkp-wsm-ep2      4395001      4417196     +0.5%     4432499     +0.9%
+lkp-skl-d01      5363977      5400003     +0.7%     5411370     +0.9%
+lkp-hsw-d01      5274131      5311294     +0.7%     5319359     +0.9%
+lkp-sb02         2917314      2913004     -0.1%     2935286     +0.6%
+
+will-it-scale.read1.processes (higer is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    73762279±14%  69322519±10% -6.0%    69349855±13%  -6.0% (result unstable)
+lkp-bdw-ex1     1.701e+08     1.704e+08    +0.1%    1.705e+08     +0.2%
+lkp-skl-2sp2    63111570      63113953     +0.0%    63836573      +1.1%
+lkp-bdw-ep2     79247409      79424610     +0.2%    78012656      -1.6%
+lkp-hsw-ep2     67677026      68308800     +0.9%    67539106      -0.2%
+lkp-wsm-ep2     13339630      13939817     +4.5%    13766865      +3.2%
+lkp-skl-d01     10969487      10972650     +0.0%    no data
+lkp-hsw-d01     9857342±2%    10080592±2%  +2.3%    10131560      +2.8%
+lkp-sb02        5189076        5197473     +0.2%    5163253       -0.5%
+
+will-it-scale.read1.threads (higher is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    62468045±12%  73666726±7% +17.9%    79553123±12% +27.4% (result unstable)
+lkp-bdw-ex1     1.62e+08      1.624e+08    +0.3%    1.614e+08     -0.3%
+lkp-skl-2sp2    58319780      59181032     +1.5%    59821353      +2.6%
+lkp-bdw-ep2     74057992      75698171     +2.2%    74990869      +1.3%
+lkp-hsw-ep2     63672959      63639652     -0.1%    64387051      +1.1%
+lkp-wsm-ep2     13489943      13526058     +0.3%    13259032      -1.7%
+lkp-skl-d01     10297906      10338796     +0.4%    10407328      +1.1%
+lkp-hsw-d01      9636721       9667376     +0.3%     9341147      -3.1%
+lkp-sb02         4801938       4804496     +0.1%     4802290      +0.0%
+
+will-it-scale.write1.processes (higer is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    1.111e+08     1.104e+08±2%  -0.7%   1.122e+08±2%  +1.0%
+lkp-bdw-ex1     1.392e+08     1.399e+08     +0.5%   1.397e+08     +0.4%
+lkp-skl-2sp2     59369233      58994841     -0.6%    58715168     -1.1%
+lkp-bdw-ep2      61820979      CPU throttle          63593123     +2.9%
+lkp-hsw-ep2      57897587      57435605     -0.8%    56347450     -2.7%
+lkp-wsm-ep2       7814203       7918017±2%  +1.3%     7669068     -1.9%
+lkp-skl-d01       8886557       8971422     +1.0%     8818366     -0.8%
+lkp-hsw-d01       9171001±5%    9189915     +0.2%     9483909     +3.4%
+lkp-sb02          4475406       4475294     -0.0%     4501756     +0.6%
+
+will-it-scale.write1.threads (higer is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    1.058e+08     1.055e+08±2%  -0.2%   1.065e+08  +0.7%
+lkp-bdw-ex1     1.316e+08     1.300e+08     -1.2%   1.308e+08  -0.6%
+lkp-skl-2sp2     54492421      56086678     +2.9%    55975657  +2.7%
+lkp-bdw-ep2      59360449      59003957     -0.6%    58101262  -2.1%
+lkp-hsw-ep2      53346346±2%   52530876     -1.5%    52902487  -0.8%
+lkp-wsm-ep2       7774006       7800092±2%  +0.3%     7558833  -2.8%
+lkp-skl-d01       8346174       8235695     -1.3%     no data
+lkp-hsw-d01       8636244       8655731     +0.2%     8658868  +0.3%
+lkp-sb02          4181820       4204107     +0.5%     4182992  +0.0%
+
+vm-scalability.anon-r-rand.throughput (higher is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    11933873±3%   12356544±2%  +3.5%   12188624     +2.1%
+lkp-bdw-ex1      7114424±2%    7330949±2%  +3.0%    7392419     +3.9%
+lkp-skl-2sp2     6773277±5%    6492332±8%  -4.1%    6543962     -3.4%
+lkp-bdw-ep2      7133846±4%    7233508     +1.4%    7013518±3%  -1.7%
+lkp-hsw-ep2      4576626       4527098     -1.1%    4551679     -0.5%
+lkp-wsm-ep2      2583599       2592492     +0.3%    2588039     +0.2%
+lkp-hsw-d01       998199±2%    1028311     +3.0%    1006460±2%  +0.8%
+lkp-sb02          570572        567854     -0.5%     568449     -0.4%
+
+vm-scalability.anon-r-rand-mt.throughput (higher is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1     1789419       1787830     -0.1%    1788208     -0.1%
+lkp-bdw-ex1      3492595±2%    3554966±2%  +1.8%    3558835±3%  +1.9%
+lkp-skl-2sp2     3856238±2%    3975403±4%  +3.1%    3994600     +3.6%
+lkp-bdw-ep2      3726963±11%   3809292±6%  +2.2%    3871924±4%  +3.9%
+lkp-hsw-ep2      2131760±3%    2033578±4%  -4.6%    2130727±6%  -0.0%
+lkp-wsm-ep2      2369731       2368384     -0.1%    2370252     +0.0%
+lkp-skl-d01      1207128       1206220     -0.1%    1205801     -0.1%
+lkp-hsw-d01       964317        992329±2%  +2.9%     992099±2%  +2.9%
+lkp-sb02          567137        567346     +0.0%     566144     -0.2%
+
+vm-scalability.lru-file-mmap-read.throughput (higher is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1    19560469±6%   23018999     +17.7%   23418800     +19.7%
+lkp-bdw-ex1     17769135±14%  26141676±3%  +47.1%   26284723±5%  +47.9%
+lkp-skl-2sp2    14056512      13578884      -3.4%   13146214      -6.5%
+lkp-bdw-ep2     15336542      14737654      -3.9%   14088159      -8.1%
+lkp-hsw-ep2     16275498      15756296      -3.2%   15018090      -7.7%
+lkp-wsm-ep2     11272160      11237231      -0.3%   11310047      +0.3%
+lkp-skl-d01      7322119       7324569      +0.0%    7184148      -1.9%
+lkp-hsw-d01      6449234       6404542      -0.7%    6356141      -1.4%
+lkp-sb02         3517943       3520668      +0.1%    3527309      +0.3%
+
+vm-scalability.lru-file-mmap-read-rand.throughput (higher is better)
+
+machine         batch=31      batch=63             batch=127
+lkp-skl-4sp1     1689052       1697553  +0.5%       1698726  +0.6%
+lkp-bdw-ex1      1675246       1699764  +1.5%       1712226  +2.2%
+lkp-skl-2sp2     1800533       1799749  -0.0%       1800581  +0.0%
+lkp-bdw-ep2      1807422       1807758  +0.0%       1804932  -0.1%
+lkp-hsw-ep2      1809807       1808781  -0.1%       1807811  -0.1%
+lkp-wsm-ep2      1800198       1802434  +0.1%       1801236  +0.1%
+lkp-skl-d01       696689        695537  -0.2%        694106  -0.4%
+lkp-hsw-d01       698364        698666  +0.0%        696686  -0.2%
+lkp-sb02          258939        258787  -0.1%        258199  -0.3%
+
+Link: http://lkml.kernel.org/r/20180711055855.29072-1-aaron.lu@intel.com
+Signed-off-by: Aaron Lu <aaron.lu@intel.com>
+Suggested-by: Dave Hansen <dave.hansen@intel.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Cc: Huang Ying <ying.huang@intel.com>
+Cc: Kemi Wang <kemi.wang@intel.com>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

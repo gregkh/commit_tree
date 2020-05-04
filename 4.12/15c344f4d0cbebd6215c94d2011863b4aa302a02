@@ -1,0 +1,181 @@
+drm/i915/userptr: Reinvent GGTT self-faulting protection
+
+lockdep doesn't like us taking the mm->mmap_sem inside the get_pages
+callback for a couple of reasons. The straightforward deadlock:
+
+[13755.434059] =============================================
+[13755.434061] [ INFO: possible recursive locking detected ]
+[13755.434064] 4.11.0-rc1-CI-CI_DRM_297+ #1 Tainted: G     U
+[13755.434066] ---------------------------------------------
+[13755.434068] gem_userptr_bli/8398 is trying to acquire lock:
+[13755.434070]  (&mm->mmap_sem){++++++}, at: [<ffffffffa00c988a>] i915_gem_userptr_get_pages+0x5a/0x2e0 [i915]
+[13755.434096]
+               but task is already holding lock:
+[13755.434098]  (&mm->mmap_sem){++++++}, at: [<ffffffff8104d485>] __do_page_fault+0x105/0x560
+[13755.434105]
+               other info that might help us debug this:
+[13755.434108]  Possible unsafe locking scenario:
+
+[13755.434110]        CPU0
+[13755.434111]        ----
+[13755.434112]   lock(&mm->mmap_sem);
+[13755.434115]   lock(&mm->mmap_sem);
+[13755.434117]
+                *** DEADLOCK ***
+
+[13755.434121]  May be due to missing lock nesting notation
+
+[13755.434126] 2 locks held by gem_userptr_bli/8398:
+[13755.434128]  #0:  (&mm->mmap_sem){++++++}, at: [<ffffffff8104d485>] __do_page_fault+0x105/0x560
+[13755.434135]  #1:  (&obj->mm.lock){+.+.+.}, at: [<ffffffffa00b887d>] __i915_gem_object_get_pages+0x1d/0x70 [i915]
+[13755.434156]
+               stack backtrace:
+[13755.434161] CPU: 3 PID: 8398 Comm: gem_userptr_bli Tainted: G     U          4.11.0-rc1-CI-CI_DRM_297+ #1
+[13755.434165] Hardware name: GIGABYTE GB-BKi7(H)A-7500/MFLP7AP-00, BIOS F4 02/20/2017
+[13755.434169] Call Trace:
+[13755.434174]  dump_stack+0x67/0x92
+[13755.434178]  __lock_acquire+0x133a/0x1b50
+[13755.434182]  lock_acquire+0xc9/0x220
+[13755.434200]  ? i915_gem_userptr_get_pages+0x5a/0x2e0 [i915]
+[13755.434204]  down_read+0x42/0x70
+[13755.434221]  ? i915_gem_userptr_get_pages+0x5a/0x2e0 [i915]
+[13755.434238]  i915_gem_userptr_get_pages+0x5a/0x2e0 [i915]
+[13755.434255]  ____i915_gem_object_get_pages+0x25/0x60 [i915]
+[13755.434272]  __i915_gem_object_get_pages+0x59/0x70 [i915]
+[13755.434288]  i915_gem_fault+0x397/0x6a0 [i915]
+[13755.434304]  ? i915_gem_fault+0x1a1/0x6a0 [i915]
+[13755.434308]  ? __lock_acquire+0x449/0x1b50
+[13755.434311]  ? __lock_acquire+0x449/0x1b50
+[13755.434315]  ? vm_mmap_pgoff+0xa9/0xd0
+[13755.434318]  __do_fault+0x19/0x70
+[13755.434321]  __handle_mm_fault+0x863/0xe50
+[13755.434325]  handle_mm_fault+0x17f/0x370
+[13755.434329]  ? handle_mm_fault+0x40/0x370
+[13755.434332]  __do_page_fault+0x279/0x560
+[13755.434336]  do_page_fault+0xc/0x10
+[13755.434339]  page_fault+0x22/0x30
+[13755.434342] RIP: 0033:0x7f5ab91b5880
+[13755.434345] RSP: 002b:00007fff62922218 EFLAGS: 00010216
+[13755.434348] RAX: 0000000000b74500 RBX: 00007f5ab7f81000 RCX: 0000000000000000
+[13755.434352] RDX: 0000000000100000 RSI: 00007f5ab7f81000 RDI: 00007f5aba61c000
+[13755.434355] RBP: 00007f5aba61c000 R08: 0000000000000007 R09: 0000000100000000
+[13755.434359] R10: 000000000000037d R11: 00007f5ab91b5840 R12: 0000000000000001
+[13755.434362] R13: 0000000000000005 R14: 0000000000000001 R15: 0000000000000000
+
+and cyclic deadlocks:
+
+[ 2566.458979] ======================================================
+[ 2566.459054] [ INFO: possible circular locking dependency detected ]
+[ 2566.459127] 4.11.0-rc1+ #26 Not tainted
+[ 2566.459194] -------------------------------------------------------
+[ 2566.459266] gem_streaming_w/759 is trying to acquire lock:
+[ 2566.459334]  (&obj->mm.lock){+.+.+.}, at: [<ffffffffa034bc80>] i915_gem_object_pin_pages+0x0/0xc0 [i915]
+[ 2566.459605]
+[ 2566.459605] but task is already holding lock:
+[ 2566.459699]  (&mm->mmap_sem){++++++}, at: [<ffffffff8106fd11>] __do_page_fault+0x121/0x500
+[ 2566.459814]
+[ 2566.459814] which lock already depends on the new lock.
+[ 2566.459814]
+[ 2566.459934]
+[ 2566.459934] the existing dependency chain (in reverse order) is:
+[ 2566.460030]
+[ 2566.460030] -> #1 (&mm->mmap_sem){++++++}:
+[ 2566.460139]        lock_acquire+0xfe/0x220
+[ 2566.460214]        down_read+0x4e/0x90
+[ 2566.460444]        i915_gem_userptr_get_pages+0x6e/0x340 [i915]
+[ 2566.460669]        ____i915_gem_object_get_pages+0x8b/0xd0 [i915]
+[ 2566.460900]        __i915_gem_object_get_pages+0x6a/0x80 [i915]
+[ 2566.461132]        __i915_vma_do_pin+0x7fa/0x930 [i915]
+[ 2566.461352]        eb_add_vma+0x67b/0x830 [i915]
+[ 2566.461572]        eb_lookup_vmas+0xafe/0x1010 [i915]
+[ 2566.461792]        i915_gem_do_execbuffer+0x715/0x2870 [i915]
+[ 2566.462012]        i915_gem_execbuffer2+0x106/0x2b0 [i915]
+[ 2566.462152]        drm_ioctl+0x36c/0x670 [drm]
+[ 2566.462236]        do_vfs_ioctl+0x12c/0xa60
+[ 2566.462317]        SyS_ioctl+0x41/0x70
+[ 2566.462399]        entry_SYSCALL_64_fastpath+0x1c/0xb1
+[ 2566.462477]
+[ 2566.462477] -> #0 (&obj->mm.lock){+.+.+.}:
+[ 2566.462587]        __lock_acquire+0x1602/0x1790
+[ 2566.462661]        lock_acquire+0xfe/0x220
+[ 2566.462893]        i915_gem_object_pin_pages+0x4c/0xc0 [i915]
+[ 2566.463116]        i915_gem_fault+0x2c2/0x8c0 [i915]
+[ 2566.463197]        __do_fault+0x42/0x130
+[ 2566.463276]        __handle_mm_fault+0x92c/0x1280
+[ 2566.463356]        handle_mm_fault+0x1e2/0x440
+[ 2566.463443]        __do_page_fault+0x1c4/0x500
+[ 2566.463529]        do_page_fault+0xc/0x10
+[ 2566.463613]        page_fault+0x1f/0x30
+[ 2566.463693]
+[ 2566.463693] other info that might help us debug this:
+[ 2566.463693]
+[ 2566.463820]  Possible unsafe locking scenario:
+[ 2566.463820]
+[ 2566.463918]        CPU0                    CPU1
+[ 2566.463988]        ----                    ----
+[ 2566.464068]   lock(&mm->mmap_sem);
+[ 2566.464143]                                lock(&obj->mm.lock);
+[ 2566.464226]                                lock(&mm->mmap_sem);
+[ 2566.464304]   lock(&obj->mm.lock);
+[ 2566.464378]
+[ 2566.464378]  *** DEADLOCK ***
+[ 2566.464378]
+[ 2566.464504] 1 lock held by gem_streaming_w/759:
+[ 2566.464576]  #0:  (&mm->mmap_sem){++++++}, at: [<ffffffff8106fd11>] __do_page_fault+0x121/0x500
+[ 2566.464699]
+[ 2566.464699] stack backtrace:
+[ 2566.464801] CPU: 0 PID: 759 Comm: gem_streaming_w Not tainted 4.11.0-rc1+ #26
+[ 2566.464881] Hardware name: GIGABYTE GB-BXBT-1900/MZBAYAB-00, BIOS F8 03/02/2016
+[ 2566.464983] Call Trace:
+[ 2566.465061]  dump_stack+0x68/0x9f
+[ 2566.465144]  print_circular_bug+0x20b/0x260
+[ 2566.465234]  __lock_acquire+0x1602/0x1790
+[ 2566.465323]  ? debug_check_no_locks_freed+0x1a0/0x1a0
+[ 2566.465564]  ? i915_gem_object_wait+0x238/0x650 [i915]
+[ 2566.465657]  ? debug_lockdep_rcu_enabled.part.4+0x1a/0x30
+[ 2566.465749]  lock_acquire+0xfe/0x220
+[ 2566.465985]  ? i915_sg_trim+0x1b0/0x1b0 [i915]
+[ 2566.466223]  i915_gem_object_pin_pages+0x4c/0xc0 [i915]
+[ 2566.466461]  ? i915_sg_trim+0x1b0/0x1b0 [i915]
+[ 2566.466699]  i915_gem_fault+0x2c2/0x8c0 [i915]
+[ 2566.466939]  ? i915_gem_pwrite_ioctl+0xce0/0xce0 [i915]
+[ 2566.467030]  ? __lock_acquire+0x642/0x1790
+[ 2566.467122]  ? __lock_acquire+0x642/0x1790
+[ 2566.467209]  ? debug_lockdep_rcu_enabled+0x35/0x40
+[ 2566.467299]  ? get_unmapped_area+0x1b4/0x1d0
+[ 2566.467387]  __do_fault+0x42/0x130
+[ 2566.467474]  __handle_mm_fault+0x92c/0x1280
+[ 2566.467564]  ? __pmd_alloc+0x1e0/0x1e0
+[ 2566.467651]  ? vm_mmap_pgoff+0x160/0x190
+[ 2566.467740]  ? handle_mm_fault+0x111/0x440
+[ 2566.467827]  handle_mm_fault+0x1e2/0x440
+[ 2566.467914]  ? handle_mm_fault+0x5d/0x440
+[ 2566.468002]  __do_page_fault+0x1c4/0x500
+[ 2566.468090]  do_page_fault+0xc/0x10
+[ 2566.468180]  page_fault+0x1f/0x30
+[ 2566.468263] RIP: 0033:0x557895ced32a
+[ 2566.468337] RSP: 002b:00007fffd6dd8a10 EFLAGS: 00010202
+[ 2566.468419] RAX: 00007f659a4db000 RBX: 0000000000000003 RCX: 00007f659ad032da
+[ 2566.468501] RDX: 0000000000000000 RSI: 0000000000100000 RDI: 0000000000000000
+[ 2566.468586] RBP: 0000000000000007 R08: 0000000000000003 R09: 0000000100000000
+[ 2566.468667] R10: 0000000000000001 R11: 0000000000000246 R12: 0000557895ceda60
+[ 2566.468749] R13: 0000000000000001 R14: 00007fffd6dd8ac0 R15: 00007f659a4db000
+
+By checking the status of the gup worker (serialized by the
+obj->mm.lock) we can determine whether it is still active, has failed or
+has succeeded. If the worker is still active (or failed), we know that
+it cannot be bound and so we can skip taking struct_mutex (risking
+potential recursion). As we check the worker status, we mark it to
+discard any partial results, forcing us to restart on the next
+get_pages.
+
+Reported-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Fixes: 1c8782dd313e ("drm/i915/userptr: Disallow wrapping GTT into a userptr")
+Testcase: igt/gem_userptr_blits/map-fixed-invalidate-gup
+Testcase: igt/gem_userptr_blits/dmabuf-sync
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Michał Winiarski <michal.winiarski@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170315140150.19432-1-chris@chris-wilson.co.uk
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+

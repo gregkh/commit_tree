@@ -1,0 +1,83 @@
+bpf: sockhash fix omitted bucket lock in sock_close
+
+First the sk_callback_lock() was being used to protect both the
+sock callback hooks and the psock->maps list. This got overly
+convoluted after the addition of sockhash (in sockmap it made
+some sense because masp and callbacks were tightly coupled) so
+lets split out a specific lock for maps and only use the callback
+lock for its intended purpose. This fixes a couple cases where
+we missed using maps lock when it was in fact needed. Also this
+makes it easier to follow the code because now we can put the
+locking closer to the actual code its serializing.
+
+Next, in sock_hash_delete_elem() the pattern was as follows,
+
+  sock_hash_delete_elem()
+     [...]
+     spin_lock(bucket_lock)
+     l = lookup_elem_raw()
+     if (l)
+        hlist_del_rcu()
+        write_lock(sk_callback_lock)
+         .... destroy psock ...
+        write_unlock(sk_callback_lock)
+     spin_unlock(bucket_lock)
+
+The ordering is necessary because we only know the {p}sock after
+dereferencing the hash table which we can't do unless we have the
+bucket lock held. Once we have the bucket lock and the psock element
+it is deleted from the hashmap to ensure any other path doing a lookup
+will fail. Finally, the refcnt is decremented and if zero the psock
+is destroyed.
+
+In parallel with the above (or free'ing the map) a tcp close event
+may trigger tcp_close(). Which at the moment omits the bucket lock
+altogether (oops!) where the flow looks like this,
+
+  bpf_tcp_close()
+     [...]
+     write_lock(sk_callback_lock)
+     for each psock->maps // list of maps this sock is part of
+         hlist_del_rcu(ref_hash_node);
+         .... destroy psock ...
+     write_unlock(sk_callback_lock)
+
+Obviously, and demonstrated by syzbot, this is broken because
+we can have multiple threads deleting entries via hlist_del_rcu().
+
+To fix this we might be tempted to wrap the hlist operation in a
+bucket lock but that would create a lock inversion problem. In
+summary to follow locking rules the psocks maps list needs the
+sk_callback_lock (after this patch maps_lock) but we need the bucket
+lock to do the hlist_del_rcu.
+
+To resolve the lock inversion problem pop the head of the maps list
+repeatedly and remove the reference until no more are left. If a
+delete happens in parallel from the BPF API that is OK as well because
+it will do a similar action, lookup the lock in the map/hash, delete
+it from the map/hash, and dec the refcnt. We check for this case
+before doing a destroy on the psock to ensure we don't have two
+threads tearing down a psock. The new logic is as follows,
+
+  bpf_tcp_close()
+  e = psock_map_pop(psock->maps) // done with map lock
+  bucket_lock() // lock hash list bucket
+  l = lookup_elem_raw(head, hash, key, key_size);
+  if (l) {
+     //only get here if elmnt was not already removed
+     hlist_del_rcu()
+     ... destroy psock...
+  }
+  bucket_unlock()
+
+And finally for all the above to work add missing locking around  map
+operations per above. Then add RCU annotations and use
+rcu_dereference/rcu_assign_pointer to manage values relying on RCU so
+that the object is not free'd from sock_hash_free() while it is being
+referenced in bpf_tcp_close().
+
+Reported-by: syzbot+0ce137753c78f7b6acc1@syzkaller.appspotmail.com
+Fixes: 81110384441a ("bpf: sockmap, add hash map support")
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+

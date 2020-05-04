@@ -1,0 +1,52 @@
+sparc64: new context wrap
+
+The current wrap implementation has a race issue: it is called outside of
+the ctx_alloc_lock, and also does not wait for all CPUs to complete the
+wrap.  This means that a thread can get a new context with a new version
+and another thread might still be running with the same context. The
+problem is especially severe on CPUs with shared TLBs, like sun4v. I used
+the following test to very quickly reproduce the problem:
+- start over 8K processes (must be more than context IDs)
+- write and read values at a  memory location in every process.
+
+Very quickly memory corruptions start happening, and what we read back
+does not equal what we wrote.
+
+Several approaches were explored before settling on this one:
+
+Approach 1:
+Move smp_new_mmu_context_version() inside ctx_alloc_lock, and wait for
+every process to complete the wrap. (Note: every CPU must WAIT before
+leaving smp_new_mmu_context_version_client() until every one arrives).
+
+This approach ends up with deadlocks, as some threads own locks which other
+threads are waiting for, and they never receive softint until these threads
+exit smp_new_mmu_context_version_client(). Since we do not allow the exit,
+deadlock happens.
+
+Approach 2:
+Handle wrap right during mondo interrupt. Use etrap/rtrap to enter into
+into C code, and issue new versions to every CPU.
+This approach adds some overhead to runtime: in switch_mm() we must add
+some checks to make sure that versions have not changed due to wrap while
+we were loading the new secondary context. (could be protected by PSTATE_IE
+but that degrades performance as on M7 and older CPUs as it takes 50 cycles
+for each access). Also, we still need a global per-cpu array of MMs to know
+where we need to load new contexts, otherwise we can change context to a
+thread that is going way (if we received mondo between switch_mm() and
+switch_to() time). Finally, there are some issues with window registers in
+rtrap() when context IDs are changed during CPU mondo time.
+
+The approach in this patch is the simplest and has almost no impact on
+runtime.  We use the array with mm's where last secondary contexts were
+loaded onto CPUs and bump their versions to the new generation without
+changing context IDs. If a new process comes in to get a context ID, it
+will go through get_new_mmu_context() because of version mismatch. But the
+running processes do not need to be interrupted. And wrap is quicker as we
+do not need to xcall and wait for everyone to receive and complete wrap.
+
+Signed-off-by: Pavel Tatashin <pasha.tatashin@oracle.com>
+Reviewed-by: Bob Picco <bob.picco@oracle.com>
+Reviewed-by: Steven Sistare <steven.sistare@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

@@ -1,0 +1,80 @@
+android: binder: fix the race mmap and alloc_new_buf_locked
+
+There is RaceFuzzer report like below because we have no lock to close
+below the race between binder_mmap and binder_alloc_new_buf_locked.
+To close the race, let's use memory barrier so that if someone see
+alloc->vma is not NULL, alloc->vma_vm_mm should be never NULL.
+
+(I didn't add stable mark intentionallybecause standard android
+userspace libraries that interact with binder (libbinder & libhwbinder)
+prevent the mmap/ioctl race. - from Todd)
+
+"
+Thread interleaving:
+CPU0 (binder_alloc_mmap_handler)              CPU1 (binder_alloc_new_buf_locked)
+=====                                         =====
+// drivers/android/binder_alloc.c
+// #L718 (v4.18-rc3)
+alloc->vma = vma;
+                                              // drivers/android/binder_alloc.c
+                                              // #L346 (v4.18-rc3)
+                                              if (alloc->vma == NULL) {
+                                                  ...
+                                                  // alloc->vma is not NULL at this point
+                                                  return ERR_PTR(-ESRCH);
+                                              }
+                                              ...
+                                              // #L438
+                                              binder_update_page_range(alloc, 0,
+                                                      (void *)PAGE_ALIGN((uintptr_t)buffer->data),
+                                                      end_page_addr);
+
+                                              // In binder_update_page_range() #L218
+                                              // But still alloc->vma_vm_mm is NULL here
+                                              if (need_mm && mmget_not_zero(alloc->vma_vm_mm))
+alloc->vma_vm_mm = vma->vm_mm;
+
+Crash Log:
+==================================================================
+BUG: KASAN: null-ptr-deref in __atomic_add_unless include/asm-generic/atomic-instrumented.h:89 [inline]
+BUG: KASAN: null-ptr-deref in atomic_add_unless include/linux/atomic.h:533 [inline]
+BUG: KASAN: null-ptr-deref in mmget_not_zero include/linux/sched/mm.h:75 [inline]
+BUG: KASAN: null-ptr-deref in binder_update_page_range+0xece/0x18e0 drivers/android/binder_alloc.c:218
+Write of size 4 at addr 0000000000000058 by task syz-executor0/11184
+
+CPU: 1 PID: 11184 Comm: syz-executor0 Not tainted 4.18.0-rc3 #1
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.8.2-0-g33fbe13 by qemu-project.org 04/01/2014
+Call Trace:
+ __dump_stack lib/dump_stack.c:77 [inline]
+ dump_stack+0x16e/0x22c lib/dump_stack.c:113
+ kasan_report_error mm/kasan/report.c:352 [inline]
+ kasan_report+0x163/0x380 mm/kasan/report.c:412
+ check_memory_region_inline mm/kasan/kasan.c:260 [inline]
+ check_memory_region+0x140/0x1a0 mm/kasan/kasan.c:267
+ kasan_check_write+0x14/0x20 mm/kasan/kasan.c:278
+ __atomic_add_unless include/asm-generic/atomic-instrumented.h:89 [inline]
+ atomic_add_unless include/linux/atomic.h:533 [inline]
+ mmget_not_zero include/linux/sched/mm.h:75 [inline]
+ binder_update_page_range+0xece/0x18e0 drivers/android/binder_alloc.c:218
+ binder_alloc_new_buf_locked drivers/android/binder_alloc.c:443 [inline]
+ binder_alloc_new_buf+0x467/0xc30 drivers/android/binder_alloc.c:513
+ binder_transaction+0x125b/0x4fb0 drivers/android/binder.c:2957
+ binder_thread_write+0xc08/0x2770 drivers/android/binder.c:3528
+ binder_ioctl_write_read.isra.39+0x24f/0x8e0 drivers/android/binder.c:4456
+ binder_ioctl+0xa86/0xf34 drivers/android/binder.c:4596
+ vfs_ioctl fs/ioctl.c:46 [inline]
+ do_vfs_ioctl+0x154/0xd40 fs/ioctl.c:686
+ ksys_ioctl+0x94/0xb0 fs/ioctl.c:701
+ __do_sys_ioctl fs/ioctl.c:708 [inline]
+ __se_sys_ioctl fs/ioctl.c:706 [inline]
+ __x64_sys_ioctl+0x43/0x50 fs/ioctl.c:706
+ do_syscall_64+0x167/0x4b0 arch/x86/entry/common.c:290
+ entry_SYSCALL_64_after_hwframe+0x49/0xbe
+"
+
+Signed-off-by: Todd Kjos <tkjos@google.com>
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Reviewed-by: Martijn Coenen <maco@android.com>
+Cc: stable <stable@vger.kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

@@ -1,0 +1,63 @@
+batman-adv: fix rare race conditions on interface removal
+
+In rare cases during shutdown the following general protection fault can
+happen:
+
+  general protection fault: 0000 [#1] SMP
+  Modules linked in: batman_adv(O-) [...]
+  CPU: 3 PID: 1714 Comm: rmmod Tainted: G           O    4.6.0-rc6+ #1
+  [...]
+  Call Trace:
+   [<ffffffffa0363294>] batadv_hardif_disable_interface+0x29a/0x3a6 [batman_adv]
+   [<ffffffffa0373db4>] batadv_softif_destroy_netlink+0x4b/0xa4 [batman_adv]
+   [<ffffffff813b52f3>] __rtnl_link_unregister+0x48/0x92
+   [<ffffffff813b9240>] rtnl_link_unregister+0xc1/0xdb
+   [<ffffffff8108547c>] ? bit_waitqueue+0x87/0x87
+   [<ffffffffa03850d2>] batadv_exit+0x1a/0xf48 [batman_adv]
+   [<ffffffff810c26f9>] SyS_delete_module+0x136/0x1b0
+   [<ffffffff8144dc65>] entry_SYSCALL_64_fastpath+0x18/0xa8
+   [<ffffffff8108aaca>] ? trace_hardirqs_off_caller+0x37/0xa6
+  Code: 89 f7 e8 21 bd 0d e1 4d 85 e4 75 0e 31 f6 48 c7 c7 50 d7 3b a0 e8 50 16 f2 e0 49 8b 9c 24 28 01 00 00 48 85 db 0f 84 b2 00 00 00 <48> 8b 03 4d 85 ed 48 89 45 c8 74 09 4c 39 ab f8 00 00 00 75 1c
+  RIP  [<ffffffffa0371852>] batadv_purge_outstanding_packets+0x1c8/0x291 [batman_adv]
+   RSP <ffff88001da5fd78>
+  ---[ end trace 803b9bdc6a4a952b ]---
+  Kernel panic - not syncing: Fatal exception in interrupt
+  Kernel Offset: disabled
+  ---[ end Kernel panic - not syncing: Fatal exception in interrupt
+
+It does not happen often, but may potentially happen when frequently
+shutting down and reinitializing an interface. With some carefully
+placed msleep()s/mdelay()s it can be reproduced easily.
+
+The issue is, that on interface removal, any still running worker thread
+of a forwarding packet will race with the interface purging routine to
+free a forwarding packet. Temporarily giving up a spin-lock to be able
+to sleep in the purging routine is not safe.
+
+Furthermore, there is a potential general protection fault not just for
+the purging side shown above, but also on the worker side: Temporarily
+removing a forw_packet from the according forw_{bcast,bat}_list will make
+it impossible for the purging routine to catch and cancel it.
+
+ # How this patch tries to fix it:
+
+With this patch we split the queue purging into three steps: Step 1),
+removing forward packets from the queue of an interface and by that
+claim it as our responsibility to free.
+
+Step 2), we are either lucky to cancel a pending worker before it starts
+to run. Or if it is already running, we wait and let it do its thing,
+except two things:
+
+Through the claiming in step 1) we prevent workers from a) re-arming
+themselves. And b) prevent workers from freeing packets which we still
+hold in the interface purging routine.
+
+Finally, step 3, we are sure that no forwarding packets are pending or
+even running anymore on the interface to remove. We can then safely free
+the claimed forwarding packets.
+
+Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
+Signed-off-by: Sven Eckelmann <sven@narfation.org>
+Signed-off-by: Simon Wunderlich <sw@simonwunderlich.de>
+

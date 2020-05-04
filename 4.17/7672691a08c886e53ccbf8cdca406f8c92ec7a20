@@ -1,0 +1,63 @@
+powerpc/powernv: Provide a way to force a core into SMT4 mode
+
+POWER9 processors up to and including "Nimbus" v2.2 have hardware
+bugs relating to transactional memory and thread reconfiguration.
+One of these bugs has a workaround which is to get the core into
+SMT4 state temporarily.  This workaround is only needed when
+running bare-metal.
+
+This patch provides a function which gets the core into SMT4 mode
+by preventing threads from going to a stop state, and waking up
+those which are already in a stop state.  Once at least 3 threads
+are not in a stop state, the core will be in SMT4 and we can
+continue.
+
+To do this, we add a "dont_stop" flag to the paca to tell the
+thread not to go into a stop state.  If this flag is set,
+power9_idle_stop() just returns immediately with a return value
+of 0.  The pnv_power9_force_smt4_catch() function does the following:
+
+1. Set the dont_stop flag for each thread in the core, except
+   ourselves (in fact we use an atomic_inc() in case more than
+   one thread is calling this function concurrently).
+2. See how many threads are awake, indicated by their
+   requested_psscr field in the paca being 0.  If this is at
+   least 3, skip to step 5.
+3. Send a doorbell interrupt to each thread that was seen as
+   being in a stop state in step 2.
+4. Until at least 3 threads are awake, scan the threads to which
+   we sent a doorbell interrupt and check if they are awake now.
+
+This relies on the following properties:
+
+- Once dont_stop is non-zero, requested_psccr can't go from zero to
+  non-zero, except transiently (and without the thread doing stop).
+- requested_psscr being zero guarantees that the thread isn't in
+  a state-losing stop state where thread reconfiguration could occur.
+- Doing stop with a PSSCR value of 0 won't be a state-losing stop
+  and thus won't allow thread reconfiguration.
+- Once threads_per_core/2 + 1 (i.e. 3) threads are awake, the core
+  must be in SMT4 mode, since SMT modes are powers of 2.
+
+This does add a sync to power9_idle_stop(), which is necessary to
+provide the correct ordering between setting requested_psscr and
+checking dont_stop.  The overhead of the sync should be unnoticeable
+compared to the latency of going into and out of a stop state.
+
+Because some objected to incurring this extra latency on systems where
+the XER[SO] bug is not relevant, I have put the test in
+power9_idle_stop inside a feature section.  This means that
+pnv_power9_force_smt4_catch() WILL NOT WORK correctly on systems
+without the CPU_FTR_P9_TM_XER_SO_BUG feature bit set, and will
+probably hang the system.
+
+In order to cater for uses where the caller has an operation that
+has to be done while the core is in SMT4, the core continues to be
+kept in SMT4 after pnv_power9_force_smt4_catch() function returns,
+until the pnv_power9_force_smt4_release() function is called.
+It undoes the effect of step 1 above and allows the other threads
+to go into a stop state.
+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+

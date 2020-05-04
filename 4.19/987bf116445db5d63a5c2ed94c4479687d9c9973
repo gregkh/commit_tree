@@ -1,0 +1,83 @@
+drm/amd/display: Signal hw_done() after waiting for flip_done()
+
+In amdgpu_dm_commit_tail(), wait until flip_done() is signaled before
+we signal hw_done().
+
+[Why]
+
+This is to temporarily address a paging error that occurs when a
+nonblocking commit contends with another commit, particularly in a
+mirrored display configuration where at least 2 CRTCs are updated.
+The error occurs in drm_atomic_helper_wait_for_flip_done(), when we
+attempt to access the contents of new_crtc_state->commit.
+
+Here's the sequence for a mirrored 2 display setup (irrelevant steps
+left out for clarity):
+
+**THREAD 1**                        | **THREAD 2**
+                                    |
+Initialize atomic state for flip    |
+                                    |
+Queue worker                        |
+                                   ...
+
+                                    | Do work for flip
+                                    |
+                                    | Signal hw_done() on CRTC 1
+                                    | Signal hw_done() on CRTC 2
+                                    |
+                                    | Wait for flip_done() on CRTC 1
+
+                                <---- **PREEMPTED BY THREAD 1**
+
+Initialize atomic state for cursor  |
+update (1)                          |
+                                    |
+Do cursor update work on both CRTCs |
+                                    |
+Clear atomic state (2)              |
+**DONE**                            |
+                                   ...
+                                    |
+                                    | Wait for flip_done() on CRTC 2
+                                    | *ERROR*
+                                    |
+
+The issue starts with (1). When the atomic state is initialized, the
+current CRTC states are duplicated to be the new_crtc_states, and
+referenced to be the old_crtc_states. (The new_crtc_states are to be
+filled with update data.)
+
+Some things to note:
+
+* Due to the mirrored configuration, the cursor updates on both CRTCs.
+
+* At this point, the pflip IRQ has already been handled, and flip_done
+  signaled on all CRTCs. The cursor commit can therefore continue.
+
+* The old_crtc_states used by the cursor update are the **same states**
+  as the new_crtc_states used by the flip worker.
+
+At (2), the old_crtc_state is freed (*), and the cursor commit
+completes. We then context switch back to the flip worker, where we
+attempt to access the new_crtc_state->commit object. This is
+problematic, as this state has already been freed.
+
+(*) Technically, 'state->crtcs[i].state' is freed, which was made to
+    reference old_crtc_state in drm_atomic_helper_swap_state()
+
+[How]
+
+By moving hw_done() after wait_for_flip_done(), we're guaranteed that
+the new_crtc_state (from the flip worker's perspective) still exists.
+This is because any other commit will be blocked, waiting for the
+hw_done() signal.
+
+Note that both the i915 and imx drivers have this sequence flipped
+already, masking this problem.
+
+Signed-off-by: Shirish S <shirish.s@amd.com>
+Signed-off-by: Leo Li <sunpeng.li@amd.com>
+Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+

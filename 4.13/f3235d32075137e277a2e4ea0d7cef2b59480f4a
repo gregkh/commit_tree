@@ -1,0 +1,191 @@
+MIPS: MIPS16e2: Subdecode extended LWSP/SWSP instructions
+
+Implement extended LWSP/SWSP instruction subdecoding for the purpose of
+unaligned GP-relative memory access emulation.
+
+With the introduction of the MIPS16e2 ASE[1] the previously must-be-zero
+3-bit field at bits 7..5 of the extended encodings of the instructions
+selected with the LWSP and SWSP major opcodes has become a `sel' field,
+acting as an opcode extension for additional operations.  In both cases
+the `sel' value of 0 has retained the original operation, that is:
+
+	LW	rx, offset(sp)
+
+and:
+
+	SW	rx, offset(sp)
+
+for LWSP and SWSP respectively.  In hardware predating the MIPS16e2 ASE
+other values may or may not have been decoded, architecturally yielding
+unpredictable results, and in our unaligned memory access emulation we
+have treated the 3-bit field as a don't-care, that is effectively making
+all the possible encodings of the field alias to the architecturally
+defined encoding of 0.
+
+For the non-zero values of the `sel' field the MIPS16e2 ASE has in
+particular defined these GP-relative operations:
+
+	LW	rx, offset(gp)		# sel = 1
+	LH	rx, offset(gp)		# sel = 2
+	LHU	rx, offset(gp)		# sel = 4
+
+and
+
+	SW	rx, offset(gp)		# sel = 1
+	SH	rx, offset(gp)		# sel = 2
+
+for LWSP and SWSP respectively, which will trap with an Address Error
+exception if the effective address calculated is not naturally-aligned
+for the operation requested.  These operations have been selected for
+unaligned access emulation, for consistency with the corresponding
+regular MIPS and microMIPS operations.
+
+For other non-zero values of the `sel' field the MIPS16e2 ASE has
+defined further operations, which however either never trap with an
+Address Error exception, such as LWL or GP-relative SB, or are not
+supposed to be emulated, such as LL or SC.  These operations have been
+selected to exclude from unaligned access emulation, should an Address
+Error exception ever happen with them.
+
+Subdecode the `sel' field in unaligned access emulation then for the
+extended encodings of the instructions selected with the LWSP and SWSP
+major opcodes, whenever support for the MIPS16e2 ASE has been detected
+in hardware, and either emulate the operation requested or send SIGBUS
+to the originating process, according to the selection described above.
+For hardware implementing the MIPS16 ASE, however lacking MIPS16e2 ASE
+support retain the original interpretation of the `sel' field.
+
+The effects of this change are illustrated with the following user
+program:
+
+$ cat mips16e2-test.c
+#include <inttypes.h>
+#include <stdio.h>
+
+int main(void)
+{
+	int64_t scratch[16] = { 0 };
+	int32_t *tmp0, *tmp1, *tmp2;
+	int i;
+
+	scratch[0] = 0xc8c7c6c5c4c3c2c1;
+	scratch[1] = 0xd0cfcecdcccbcac9;
+
+	asm volatile(
+		"move	%0, $sp\n\t"
+		"move	%1, $gp\n\t"
+		"move	$sp, %4\n\t"
+		"addiu	%2, %4, 8\n\t"
+		"move	$gp, %2\n\t"
+
+		"lw	%2, 2($sp)\n\t"
+		"sw	%2, 16(%4)\n\t"
+		"lw	%2, 2($gp)\n\t"
+		"sw	%2, 24(%4)\n\t"
+
+		"lw	%2, 1($sp)\n\t"
+		"sw	%2, 32(%4)\n\t"
+		"lh	%2, 1($gp)\n\t"
+		"sw	%2, 40(%4)\n\t"
+
+		"lw	%2, 3($sp)\n\t"
+		"sw	%2, 48(%4)\n\t"
+		"lhu	%2, 3($gp)\n\t"
+		"sw	%2, 56(%4)\n\t"
+
+		"lw	%2, 0(%4)\n\t"
+		"sw	%2, 66($sp)\n\t"
+		"lw	%2, 8(%4)\n\t"
+		"sw	%2, 82($gp)\n\t"
+
+		"lw	%2, 0(%4)\n\t"
+		"sw	%2, 97($sp)\n\t"
+		"lw	%2, 8(%4)\n\t"
+		"sh	%2, 113($gp)\n\t"
+
+		"move	$gp, %1\n\t"
+		"move	$sp, %0"
+		: "=&d" (tmp0), "=&d" (tmp1), "=&d" (tmp2), "=m" (scratch)
+		: "d" (scratch));
+
+	for (i = 0; i < sizeof(scratch) / sizeof(*scratch); i += 2)
+		printf("%016" PRIx64 "\t%016" PRIx64 "\n",
+		       scratch[i], scratch[i + 1]);
+
+	return 0;
+}
+$
+
+to be compiled with:
+
+$ gcc -mips16 -mips32r2 -Wa,-mmips16e2 -o mips16e2-test mips16e2-test.c
+$
+
+With 74Kf hardware, which does not implement the MIPS16e2 ASE, this
+program produces the following output:
+
+$ ./mips16e2-test
+c8c7c6c5c4c3c2c1        d0cfcecdcccbcac9
+00000000c6c5c4c3        00000000c6c5c4c3
+00000000c5c4c3c2        00000000c5c4c3c2
+00000000c7c6c5c4        00000000c7c6c5c4
+0000c4c3c2c10000        0000000000000000
+0000cccbcac90000        0000000000000000
+000000c4c3c2c100        0000000000000000
+000000cccbcac900        0000000000000000
+$
+
+regardless of whether the change has been applied or not.
+
+With the change not applied and interAptive MR2 hardware[2], which does
+implement the MIPS16e2 ASE, it produces the following output:
+
+$ ./mips16e2-test
+c8c7c6c5c4c3c2c1        d0cfcecdcccbcac9
+00000000c6c5c4c3        00000000cecdcccb
+00000000c5c4c3c2        00000000cdcccbca
+00000000c7c6c5c4        00000000cfcecdcc
+0000c4c3c2c10000        0000000000000000
+0000000000000000        0000cccbcac90000
+000000c4c3c2c100        0000000000000000
+0000000000000000        000000cccbcac900
+$
+
+which shows that for GP-relative operations the correct trapping address
+calculated from $gp has been obtained from the CP0 BadVAddr register and
+so has data from the source operand, however masking and extension has
+not been applied for halfword operations.
+
+With the change applied and interAptive MR2 hardware the program
+produces the following output:
+
+$ ./mips16e2-test
+c8c7c6c5c4c3c2c1        d0cfcecdcccbcac9
+00000000c6c5c4c3        00000000cecdcccb
+00000000c5c4c3c2        00000000ffffcbca
+00000000c7c6c5c4        000000000000cdcc
+0000c4c3c2c10000        0000000000000000
+0000000000000000        0000cccbcac90000
+000000c4c3c2c100        0000000000000000
+0000000000000000        0000000000cac900
+$
+
+as expected.
+
+References:
+
+[1] "MIPS32 Architecture for Programmers: MIPS16e2 Application-Specific
+    Extension Technical Reference Manual", Imagination Technologies
+    Ltd., Document Number: MD01172, Revision 01.00, April 26, 2016
+
+[2] "MIPS32 interAptiv Multiprocessing System Software User's Manual",
+    Imagination Technologies Ltd., Document Number: MD00904, Revision
+    02.01, June 15, 2016, Chapter 24 "MIPS16e Application-Specific
+    Extension to the MIPS32 Instruction Set", pp. 871-883
+
+Signed-off-by: Maciej W. Rozycki <macro@imgtec.com>
+Reviewed-by: James Hogan <james.hogan@imgtec.com>
+Cc: linux-mips@linux-mips.org
+Patchwork: https://patchwork.linux-mips.org/patch/16095/
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+

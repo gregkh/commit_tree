@@ -1,0 +1,54 @@
+srcu: Allow use of Tiny/Tree SRCU from both process and interrupt context
+
+Linu Cherian reported a WARN in cleanup_srcu_struct() when shutting
+down a guest running iperf on a VFIO assigned device.  This happens
+because irqfd_wakeup() calls srcu_read_lock(&kvm->irq_srcu) in interrupt
+context, while a worker thread does the same inside kvm_set_irq().  If the
+interrupt happens while the worker thread is executing __srcu_read_lock(),
+updates to the Classic SRCU ->lock_count[] field or the Tree SRCU
+->srcu_lock_count[] field can be lost.
+
+The docs say you are not supposed to call srcu_read_lock() and
+srcu_read_unlock() from irq context, but KVM interrupt injection happens
+from (host) interrupt context and it would be nice if SRCU supported the
+use case.  KVM is using SRCU here not really for the "sleepable" part,
+but rather due to its IPI-free fast detection of grace periods.  It is
+therefore not desirable to switch back to RCU, which would effectively
+revert commit 719d93cd5f5c ("kvm/irqchip: Speed up KVM_SET_GSI_ROUTING",
+2014-01-16).
+
+However, the docs are overly conservative.  You can have an SRCU instance
+only has users in irq context, and you can mix process and irq context
+as long as process context users disable interrupts.  In addition,
+__srcu_read_unlock() actually uses this_cpu_dec() on both Tree SRCU and
+Classic SRCU.  For those two implementations, only srcu_read_lock()
+is unsafe.
+
+When Classic SRCU's __srcu_read_unlock() was changed to use this_cpu_dec(),
+in commit 5a41344a3d83 ("srcu: Simplify __srcu_read_unlock() via
+this_cpu_dec()", 2012-11-29), __srcu_read_lock() did two increments.
+Therefore it kept __this_cpu_inc(), with preempt_disable/enable in
+the caller.  Tree SRCU however only does one increment, so on most
+architectures it is more efficient for __srcu_read_lock() to use
+this_cpu_inc(), and any performance differences appear to be down in
+the noise.
+
+Unlike Classic and Tree SRCU, Tiny SRCU does increments and decrements on
+a single variable.  Therefore, as Peter Zijlstra pointed out, Tiny SRCU's
+implementation already supports mixed-context use of srcu_read_lock()
+and srcu_read_unlock(), at least as long as uses of srcu_read_lock()
+and srcu_read_unlock() in each handler are nested and paired properly.
+In other words, it is still illegal to (say) invoke srcu_read_lock()
+in an interrupt handler and to invoke the matching srcu_read_unlock()
+in a softirq handler.  Therefore, the only change required for Tiny SRCU
+is to its comments.
+
+Fixes: 719d93cd5f5c ("kvm/irqchip: Speed up KVM_SET_GSI_ROUTING")
+Reported-by: Linu Cherian <linuc.decode@gmail.com>
+Suggested-by: Linu Cherian <linuc.decode@gmail.com>
+Cc: kvm@vger.kernel.org
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Tested-by: Paolo Bonzini <pbonzini@redhat.com>
+

@@ -1,0 +1,95 @@
+mm: workingset: fix use-after-free in shadow node shrinker
+
+Several people report seeing warnings about inconsistent radix tree
+nodes followed by crashes in the workingset code, which all looked like
+use-after-free access from the shadow node shrinker.
+
+Dave Jones managed to reproduce the issue with a debug patch applied,
+which confirmed that the radix tree shrinking indeed frees shadow nodes
+while they are still linked to the shadow LRU:
+
+  WARNING: CPU: 2 PID: 53 at lib/radix-tree.c:643 delete_node+0x1e4/0x200
+  CPU: 2 PID: 53 Comm: kswapd0 Not tainted 4.10.0-rc2-think+ #3
+  Call Trace:
+     delete_node+0x1e4/0x200
+     __radix_tree_delete_node+0xd/0x10
+     shadow_lru_isolate+0xe6/0x220
+     __list_lru_walk_one.isra.4+0x9b/0x190
+     list_lru_walk_one+0x23/0x30
+     scan_shadow_nodes+0x2e/0x40
+     shrink_slab.part.44+0x23d/0x5d0
+     shrink_node+0x22c/0x330
+     kswapd+0x392/0x8f0
+
+This is the WARN_ON_ONCE(!list_empty(&node->private_list)) placed in the
+inlined radix_tree_shrink().
+
+The problem is with 14b468791fa9 ("mm: workingset: move shadow entry
+tracking to radix tree exceptional tracking"), which passes an update
+callback into the radix tree to link and unlink shadow leaf nodes when
+tree entries change, but forgot to pass the callback when reclaiming a
+shadow node.
+
+While the reclaimed shadow node itself is unlinked by the shrinker, its
+deletion from the tree can cause the left-most leaf node in the tree to
+be shrunk.  If that happens to be a shadow node as well, we don't unlink
+it from the LRU as we should.
+
+Consider this tree, where the s are shadow entries:
+
+       root->rnode
+            |
+       [0       n]
+        |       |
+     [s    ] [sssss]
+
+Now the shadow node shrinker reclaims the rightmost leaf node through
+the shadow node LRU:
+
+       root->rnode
+            |
+       [0        ]
+        |
+    [s     ]
+
+Because the parent of the deleted node is the first level below the
+root and has only one child in the left-most slot, the intermediate
+level is shrunk and the node containing the single shadow is put in
+its place:
+
+       root->rnode
+            |
+       [s        ]
+
+The shrinker again sees a single left-most slot in a first level node
+and thus decides to store the shadow in root->rnode directly and free
+the node - which is a leaf node on the shadow node LRU.
+
+  root->rnode
+       |
+       s
+
+Without the update callback, the freed node remains on the shadow LRU,
+where it causes later shrinker runs to crash.
+
+Pass the node updater callback into __radix_tree_delete_node() in case
+the deletion causes the left-most branch in the tree to collapse too.
+
+Also add warnings when linked nodes are freed right away, rather than
+wait for the use-after-free when the list is scanned much later.
+
+Fixes: 14b468791fa9 ("mm: workingset: move shadow entry tracking to radix tree exceptional tracking")
+Reported-by: Dave Chinner <david@fromorbit.com>
+Reported-by: Hugh Dickins <hughd@google.com>
+Reported-by: Andrea Arcangeli <aarcange@redhat.com>
+Reported-and-tested-by: Dave Jones <davej@codemonkey.org.uk>
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Chris Leech <cleech@redhat.com>
+Cc: Lee Duncan <lduncan@suse.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Matthew Wilcox <mawilcox@linuxonhyperv.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

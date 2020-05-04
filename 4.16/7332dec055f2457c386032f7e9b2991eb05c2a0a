@@ -1,0 +1,230 @@
+sched/fair: Only immediately migrate tasks due to interrupts if prev and target CPUs share cache
+
+If waking from an idle CPU due to an interrupt then it's possible that
+the waker task will be pulled to wake on the current CPU. Unfortunately,
+depending on the type of interrupt and IRQ configuration, there may not
+be a strong relationship between the CPU an interrupt was delivered on
+and the CPU a task was running on. For example, the interrupts could all
+be delivered to CPUs on one particular node due to the machine topology
+or IRQ affinity configuration. Another example is an interrupt for an IO
+completion which can be delivered to any CPU where there is no guarantee
+the data is either cache hot or even local.
+
+This patch was motivated by the observation that an IO workload was
+being pulled cross-node on a frequent basis when IO completed.  From a
+wakeup latency perspective, it's still useful to know that an idle CPU is
+immediately available for use but lets only consider an automatic migration
+if the CPUs share cache to limit damage due to NUMA migrations. Migrations
+may still occur if wake_affine_weight determines it's appropriate.
+
+These are the throughput results for dbench running on ext4 comparing
+4.15-rc3 and this patch on a 2-socket machine where interrupts due to IO
+completions can happen on any CPU.
+
+                          4.15.0-rc3             4.15.0-rc3
+                             vanilla            lessmigrate
+Hmean     1        854.64 (   0.00%)      865.01 (   1.21%)
+Hmean     2       1229.60 (   0.00%)     1274.44 (   3.65%)
+Hmean     4       1591.81 (   0.00%)     1628.08 (   2.28%)
+Hmean     8       1845.04 (   0.00%)     1831.80 (  -0.72%)
+Hmean     16      2038.61 (   0.00%)     2091.44 (   2.59%)
+Hmean     32      2327.19 (   0.00%)     2430.29 (   4.43%)
+Hmean     64      2570.61 (   0.00%)     2568.54 (  -0.08%)
+Hmean     128     2481.89 (   0.00%)     2499.28 (   0.70%)
+Stddev    1         14.31 (   0.00%)        5.35 (  62.65%)
+Stddev    2         21.29 (   0.00%)       11.09 (  47.92%)
+Stddev    4          7.22 (   0.00%)        6.80 (   5.92%)
+Stddev    8         26.70 (   0.00%)        9.41 (  64.76%)
+Stddev    16        22.40 (   0.00%)       20.01 (  10.70%)
+Stddev    32        45.13 (   0.00%)       44.74 (   0.85%)
+Stddev    64        93.10 (   0.00%)       93.18 (  -0.09%)
+Stddev    128      184.28 (   0.00%)      177.85 (   3.49%)
+
+Note the small increase in throughput for low thread counts but also
+note that the standard deviation for each sample during the test run is
+lower. The throughput figures for dbench can be misleading so the benchmark
+is actually modified to time the latency of the processing of one load
+file with many samples taken. The difference in latency is
+
+                           4.15.0-rc3             4.15.0-rc3
+                              vanilla            lessmigrate
+Amean      1         21.71 (   0.00%)       21.47 (   1.08%)
+Amean      2         30.89 (   0.00%)       29.58 (   4.26%)
+Amean      4         47.54 (   0.00%)       46.61 (   1.97%)
+Amean      8         82.71 (   0.00%)       82.81 (  -0.12%)
+Amean      16       149.45 (   0.00%)      145.01 (   2.97%)
+Amean      32       265.49 (   0.00%)      248.43 (   6.42%)
+Amean      64       463.23 (   0.00%)      463.55 (  -0.07%)
+Amean      128      933.97 (   0.00%)      935.50 (  -0.16%)
+Stddev     1          1.58 (   0.00%)        1.54 (   2.26%)
+Stddev     2          2.84 (   0.00%)        2.95 (  -4.15%)
+Stddev     4          6.78 (   0.00%)        6.85 (  -0.99%)
+Stddev     8         16.85 (   0.00%)       16.37 (   2.85%)
+Stddev     16        41.59 (   0.00%)       41.04 (   1.32%)
+Stddev     32       111.05 (   0.00%)      105.11 (   5.35%)
+Stddev     64       285.94 (   0.00%)      288.01 (  -0.72%)
+Stddev     128      803.39 (   0.00%)      809.73 (  -0.79%)
+
+It's a small improvement which is not surprising given that migrations that
+migrate to a different node as not that common. However, it is noticeable
+in the CPU migration statistics which are reduced by 24%.
+
+There was a query for v1 of this patch about NAS so here are the results
+for C-class using MPI for parallelisation on the same machine
+
+nas-mpi
+                      4.15.0-rc3             4.15.0-rc3
+                         vanilla                  noirq
+Time cg.C       24.25 (   0.00%)       23.17 (   4.45%)
+Time ep.C        8.22 (   0.00%)        8.29 (  -0.85%)
+Time ft.C       22.67 (   0.00%)       20.34 (  10.28%)
+Time is.C        1.42 (   0.00%)        1.47 (  -3.52%)
+Time lu.C       55.62 (   0.00%)       54.81 (   1.46%)
+Time mg.C        7.93 (   0.00%)        7.91 (   0.25%)
+
+          4.15.0-rc3  4.15.0-rc3
+             vanilla  noirq-v1r1
+User         3799.96     3748.34
+System        672.10      626.15
+Elapsed        91.91       79.49
+
+lu.C sees a small gain, ft.C a large gain and ep.C and is.C see small
+regressions but in terms of absolute time, the difference is small and
+likely within run-to-run variance. System CPU usage is slightly reduced.
+
+schbench from Facebook was also requested. This is a bit of a mixed bag but
+it's important to note that this workload should not be heavily impacted
+by wakeups from interrupt context.
+
+                                 4.15.0-rc3             4.15.0-rc3
+                                    vanilla             noirq-v1r1
+Lat 50.00th-qrtle-1        41.00 (   0.00%)       41.00 (   0.00%)
+Lat 75.00th-qrtle-1        42.00 (   0.00%)       42.00 (   0.00%)
+Lat 90.00th-qrtle-1        43.00 (   0.00%)       44.00 (  -2.33%)
+Lat 95.00th-qrtle-1        44.00 (   0.00%)       46.00 (  -4.55%)
+Lat 99.00th-qrtle-1        57.00 (   0.00%)       58.00 (  -1.75%)
+Lat 99.50th-qrtle-1        59.00 (   0.00%)       59.00 (   0.00%)
+Lat 99.90th-qrtle-1        67.00 (   0.00%)       78.00 ( -16.42%)
+Lat 50.00th-qrtle-2        40.00 (   0.00%)       51.00 ( -27.50%)
+Lat 75.00th-qrtle-2        45.00 (   0.00%)       56.00 ( -24.44%)
+Lat 90.00th-qrtle-2        53.00 (   0.00%)       59.00 ( -11.32%)
+Lat 95.00th-qrtle-2        57.00 (   0.00%)       61.00 (  -7.02%)
+Lat 99.00th-qrtle-2        67.00 (   0.00%)       71.00 (  -5.97%)
+Lat 99.50th-qrtle-2        69.00 (   0.00%)       74.00 (  -7.25%)
+Lat 99.90th-qrtle-2        83.00 (   0.00%)       77.00 (   7.23%)
+Lat 50.00th-qrtle-4        51.00 (   0.00%)       51.00 (   0.00%)
+Lat 75.00th-qrtle-4        57.00 (   0.00%)       56.00 (   1.75%)
+Lat 90.00th-qrtle-4        60.00 (   0.00%)       59.00 (   1.67%)
+Lat 95.00th-qrtle-4        62.00 (   0.00%)       62.00 (   0.00%)
+Lat 99.00th-qrtle-4        73.00 (   0.00%)       72.00 (   1.37%)
+Lat 99.50th-qrtle-4        76.00 (   0.00%)       74.00 (   2.63%)
+Lat 99.90th-qrtle-4        85.00 (   0.00%)       78.00 (   8.24%)
+Lat 50.00th-qrtle-8        54.00 (   0.00%)       58.00 (  -7.41%)
+Lat 75.00th-qrtle-8        59.00 (   0.00%)       62.00 (  -5.08%)
+Lat 90.00th-qrtle-8        65.00 (   0.00%)       66.00 (  -1.54%)
+Lat 95.00th-qrtle-8        67.00 (   0.00%)       70.00 (  -4.48%)
+Lat 99.00th-qrtle-8        78.00 (   0.00%)       79.00 (  -1.28%)
+Lat 99.50th-qrtle-8        81.00 (   0.00%)       80.00 (   1.23%)
+Lat 99.90th-qrtle-8       116.00 (   0.00%)       83.00 (  28.45%)
+Lat 50.00th-qrtle-16       65.00 (   0.00%)       64.00 (   1.54%)
+Lat 75.00th-qrtle-16       77.00 (   0.00%)       71.00 (   7.79%)
+Lat 90.00th-qrtle-16       83.00 (   0.00%)       82.00 (   1.20%)
+Lat 95.00th-qrtle-16       87.00 (   0.00%)       87.00 (   0.00%)
+Lat 99.00th-qrtle-16       95.00 (   0.00%)       96.00 (  -1.05%)
+Lat 99.50th-qrtle-16       99.00 (   0.00%)      103.00 (  -4.04%)
+Lat 99.90th-qrtle-16      104.00 (   0.00%)      122.00 ( -17.31%)
+Lat 50.00th-qrtle-32       71.00 (   0.00%)       73.00 (  -2.82%)
+Lat 75.00th-qrtle-32       91.00 (   0.00%)       92.00 (  -1.10%)
+Lat 90.00th-qrtle-32      108.00 (   0.00%)      107.00 (   0.93%)
+Lat 95.00th-qrtle-32      118.00 (   0.00%)      115.00 (   2.54%)
+Lat 99.00th-qrtle-32      134.00 (   0.00%)      129.00 (   3.73%)
+Lat 99.50th-qrtle-32      138.00 (   0.00%)      133.00 (   3.62%)
+Lat 99.90th-qrtle-32      149.00 (   0.00%)      146.00 (   2.01%)
+Lat 50.00th-qrtle-39       83.00 (   0.00%)       81.00 (   2.41%)
+Lat 75.00th-qrtle-39      105.00 (   0.00%)      102.00 (   2.86%)
+Lat 90.00th-qrtle-39      120.00 (   0.00%)      119.00 (   0.83%)
+Lat 95.00th-qrtle-39      129.00 (   0.00%)      128.00 (   0.78%)
+Lat 99.00th-qrtle-39      153.00 (   0.00%)      149.00 (   2.61%)
+Lat 99.50th-qrtle-39      166.00 (   0.00%)      156.00 (   6.02%)
+Lat 99.90th-qrtle-39    12304.00 (   0.00%)    12848.00 (  -4.42%)
+
+When heavily loaded (e.g. 99.50th-qrtle-39 indicates 39 threads), there
+are small gains in many cases. Otherwise it depends on the quartile used
+where it can be bad -- e.g. 75.00th-qrtle-2. However, even these results
+are probably a co-incidence. For this workload, much depends on what node
+the threads get placed on and their relative locality and not wakeups from
+interrupt context. A larger component on how it behaves would be automatic
+NUMA balancing where a fault incurred to measure locality would be a much
+larger contributer to latency than the wakeup path.
+
+This is the results from an almost identical machine that happened to run
+the same test.  They only differ in terms of storage which is irrelevant
+for this test.
+
+                                 4.15.0-rc3             4.15.0-rc3
+                                    vanilla             noirq-v1r1
+Lat 50.00th-qrtle-1        41.00 (   0.00%)       41.00 (   0.00%)
+Lat 75.00th-qrtle-1        42.00 (   0.00%)       42.00 (   0.00%)
+Lat 90.00th-qrtle-1        44.00 (   0.00%)       43.00 (   2.27%)
+Lat 95.00th-qrtle-1        53.00 (   0.00%)       45.00 (  15.09%)
+Lat 99.00th-qrtle-1        59.00 (   0.00%)       58.00 (   1.69%)
+Lat 99.50th-qrtle-1        60.00 (   0.00%)       59.00 (   1.67%)
+Lat 99.90th-qrtle-1        86.00 (   0.00%)       61.00 (  29.07%)
+Lat 50.00th-qrtle-2        52.00 (   0.00%)       41.00 (  21.15%)
+Lat 75.00th-qrtle-2        57.00 (   0.00%)       46.00 (  19.30%)
+Lat 90.00th-qrtle-2        60.00 (   0.00%)       53.00 (  11.67%)
+Lat 95.00th-qrtle-2        62.00 (   0.00%)       57.00 (   8.06%)
+Lat 99.00th-qrtle-2        73.00 (   0.00%)       68.00 (   6.85%)
+Lat 99.50th-qrtle-2        74.00 (   0.00%)       71.00 (   4.05%)
+Lat 99.90th-qrtle-2        90.00 (   0.00%)       75.00 (  16.67%)
+Lat 50.00th-qrtle-4        57.00 (   0.00%)       52.00 (   8.77%)
+Lat 75.00th-qrtle-4        60.00 (   0.00%)       58.00 (   3.33%)
+Lat 90.00th-qrtle-4        62.00 (   0.00%)       62.00 (   0.00%)
+Lat 95.00th-qrtle-4        65.00 (   0.00%)       65.00 (   0.00%)
+Lat 99.00th-qrtle-4        76.00 (   0.00%)       75.00 (   1.32%)
+Lat 99.50th-qrtle-4        77.00 (   0.00%)       77.00 (   0.00%)
+Lat 99.90th-qrtle-4        87.00 (   0.00%)       81.00 (   6.90%)
+Lat 50.00th-qrtle-8        59.00 (   0.00%)       57.00 (   3.39%)
+Lat 75.00th-qrtle-8        63.00 (   0.00%)       62.00 (   1.59%)
+Lat 90.00th-qrtle-8        66.00 (   0.00%)       67.00 (  -1.52%)
+Lat 95.00th-qrtle-8        68.00 (   0.00%)       70.00 (  -2.94%)
+Lat 99.00th-qrtle-8        79.00 (   0.00%)       80.00 (  -1.27%)
+Lat 99.50th-qrtle-8        80.00 (   0.00%)       84.00 (  -5.00%)
+Lat 99.90th-qrtle-8        84.00 (   0.00%)       90.00 (  -7.14%)
+Lat 50.00th-qrtle-16       65.00 (   0.00%)       65.00 (   0.00%)
+Lat 75.00th-qrtle-16       77.00 (   0.00%)       75.00 (   2.60%)
+Lat 90.00th-qrtle-16       84.00 (   0.00%)       83.00 (   1.19%)
+Lat 95.00th-qrtle-16       88.00 (   0.00%)       87.00 (   1.14%)
+Lat 99.00th-qrtle-16       97.00 (   0.00%)       96.00 (   1.03%)
+Lat 99.50th-qrtle-16      100.00 (   0.00%)      104.00 (  -4.00%)
+Lat 99.90th-qrtle-16      110.00 (   0.00%)      126.00 ( -14.55%)
+Lat 50.00th-qrtle-32       70.00 (   0.00%)       71.00 (  -1.43%)
+Lat 75.00th-qrtle-32       92.00 (   0.00%)       94.00 (  -2.17%)
+Lat 90.00th-qrtle-32      110.00 (   0.00%)      110.00 (   0.00%)
+Lat 95.00th-qrtle-32      121.00 (   0.00%)      118.00 (   2.48%)
+Lat 99.00th-qrtle-32      135.00 (   0.00%)      137.00 (  -1.48%)
+Lat 99.50th-qrtle-32      140.00 (   0.00%)      146.00 (  -4.29%)
+Lat 99.90th-qrtle-32      150.00 (   0.00%)      160.00 (  -6.67%)
+Lat 50.00th-qrtle-39       80.00 (   0.00%)       71.00 (  11.25%)
+Lat 75.00th-qrtle-39      102.00 (   0.00%)       91.00 (  10.78%)
+Lat 90.00th-qrtle-39      118.00 (   0.00%)      108.00 (   8.47%)
+Lat 95.00th-qrtle-39      128.00 (   0.00%)      117.00 (   8.59%)
+Lat 99.00th-qrtle-39      149.00 (   0.00%)      133.00 (  10.74%)
+Lat 99.50th-qrtle-39      160.00 (   0.00%)      139.00 (  13.12%)
+Lat 99.90th-qrtle-39    13808.00 (   0.00%)     4920.00 (  64.37%)
+
+Despite being nearly identical, it showed a variety of major gains so
+I'm not convinced that heavy emphasis should be placed on this particular
+workload in terms of evaluating this particular patch. Further evidence of
+this is the fact that testing on a UMA machine showed small gains/losses
+even though the patch should be a no-op on UMA.
+
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Matt Fleming <matt@codeblueprint.co.uk>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20171219085947.13136-2-mgorman@techsingularity.net
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

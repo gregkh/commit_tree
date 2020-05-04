@@ -1,0 +1,70 @@
+mm: memcontrol: fix NULL pointer crash in test_clear_page_writeback()
+
+Jaegeuk and Brad report a NULL pointer crash when writeback ending tries
+to update the memcg stats:
+
+    BUG: unable to handle kernel NULL pointer dereference at 00000000000003b0
+    IP: test_clear_page_writeback+0x12e/0x2c0
+    [...]
+    RIP: 0010:test_clear_page_writeback+0x12e/0x2c0
+    Call Trace:
+     <IRQ>
+     end_page_writeback+0x47/0x70
+     f2fs_write_end_io+0x76/0x180 [f2fs]
+     bio_endio+0x9f/0x120
+     blk_update_request+0xa8/0x2f0
+     scsi_end_request+0x39/0x1d0
+     scsi_io_completion+0x211/0x690
+     scsi_finish_command+0xd9/0x120
+     scsi_softirq_done+0x127/0x150
+     __blk_mq_complete_request_remote+0x13/0x20
+     flush_smp_call_function_queue+0x56/0x110
+     generic_smp_call_function_single_interrupt+0x13/0x30
+     smp_call_function_single_interrupt+0x27/0x40
+     call_function_single_interrupt+0x89/0x90
+    RIP: 0010:native_safe_halt+0x6/0x10
+
+    (gdb) l *(test_clear_page_writeback+0x12e)
+    0xffffffff811bae3e is in test_clear_page_writeback (./include/linux/memcontrol.h:619).
+    614		mod_node_page_state(page_pgdat(page), idx, val);
+    615		if (mem_cgroup_disabled() || !page->mem_cgroup)
+    616			return;
+    617		mod_memcg_state(page->mem_cgroup, idx, val);
+    618		pn = page->mem_cgroup->nodeinfo[page_to_nid(page)];
+    619		this_cpu_add(pn->lruvec_stat->count[idx], val);
+    620	}
+    621
+    622	unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
+    623							gfp_t gfp_mask,
+
+The issue is that writeback doesn't hold a page reference and the page
+might get freed after PG_writeback is cleared (and the mapping is
+unlocked) in test_clear_page_writeback().  The stat functions looking up
+the page's node or zone are safe, as those attributes are static across
+allocation and free cycles.  But page->mem_cgroup is not, and it will
+get cleared if we race with truncation or migration.
+
+It appears this race window has been around for a while, but less likely
+to trigger when the memcg stats were updated first thing after
+PG_writeback is cleared.  Recent changes reshuffled this code to update
+the global node stats before the memcg ones, though, stretching the race
+window out to an extent where people can reproduce the problem.
+
+Update test_clear_page_writeback() to look up and pin page->mem_cgroup
+before clearing PG_writeback, then not use that pointer afterward.  It
+is a partial revert of 62cccb8c8e7a ("mm: simplify lock_page_memcg()")
+but leaves the pageref-holding callsites that aren't affected alone.
+
+Link: http://lkml.kernel.org/r/20170809183825.GA26387@cmpxchg.org
+Fixes: 62cccb8c8e7a ("mm: simplify lock_page_memcg()")
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reported-by: Jaegeuk Kim <jaegeuk@kernel.org>
+Tested-by: Jaegeuk Kim <jaegeuk@kernel.org>
+Reported-by: Bradley Bolen <bradleybolen@gmail.com>
+Tested-by: Brad Bolen <bradleybolen@gmail.com>
+Cc: Vladimir Davydov <vdavydov@virtuozzo.com>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: <stable@vger.kernel.org>	[4.6+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

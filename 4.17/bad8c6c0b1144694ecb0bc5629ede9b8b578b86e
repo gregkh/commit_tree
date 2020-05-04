@@ -1,0 +1,165 @@
+mm/cma: manage the memory of the CMA area by using the ZONE_MOVABLE
+
+Patch series "mm/cma: manage the memory of the CMA area by using the
+ZONE_MOVABLE", v2.
+
+0. History
+
+This patchset is the follow-up of the discussion about the "Introduce
+ZONE_CMA (v7)" [1].  Please reference it if more information is needed.
+
+1. What does this patch do?
+
+This patch changes the management way for the memory of the CMA area in
+the MM subsystem.  Currently the memory of the CMA area is managed by
+the zone where their pfn is belong to.  However, this approach has some
+problems since MM subsystem doesn't have enough logic to handle the
+situation that different characteristic memories are in a single zone.
+To solve this issue, this patch try to manage all the memory of the CMA
+area by using the MOVABLE zone.  In MM subsystem's point of view,
+characteristic of the memory on the MOVABLE zone and the memory of the
+CMA area are the same.  So, managing the memory of the CMA area by using
+the MOVABLE zone will not have any problem.
+
+2. Motivation
+
+There are some problems with current approach.  See following.  Although
+these problem would not be inherent and it could be fixed without this
+conception change, it requires many hooks addition in various code path
+and it would be intrusive to core MM and would be really error-prone.
+Therefore, I try to solve them with this new approach.  Anyway,
+following is the problems of the current implementation.
+
+o CMA memory utilization
+
+First, following is the freepage calculation logic in MM.
+
+ - For movable allocation: freepage = total freepage
+ - For unmovable allocation: freepage = total freepage - CMA freepage
+
+Freepages on the CMA area is used after the normal freepages in the zone
+where the memory of the CMA area is belong to are exhausted.  At that
+moment that the number of the normal freepages is zero, so
+
+ - For movable allocation: freepage = total freepage = CMA freepage
+ - For unmovable allocation: freepage = 0
+
+If unmovable allocation comes at this moment, allocation request would
+fail to pass the watermark check and reclaim is started.  After reclaim,
+there would exist the normal freepages so freepages on the CMA areas
+would not be used.
+
+FYI, there is another attempt [2] trying to solve this problem in lkml.
+And, as far as I know, Qualcomm also has out-of-tree solution for this
+problem.
+
+Useless reclaim:
+
+There is no logic to distinguish CMA pages in the reclaim path.  Hence,
+CMA page is reclaimed even if the system just needs the page that can be
+usable for the kernel allocation.
+
+Atomic allocation failure:
+
+This is also related to the fallback allocation policy for the memory of
+the CMA area.  Consider the situation that the number of the normal
+freepages is *zero* since the bunch of the movable allocation requests
+come.  Kswapd would not be woken up due to following freepage
+calculation logic.
+
+- For movable allocation: freepage = total freepage = CMA freepage
+
+If atomic unmovable allocation request comes at this moment, it would
+fails due to following logic.
+
+- For unmovable allocation: freepage = total freepage - CMA freepage = 0
+
+It was reported by Aneesh [3].
+
+Useless compaction:
+
+Usual high-order allocation request is unmovable allocation request and
+it cannot be served from the memory of the CMA area.  In compaction,
+migration scanner try to migrate the page in the CMA area and make
+high-order page there.  As mentioned above, it cannot be usable for the
+unmovable allocation request so it's just waste.
+
+3. Current approach and new approach
+
+Current approach is that the memory of the CMA area is managed by the
+zone where their pfn is belong to.  However, these memory should be
+distinguishable since they have a strong limitation.  So, they are
+marked as MIGRATE_CMA in pageblock flag and handled specially.  However,
+as mentioned in section 2, the MM subsystem doesn't have enough logic to
+deal with this special pageblock so many problems raised.
+
+New approach is that the memory of the CMA area is managed by the
+MOVABLE zone.  MM already have enough logic to deal with special zone
+like as HIGHMEM and MOVABLE zone.  So, managing the memory of the CMA
+area by the MOVABLE zone just naturally work well because constraints
+for the memory of the CMA area that the memory should always be
+migratable is the same with the constraint for the MOVABLE zone.
+
+There is one side-effect for the usability of the memory of the CMA
+area.  The use of MOVABLE zone is only allowed for a request with
+GFP_HIGHMEM && GFP_MOVABLE so now the memory of the CMA area is also
+only allowed for this gfp flag.  Before this patchset, a request with
+GFP_MOVABLE can use them.  IMO, It would not be a big issue since most
+of GFP_MOVABLE request also has GFP_HIGHMEM flag.  For example, file
+cache page and anonymous page.  However, file cache page for blockdev
+file is an exception.  Request for it has no GFP_HIGHMEM flag.  There is
+pros and cons on this exception.  In my experience, blockdev file cache
+pages are one of the top reason that causes cma_alloc() to fail
+temporarily.  So, we can get more guarantee of cma_alloc() success by
+discarding this case.
+
+Note that there is no change in admin POV since this patchset is just
+for internal implementation change in MM subsystem.  Just one minor
+difference for admin is that the memory stat for CMA area will be
+printed in the MOVABLE zone.  That's all.
+
+4. Result
+
+Following is the experimental result related to utilization problem.
+
+8 CPUs, 1024 MB, VIRTUAL MACHINE
+make -j16
+
+<Before>
+  CMA area:               0 MB            512 MB
+  Elapsed-time:           92.4		186.5
+  pswpin:                 82		18647
+  pswpout:                160		69839
+
+<After>
+  CMA        :            0 MB            512 MB
+  Elapsed-time:           93.1		93.4
+  pswpin:                 84		46
+  pswpout:                183		92
+
+akpm: "kernel test robot" reported a 26% improvement in
+vm-scalability.throughput:
+http://lkml.kernel.org/r/20180330012721.GA3845@yexl-desktop
+
+[1]: lkml.kernel.org/r/1491880640-9944-1-git-send-email-iamjoonsoo.kim@lge.com
+[2]: https://lkml.org/lkml/2014/10/15/623
+[3]: http://www.spinics.net/lists/linux-mm/msg100562.html
+
+Link: http://lkml.kernel.org/r/1512114786-5085-2-git-send-email-iamjoonsoo.kim@lge.com
+Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Tested-by: Tony Lindgren <tony@atomide.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Laura Abbott <lauraa@codeaurora.org>
+Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Michal Nazarewicz <mina86@mina86.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Russell King <linux@armlinux.org.uk>
+Cc: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

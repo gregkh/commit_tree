@@ -1,0 +1,66 @@
+xfs: xfs_iflush_abort() can be called twice on cluster writeback failure
+
+When a corrupt inode is detected during xfs_iflush_cluster, we can
+get a shutdown ASSERT failure like this:
+
+XFS (pmem1): Metadata corruption detected at xfs_symlink_shortform_verify+0x5c/0xa0, inode 0x86627 data fork
+XFS (pmem1): Unmount and run xfs_repair
+XFS (pmem1): xfs_do_force_shutdown(0x8) called from line 3372 of file fs/xfs/xfs_inode.c.  Return address = ffffffff814f4116
+XFS (pmem1): Corruption of in-memory data detected.  Shutting down filesystem
+XFS (pmem1): xfs_do_force_shutdown(0x1) called from line 222 of file fs/xfs/libxfs/xfs_defer.c.  Return address = ffffffff814a8a88
+XFS (pmem1): xfs_do_force_shutdown(0x1) called from line 222 of file fs/xfs/libxfs/xfs_defer.c.  Return address = ffffffff814a8ef9
+XFS (pmem1): Please umount the filesystem and rectify the problem(s)
+XFS: Assertion failed: xfs_isiflocked(ip), file: fs/xfs/xfs_inode.h, line: 258
+.....
+Call Trace:
+ xfs_iflush_abort+0x10a/0x110
+ xfs_iflush+0xf3/0x390
+ xfs_inode_item_push+0x126/0x1e0
+ xfsaild+0x2c5/0x890
+ kthread+0x11c/0x140
+ ret_from_fork+0x24/0x30
+
+Essentially, xfs_iflush_abort() has been called twice on the
+original inode that that was flushed. This happens because the
+inode has been flushed to teh buffer successfully via
+xfs_iflush_int(), and so when another inode is detected as corrupt
+in xfs_iflush_cluster, the buffer is marked stale and EIO, and
+iodone callbacks are run on it.
+
+Running the iodone callbacks walks across the original inode and
+calls xfs_iflush_abort() on it. When xfs_iflush_cluster() returns
+to xfs_iflush(), it runs the error path for that function, and that
+calls xfs_iflush_abort() on the inode a second time, leading to the
+above assert failure as the inode is not flush locked anymore.
+
+This bug has been there a long time.
+
+The simple fix would be to just avoid calling xfs_iflush_abort() in
+xfs_iflush() if we've got a failure from xfs_iflush_cluster().
+However, xfs_iflush_cluster() has magic delwri buffer handling that
+means it may or may not have run IO completion on the buffer, and
+hence sometimes we have to call xfs_iflush_abort() from
+xfs_iflush(), and sometimes we shouldn't.
+
+After reading through all the error paths and the delwri buffer
+code, it's clear that the error handling in xfs_iflush_cluster() is
+unnecessary. If the buffer is delwri, it leaves it on the delwri
+list so that when the delwri list is submitted it sees a shutdown
+fliesystem in xfs_buf_submit() and that marks the buffer stale, EIO
+and runs IO completion. i.e. exactly what xfs+iflush_cluster() does
+when it's not a delwri buffer. Further, marking a buffer stale
+clears the _XBF_DELWRI_Q flag on the buffer, which means when
+submission of the buffer occurs, it just skips over it and releases
+it.
+
+IOWs, the error handling in xfs_iflush_cluster doesn't need to care
+if the buffer is already on a the delwri queue or not - it just
+needs to mark the buffer stale, EIO and run completions. That means
+we can just use the easy fix for xfs_iflush() to avoid the double
+abort.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+

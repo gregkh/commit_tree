@@ -1,0 +1,38 @@
+fix mntput/mntput race
+
+mntput_no_expire() does the calculation of total refcount under mount_lock;
+unfortunately, the decrement (as well as all increments) are done outside
+of it, leading to false positives in the "are we dropping the last reference"
+test.  Consider the following situation:
+	* mnt is a lazy-umounted mount, kept alive by two opened files.  One
+of those files gets closed.  Total refcount of mnt is 2.  On CPU 42
+mntput(mnt) (called from __fput()) drops one reference, decrementing component
+	* After it has looked at component #0, the process on CPU 0 does
+mntget(), incrementing component #0, gets preempted and gets to run again -
+on CPU 69.  There it does mntput(), which drops the reference (component #69)
+and proceeds to spin on mount_lock.
+	* On CPU 42 our first mntput() finishes counting.  It observes the
+decrement of component #69, but not the increment of component #0.  As the
+result, the total it gets is not 1 as it should've been - it's 0.  At which
+point we decide that vfsmount needs to be killed and proceed to free it and
+shut the filesystem down.  However, there's still another opened file
+on that filesystem, with reference to (now freed) vfsmount, etc. and we are
+screwed.
+
+It's not a wide race, but it can be reproduced with artificial slowdown of
+the mnt_get_count() loop, and it should be easier to hit on SMP KVM setups.
+
+Fix consists of moving the refcount decrement under mount_lock; the tricky
+part is that we want (and can) keep the fast case (i.e. mount that still
+has non-NULL ->mnt_ns) entirely out of mount_lock.  All places that zero
+mnt->mnt_ns are dropping some reference to mnt and they call synchronize_rcu()
+before that mntput().  IOW, if mntput() observes (under rcu_read_lock())
+a non-NULL ->mnt_ns, it is guaranteed that there is another reference yet to
+be dropped.
+
+Reported-by: Jann Horn <jannh@google.com>
+Tested-by: Jann Horn <jannh@google.com>
+Fixes: 48a066e72d97 ("RCU'd vsfmounts")
+Cc: stable@vger.kernel.org
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

@@ -1,0 +1,120 @@
+Btrfs: kill btrfs_clear_path_blocking
+
+Btrfs's btree locking has two modes, spinning mode and blocking mode,
+while searching btree, locking is always acquired in spinning mode and
+then converted to blocking mode if necessary, and in some hot paths we may
+switch the locking back to spinning mode by btrfs_clear_path_blocking().
+
+When acquiring locks, both of reader and writer need to wait for blocking
+readers and writers to complete before doing read_lock()/write_lock().
+
+The problem is that btrfs_clear_path_blocking() needs to switch nodes
+in the path to blocking mode at first (by btrfs_set_path_blocking) to
+make lockdep happy before doing its actual clearing blocking job.
+
+When switching to blocking mode from spinning mode, it consists of
+
+step 1) bumping up blocking readers counter and
+step 2) read_unlock()/write_unlock(),
+
+this has caused serious ping-pong effect if there're a great amount of
+concurrent readers/writers, as waiters will be woken up and go to
+sleep immediately.
+
+1) Killing this kind of ping-pong results in a big improvement in my 1600k
+files creation script,
+
+MNT=/mnt/btrfs
+mkfs.btrfs -f /dev/sdf
+mount /dev/def $MNT
+time fsmark  -D  10000  -S0  -n  100000  -s  0  -L  1 -l /tmp/fs_log.txt \
+        -d  $MNT/0  -d  $MNT/1 \
+        -d  $MNT/2  -d  $MNT/3 \
+        -d  $MNT/4  -d  $MNT/5 \
+        -d  $MNT/6  -d  $MNT/7 \
+        -d  $MNT/8  -d  $MNT/9 \
+        -d  $MNT/10  -d  $MNT/11 \
+        -d  $MNT/12  -d  $MNT/13 \
+        -d  $MNT/14  -d  $MNT/15
+
+w/o patch:
+real    2m27.307s
+user    0m12.839s
+sys     13m42.831s
+
+w/ patch:
+real    1m2.273s
+user    0m15.802s
+sys     8m16.495s
+
+1.1) latency histogram from funclatency[1]
+
+Overall with the patch, there're ~50% less write lock acquisition and
+the 95% max latency that write lock takes also reduces to ~100ms from
+>500ms.
+
+--------------------------------------------
+w/o patch:
+--------------------------------------------
+Function = btrfs_tree_lock
+     msecs               : count     distribution
+         0 -> 1          : 2385222  |****************************************|
+         2 -> 3          : 37147    |                                        |
+         4 -> 7          : 20452    |                                        |
+         8 -> 15         : 13131    |                                        |
+        16 -> 31         : 3877     |                                        |
+        32 -> 63         : 3900     |                                        |
+        64 -> 127        : 2612     |                                        |
+       128 -> 255        : 974      |                                        |
+       256 -> 511        : 165      |                                        |
+       512 -> 1023       : 13       |                                        |
+
+Function = btrfs_tree_read_lock
+     msecs               : count     distribution
+         0 -> 1          : 6743860  |****************************************|
+         2 -> 3          : 2146     |                                        |
+         4 -> 7          : 190      |                                        |
+         8 -> 15         : 38       |                                        |
+        16 -> 31         : 4        |                                        |
+
+--------------------------------------------
+w/ patch:
+--------------------------------------------
+Function = btrfs_tree_lock
+     msecs               : count     distribution
+         0 -> 1          : 1318454  |****************************************|
+         2 -> 3          : 6800     |                                        |
+         4 -> 7          : 3664     |                                        |
+         8 -> 15         : 2145     |                                        |
+        16 -> 31         : 809      |                                        |
+        32 -> 63         : 219      |                                        |
+        64 -> 127        : 10       |                                        |
+
+Function = btrfs_tree_read_lock
+     msecs               : count     distribution
+         0 -> 1          : 6854317  |****************************************|
+         2 -> 3          : 2383     |                                        |
+         4 -> 7          : 601      |                                        |
+         8 -> 15         : 92       |                                        |
+
+2) dbench also proves the improvement,
+dbench -t 120 -D /mnt/btrfs 16
+
+w/o patch:
+Throughput 158.363 MB/sec
+
+w/ patch:
+Throughput 449.52 MB/sec
+
+3) xfstests didn't show any additional failures.
+
+One thing to note is that callers may set path->leave_spinning to have
+all nodes in the path stay in spinning mode, which means callers are
+ready to not sleep before releasing the path, but it won't cause
+problems if they don't want to sleep in blocking mode.
+
+[1]: https://github.com/iovisor/bcc/blob/master/tools/funclatency.py
+
+Signed-off-by: Liu Bo <bo.liu@linux.alibaba.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

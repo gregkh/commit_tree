@@ -1,0 +1,144 @@
+block, bfq: introduce the BFQ-v0 I/O scheduler as an extra scheduler
+
+We tag as v0 the version of BFQ containing only BFQ's engine plus
+hierarchical support. BFQ's engine is introduced by this commit, while
+hierarchical support is added by next commit. We use the v0 tag to
+distinguish this minimal version of BFQ from the versions containing
+also the features and the improvements added by next commits. BFQ-v0
+coincides with the version of BFQ submitted a few years ago [1], apart
+from the introduction of preemption, described below.
+
+BFQ is a proportional-share I/O scheduler, whose general structure,
+plus a lot of code, are borrowed from CFQ.
+
+- Each process doing I/O on a device is associated with a weight and a
+  (bfq_)queue.
+
+- BFQ grants exclusive access to the device, for a while, to one queue
+  (process) at a time, and implements this service model by
+  associating every queue with a budget, measured in number of
+  sectors.
+
+  - After a queue is granted access to the device, the budget of the
+    queue is decremented, on each request dispatch, by the size of the
+    request.
+
+  - The in-service queue is expired, i.e., its service is suspended,
+    only if one of the following events occurs: 1) the queue finishes
+    its budget, 2) the queue empties, 3) a "budget timeout" fires.
+
+    - The budget timeout prevents processes doing random I/O from
+      holding the device for too long and dramatically reducing
+      throughput.
+
+    - Actually, as in CFQ, a queue associated with a process issuing
+      sync requests may not be expired immediately when it empties. In
+      contrast, BFQ may idle the device for a short time interval,
+      giving the process the chance to go on being served if it issues
+      a new request in time. Device idling typically boosts the
+      throughput on rotational devices, if processes do synchronous
+      and sequential I/O. In addition, under BFQ, device idling is
+      also instrumental in guaranteeing the desired throughput
+      fraction to processes issuing sync requests (see [2] for
+      details).
+
+      - With respect to idling for service guarantees, if several
+        processes are competing for the device at the same time, but
+        all processes (and groups, after the following commit) have
+        the same weight, then BFQ guarantees the expected throughput
+        distribution without ever idling the device. Throughput is
+        thus as high as possible in this common scenario.
+
+  - Queues are scheduled according to a variant of WF2Q+, named
+    B-WF2Q+, and implemented using an augmented rb-tree to preserve an
+    O(log N) overall complexity.  See [2] for more details. B-WF2Q+ is
+    also ready for hierarchical scheduling. However, for a cleaner
+    logical breakdown, the code that enables and completes
+    hierarchical support is provided in the next commit, which focuses
+    exactly on this feature.
+
+  - B-WF2Q+ guarantees a tight deviation with respect to an ideal,
+    perfectly fair, and smooth service. In particular, B-WF2Q+
+    guarantees that each queue receives a fraction of the device
+    throughput proportional to its weight, even if the throughput
+    fluctuates, and regardless of: the device parameters, the current
+    workload and the budgets assigned to the queue.
+
+  - The last, budget-independence, property (although probably
+    counterintuitive in the first place) is definitely beneficial, for
+    the following reasons:
+
+    - First, with any proportional-share scheduler, the maximum
+      deviation with respect to an ideal service is proportional to
+      the maximum budget (slice) assigned to queues. As a consequence,
+      BFQ can keep this deviation tight not only because of the
+      accurate service of B-WF2Q+, but also because BFQ *does not*
+      need to assign a larger budget to a queue to let the queue
+      receive a higher fraction of the device throughput.
+
+    - Second, BFQ is free to choose, for every process (queue), the
+      budget that best fits the needs of the process, or best
+      leverages the I/O pattern of the process. In particular, BFQ
+      updates queue budgets with a simple feedback-loop algorithm that
+      allows a high throughput to be achieved, while still providing
+      tight latency guarantees to time-sensitive applications. When
+      the in-service queue expires, this algorithm computes the next
+      budget of the queue so as to:
+
+      - Let large budgets be eventually assigned to the queues
+        associated with I/O-bound applications performing sequential
+        I/O: in fact, the longer these applications are served once
+        got access to the device, the higher the throughput is.
+
+      - Let small budgets be eventually assigned to the queues
+        associated with time-sensitive applications (which typically
+        perform sporadic and short I/O), because, the smaller the
+        budget assigned to a queue waiting for service is, the sooner
+        B-WF2Q+ will serve that queue (Subsec 3.3 in [2]).
+
+- Weights can be assigned to processes only indirectly, through I/O
+  priorities, and according to the relation:
+  weight = 10 * (IOPRIO_BE_NR - ioprio).
+  The next patch provides, instead, a cgroups interface through which
+  weights can be assigned explicitly.
+
+- If several processes are competing for the device at the same time,
+  but all processes and groups have the same weight, then BFQ
+  guarantees the expected throughput distribution without ever idling
+  the device. It uses preemption instead. Throughput is then much
+  higher in this common scenario.
+
+- ioprio classes are served in strict priority order, i.e.,
+  lower-priority queues are not served as long as there are
+  higher-priority queues.  Among queues in the same class, the
+  bandwidth is distributed in proportion to the weight of each
+  queue. A very thin extra bandwidth is however guaranteed to the Idle
+  class, to prevent it from starving.
+
+- If the strict_guarantees parameter is set (default: unset), then BFQ
+     - always performs idling when the in-service queue becomes empty;
+     - forces the device to serve one I/O request at a time, by
+       dispatching a new request only if there is no outstanding
+       request.
+  In the presence of differentiated weights or I/O-request sizes,
+  both the above conditions are needed to guarantee that every
+  queue receives its allotted share of the bandwidth (see
+  Documentation/block/bfq-iosched.txt for more details). Setting
+  strict_guarantees may evidently affect throughput.
+
+[1] https://lkml.org/lkml/2008/4/1/234
+    https://lkml.org/lkml/2008/11/11/148
+
+[2] P. Valente and M. Andreolini, "Improving Application
+    Responsiveness with the BFQ Disk I/O Scheduler", Proceedings of
+    the 5th Annual International Systems and Storage Conference
+    (SYSTOR '12), June 2012.
+    Slightly extended version:
+    http://algogroup.unimore.it/people/paolo/disk_sched/bfq-v1-suite-
+							results.pdf
+
+Signed-off-by: Fabio Checconi <fchecconi@gmail.com>
+Signed-off-by: Paolo Valente <paolo.valente@linaro.org>
+Signed-off-by: Arianna Avanzini <avanzini.arianna@gmail.com>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+

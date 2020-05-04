@@ -1,0 +1,132 @@
+afs: Overhaul volume and server record caching and fileserver rotation
+
+The current code assumes that volumes and servers are per-cell and are
+never shared, but this is not enforced, and, indeed, public cells do exist
+that are aliases of each other.  Further, an organisation can, say, set up
+a public cell and a private cell with overlapping, but not identical, sets
+of servers.  The difference is purely in the database attached to the VL
+servers.
+
+The current code will malfunction if it sees a server in two cells as it
+assumes global address -> server record mappings and that each server is in
+just one cell.
+
+Further, each server may have multiple addresses - and may have addresses
+of different families (IPv4 and IPv6, say).
+
+To this end, the following structural changes are made:
+
+ (1) Server record management is overhauled:
+
+     (a) Server records are made independent of cell.  The namespace keeps
+     	 track of them, volume records have lists of them and each vnode
+     	 has a server on which its callback interest currently resides.
+
+     (b) The cell record no longer keeps a list of servers known to be in
+     	 that cell.
+
+     (c) The server records are now kept in a flat list because there's no
+     	 single address to sort on.
+
+     (d) Server records are now keyed by their UUID within the namespace.
+
+     (e) The addresses for a server are obtained with the VL.GetAddrsU
+     	 rather than with VL.GetEntryByName, using the server's UUID as a
+     	 parameter.
+
+     (f) Cached server records are garbage collected after a period of
+     	 non-use and are counted out of existence before purging is allowed
+     	 to complete.  This protects the work functions against rmmod.
+
+     (g) The servers list is now in /proc/fs/afs/servers.
+
+ (2) Volume record management is overhauled:
+
+     (a) An RCU-replaceable server list is introduced.  This tracks both
+     	 servers and their coresponding callback interests.
+
+     (b) The superblock is now keyed on cell record and numeric volume ID.
+
+     (c) The volume record is now tied to the superblock which mounts it,
+     	 and is activated when mounted and deactivated when unmounted.
+     	 This makes it easier to handle the cache cookie without causing a
+     	 double-use in fscache.
+
+     (d) The volume record is loaded from the VLDB using VL.GetEntryByNameU
+     	 to get the server UUID list.
+
+     (e) The volume name is updated if it is seen to have changed when the
+     	 volume is updated (the update is keyed on the volume ID).
+
+ (3) The vlocation record is got rid of and VLDB records are no longer
+     cached.  Sufficient information is stored in the volume record, though
+     an update to a volume record is now no longer shared between related
+     volumes (volumes come in bundles of three: R/W, R/O and backup).
+
+and the following procedural changes are made:
+
+ (1) The fileserver cursor introduced previously is now fleshed out and
+     used to iterate over fileservers and their addresses.
+
+ (2) Volume status is checked during iteration, and the server list is
+     replaced if a change is detected.
+
+ (3) Server status is checked during iteration, and the address list is
+     replaced if a change is detected.
+
+ (4) The abort code is saved into the address list cursor and -ECONNABORTED
+     returned in afs_make_call() if a remote abort happened rather than
+     translating the abort into an error message.  This allows actions to
+     be taken depending on the abort code more easily.
+
+     (a) If a VMOVED abort is seen then this is handled by rechecking the
+     	 volume and restarting the iteration.
+
+     (b) If a VBUSY, VRESTARTING or VSALVAGING abort is seen then this is
+         handled by sleeping for a short period and retrying and/or trying
+         other servers that might serve that volume.  A message is also
+         displayed once until the condition has cleared.
+
+     (c) If a VOFFLINE abort is seen, then this is handled as VBUSY for the
+     	 moment.
+
+     (d) If a VNOVOL abort is seen, the volume is rechecked in the VLDB to
+     	 see if it has been deleted; if not, the fileserver is probably
+     	 indicating that the volume couldn't be attached and needs
+     	 salvaging.
+
+     (e) If statfs() sees one of these aborts, it does not sleep, but
+     	 rather returns an error, so as not to block the umount program.
+
+ (5) The fileserver iteration functions in vnode.c are now merged into
+     their callers and more heavily macroised around the cursor.  vnode.c
+     is removed.
+
+ (6) Operations on a particular vnode are serialised on that vnode because
+     the server will lock that vnode whilst it operates on it, so a second
+     op sent will just have to wait.
+
+ (7) Fileservers are probed with FS.GetCapabilities before being used.
+     This is where service upgrade will be done.
+
+ (8) A callback interest on a fileserver is set up before an FS operation
+     is performed and passed through to afs_make_call() so that it can be
+     set on the vnode if the operation returns a callback.  The callback
+     interest is passed through to afs_iget() also so that it can be set
+     there too.
+
+In general, record updating is done on an as-needed basis when we try to
+access servers, volumes or vnodes rather than offloading it to work items
+and special threads.
+
+Notes:
+
+ (1) Pre AFS-3.4 servers are no longer supported, though this can be added
+     back if necessary (AFS-3.4 was released in 1998).
+
+ (2) VBUSY is retried forever for the moment at intervals of 1s.
+
+ (3) /proc/fs/afs/<cell>/servers no longer exists.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+

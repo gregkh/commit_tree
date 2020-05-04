@@ -1,0 +1,89 @@
+blk-mq: replace timeout synchronization with a RCU and generation based scheme
+
+Currently, blk-mq timeout path synchronizes against the usual
+issue/completion path using a complex scheme involving atomic
+bitflags, REQ_ATOM_*, memory barriers and subtle memory coherence
+rules.  Unfortunately, it contains quite a few holes.
+
+There's a complex dancing around REQ_ATOM_STARTED and
+REQ_ATOM_COMPLETE between issue/completion and timeout paths; however,
+they don't have a synchronization point across request recycle
+instances and it isn't clear what the barriers add.
+blk_mq_check_expired() can easily read STARTED from N-2'th iteration,
+deadline from N-1'th, blk_mark_rq_complete() against Nth instance.
+
+In fact, it's pretty easy to make blk_mq_check_expired() terminate a
+later instance of a request.  If we induce 5 sec delay before
+time_after_eq() test in blk_mq_check_expired(), shorten the timeout to
+2s, and issue back-to-back large IOs, blk-mq starts timing out
+requests spuriously pretty quickly.  Nothing actually timed out.  It
+just made the call on a recycle instance of a request and then
+terminated a later instance long after the original instance finished.
+The scenario isn't theoretical either.
+
+This patch replaces the broken synchronization mechanism with a RCU
+and generation number based one.
+
+1. Each request has a u64 generation + state value, which can be
+   updated only by the request owner.  Whenever a request becomes
+   in-flight, the generation number gets bumped up too.  This provides
+   the basis for the timeout path to distinguish different recycle
+   instances of the request.
+
+   Also, marking a request in-flight and setting its deadline are
+   protected with a seqcount so that the timeout path can fetch both
+   values coherently.
+
+2. The timeout path fetches the generation, state and deadline.  If
+   the verdict is timeout, it records the generation into a dedicated
+   request abortion field and does RCU wait.
+
+3. The completion path is also protected by RCU (from the previous
+   patch) and checks whether the current generation number and state
+   match the abortion field.  If so, it skips completion.
+
+4. The timeout path, after RCU wait, scans requests again and
+   terminates the ones whose generation and state still match the ones
+   requested for abortion.
+
+   By now, the timeout path knows that either the generation number
+   and state changed if it lost the race or the completion will yield
+   to it and can safely timeout the request.
+
+While it's more lines of code, it's conceptually simpler, doesn't
+depend on direct use of subtle memory ordering or coherence, and
+hopefully doesn't terminate the wrong instance.
+
+While this change makes REQ_ATOM_COMPLETE synchronization unnecessary
+between issue/complete and timeout paths, REQ_ATOM_COMPLETE isn't
+removed yet as it's still used in other places.  Future patches will
+move all state tracking to the new mechanism and remove all bitops in
+the hot paths.
+
+Note that this patch adds a comment explaining a race condition in
+BLK_EH_RESET_TIMER path.  The race has always been there and this
+patch doesn't change it.  It's just documenting the existing race.
+
+v2: - Fixed BLK_EH_RESET_TIMER handling as pointed out by Jianchao.
+    - s/request->gstate_seqc/request->gstate_seq/ as suggested by Peter.
+    - READ_ONCE() added in blk_mq_rq_update_state() as suggested by Peter.
+
+v3: - Fixed possible extended seqcount / u64_stats_sync read looping
+      spotted by Peter.
+    - MQ_RQ_IDLE was incorrectly being set in complete_request instead
+      of free_request.  Fixed.
+
+v4: - Rebased on top of hctx_lock() refactoring patch.
+    - Added comment explaining the use of hctx_lock() in completion path.
+
+v5: - Added comments requested by Bart.
+    - Note the addition of BLK_EH_RESET_TIMER race condition in the
+      commit message.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: "jianchao.wang" <jianchao.w.wang@oracle.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Bart Van Assche <Bart.VanAssche@wdc.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

@@ -1,0 +1,79 @@
+hv_netvsc: Fix a deadlock by getting rtnl lock earlier in netvsc_probe()
+
+This patch fixes the race between netvsc_probe() and
+rndis_set_subchannel(), which can cause a deadlock.
+
+These are the related 3 paths which show the deadlock:
+
+path #1:
+    Workqueue: hv_vmbus_con vmbus_onmessage_work [hv_vmbus]
+    Call Trace:
+     schedule
+     schedule_preempt_disabled
+     __mutex_lock
+     __device_attach
+     bus_probe_device
+     device_add
+     vmbus_device_register
+     vmbus_onoffer
+     vmbus_onmessage_work
+     process_one_work
+     worker_thread
+     kthread
+     ret_from_fork
+
+path #2:
+    schedule
+     schedule_preempt_disabled
+     __mutex_lock
+     netvsc_probe
+     vmbus_probe
+     really_probe
+     __driver_attach
+     bus_for_each_dev
+     driver_attach_async
+     async_run_entry_fn
+     process_one_work
+     worker_thread
+     kthread
+     ret_from_fork
+
+path #3:
+    Workqueue: events netvsc_subchan_work [hv_netvsc]
+    Call Trace:
+     schedule
+     rndis_set_subchannel
+     netvsc_subchan_work
+     process_one_work
+     worker_thread
+     kthread
+     ret_from_fork
+
+Before path #1 finishes, path #2 can start to run, because just before
+the "bus_probe_device(dev);" in device_add() in path #1, there is a line
+"object_uevent(&dev->kobj, KOBJ_ADD);", so systemd-udevd can
+immediately try to load hv_netvsc and hence path #2 can start to run.
+
+Next, path #2 offloads the subchannal's initialization to a workqueue,
+i.e. path #3, so we can end up in a deadlock situation like this:
+
+Path #2 gets the device lock, and is trying to get the rtnl lock;
+Path #3 gets the rtnl lock and is waiting for all the subchannel messages
+to be processed;
+Path #1 is trying to get the device lock, but since #2 is not releasing
+the device lock, path #1 has to sleep; since the VMBus messages are
+processed one by one, this means the sub-channel messages can't be
+procedded, so #3 has to sleep with the rtnl lock held, and finally #2
+has to sleep... Now all the 3 paths are sleeping and we hit the deadlock.
+
+With the patch, we can make sure #2 gets both the device lock and the
+rtnl lock together, gets its job done, and releases the locks, so #1
+and #3 will not be blocked for ever.
+
+Fixes: 8195b1396ec8 ("hv_netvsc: fix deadlock on hotplug")
+Signed-off-by: Dexuan Cui <decui@microsoft.com>
+Cc: Stephen Hemminger <sthemmin@microsoft.com>
+Cc: K. Y. Srinivasan <kys@microsoft.com>
+Cc: Haiyang Zhang <haiyangz@microsoft.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

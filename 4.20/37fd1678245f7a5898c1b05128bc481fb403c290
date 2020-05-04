@@ -1,0 +1,53 @@
+xfs: fix use-after-free race in xfs_buf_rele
+
+When looking at a 4.18 based KASAN use after free report, I noticed
+that racing xfs_buf_rele() may race on dropping the last reference
+to the buffer and taking the buffer lock. This was the symptom
+displayed by the KASAN report, but the actual issue that was
+reported had already been fixed in 4.19-rc1 by commit e339dd8d8b04
+("xfs: use sync buffer I/O for sync delwri queue submission").
+
+Despite this, I think there is still an issue with xfs_buf_rele()
+in this code:
+
+        release = atomic_dec_and_lock(&bp->b_hold, &pag->pag_buf_lock);
+        spin_lock(&bp->b_lock);
+        if (!release) {
+.....
+
+If two threads race on the b_lock after both dropping a reference
+and one getting dropping the last reference so release = true, we
+end up with:
+
+CPU 0				CPU 1
+atomic_dec_and_lock()
+				atomic_dec_and_lock()
+				spin_lock(&bp->b_lock)
+spin_lock(&bp->b_lock)
+<spins>
+				<release = true bp->b_lru_ref = 0>
+				<remove from lists>
+				freebuf = true
+				spin_unlock(&bp->b_lock)
+				xfs_buf_free(bp)
+<gets lock, reading and writing freed memory>
+<accesses freed memory>
+spin_unlock(&bp->b_lock) <reads/writes freed memory>
+
+IOWs, we can't safely take bp->b_lock after dropping the hold
+reference because the buffer may go away at any time after we
+drop that reference. However, this can be fixed simply by taking the
+bp->b_lock before we drop the reference.
+
+It is safe to nest the pag_buf_lock inside bp->b_lock as the
+pag_buf_lock is only used to serialise against lookup in
+xfs_buf_find() and no other locks are held over or under the
+pag_buf_lock there. Make this clear by documenting the buffer lock
+orders at the top of the file.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Carlos Maiolino <cmaiolino@redhat.com
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+

@@ -1,0 +1,112 @@
+vga_switcheroo: Use device link for HDA controller
+
+Back in 2013, runtime PM for GPUs with integrated HDA controller was
+introduced with commits 0d69704ae348 ("gpu/vga_switcheroo: add driver
+control power feature. (v3)") and 246efa4a072f ("snd/hda: add runtime
+suspend/resume on optimus support (v4)").
+
+Briefly, the idea was that the HDA controller is forced on and off in
+unison with the GPU.
+
+The original code is mostly still in place even though it was never a
+100% perfect solution:  E.g. on access to the HDA controller, the GPU
+is powered up via vga_switcheroo_runtime_resume_hdmi_audio() but there
+are no provisions to keep it resumed until access to the HDA controller
+has ceased:  The GPU autosuspends after 5 seconds, rendering the HDA
+controller inaccessible.
+
+Additionally, a kludge is required when hda_intel.c probes:  It has to
+check whether the GPU is powered down (check_hdmi_disabled()) and defer
+probing if so.
+
+However in the meantime (in v4.10) the driver core has gained a feature
+called device links which promises to solve such issues in a clean way:
+It allows us to declare a dependency from the HDA controller (consumer)
+to the GPU (supplier).  The PM core then automagically ensures that the
+GPU is runtime resumed as long as the HDA controller's ->probe hook is
+executed and whenever the HDA controller is accessed.
+
+By default, the HDA controller has a dependency on its parent, a PCIe
+Root Port.  Adding a device link creates another dependency on its
+sibling:
+
+                            PCIe Root Port
+                             ^          ^
+                             |          |
+                             |          |
+                            HDA  ===>  GPU
+
+The device link is not only used for runtime PM, it also guarantees that
+on system sleep, the HDA controller suspends before the GPU and resumes
+after the GPU, and on system shutdown the HDA controller's ->shutdown
+hook is executed before the one of the GPU.  It is a complete solution.
+
+Using this functionality is as simple as calling device_link_add(),
+which results in a dmesg entry like this:
+
+        pci 0000:01:00.1: Linked as a consumer to 0000:01:00.0
+
+The code for the GPU-governed audio power management can thus be removed
+(except where it's still needed for legacy manual power control).
+
+The device link is added in a PCI quirk rather than in hda_intel.c.
+It is therefore legal for the GPU to runtime suspend to D3cold even if
+the HDA controller is not bound to a driver or if CONFIG_SND_HDA_INTEL
+is not enabled, for accesses to the HDA controller will cause the GPU to
+wake up regardless if they're occurring outside of hda_intel.c (think
+config space readout via sysfs).
+
+Contrary to the previous implementation, the HDA controller's power
+state is now self-governed, rather than GPU-governed, whereas the GPU's
+power state is no longer fully self-governed.  (The HDA controller needs
+to runtime suspend before the GPU can.)
+
+It is thus crucial that runtime PM is always activated on the HDA
+controller even if CONFIG_SND_HDA_POWER_SAVE_DEFAULT is set to 0 (which
+is the default), lest the GPU stays awake.  This is achieved by setting
+the auto_runtime_pm flag on every codec and the AZX_DCAPS_PM_RUNTIME
+flag on the HDA controller.
+
+A side effect is that power consumption might be reduced if the GPU is
+in use but the HDA controller is not, because the HDA controller is now
+allowed to go to D3hot.  Before, it was forced to stay in D0 as long as
+the GPU was in use.  (There is no reduction in power consumption on my
+Nvidia GK107, but there might be on other chips.)
+
+The code paths for legacy manual power control are adjusted such that
+runtime PM is disabled during power off, thereby preventing the PM core
+from resuming the HDA controller.
+
+Note that the device link is not only added on vga_switcheroo capable
+systems, but for *any* GPU with integrated HDA controller.  The idea is
+that the HDA controller streams audio via connectors located on the GPU,
+so the GPU needs to be on for the HDA controller to do anything useful.
+
+This commit implicitly fixes an unbalanced runtime PM ref upon unbind of
+hda_intel.c:  On ->probe, a runtime PM ref was previously released under
+the condition "azx_has_pm_runtime(chip) || hda->use_vga_switcheroo", but
+on ->remove a runtime PM ref was only acquired under the first of those
+conditions.  Thus, binding and unbinding the driver twice on a
+vga_switcheroo capable system caused the runtime PM refcount to drop
+below zero.  The issue is resolved because the AZX_DCAPS_PM_RUNTIME flag
+is now always set if use_vga_switcheroo is true.
+
+For more information on device links please refer to:
+https://www.kernel.org/doc/html/latest/driver-api/device_link.html
+Documentation/driver-api/device_link.rst
+
+Cc: Dave Airlie <airlied@redhat.com>
+Cc: Ben Skeggs <bskeggs@redhat.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+Reviewed-by: Takashi Iwai <tiwai@suse.de>
+Reviewed-by: Peter Wu <peter@lekensteyn.nl>
+Tested-by: Kai Heng Feng <kai.heng.feng@canonical.com> # AMD PowerXpress
+Tested-by: Mike Lothian <mike@fireburn.co.uk>          # AMD PowerXpress
+Tested-by: Denis Lisov <dennis.lissov@gmail.com>       # Nvidia Optimus
+Tested-by: Peter Wu <peter@lekensteyn.nl>              # Nvidia Optimus
+Tested-by: Lukas Wunner <lukas@wunner.de>              # MacBook Pro
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Link: https://patchwork.freedesktop.org/patch/msgid/51bd38360ff502a8c42b1ebf4405ee1d3f27118d.1520068884.git.lukas@wunner.de
+

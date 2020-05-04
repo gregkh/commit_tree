@@ -1,0 +1,92 @@
+RAID1: avoid unnecessary spin locks in I/O barrier code
+
+When I run a parallel reading performan testing on a md raid1 device with
+two NVMe SSDs, I observe very bad throughput in supprise: by fio with 64KB
+block size, 40 seq read I/O jobs, 128 iodepth, overall throughput is
+only 2.7GB/s, this is around 50% of the idea performance number.
+
+The perf reports locking contention happens at allow_barrier() and
+wait_barrier() code,
+ - 41.41%  fio [kernel.kallsyms]     [k] _raw_spin_lock_irqsave
+   - _raw_spin_lock_irqsave
+         + 89.92% allow_barrier
+         + 9.34% __wake_up
+ - 37.30%  fio [kernel.kallsyms]     [k] _raw_spin_lock_irq
+   - _raw_spin_lock_irq
+         - 100.00% wait_barrier
+
+The reason is, in these I/O barrier related functions,
+ - raise_barrier()
+ - lower_barrier()
+ - wait_barrier()
+ - allow_barrier()
+They always hold conf->resync_lock firstly, even there are only regular
+reading I/Os and no resync I/O at all. This is a huge performance penalty.
+
+The solution is a lockless-like algorithm in I/O barrier code, and only
+holding conf->resync_lock when it has to.
+
+The original idea is from Hannes Reinecke, and Neil Brown provides
+comments to improve it. I continue to work on it, and make the patch into
+current form.
+
+In the new simpler raid1 I/O barrier implementation, there are two
+wait barrier functions,
+ - wait_barrier()
+   Which calls _wait_barrier(), is used for regular write I/O. If there is
+   resync I/O happening on the same I/O barrier bucket, or the whole
+   array is frozen, task will wait until no barrier on same barrier bucket,
+   or the whold array is unfreezed.
+ - wait_read_barrier()
+   Since regular read I/O won't interfere with resync I/O (read_balance()
+   will make sure only uptodate data will be read out), it is unnecessary
+   to wait for barrier in regular read I/Os, waiting in only necessary
+   when the whole array is frozen.
+
+The operations on conf->nr_pending[idx], conf->nr_waiting[idx], conf->
+barrier[idx] are very carefully designed in raise_barrier(),
+lower_barrier(), _wait_barrier() and wait_read_barrier(), in order to
+avoid unnecessary spin locks in these functions. Once conf->
+nr_pengding[idx] is increased, a resync I/O with same barrier bucket index
+has to wait in raise_barrier(). Then in _wait_barrier() if no barrier
+raised in same barrier bucket index and array is not frozen, the regular
+I/O doesn't need to hold conf->resync_lock, it can just increase
+conf->nr_pending[idx], and return to its caller. wait_read_barrier() is
+very similar to _wait_barrier(), the only difference is it only waits when
+array is frozen. For heavy parallel reading I/Os, the lockless I/O barrier
+code almostly gets rid of all spin lock cost.
+
+This patch significantly improves raid1 reading peroformance. From my
+testing, a raid1 device built by two NVMe SSD, runs fio with 64KB
+blocksize, 40 seq read I/O jobs, 128 iodepth, overall throughput
+increases from 2.7GB/s to 4.6GB/s (+70%).
+
+Changelog
+V4:
+- Change conf->nr_queued[] to atomic_t.
+- Define BARRIER_BUCKETS_NR_BITS by (PAGE_SHIFT - ilog2(sizeof(atomic_t)))
+V3:
+- Add smp_mb__after_atomic() as Shaohua and Neil suggested.
+- Change conf->nr_queued[] from atomic_t to int.
+- Change conf->array_frozen from atomic_t back to int, and use
+  READ_ONCE(conf->array_frozen) to check value of conf->array_frozen
+  in _wait_barrier() and wait_read_barrier().
+- In _wait_barrier() and wait_read_barrier(), add a call to
+  wake_up(&conf->wait_barrier) after atomic_dec(&conf->nr_pending[idx]),
+  to fix a deadlock between  _wait_barrier()/wait_read_barrier and
+  freeze_array().
+V2:
+- Remove a spin_lock/unlock pair in raid1d().
+- Add more code comments to explain why there is no racy when checking two
+  atomic_t variables at same time.
+V1:
+- Original RFC patch for comments.
+
+Signed-off-by: Coly Li <colyli@suse.de>
+Cc: Shaohua Li <shli@fb.com>
+Cc: Hannes Reinecke <hare@suse.com>
+Cc: Johannes Thumshirn <jthumshirn@suse.de>
+Cc: Guoqing Jiang <gqjiang@suse.com>
+Reviewed-by: Neil Brown <neilb@suse.de>
+Signed-off-by: Shaohua Li <shli@fb.com>
+

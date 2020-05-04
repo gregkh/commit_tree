@@ -1,0 +1,87 @@
+radix tree test suite: multi-order iteration race
+
+Add a test which shows a race in the multi-order iteration code.  This
+test reliably hits the race in under a second on my machine, and is the
+result of a real bug report against kernel a production v4.15 based
+kernel (4.15.6-300.fc27.x86_64).  With a real kernel this issue is hit
+when using order 9 PMD DAX radix tree entries.
+
+The race has to do with how we tear down multi-order sibling entries
+when we are removing an item from the tree.  Remember that an order 2
+entry looks like this:
+
+  struct radix_tree_node.slots[] = [entry][sibling][sibling][sibling]
+
+where 'entry' is in some slot in the struct radix_tree_node, and the
+three slots following 'entry' contain sibling pointers which point back
+to 'entry.'
+
+When we delete 'entry' from the tree, we call :
+
+  radix_tree_delete()
+    radix_tree_delete_item()
+      __radix_tree_delete()
+        replace_slot()
+
+replace_slot() first removes the siblings in order from the first to the
+last, then at then replaces 'entry' with NULL.  This means that for a
+brief period of time we end up with one or more of the siblings removed,
+so:
+
+  struct radix_tree_node.slots[] = [entry][NULL][sibling][sibling]
+
+This causes an issue if you have a reader iterating over the slots in
+the tree via radix_tree_for_each_slot() while only under
+rcu_read_lock()/rcu_read_unlock() protection.  This is a common case in
+mm/filemap.c.
+
+The issue is that when __radix_tree_next_slot() => skip_siblings() tries
+to skip over the sibling entries in the slots, it currently does so with
+an exact match on the slot directly preceding our current slot.
+Normally this works:
+
+                                      V preceding slot
+  struct radix_tree_node.slots[] = [entry][sibling][sibling][sibling]
+                                              ^ current slot
+
+This lets you find the first sibling, and you skip them all in order.
+
+But in the case where one of the siblings is NULL, that slot is skipped
+and then our sibling detection is interrupted:
+
+                                             V preceding slot
+  struct radix_tree_node.slots[] = [entry][NULL][sibling][sibling]
+                                                    ^ current slot
+
+This means that the sibling pointers aren't recognized since they point
+all the way back to 'entry', so we think that they are normal internal
+radix tree pointers.  This causes us to think we need to walk down to a
+struct radix_tree_node starting at the address of 'entry'.
+
+In a real running kernel this will crash the thread with a GP fault when
+you try and dereference the slots in your broken node starting at
+'entry'.
+
+In the radix tree test suite this will be caught by the address
+sanitizer:
+
+  ==27063==ERROR: AddressSanitizer: heap-buffer-overflow on address
+  0x60c0008ae400 at pc 0x00000040ce4f bp 0x7fa89b8fcad0 sp 0x7fa89b8fcac0
+  READ of size 8 at 0x60c0008ae400 thread T3
+      #0 0x40ce4e in __radix_tree_next_slot /home/rzwisler/project/linux/tools/testing/radix-tree/radix-tree.c:1660
+      #1 0x4022cc in radix_tree_next_slot linux/../../../../include/linux/radix-tree.h:567
+      #2 0x4022cc in iterator_func /home/rzwisler/project/linux/tools/testing/radix-tree/multiorder.c:655
+      #3 0x7fa8a088d50a in start_thread (/lib64/libpthread.so.0+0x750a)
+      #4 0x7fa8a03bd16e in clone (/lib64/libc.so.6+0xf516e)
+
+Link: http://lkml.kernel.org/r/20180503192430.7582-5-ross.zwisler@linux.intel.com
+Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: CR, Sapthagirish <sapthagirish.cr@intel.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

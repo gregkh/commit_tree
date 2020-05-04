@@ -1,0 +1,90 @@
+ibmveth: Support to enable LSO/CSO for Trunk VEA.
+
+Current largesend and checksum offload feature in ibmveth driver,
+ - Source VM sends the TCP packets with ip_summed field set as
+   CHECKSUM_PARTIAL and TCP pseudo header checksum is placed in
+   checksum field
+ - CHECKSUM_PARTIAL flag in SKB will enable ibmveth driver to mark
+   "no checksum" and "checksum good" bits in transmit buffer descriptor
+   before the packet is delivered to pseries PowerVM Hypervisor
+ - If ibmveth has largesend capability enabled, transmit buffer descriptors
+   are market accordingly before packet is delivered to Hypervisor
+   (along with mss value for packets with length > MSS)
+ - Destination VM's ibmveth driver receives the packet with "checksum good"
+   bit set and so, SKB's ip_summed field is set with CHECKSUM_UNNECESSARY
+ - If "largesend" bit was on, mss value is copied from receive descriptor
+   into SKB's gso_size and other flags are appropriately set for
+   packets > MSS size
+ - The packet is now successfully delivered up the stack in destination VM
+
+The offloads described above works fine for TCP communication among VMs in
+the same pseries server ( VM A <=> PowerVM Hypervisor <=> VM B )
+
+We are now enabling support for OVS in pseries PowerVM environment. One of
+our requirements is to have ibmveth driver configured in "Trunk" mode, when
+they are used with OVS. This is because, PowerVM Hypervisor will no more
+bridge the packets between VMs, instead the packets are delivered to
+IO Server which hosts OVS to bridge them between VMs or to external
+networks (flow shown below),
+  VM A <=> PowerVM Hypervisor <=> IO Server(OVS) <=> PowerVM Hypervisor
+                                                                   <=> VM B
+In "IO server" the packet is received by inbound Trunk ibmveth and then
+delivered to OVS, which is then bridged to outbound Trunk ibmveth (shown
+below),
+        Inbound Trunk ibmveth <=> OVS <=> Outbound Trunk ibmveth
+
+In this model, we hit the following issues which impacted the VM
+communication performance,
+
+ - Issue 1: ibmveth doesn't support largesend and checksum offload features
+   when configured as "Trunk". Driver has explicit checks to prevent
+   enabling these offloads.
+
+ - Issue 2: SYN packet drops seen at destination VM. When the packet
+   originates, it has CHECKSUM_PARTIAL flag set and as it gets delivered to
+   IO server's inbound Trunk ibmveth, on validating "checksum good" bits
+   in ibmveth receive routine, SKB's ip_summed field is set with
+   CHECKSUM_UNNECESSARY flag. This packet is then bridged by OVS (or Linux
+   Bridge) and delivered to outbound Trunk ibmveth. At this point the
+   outbound ibmveth transmit routine will not set "no checksum" and
+   "checksum good" bits in transmit buffer descriptor, as it does so only
+   when the ip_summed field is CHECKSUM_PARTIAL. When this packet gets
+   delivered to destination VM, TCP layer receives the packet with checksum
+   value of 0 and with no checksum related flags in ip_summed field. This
+   leads to packet drops. So, TCP connections never goes through fine.
+
+ - Issue 3: First packet of a TCP connection will be dropped, if there is
+   no OVS flow cached in datapath. OVS while trying to identify the flow,
+   computes the checksum. The computed checksum will be invalid at the
+   receiving end, as ibmveth transmit routine zeroes out the pseudo
+   checksum value in the packet. This leads to packet drop.
+
+ - Issue 4: ibmveth driver doesn't have support for SKB's with frag_list.
+   When Physical NIC has GRO enabled and when OVS bridges these packets,
+   OVS vport send code will end up calling dev_queue_xmit, which in turn
+   calls validate_xmit_skb.
+   In validate_xmit_skb routine, the larger packets will get segmented into
+   MSS sized segments, if SKB has a frag_list and if the driver to which
+   they are delivered to doesn't support NETIF_F_FRAGLIST feature.
+
+This patch addresses the above four issues, thereby enabling end to end
+largesend and checksum offload support for better performance.
+
+ - Fix for Issue 1 : Remove checks which prevent enabling TCP largesend and
+   checksum offloads.
+ - Fix for Issue 2 : When ibmveth receives a packet with "checksum good"
+   bit set and if its configured in Trunk mode, set appropriate SKB fields
+   using skb_partial_csum_set (ip_summed field is set with
+   CHECKSUM_PARTIAL)
+ - Fix for Issue 3: Recompute the pseudo header checksum before sending the
+   SKB up the stack.
+ - Fix for Issue 4: Linearize the SKBs with frag_list. Though we end up
+   allocating buffers and copying data, this fix gives
+   upto 4X throughput increase.
+
+Note: All these fixes need to be dropped together as fixing just one of
+them will lead to other issues immediately (especially for Issues 1,2 & 3).
+
+Signed-off-by: Sivakumar Krishnasamy <ksiva@linux.vnet.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

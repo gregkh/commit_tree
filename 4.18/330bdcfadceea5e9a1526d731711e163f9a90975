@@ -1,0 +1,78 @@
+rxrpc: Fix the keepalive generator [ver #2]
+
+AF_RXRPC has a keepalive message generator that generates a message for a
+peer ~20s after the last transmission to that peer to keep firewall ports
+open.  The implementation is incorrect in the following ways:
+
+ (1) It mixes up ktime_t and time64_t types.
+
+ (2) It uses ktime_get_real(), the output of which may jump forward or
+     backward due to adjustments to the time of day.
+
+ (3) If the current time jumps forward too much or jumps backwards, the
+     generator function will crank the base of the time ring round one slot
+     at a time (ie. a 1s period) until it catches up, spewing out VERSION
+     packets as it goes.
+
+Fix the problem by:
+
+ (1) Only using time64_t.  There's no need for sub-second resolution.
+
+ (2) Use ktime_get_seconds() rather than ktime_get_real() so that time
+     isn't perceived to go backwards.
+
+ (3) Simplifying rxrpc_peer_keepalive_worker() by splitting it into two
+     parts:
+
+     (a) The "worker" function that manages the buckets and the timer.
+
+     (b) The "dispatch" function that takes the pending peers and
+     	 potentially transmits a keepalive packet before putting them back
+     	 in the ring into the slot appropriate to the revised last-Tx time.
+
+ (4) Taking everything that's pending out of the ring and splicing it into
+     a temporary collector list for processing.
+
+     In the case that there's been a significant jump forward, the ring
+     gets entirely emptied and then the time base can be warped forward
+     before the peers are processed.
+
+     The warping can't happen if the ring isn't empty because the slot a
+     peer is in is keepalive-time dependent, relative to the base time.
+
+ (5) Limit the number of iterations of the bucket array when scanning it.
+
+ (6) Set the timer to skip any empty slots as there's no point waking up if
+     there's nothing to do yet.
+
+This can be triggered by an incoming call from a server after a reboot with
+AF_RXRPC and AFS built into the kernel causing a peer record to be set up
+before userspace is started.  The system clock is then adjusted by
+userspace, thereby potentially causing the keepalive generator to have a
+meltdown - which leads to a message like:
+
+	watchdog: BUG: soft lockup - CPU#0 stuck for 23s! [kworker/0:1:23]
+	...
+	Workqueue: krxrpcd rxrpc_peer_keepalive_worker
+	EIP: lock_acquire+0x69/0x80
+	...
+	Call Trace:
+	 ? rxrpc_peer_keepalive_worker+0x5e/0x350
+	 ? _raw_spin_lock_bh+0x29/0x60
+	 ? rxrpc_peer_keepalive_worker+0x5e/0x350
+	 ? rxrpc_peer_keepalive_worker+0x5e/0x350
+	 ? __lock_acquire+0x3d3/0x870
+	 ? process_one_work+0x110/0x340
+	 ? process_one_work+0x166/0x340
+	 ? process_one_work+0x110/0x340
+	 ? worker_thread+0x39/0x3c0
+	 ? kthread+0xdb/0x110
+	 ? cancel_delayed_work+0x90/0x90
+	 ? kthread_stop+0x70/0x70
+	 ? ret_from_fork+0x19/0x24
+
+Fixes: ace45bec6d77 ("rxrpc: Fix firewall route keepalive")
+Reported-by: kernel test robot <lkp@intel.com>
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

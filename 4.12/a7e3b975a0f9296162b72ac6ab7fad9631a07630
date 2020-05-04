@@ -1,0 +1,82 @@
+Btrfs: fix reported number of inode blocks
+
+Currently when there are buffered writes that were not yet flushed and
+they fall within allocated ranges of the file (that is, not in holes or
+beyond eof assuming there are no prealloc extents beyond eof), btrfs
+simply reports an incorrect number of used blocks through the stat(2)
+system call (or any of its variants), regardless of mount options or
+inode flags (compress, compress-force, nodatacow). This is because the
+number of blocks used that is reported is based on the current number
+of bytes in the vfs inode plus the number of dealloc bytes in the btrfs
+inode. The later covers bytes that both fall within allocated regions
+of the file and holes.
+
+Example scenarios where the number of reported blocks is wrong while the
+buffered writes are not flushed:
+
+  $ mkfs.btrfs -f /dev/sdc
+  $ mount /dev/sdc /mnt/sdc
+
+  $ xfs_io -f -c "pwrite -S 0xaa 0 64K" /mnt/sdc/foo1
+  wrote 65536/65536 bytes at offset 0
+  64 KiB, 16 ops; 0.0000 sec (259.336 MiB/sec and 66390.0415 ops/sec)
+
+  $ sync
+
+  $ xfs_io -c "pwrite -S 0xbb 0 64K" /mnt/sdc/foo1
+  wrote 65536/65536 bytes at offset 0
+  64 KiB, 16 ops; 0.0000 sec (192.308 MiB/sec and 49230.7692 ops/sec)
+
+  # The following should have reported 64K...
+  $ du -h /mnt/sdc/foo1
+  128K	/mnt/sdc/foo1
+
+  $ sync
+
+  # After flushing the buffered write, it now reports the correct value.
+  $ du -h /mnt/sdc/foo1
+  64K	/mnt/sdc/foo1
+
+  $ xfs_io -f -c "falloc -k 0 128K" -c "pwrite -S 0xaa 0 64K" /mnt/sdc/foo2
+  wrote 65536/65536 bytes at offset 0
+  64 KiB, 16 ops; 0.0000 sec (520.833 MiB/sec and 133333.3333 ops/sec)
+
+  $ sync
+
+  $ xfs_io -c "pwrite -S 0xbb 64K 64K" /mnt/sdc/foo2
+  wrote 65536/65536 bytes at offset 65536
+  64 KiB, 16 ops; 0.0000 sec (260.417 MiB/sec and 66666.6667 ops/sec)
+
+  # The following should have reported 128K...
+  $ du -h /mnt/sdc/foo2
+  192K	/mnt/sdc/foo2
+
+  $ sync
+
+  # After flushing the buffered write, it now reports the correct value.
+  $ du -h /mnt/sdc/foo2
+  128K	/mnt/sdc/foo2
+
+So the number of used file blocks is simply incorrect, unlike in other
+filesystems such as ext4 and xfs for example, but only while the buffered
+writes are not flushed.
+
+Fix this by tracking the number of delalloc bytes that fall within holes
+and beyond eof of a file, and use instead this new counter when reporting
+the number of used blocks for an inode.
+
+Another different problem that exists is that the delalloc bytes counter
+is reset when writeback starts (by clearing the EXTENT_DEALLOC flag from
+the respective range in the inode's iotree) and the vfs inode's bytes
+counter is only incremented when writeback finishes (through
+insert_reserved_file_extent()). Therefore while writeback is ongoing we
+simply report a wrong number of blocks used by an inode if the write
+operation covers a range previously unallocated. While this change does
+not fix this problem, it does minimizes it a lot by shortening that time
+window, as the new dealloc bytes counter (new_delalloc_bytes) is only
+decremented when writeback finishes right before updating the vfs inode's
+bytes counter. Fully fixing this second problem is not trivial and will
+be addressed later by a different patch.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+

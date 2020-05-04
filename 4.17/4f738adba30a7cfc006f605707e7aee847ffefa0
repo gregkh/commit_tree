@@ -1,0 +1,108 @@
+bpf: create tcp_bpf_ulp allowing BPF to monitor socket TX/RX data
+
+This implements a BPF ULP layer to allow policy enforcement and
+monitoring at the socket layer. In order to support this a new
+program type BPF_PROG_TYPE_SK_MSG is used to run the policy at
+the sendmsg/sendpage hook. To attach the policy to sockets a
+sockmap is used with a new program attach type BPF_SK_MSG_VERDICT.
+
+Similar to previous sockmap usages when a sock is added to a
+sockmap, via a map update, if the map contains a BPF_SK_MSG_VERDICT
+program type attached then the BPF ULP layer is created on the
+socket and the attached BPF_PROG_TYPE_SK_MSG program is run for
+every msg in sendmsg case and page/offset in sendpage case.
+
+BPF_PROG_TYPE_SK_MSG Semantics/API:
+
+BPF_PROG_TYPE_SK_MSG supports only two return codes SK_PASS and
+SK_DROP. Returning SK_DROP free's the copied data in the sendmsg
+case and in the sendpage case leaves the data untouched. Both cases
+return -EACESS to the user. Returning SK_PASS will allow the msg to
+be sent.
+
+In the sendmsg case data is copied into kernel space buffers before
+running the BPF program. The kernel space buffers are stored in a
+scatterlist object where each element is a kernel memory buffer.
+Some effort is made to coalesce data from the sendmsg call here.
+For example a sendmsg call with many one byte iov entries will
+likely be pushed into a single entry. The BPF program is run with
+data pointers (start/end) pointing to the first sg element.
+
+In the sendpage case data is not copied. We opt not to copy the
+data by default here, because the BPF infrastructure does not
+know what bytes will be needed nor when they will be needed. So
+copying all bytes may be wasteful. Because of this the initial
+start/end data pointers are (0,0). Meaning no data can be read or
+written. This avoids reading data that may be modified by the
+user. A new helper is added later in this series if reading and
+writing the data is needed. The helper call will do a copy by
+default so that the page is exclusively owned by the BPF call.
+
+The verdict from the BPF_PROG_TYPE_SK_MSG applies to the entire msg
+in the sendmsg() case and the entire page/offset in the sendpage case.
+This avoids ambiguity on how to handle mixed return codes in the
+sendmsg case. Again a helper is added later in the series if
+a verdict needs to apply to multiple system calls and/or only
+a subpart of the currently being processed message.
+
+The helper msg_redirect_map() can be used to select the socket to
+send the data on. This is used similar to existing redirect use
+cases. This allows policy to redirect msgs.
+
+Pseudo code simple example:
+
+The basic logic to attach a program to a socket is as follows,
+
+  // load the programs
+  bpf_prog_load(SOCKMAP_TCP_MSG_PROG, BPF_PROG_TYPE_SK_MSG,
+		&obj, &msg_prog);
+
+  // lookup the sockmap
+  bpf_map_msg = bpf_object__find_map_by_name(obj, "my_sock_map");
+
+  // get fd for sockmap
+  map_fd_msg = bpf_map__fd(bpf_map_msg);
+
+  // attach program to sockmap
+  bpf_prog_attach(msg_prog, map_fd_msg, BPF_SK_MSG_VERDICT, 0);
+
+Adding sockets to the map is done in the normal way,
+
+  // Add a socket 'fd' to sockmap at location 'i'
+  bpf_map_update_elem(map_fd_msg, &i, fd, BPF_ANY);
+
+After the above any socket attached to "my_sock_map", in this case
+'fd', will run the BPF msg verdict program (msg_prog) on every
+sendmsg and sendpage system call.
+
+For a complete example see BPF selftests or sockmap samples.
+
+Implementation notes:
+
+It seemed the simplest, to me at least, to use a refcnt to ensure
+psock is not lost across the sendmsg copy into the sg, the bpf program
+running on the data in sg_data, and the final pass to the TCP stack.
+Some performance testing may show a better method to do this and avoid
+the refcnt cost, but for now use the simpler method.
+
+Another item that will come after basic support is in place is
+supporting MSG_MORE flag. At the moment we call sendpages even if
+the MSG_MORE flag is set. An enhancement would be to collect the
+pages into a larger scatterlist and pass down the stack. Notice that
+bpf_tcp_sendmsg() could support this with some additional state saved
+across sendmsg calls. I built the code to support this without having
+to do refactoring work. Other features TBD include ZEROCOPY and the
+TCP_RECV_QUEUE/TCP_NO_QUEUE support. This will follow initial series
+shortly.
+
+Future work could improve size limits on the scatterlist rings used
+here. Currently, we use MAX_SKB_FRAGS simply because this was being
+used already in the TLS case. Future work could extend the kernel sk
+APIs to tune this depending on workload. This is a trade-off
+between memory usage and throughput performance.
+
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Acked-by: David S. Miller <davem@davemloft.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+

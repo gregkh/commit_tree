@@ -1,0 +1,64 @@
+cgroup/cpuset: remove circular dependency deadlock
+
+Remove circular dependency deadlock in a scenario where hotplug of CPU is
+being done while there is updation in cgroup and cpuset triggered from
+userspace.
+
+Process A => kthreadd => Process B => Process C => Process A
+
+Process A
+cpu_subsys_offline();
+  cpu_down();
+    _cpu_down();
+      percpu_down_write(&cpu_hotplug_lock); //held
+      cpuhp_invoke_callback();
+	     workqueue_offline_cpu();
+            queue_work_on(); // unbind_work on system_highpri_wq
+               __queue_work();
+                 insert_work();
+                    wake_up_worker();
+            flush_work();
+               wait_for_completion();
+
+worker_thread();
+   manage_workers();
+      create_worker();
+	     kthread_create_on_node();
+		    wake_up_process(kthreadd_task);
+
+kthreadd
+kthreadd();
+  kernel_thread();
+    do_fork();
+      copy_process();
+        percpu_down_read(&cgroup_threadgroup_rwsem);
+          __rwsem_down_read_failed_common(); //waiting
+
+Process B
+kernfs_fop_write();
+  cgroup_file_write();
+    cgroup_procs_write();
+      percpu_down_write(&cgroup_threadgroup_rwsem); //held
+      cgroup_attach_task();
+        cgroup_migrate();
+          cgroup_migrate_execute();
+            cpuset_can_attach();
+              mutex_lock(&cpuset_mutex); //waiting
+
+Process C
+kernfs_fop_write();
+  cgroup_file_write();
+    cpuset_write_resmask();
+      mutex_lock(&cpuset_mutex); //held
+      update_cpumask();
+        update_cpumasks_hier();
+          rebuild_sched_domains_locked();
+            get_online_cpus();
+              percpu_down_read(&cpu_hotplug_lock); //waiting
+
+Eliminating deadlock by reversing the locking order for cpuset_mutex and
+cpu_hotplug_lock.
+
+Signed-off-by: Prateek Sood <prsood@codeaurora.org>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+

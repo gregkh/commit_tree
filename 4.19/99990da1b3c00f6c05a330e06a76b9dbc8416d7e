@@ -1,0 +1,77 @@
+rcu: Suppress more involved false-positive preempted-task splats
+
+Consider the following sequence of events in a PREEMPT=y kernel:
+
+1.	All but one of the CPUs corresponding to a given leaf rcu_node
+	structure go offline.  Each of these CPUs clears its bit in that
+	structure's ->qsmaskinitnext field.
+
+2.	A new grace period starts, and rcu_gp_init() scans the leaf
+	rcu_node structures, applying CPU-hotplug changes since the
+	start of the previous grace period, including those changes in
+	#1 above.  This copies each leaf structure's ->qsmaskinitnext
+	to its ->qsmask field, which represents the CPUs that this new
+	grace period will wait on.  Each copy operation is done holding
+	the corresponding leaf rcu_node structure's ->lock, and at the
+	end of this scan, rcu_gp_init() holds no locks.
+
+3.	The last CPU corresponding to #1's leaf rcu_node structure goes
+	offline, clearing its bit in that structure's ->qsmaskinitnext
+	field, but not touching the ->qsmaskinit field.  Note that
+	rcu_gp_init() is not currently holding any locks!  This CPU does
+	-not- report a quiescent state because the grace period has not
+	yet initialized itself sufficiently to have set any bits in any
+	of the leaf rcu_node structures' ->qsmask fields.
+
+4.	The rcu_gp_init() function continues initializing the new grace
+	period, copying each leaf rcu_node structure's ->qsmaskinit
+	field to its ->qsmask field while holding the corresponding ->lock.
+	This sets the ->qsmask bit corresponding to #3's CPU.
+
+5.	Before the grace period ends, #3's CPU comes back online.
+	Because te grace period has not yet done any force-quiescent-state
+	scans (which would report a quiescent state on behalf of any
+	offline CPUs), this CPU's ->qsmask bit is still set.
+
+6.	A task running on the newly onlined CPU is preempted while in
+	an RCU read-side critical section.  Because this CPU's ->qsmask
+	bit is net, not only does this task queue itself on the leaf
+	rcu_node structure's ->blkd_tasks list, it also sets that
+	structure's ->gp_tasks pointer to reference it.
+
+7.	The grace period started in #1 above comes to an end.  This
+	results in rcu_gp_cleanup() being invoked, which, among other
+	things, checks to make sure that there are no tasks blocking the
+	just-ended grace period, that is, that all ->gp_tasks pointers
+	are NULL.  The ->gp_tasks pointer corresponding to the task
+	preempted in #3 above is non-NULL, which results in a splat.
+
+This splat is a false positive.  The task's RCU read-side critical
+section cannot have begun before the just-ended grace period because
+this would mean either: (1) The CPU came online before the grace period
+started, which cannot have happened because the grace period started
+before that CPU went offline, or (2) The task started its RCU read-side
+critical section on some other CPU, but then it would have had to have
+been preempted before migrating to this CPU, which would mean that it
+would have instead queued itself on that other CPU's rcu_node structure.
+RCU's grace periods thus are working correctly.  Or, more accurately,
+that remaining bugs in RCU's grace periods are elsewhere.
+
+This commit eliminates this false positive by adding code to the end
+of rcu_cpu_starting() that reports a quiescent state to RCU, which has
+the side-effect of clearing that CPU's ->qsmask bit, preventing the
+above scenario.  This approach has the added benefit of more promptly
+reporting quiescent states corresponding to offline CPUs.  Nevertheless,
+this commit does -not- remove the need for the force-quiescent-state
+scans to check for offline CPUs, given that a CPU might remain offline
+indefinitely.  And without the checks in the force-quiescent-state scans,
+the grace period would also persist indefinitely, which could result in
+hangs or memory exhaustion.
+
+Note well that the call to rcu_report_qs_rnp() reporting the quiescent
+state must come -after- the setting of this CPU's bit in the leaf rcu_node
+structure's ->qsmaskinitnext field.  Otherwise, lockdep-RCU will complain
+bitterly about quiescent states coming from an offline CPU.
+
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+

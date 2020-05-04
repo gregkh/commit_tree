@@ -1,0 +1,194 @@
+printk: Add console owner and waiter logic to load balance console writes
+
+This patch implements what I discussed in Kernel Summit. I added
+lockdep annotation (hopefully correctly), and it hasn't had any splats
+(since I fixed some bugs in the first iterations). It did catch
+problems when I had the owner covering too much. But now that the owner
+is only set when actively calling the consoles, lockdep has stayed
+quiet.
+
+Here's the design again:
+
+I added a "console_owner" which is set to a task that is actively
+writing to the consoles. It is *not* the same as the owner of the
+console_lock. It is only set when doing the calls to the console
+functions. It is protected by a console_owner_lock which is a raw spin
+lock.
+
+There is a console_waiter. This is set when there is an active console
+owner that is not current, and waiter is not set. This too is protected
+by console_owner_lock.
+
+In printk() when it tries to write to the consoles, we have:
+
+	if (console_trylock())
+		console_unlock();
+
+Now I added an else, which will check if there is an active owner, and
+no current waiter. If that is the case, then console_waiter is set, and
+the task goes into a spin until it is no longer set.
+
+When the active console owner finishes writing the current message to
+the consoles, it grabs the console_owner_lock and sees if there is a
+waiter, and clears console_owner.
+
+If there is a waiter, then it breaks out of the loop, clears the waiter
+flag (because that will release the waiter from its spin), and exits.
+Note, it does *not* release the console semaphore. Because it is a
+semaphore, there is no owner. Another task may release it. This means
+that the waiter is guaranteed to be the new console owner! Which it
+becomes.
+
+Then the waiter calls console_unlock() and continues to write to the
+consoles.
+
+If another task comes along and does a printk() it too can become the
+new waiter, and we wash rinse and repeat!
+
+By Petr Mladek about possible new deadlocks:
+
+The thing is that we move console_sem only to printk() call
+that normally calls console_unlock() as well. It means that
+the transferred owner should not bring new type of dependencies.
+As Steven said somewhere: "If there is a deadlock, it was
+there even before."
+
+We could look at it from this side. The possible deadlock would
+look like:
+
+CPU0                            CPU1
+
+console_unlock()
+
+  console_owner = current;
+
+				spin_lockA()
+				  printk()
+				    spin = true;
+				    while (...)
+
+    call_console_drivers()
+      spin_lockA()
+
+This would be a deadlock. CPU0 would wait for the lock A.
+While CPU1 would own the lockA and would wait for CPU0
+to finish calling the console drivers and pass the console_sem
+owner.
+
+But if the above is true than the following scenario was
+already possible before:
+
+CPU0
+
+spin_lockA()
+  printk()
+    console_unlock()
+      call_console_drivers()
+	spin_lockA()
+
+By other words, this deadlock was there even before. Such
+deadlocks are prevented by using printk_deferred() in
+the sections guarded by the lock A.
+
+By Steven Rostedt:
+
+To demonstrate the issue, this module has been shown to lock up a
+system with 4 CPUs and a slow console (like a serial console). It is
+also able to lock up a 8 CPU system with only a fast (VGA) console, by
+passing in "loops=100". The changes in this commit prevent this module
+from locking up the system.
+
+ #include <linux/module.h>
+ #include <linux/delay.h>
+ #include <linux/sched.h>
+ #include <linux/mutex.h>
+ #include <linux/workqueue.h>
+ #include <linux/hrtimer.h>
+
+ static bool stop_testing;
+ static unsigned int loops = 1;
+
+ static void preempt_printk_workfn(struct work_struct *work)
+ {
+ 	int i;
+
+ 	while (!READ_ONCE(stop_testing)) {
+ 		for (i = 0; i < loops && !READ_ONCE(stop_testing); i++) {
+ 			preempt_disable();
+ 			pr_emerg("%5d%-75s\n", smp_processor_id(),
+ 				 " XXX NOPREEMPT");
+ 			preempt_enable();
+ 		}
+ 		msleep(1);
+ 	}
+ }
+
+ static struct work_struct __percpu *works;
+
+ static void finish(void)
+ {
+ 	int cpu;
+
+ 	WRITE_ONCE(stop_testing, true);
+ 	for_each_online_cpu(cpu)
+ 		flush_work(per_cpu_ptr(works, cpu));
+ 	free_percpu(works);
+ }
+
+ static int __init test_init(void)
+ {
+ 	int cpu;
+
+ 	works = alloc_percpu(struct work_struct);
+ 	if (!works)
+ 		return -ENOMEM;
+
+ 	/*
+ 	 * This is just a test module. This will break if you
+ 	 * do any CPU hot plugging between loading and
+ 	 * unloading the module.
+ 	 */
+
+ 	for_each_online_cpu(cpu) {
+ 		struct work_struct *work = per_cpu_ptr(works, cpu);
+
+ 		INIT_WORK(work, &preempt_printk_workfn);
+ 		schedule_work_on(cpu, work);
+ 	}
+
+ 	return 0;
+ }
+
+ static void __exit test_exit(void)
+ {
+ 	finish();
+ }
+
+ module_param(loops, uint, 0);
+ module_init(test_init);
+ module_exit(test_exit);
+ MODULE_LICENSE("GPL");
+
+Link: http://lkml.kernel.org/r/20180110132418.7080-2-pmladek@suse.com
+Cc: akpm@linux-foundation.org
+Cc: linux-mm@kvack.org
+Cc: Cong Wang <xiyou.wangcong@gmail.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Cc: Byungchul Park <byungchul.park@lge.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Pavel Machek <pavel@ucw.cz>
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+[pmladek@suse.com: Commit message about possible deadlocks]
+Acked-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+

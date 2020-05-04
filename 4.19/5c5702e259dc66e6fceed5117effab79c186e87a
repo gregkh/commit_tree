@@ -1,0 +1,67 @@
+RDMA/core: Set right entry state before releasing reference
+
+Currently add_modify_gid() for IB link layer has followong issue
+in cache update path.
+
+When GID update event occurs, core releases reference to the GID
+table without updating its state and/or entry pointer.
+
+CPU-0                              CPU-1
+------                             -----
+ib_cache_update()                    IPoIB ULP
+   add_modify_gid()                   [..]
+      put_gid_entry()
+      refcnt = 0, but
+      state = valid,
+      entry is valid.
+      (work item is not yet executed).
+                                   ipoib_create_ah()
+                                     rdma_create_ah()
+                                        rdma_get_gid_attr() <--
+                                   	Tries to acquire gid_attr
+                                        which has refcnt = 0.
+                                   	This is incorrect.
+
+GID entry state and entry pointer is provides the accurate GID enty
+state. Such fields must be updated with rwlock to protect against
+readers and, such fields must be in sane state before refcount can drop
+to zero. Otherwise above race condition can happen leading to
+use-after-free situation.
+
+Following backtrace has been observed when cache update for an IB port
+is triggered while IPoIB ULP is creating an AH.
+
+Therefore, when updating GID entry, first mark a valid entry as invalid
+through state and set the barrier so that no callers can acquired
+the GID entry, followed by release reference to it.
+
+refcount_t: increment on 0; use-after-free.
+WARNING: CPU: 4 PID: 29106 at lib/refcount.c:153 refcount_inc_checked+0x30/0x50
+Workqueue: ib-comp-unb-wq ib_cq_poll_work [ib_core]
+RIP: 0010:refcount_inc_checked+0x30/0x50
+RSP: 0018:ffff8802ad36f600 EFLAGS: 00010082
+RAX: 0000000000000000 RBX: 0000000000000000 RCX: 0000000000000000
+RDX: 0000000000000002 RSI: 0000000000000008 RDI: ffffffff86710100
+RBP: ffff8802d6e60a30 R08: ffffed005d67bf8b R09: ffffed005d67bf8b
+R10: 0000000000000001 R11: ffffed005d67bf8a R12: ffff88027620cee8
+R13: ffff8802d6e60988 R14: ffff8802d6e60a78 R15: 0000000000000202
+FS: 0000000000000000(0000) GS:ffff8802eb200000(0000) knlGS:0000000000000000
+CS: 0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00007f3ab35e5c88 CR3: 00000002ce84a000 CR4: 00000000000006e0
+IPv6: ADDRCONF(NETDEV_CHANGE): ib1: link becomes ready
+Call Trace:
+rdma_get_gid_attr+0x220/0x310 [ib_core]
+? lock_acquire+0x145/0x3a0
+rdma_fill_sgid_attr+0x32c/0x470 [ib_core]
+rdma_create_ah+0x89/0x160 [ib_core]
+? rdma_fill_sgid_attr+0x470/0x470 [ib_core]
+? ipoib_create_ah+0x52/0x260 [ib_ipoib]
+ipoib_create_ah+0xf5/0x260 [ib_ipoib]
+ipoib_mcast_join_complete+0xbbe/0x2540 [ib_ipoib]
+
+Fixes: b150c3862d21 ("IB/core: Introduce GID entry reference counts")
+Signed-off-by: Parav Pandit <parav@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+

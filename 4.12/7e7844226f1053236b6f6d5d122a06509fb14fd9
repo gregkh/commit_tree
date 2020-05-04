@@ -1,0 +1,108 @@
+lockdep: allow to disable reclaim lockup detection
+
+The current implementation of the reclaim lockup detection can lead to
+false positives and those even happen and usually lead to tweak the code
+to silence the lockdep by using GFP_NOFS even though the context can use
+__GFP_FS just fine.
+
+See
+
+  http://lkml.kernel.org/r/20160512080321.GA18496@dastard
+
+as an example.
+
+  =================================
+  [ INFO: inconsistent lock state ]
+  4.5.0-rc2+ #4 Tainted: G           O
+  ---------------------------------
+  inconsistent {RECLAIM_FS-ON-R} -> {IN-RECLAIM_FS-W} usage.
+  kswapd0/543 [HC0[0]:SC0[0]:HE1:SE1] takes:
+
+  (&xfs_nondir_ilock_class){++++-+}, at: xfs_ilock+0x177/0x200 [xfs]
+
+  {RECLAIM_FS-ON-R} state was registered at:
+    mark_held_locks+0x79/0xa0
+    lockdep_trace_alloc+0xb3/0x100
+    kmem_cache_alloc+0x33/0x230
+    kmem_zone_alloc+0x81/0x120 [xfs]
+    xfs_refcountbt_init_cursor+0x3e/0xa0 [xfs]
+    __xfs_refcount_find_shared+0x75/0x580 [xfs]
+    xfs_refcount_find_shared+0x84/0xb0 [xfs]
+    xfs_getbmap+0x608/0x8c0 [xfs]
+    xfs_vn_fiemap+0xab/0xc0 [xfs]
+    do_vfs_ioctl+0x498/0x670
+    SyS_ioctl+0x79/0x90
+    entry_SYSCALL_64_fastpath+0x12/0x6f
+
+         CPU0
+         ----
+    lock(&xfs_nondir_ilock_class);
+    <Interrupt>
+      lock(&xfs_nondir_ilock_class);
+
+   *** DEADLOCK ***
+
+  3 locks held by kswapd0/543:
+
+  stack backtrace:
+  CPU: 0 PID: 543 Comm: kswapd0 Tainted: G           O    4.5.0-rc2+ #4
+  Call Trace:
+   lock_acquire+0xd8/0x1e0
+   down_write_nested+0x5e/0xc0
+   xfs_ilock+0x177/0x200 [xfs]
+   xfs_reflink_cancel_cow_range+0x150/0x300 [xfs]
+   xfs_fs_evict_inode+0xdc/0x1e0 [xfs]
+   evict+0xc5/0x190
+   dispose_list+0x39/0x60
+   prune_icache_sb+0x4b/0x60
+   super_cache_scan+0x14f/0x1a0
+   shrink_slab.part.63.constprop.79+0x1e9/0x4e0
+   shrink_zone+0x15e/0x170
+   kswapd+0x4f1/0xa80
+   kthread+0xf2/0x110
+   ret_from_fork+0x3f/0x70
+
+To quote Dave:
+ "Ignoring whether reflink should be doing anything or not, that's a
+  "xfs_refcountbt_init_cursor() gets called both outside and inside
+  transactions" lockdep false positive case. The problem here is lockdep
+  has seen this allocation from within a transaction, hence a GFP_NOFS
+  allocation, and now it's seeing it in a GFP_KERNEL context. Also note
+  that we have an active reference to this inode.
+
+  So, because the reclaim annotations overload the interrupt level
+  detections and it's seen the inode ilock been taken in reclaim
+  ("interrupt") context, this triggers a reclaim context warning where
+  it thinks it is unsafe to do this allocation in GFP_KERNEL context
+  holding the inode ilock..."
+
+This sounds like a fundamental problem of the reclaim lock detection.
+It is really impossible to annotate such a special usecase IMHO unless
+the reclaim lockup detection is reworked completely.  Until then it is
+much better to provide a way to add "I know what I am doing flag" and
+mark problematic places.  This would prevent from abusing GFP_NOFS flag
+which has a runtime effect even on configurations which have lockdep
+disabled.
+
+Introduce __GFP_NOLOCKDEP flag which tells the lockdep gfp tracking to
+skip the current allocation request.
+
+While we are at it also make sure that the radix tree doesn't
+accidentaly override tags stored in the upper part of the gfp_mask.
+
+Link: http://lkml.kernel.org/r/20170306131408.9828-3-mhocko@kernel.org
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Suggested-by: Peter Zijlstra <peterz@infradead.org>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Theodore Ts'o <tytso@mit.edu>
+Cc: Chris Mason <clm@fb.com>
+Cc: David Sterba <dsterba@suse.cz>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Brian Foster <bfoster@redhat.com>
+Cc: Darrick J. Wong <darrick.wong@oracle.com>
+Cc: Nikolay Borisov <nborisov@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

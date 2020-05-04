@@ -1,0 +1,76 @@
+f2fs: fix to avoid broken of dnode block list
+
+f2fs recovery flow is relying on dnode block link list, it means fsynced
+file recovery depends on previous dnode's persistence in the list, so
+during fsync() we should wait on all regular inode's dnode writebacked
+before issuing flush.
+
+By this way, we can avoid dnode block list being broken by out-of-order
+IO submission due to IO scheduler or driver.
+
+Sheng Yong helps to do the test with this patch:
+
+Target:/data (f2fs, -)
+64MB / 32768KB / 4KB / 8
+
+1 / PERSIST / Index
+
+Base:
+	SEQ-RD(MB/s)	SEQ-WR(MB/s)	RND-RD(IOPS)	RND-WR(IOPS)	Insert(TPS)	Update(TPS)	Delete(TPS)
+1	867.82		204.15		41440.03	41370.54	680.8		1025.94		1031.08
+2	871.87		205.87		41370.3		40275.2		791.14		1065.84		1101.7
+3	866.52		205.69		41795.67	40596.16	694.69		1037.16		1031.48
+Avg	868.7366667	205.2366667	41535.33333	40747.3		722.21		1042.98		1054.753333
+
+After:
+	SEQ-RD(MB/s)	SEQ-WR(MB/s)	RND-RD(IOPS)	RND-WR(IOPS)	Insert(TPS)	Update(TPS)	Delete(TPS)
+1	798.81		202.5		41143		40613.87	602.71		838.08		913.83
+2	805.79		206.47		40297.2		41291.46	604.44		840.75		924.27
+3	814.83		206.17		41209.57	40453.62	602.85		834.66		927.91
+Avg	806.4766667	205.0466667	40883.25667	40786.31667	603.3333333	837.83		922.0033333
+
+Patched/Original:
+	0.928332713	0.999074239	0.984300676	1.000957528	0.835398753	0.803303994	0.874141189
+
+It looks like atomic write will suffer performance regression.
+
+I suspect that the criminal is that we forcing to wait all dnode being in
+storage cache before we issue PREFLUSH+FUA.
+
+BTW, will commit ("f2fs: don't need to wait for node writes for atomic write")
+cause the problem: we will lose data of last transaction after SPO, even if
+atomic write return no error:
+
+- atomic_open();
+- write() P1, P2, P3;
+- atomic_commit();
+ - writeback data: P1, P2, P3;
+ - writeback node: N1, N2, N3;  <--- If N1, N2 is not writebacked, N3 with fsync_mark is
+writebacked, In SPOR, we won't find N3 since node chain is broken, turns out that losing
+last transaction.
+ - preflush + fua;
+- power-cut
+
+If we don't wait dnode writeback for atomic_write:
+
+	SEQ-RD(MB/s)	SEQ-WR(MB/s)	RND-RD(IOPS)	RND-WR(IOPS)	Insert(TPS)	Update(TPS)	Delete(TPS)
+1	779.91		206.03		41621.5		40333.16	716.9		1038.21		1034.85
+2	848.51		204.35		40082.44	39486.17	791.83		1119.96		1083.77
+3	772.12		206.27		41335.25	41599.65	723.29		1055.07		971.92
+Avg	800.18		205.55		41013.06333	40472.99333	744.0066667	1071.08		1030.18
+
+Patched/Original:
+	0.92108464	1.001526693	0.987425886	0.993268102	1.030180511	1.026942031	0.976702294
+
+SQLite's performance recovers.
+
+Jaegeuk:
+"Practically, I don't see db corruption becase of this. We can excuse to lose
+the last transaction."
+
+Finally, we decide to keep original implementation of atomic write interface
+sematics that we don't wait all dnode writeback before preflush+fua submission.
+
+Signed-off-by: Chao Yu <yuchao0@huawei.com>
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+

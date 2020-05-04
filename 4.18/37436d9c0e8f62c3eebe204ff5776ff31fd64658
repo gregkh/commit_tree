@@ -1,0 +1,47 @@
+tipc: fix an interrupt unsafe locking scenario
+
+Commit 9faa89d4ed9d ("tipc: make function tipc_net_finalize() thread
+safe") tries to make it thread safe to set node address, so it uses
+node_list_lock lock to serialize the whole process of setting node
+address in tipc_net_finalize(). But it causes the following interrupt
+unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  rht_deferred_worker()
+  rhashtable_rehash_table()
+  lock(&(&ht->lock)->rlock)
+			       tipc_nl_compat_doit()
+                               tipc_net_finalize()
+                               local_irq_disable();
+                               lock(&(&tn->node_list_lock)->rlock);
+                               tipc_sk_reinit()
+                               rhashtable_walk_enter()
+                               lock(&(&ht->lock)->rlock);
+  <Interrupt>
+  tipc_disc_rcv()
+  tipc_node_check_dest()
+  tipc_node_create()
+  lock(&(&tn->node_list_lock)->rlock);
+
+ *** DEADLOCK ***
+
+When rhashtable_rehash_table() holds ht->lock on CPU0, it doesn't
+disable BH. So if an interrupt happens after the lock, it can create
+an inverse lock ordering between ht->lock and tn->node_list_lock. As
+a consequence, deadlock might happen.
+
+The reason causing the inverse lock ordering scenario above is because
+the initial purpose of node_list_lock is not designed to do the
+serialization of node address setting.
+
+As cmpxchg() can guarantee CAS (compare-and-swap) process is atomic,
+we use it to replace node_list_lock to ensure setting node address can
+be atomically finished. It turns out the potential deadlock can be
+avoided as well.
+
+Fixes: 9faa89d4ed9d ("tipc: make function tipc_net_finalize() thread safe")
+Signed-off-by: Ying Xue <ying.xue@windriver.com>
+Acked-by: Jon Maloy <maloy@donjonn.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

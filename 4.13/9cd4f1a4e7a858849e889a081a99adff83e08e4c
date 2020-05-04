@@ -1,0 +1,73 @@
+smp/hotplug: Move unparking of percpu threads to the control CPU
+
+Vikram reported the following backtrace:
+
+   BUG: scheduling while atomic: swapper/7/0/0x00000002
+   CPU: 7 PID: 0 Comm: swapper/7 Not tainted 4.9.32-perf+ #680
+   schedule
+   schedule_hrtimeout_range_clock
+   schedule_hrtimeout
+   wait_task_inactive
+   __kthread_bind_mask
+   __kthread_bind
+   __kthread_unpark
+   kthread_unpark
+   cpuhp_online_idle
+   cpu_startup_entry
+   secondary_start_kernel
+
+He analyzed correctly that a parked cpu hotplug thread of an offlined CPU
+was still on the runqueue when the CPU came back online and tried to unpark
+it. This causes the thread which invoked kthread_unpark() to call
+wait_task_inactive() and subsequently schedule() with preemption disabled.
+His proposed workaround was to "make sure" that a parked thread has
+scheduled out when the CPU goes offline, so the situation cannot happen.
+
+But that's still wrong because the root cause is not the fact that the
+percpu thread is still on the runqueue and neither that preemption is
+disabled, which could be simply solved by enabling preemption before
+calling kthread_unpark().
+
+The real issue is that the calling thread is the idle task of the upcoming
+CPU, which is not supposed to call anything which might sleep.  The moron,
+who wrote that code, missed completely that kthread_unpark() might end up
+in schedule().
+
+The solution is simpler than expected. The thread which controls the
+hotplug operation is waiting for the CPU to call complete() on the hotplug
+state completion. So the idle task of the upcoming CPU can set its state to
+CPUHP_AP_ONLINE_IDLE and invoke complete(). This in turn wakes the control
+task on a different CPU, which then can safely do the unpark and kick the
+now unparked hotplug thread of the upcoming CPU to complete the bringup to
+the final target state.
+
+Control CPU                     AP
+
+bringup_cpu();
+  __cpu_up()  ------------>
+				bringup_ap();
+  bringup_wait_for_ap()
+    wait_for_completion();
+                                cpuhp_online_idle();
+                <------------    complete();
+    unpark(AP->stopper);
+    unpark(AP->hotplugthread);
+                                while(1)
+                                  do_idle();
+    kick(AP->hotplugthread);
+    wait_for_completion();	hotplug_thread()
+				  run_online_callbacks();
+				  complete();
+
+Fixes: 8df3e07e7f21 ("cpu/hotplug: Let upcoming cpu bring itself fully up")
+Reported-by: Vikram Mulukutla <markivx@codeaurora.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Peter Zijlstra <peterz@infradead.org>
+Cc: Sebastian Sewior <bigeasy@linutronix.de>
+Cc: Rusty Russell <rusty@rustcorp.com.au>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Link: http://lkml.kernel.org/r/alpine.DEB.2.20.1707042218020.2131@nanos
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+

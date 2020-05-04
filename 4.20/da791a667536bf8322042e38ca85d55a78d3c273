@@ -1,0 +1,51 @@
+futex: Cure exit race
+
+Stefan reported, that the glibc tst-robustpi4 test case fails
+occasionally. That case creates the following race between
+sys_exit() and sys_futex_lock_pi():
+
+ CPU0				CPU1
+
+ sys_exit()			sys_futex()
+  do_exit()			 futex_lock_pi()
+   exit_signals(tsk)		  No waiters:
+    tsk->flags |= PF_EXITING;	  *uaddr == 0x00000PID
+  mm_release(tsk)		  Set waiter bit
+   exit_robust_list(tsk) {	  *uaddr = 0x80000PID;
+      Set owner died		  attach_to_pi_owner() {
+    *uaddr = 0xC0000000;	   tsk = get_task(PID);
+   }				   if (!tsk->flags & PF_EXITING) {
+  ...				     attach();
+  tsk->flags |= PF_EXITPIDONE;	   } else {
+				     if (!(tsk->flags & PF_EXITPIDONE))
+				       return -EAGAIN;
+				     return -ESRCH; <--- FAIL
+				   }
+
+ESRCH is returned all the way to user space, which triggers the glibc test
+case assert. Returning ESRCH unconditionally is wrong here because the user
+space value has been changed by the exiting task to 0xC0000000, i.e. the
+FUTEX_OWNER_DIED bit is set and the futex PID value has been cleared. This
+is a valid state and the kernel has to handle it, i.e. taking the futex.
+
+Cure it by rereading the user space value when PF_EXITING and PF_EXITPIDONE
+is set in the task which 'owns' the futex. If the value has changed, let
+the kernel retry the operation, which includes all regular sanity checks
+and correctly handles the FUTEX_OWNER_DIED case.
+
+If it hasn't changed, then return ESRCH as there is no way to distinguish
+this case from malfunctioning user space. This happens when the exiting
+task did not have a robust list, the robust list was corrupted or the user
+space value in the futex was simply bogus.
+
+Reported-by: Stefan Liebler <stli@linux.ibm.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Peter Zijlstra <peterz@infradead.org>
+Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+Cc: Darren Hart <dvhart@infradead.org>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Sasha Levin <sashal@kernel.org>
+Cc: stable@vger.kernel.org
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=200467
+Link: https://lkml.kernel.org/r/20181210152311.986181245@linutronix.de
+

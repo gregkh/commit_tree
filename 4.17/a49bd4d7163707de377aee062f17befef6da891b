@@ -1,0 +1,105 @@
+mm, numa: rework do_pages_move
+
+Patch series "unclutter thp migration"
+
+Motivation:
+
+THP migration is hacked into the generic migration with rather
+surprising semantic.  The migration allocation callback is supposed to
+check whether the THP can be migrated at once and if that is not the
+case then it allocates a simple page to migrate.  unmap_and_move then
+fixes that up by splitting the THP into small pages while moving the
+head page to the newly allocated order-0 page.  Remaining pages are
+moved to the LRU list by split_huge_page.  The same happens if the THP
+allocation fails.  This is really ugly and error prone [2].
+
+I also believe that split_huge_page to the LRU lists is inherently wrong
+because all tail pages are not migrated.  Some callers will just work
+around that by retrying (e.g.  memory hotplug).  There are other pfn
+walkers which are simply broken though.  e.g. madvise_inject_error will
+migrate head and then advances next pfn by the huge page size.
+do_move_page_to_node_array, queue_pages_range (migrate_pages, mbind),
+will simply split the THP before migration if the THP migration is not
+supported then falls back to single page migration but it doesn't handle
+tail pages if the THP migration path is not able to allocate a fresh THP
+so we end up with ENOMEM and fail the whole migration which is a
+questionable behavior.  Page compaction doesn't try to migrate large
+pages so it should be immune.
+
+The first patch reworks do_pages_move which relies on a very ugly
+calling semantic when the return status is pushed to the migration path
+via private pointer.  It uses pre allocated fixed size batching to
+achieve that.  We simply cannot do the same if a THP is to be split
+during the migration path which is done in the patch 3.  Patch 2 is
+follow up cleanup which removes the mentioned return status calling
+convention ugliness.
+
+On a side note:
+
+There are some semantic issues I have encountered on the way when
+working on patch 1 but I am not addressing them here.  E.g. trying to
+move THP tail pages will result in either success or EBUSY (the later
+one more likely once we isolate head from the LRU list).  Hugetlb
+reports EACCESS on tail pages.  Some errors are reported via status
+parameter but migration failures are not even though the original
+`reason' argument suggests there was an intention to do so.  From a
+quick look into git history this never worked.  I have tried to keep the
+semantic unchanged.
+
+Then there is a relatively minor thing that the page isolation might
+fail because of pages not being on the LRU - e.g. because they are
+sitting on the per-cpu LRU caches.  Easily fixable.
+
+This patch (of 3):
+
+do_pages_move is supposed to move user defined memory (an array of
+addresses) to the user defined numa nodes (an array of nodes one for
+each address).  The user provided status array then contains resulting
+numa node for each address or an error.  The semantic of this function
+is little bit confusing because only some errors are reported back.
+Notably migrate_pages error is only reported via the return value.  This
+patch doesn't try to address these semantic nuances but rather change
+the underlying implementation.
+
+Currently we are processing user input (which can be really large) in
+batches which are stored to a temporarily allocated page.  Each address
+is resolved to its struct page and stored to page_to_node structure
+along with the requested target numa node.  The array of these
+structures is then conveyed down the page migration path via private
+argument.  new_page_node then finds the corresponding structure and
+allocates the proper target page.
+
+What is the problem with the current implementation and why to change
+it? Apart from being quite ugly it also doesn't cope with unexpected
+pages showing up on the migration list inside migrate_pages path.  That
+doesn't happen currently but the follow up patch would like to make the
+thp migration code more clear and that would need to split a THP into
+the list for some cases.
+
+How does the new implementation work? Well, instead of batching into a
+fixed size array we simply batch all pages that should be migrated to
+the same node and isolate all of them into a linked list which doesn't
+require any additional storage.  This should work reasonably well
+because page migration usually migrates larger ranges of memory to a
+specific node.  So the common case should work equally well as the
+current implementation.  Even if somebody constructs an input where the
+target numa nodes would be interleaved we shouldn't see a large
+performance impact because page migration alone doesn't really benefit
+from batching.  mmap_sem batching for the lookup is quite questionable
+and isolate_lru_page which would benefit from batching is not using it
+even in the current implementation.
+
+Link: http://lkml.kernel.org/r/20180103082555.14592-2-mhocko@kernel.org
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Kirill A. Shutemov <kirill@shutemov.name>
+Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Cc: Zi Yan <zi.yan@cs.rutgers.edu>
+Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Andrea Reale <ar@linux.vnet.ibm.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,95 @@
+perf machine: Use last_match threads cache only in single thread mode
+
+There's an issue with using threads::last_match in multithread mode
+which is enabled during the perf top synthesize. It might crash with
+following assertion:
+
+  perf: ...include/linux/refcount.h:109: refcount_inc:
+        Assertion `!(!refcount_inc_not_zero(r))' failed.
+
+The gdb backtrace looks like this:
+
+  0x00007ffff50839fb in raise () from /lib64/libc.so.6
+  (gdb)
+  #0  0x00007ffff50839fb in raise () from /lib64/libc.so.6
+  #1  0x00007ffff5085800 in abort () from /lib64/libc.so.6
+  #2  0x00007ffff507c0da in __assert_fail_base () from /lib64/libc.so.6
+  #3  0x00007ffff507c152 in __assert_fail () from /lib64/libc.so.6
+  #4  0x0000000000535ff9 in refcount_inc (r=0x7fffe8009a70)
+      at ...include/linux/refcount.h:109
+  #5  0x0000000000536771 in thread__get (thread=0x7fffe8009a40)
+      at util/thread.c:115
+  #6  0x0000000000523cd0 in ____machine__findnew_thread (machine=0xbfde38,
+      threads=0xbfdf28, pid=2, tid=2, create=true) at util/machine.c:432
+  #7  0x0000000000523eb4 in __machine__findnew_thread (machine=0xbfde38,
+      pid=2, tid=2) at util/machine.c:489
+  #8  0x0000000000523f24 in machine__findnew_thread (machine=0xbfde38,
+      pid=2, tid=2) at util/machine.c:499
+  #9  0x0000000000526fbe in machine__process_fork_event (machine=0xbfde38,
+  ...
+
+The failing assertion is this one:
+
+  REFCOUNT_WARN(!refcount_inc_not_zero(r), ...
+
+the problem is that we don't serialize access to threads::last_match.
+We serialize the access to the threads tree, but we don't care how's
+threads::last_match being accessed. Both locked/unlocked paths use
+that data and can set it. In multithreaded mode we can end up with
+invalid object in thread__get call, like in following paths race:
+
+  thread 1
+    ...
+    machine__findnew_thread
+      down_write(&threads->lock);
+      __machine__findnew_thread
+        ____machine__findnew_thread
+          th = threads->last_match;
+          if (th->tid == tid) {
+            thread__get
+
+  thread 2
+    ...
+    machine__find_thread
+      down_read(&threads->lock);
+      __machine__findnew_thread
+        ____machine__findnew_thread
+          th = threads->last_match;
+          if (th->tid == tid) {
+            thread__get
+
+  thread 3
+    ...
+    machine__process_fork_event
+      machine__remove_thread
+        __machine__remove_thread
+          threads->last_match = NULL
+          thread__put
+      thread__put
+
+Thread 1 and 2 might got stale last_match, before thread 3 clears
+it. Thread 1 and 2 then race with thread 3's thread__put and they
+might trigger the refcnt == 0 assertion above.
+
+The patch is disabling the last_match cache for multiple thread
+mode. It was originally meant for single thread scenarios, where
+it's common to have multiple sequential searches of the same
+thread.
+
+In multithread mode this does not make sense, because top's threads
+processes different /proc entries and so the 'struct threads' object
+is queried for various threads. Moreover we'd need to add more locks
+to make it work.
+
+Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: David Ahern <dsahern@gmail.com>
+Cc: Kan Liang <kan.liang@linux.intel.com>
+Cc: Lukasz Odzioba <lukasz.odzioba@intel.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/20180719143345.12963-4-jolsa@kernel.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

@@ -1,0 +1,101 @@
+mm: fix KSM data corruption
+
+Nadav reported KSM can corrupt the user data by the TLB batching
+race[1].  That means data user written can be lost.
+
+Quote from Nadav Amit:
+ "For this race we need 4 CPUs:
+
+  CPU0: Caches a writable and dirty PTE entry, and uses the stale value
+  for write later.
+
+  CPU1: Runs madvise_free on the range that includes the PTE. It would
+  clear the dirty-bit. It batches TLB flushes.
+
+  CPU2: Writes 4 to /proc/PID/clear_refs , clearing the PTEs soft-dirty.
+  We care about the fact that it clears the PTE write-bit, and of
+  course, batches TLB flushes.
+
+  CPU3: Runs KSM. Our purpose is to pass the following test in
+  write_protect_page():
+
+	if (pte_write(*pvmw.pte) || pte_dirty(*pvmw.pte) ||
+	    (pte_protnone(*pvmw.pte) && pte_savedwrite(*pvmw.pte)))
+
+  Since it will avoid TLB flush. And we want to do it while the PTE is
+  stale. Later, and before replacing the page, we would be able to
+  change the page.
+
+  Note that all the operations the CPU1-3 perform canhappen in parallel
+  since they only acquire mmap_sem for read.
+
+  We start with two identical pages. Everything below regards the same
+  page/PTE.
+
+  CPU0        CPU1        CPU2        CPU3
+  ----        ----        ----        ----
+  Write the same
+  value on page
+
+  [cache PTE as
+   dirty in TLB]
+
+              MADV_FREE
+              pte_mkclean()
+
+                          4 > clear_refs
+                          pte_wrprotect()
+
+                                      write_protect_page()
+                                      [ success, no flush ]
+
+                                      pages_indentical()
+                                      [ ok ]
+
+  Write to page
+  different value
+
+  [Ok, using stale
+   PTE]
+
+                                      replace_page()
+
+  Later, CPU1, CPU2 and CPU3 would flush the TLB, but that is too late.
+  CPU0 already wrote on the page, but KSM ignored this write, and it got
+  lost"
+
+In above scenario, MADV_FREE is fixed by changing TLB batching API
+including [set|clear]_tlb_flush_pending.  Remained thing is soft-dirty
+part.
+
+This patch changes soft-dirty uses TLB batching API instead of
+flush_tlb_mm and KSM checks pending TLB flush by using
+mm_tlb_flush_pending so that it will flush TLB to avoid data lost if
+there are other parallel threads pending TLB flush.
+
+[1] http://lkml.kernel.org/r/BD3A0EBE-ECF4-41D4-87FA-C755EA9AB6BD@gmail.com
+
+Link: http://lkml.kernel.org/r/20170802000818.4760-8-namit@vmware.com
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Reported-by: Nadav Amit <namit@vmware.com>
+Tested-by: Nadav Amit <namit@vmware.com>
+Reviewed-by: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jeff Dike <jdike@addtoit.com>
+Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Nadav Amit <nadav.amit@gmail.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Russell King <linux@armlinux.org.uk>
+Cc: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Cc: Tony Luck <tony.luck@intel.com>
+Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

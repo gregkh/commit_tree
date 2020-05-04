@@ -1,0 +1,86 @@
+bpf: implement ld_abs/ld_ind in native bpf
+
+The main part of this work is to finally allow removal of LD_ABS
+and LD_IND from the BPF core by reimplementing them through native
+eBPF instead. Both LD_ABS/LD_IND were carried over from cBPF and
+keeping them around in native eBPF caused way more trouble than
+actually worth it. To just list some of the security issues in
+the past:
+
+  * fdfaf64e7539 ("x86: bpf_jit: support negative offsets")
+  * 35607b02dbef ("sparc: bpf_jit: fix loads from negative offsets")
+  * e0ee9c12157d ("x86: bpf_jit: fix two bugs in eBPF JIT compiler")
+  * 07aee9439454 ("bpf, sparc: fix usage of wrong reg for load_skb_regs after call")
+  * 6d59b7dbf72e ("bpf, s390x: do not reload skb pointers in non-skb context")
+  * 87338c8e2cbb ("bpf, ppc64: do not reload skb pointers in non-skb context")
+
+For programs in native eBPF, LD_ABS/LD_IND are pretty much legacy
+these days due to their limitations and more efficient/flexible
+alternatives that have been developed over time such as direct
+packet access. LD_ABS/LD_IND only cover 1/2/4 byte loads into a
+register, the load happens in host endianness and its exception
+handling can yield unexpected behavior. The latter is explained
+in depth in f6b1b3bf0d5f ("bpf: fix subprog verifier bypass by
+div/mod by 0 exception") with similar cases of exceptions we had.
+In native eBPF more recent program types will disable LD_ABS/LD_IND
+altogether through may_access_skb() in verifier, and given the
+limitations in terms of exception handling, it's also disabled
+in programs that use BPF to BPF calls.
+
+In terms of cBPF, the LD_ABS/LD_IND is used in networking programs
+to access packet data. It is not used in seccomp-BPF but programs
+that use it for socket filtering or reuseport for demuxing with
+cBPF. This is mostly relevant for applications that have not yet
+migrated to native eBPF.
+
+The main complexity and source of bugs in LD_ABS/LD_IND is coming
+from their implementation in the various JITs. Most of them keep
+the model around from cBPF times by implementing a fastpath written
+in asm. They use typically two from the BPF program hidden CPU
+registers for caching the skb's headlen (skb->len - skb->data_len)
+and skb->data. Throughout the JIT phase this requires to keep track
+whether LD_ABS/LD_IND are used and if so, the two registers need
+to be recached each time a BPF helper would change the underlying
+packet data in native eBPF case. At least in eBPF case, available
+CPU registers are rare and the additional exit path out of the
+asm written JIT helper makes it also inflexible since not all
+parts of the JITer are in control from plain C. A LD_ABS/LD_IND
+implementation in eBPF therefore allows to significantly reduce
+the complexity in JITs with comparable performance results for
+them, e.g.:
+
+test_bpf             tcpdump port 22             tcpdump complex
+x64      - before    15 21 10                    14 19  18
+         - after      7 10 10                     7 10  15
+arm64    - before    40 91 92                    40 91 151
+         - after     51 64 73                    51 62 113
+
+For cBPF we now track any usage of LD_ABS/LD_IND in bpf_convert_filter()
+and cache the skb's headlen and data in the cBPF prologue. The
+BPF_REG_TMP gets remapped from R8 to R2 since it's mainly just
+used as a local temporary variable. This allows to shrink the
+image on x86_64 also for seccomp programs slightly since mapping
+to %rsi is not an ereg. In callee-saved R8 and R9 we now track
+skb data and headlen, respectively. For normal prologue emission
+in the JITs this does not add any extra instructions since R8, R9
+are pushed to stack in any case from eBPF side. cBPF uses the
+convert_bpf_ld_abs() emitter which probes the fast path inline
+already and falls back to bpf_skb_load_helper_{8,16,32}() helper
+relying on the cached skb data and headlen as well. R8 and R9
+never need to be reloaded due to bpf_helper_changes_pkt_data()
+since all skb access in cBPF is read-only. Then, for the case
+of native eBPF, we use the bpf_gen_ld_abs() emitter, which calls
+the bpf_skb_load_helper_{8,16,32}_no_cache() helper unconditionally,
+does neither cache skb data and headlen nor has an inlined fast
+path. The reason for the latter is that native eBPF does not have
+any extra registers available anyway, but even if there were, it
+avoids any reload of skb data and headlen in the first place.
+Additionally, for the negative offsets, we provide an alternative
+bpf_skb_load_bytes_relative() helper in eBPF which operates
+similarly as bpf_skb_load_bytes() and allows for more flexibility.
+Tested myself on x64, arm64, s390x, from Sandipan on ppc64.
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

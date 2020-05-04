@@ -1,0 +1,79 @@
+sched/fair: Fix cpu_util_wake() for 'execl' type workloads
+
+A ~10% regression has been reported for UnixBench's execl throughput
+test by Aaron Lu and Ye Xiaolong:
+
+  https://lkml.org/lkml/2018/10/30/765
+
+That test is pretty simple, it does a "recursive" execve() syscall on the
+same binary. Starting from the syscall, this sequence is possible:
+
+   do_execve()
+     do_execveat_common()
+       __do_execve_file()
+         sched_exec()
+           select_task_rq_fair()          <==| Task already enqueued
+             find_idlest_cpu()
+               find_idlest_group()
+                 capacity_spare_wake()    <==| Functions not called from
+		   cpu_util_wake()           | the wakeup path
+
+which means we can end up calling cpu_util_wake() not only from the
+"wakeup path", as its name would suggest. Indeed, the task doing an
+execve() syscall is already enqueued on the CPU we want to get the
+cpu_util_wake() for.
+
+The estimated utilization for a CPU computed in cpu_util_wake() was
+written under the assumption that function can be called only from the
+wakeup path. If instead the task is already enqueued, we end up with a
+utilization which does not remove the current task's contribution from
+the estimated utilization of the CPU.
+This will wrongly assume a reduced spare capacity on the current CPU and
+increase the chances to migrate the task on execve.
+
+The regression is tracked down to:
+
+ commit d519329f72a6 ("sched/fair: Update util_est only on util_avg updates")
+
+because in that patch we turn on by default the UTIL_EST sched feature.
+However, the real issue is introduced by:
+
+ commit f9be3e5961c5 ("sched/fair: Use util_est in LB and WU paths")
+
+Let's fix this by ensuring to always discount the task estimated
+utilization from the CPU's estimated utilization when the task is also
+the current one. The same benchmark of the bug report, executed on a
+dual socket 40 CPUs Intel(R) Xeon(R) CPU E5-2690 v2 @ 3.00GHz machine,
+reports these "Execl Throughput" figures (higher the better):
+
+   mainline     : 48136.5 lps
+   mainline+fix : 55376.5 lps
+
+which correspond to a 15% speedup.
+
+Moreover, since {cpu_util,capacity_spare}_wake() are not really only
+used from the wakeup path, let's remove this ambiguity by using a better
+matching name: {cpu_util,capacity_spare}_without().
+
+Since we are at that, let's also improve the existing documentation.
+
+Reported-by: Aaron Lu <aaron.lu@intel.com>
+Reported-by: Ye Xiaolong <xiaolong.ye@intel.com>
+Tested-by: Aaron Lu <aaron.lu@intel.com>
+Signed-off-by: Patrick Bellasi <patrick.bellasi@arm.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Cc: Juri Lelli <juri.lelli@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Morten Rasmussen <morten.rasmussen@arm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Quentin Perret <quentin.perret@arm.com>
+Cc: Steve Muckle <smuckle@google.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Todd Kjos <tkjos@google.com>
+Cc: Vincent Guittot <vincent.guittot@linaro.org>
+Fixes: f9be3e5961c5 (sched/fair: Use util_est in LB and WU paths)
+Link: https://lore.kernel.org/lkml/20181025093100.GB13236@e110439-lin/
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

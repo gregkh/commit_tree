@@ -1,0 +1,124 @@
+arm64: add VMAP_STACK overflow detection
+
+This patch adds stack overflow detection to arm64, usable when vmap'd stacks
+are in use.
+
+Overflow is detected in a small preamble executed for each exception entry,
+which checks whether there is enough space on the current stack for the general
+purpose registers to be saved. If there is not enough space, the overflow
+handler is invoked on a per-cpu overflow stack. This approach preserves the
+original exception information in ESR_EL1 (and where appropriate, FAR_EL1).
+
+Task and IRQ stacks are aligned to double their size, enabling overflow to be
+detected with a single bit test. For example, a 16K stack is aligned to 32K,
+ensuring that bit 14 of the SP must be zero. On an overflow (or underflow),
+this bit is flipped. Thus, overflow (of less than the size of the stack) can be
+detected by testing whether this bit is set.
+
+The overflow check is performed before any attempt is made to access the
+stack, avoiding recursive faults (and the loss of exception information
+these would entail). As logical operations cannot be performed on the SP
+directly, the SP is temporarily swapped with a general purpose register
+using arithmetic operations to enable the test to be performed.
+
+This gives us a useful error message on stack overflow, as can be trigger with
+the LKDTM overflow test:
+
+[  305.388749] lkdtm: Performing direct entry OVERFLOW
+[  305.395444] Insufficient stack space to handle exception!
+[  305.395482] ESR: 0x96000047 -- DABT (current EL)
+[  305.399890] FAR: 0xffff00000a5e7f30
+[  305.401315] Task stack:     [0xffff00000a5e8000..0xffff00000a5ec000]
+[  305.403815] IRQ stack:      [0xffff000008000000..0xffff000008004000]
+[  305.407035] Overflow stack: [0xffff80003efce4e0..0xffff80003efcf4e0]
+[  305.409622] CPU: 0 PID: 1219 Comm: sh Not tainted 4.13.0-rc3-00021-g9636aea #5
+[  305.412785] Hardware name: linux,dummy-virt (DT)
+[  305.415756] task: ffff80003d051c00 task.stack: ffff00000a5e8000
+[  305.419221] PC is at recursive_loop+0x10/0x48
+[  305.421637] LR is at recursive_loop+0x38/0x48
+[  305.423768] pc : [<ffff00000859f330>] lr : [<ffff00000859f358>] pstate: 40000145
+[  305.428020] sp : ffff00000a5e7f50
+[  305.430469] x29: ffff00000a5e8350 x28: ffff80003d051c00
+[  305.433191] x27: ffff000008981000 x26: ffff000008f80400
+[  305.439012] x25: ffff00000a5ebeb8 x24: ffff00000a5ebeb8
+[  305.440369] x23: ffff000008f80138 x22: 0000000000000009
+[  305.442241] x21: ffff80003ce65000 x20: ffff000008f80188
+[  305.444552] x19: 0000000000000013 x18: 0000000000000006
+[  305.446032] x17: 0000ffffa2601280 x16: ffff0000081fe0b8
+[  305.448252] x15: ffff000008ff546d x14: 000000000047a4c8
+[  305.450246] x13: ffff000008ff7872 x12: 0000000005f5e0ff
+[  305.452953] x11: ffff000008ed2548 x10: 000000000005ee8d
+[  305.454824] x9 : ffff000008545380 x8 : ffff00000a5e8770
+[  305.457105] x7 : 1313131313131313 x6 : 00000000000000e1
+[  305.459285] x5 : 0000000000000000 x4 : 0000000000000000
+[  305.461781] x3 : 0000000000000000 x2 : 0000000000000400
+[  305.465119] x1 : 0000000000000013 x0 : 0000000000000012
+[  305.467724] Kernel panic - not syncing: kernel stack overflow
+[  305.470561] CPU: 0 PID: 1219 Comm: sh Not tainted 4.13.0-rc3-00021-g9636aea #5
+[  305.473325] Hardware name: linux,dummy-virt (DT)
+[  305.475070] Call trace:
+[  305.476116] [<ffff000008088ad8>] dump_backtrace+0x0/0x378
+[  305.478991] [<ffff000008088e64>] show_stack+0x14/0x20
+[  305.481237] [<ffff00000895a178>] dump_stack+0x98/0xb8
+[  305.483294] [<ffff0000080c3288>] panic+0x118/0x280
+[  305.485673] [<ffff0000080c2e9c>] nmi_panic+0x6c/0x70
+[  305.486216] [<ffff000008089710>] handle_bad_stack+0x118/0x128
+[  305.486612] Exception stack(0xffff80003efcf3a0 to 0xffff80003efcf4e0)
+[  305.487334] f3a0: 0000000000000012 0000000000000013 0000000000000400 0000000000000000
+[  305.488025] f3c0: 0000000000000000 0000000000000000 00000000000000e1 1313131313131313
+[  305.488908] f3e0: ffff00000a5e8770 ffff000008545380 000000000005ee8d ffff000008ed2548
+[  305.489403] f400: 0000000005f5e0ff ffff000008ff7872 000000000047a4c8 ffff000008ff546d
+[  305.489759] f420: ffff0000081fe0b8 0000ffffa2601280 0000000000000006 0000000000000013
+[  305.490256] f440: ffff000008f80188 ffff80003ce65000 0000000000000009 ffff000008f80138
+[  305.490683] f460: ffff00000a5ebeb8 ffff00000a5ebeb8 ffff000008f80400 ffff000008981000
+[  305.491051] f480: ffff80003d051c00 ffff00000a5e8350 ffff00000859f358 ffff00000a5e7f50
+[  305.491444] f4a0: ffff00000859f330 0000000040000145 0000000000000000 0000000000000000
+[  305.492008] f4c0: 0001000000000000 0000000000000000 ffff00000a5e8350 ffff00000859f330
+[  305.493063] [<ffff00000808205c>] __bad_stack+0x88/0x8c
+[  305.493396] [<ffff00000859f330>] recursive_loop+0x10/0x48
+[  305.493731] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.494088] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.494425] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.494649] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.494898] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.495205] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.495453] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.495708] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.496000] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.496302] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.496644] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.496894] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.497138] [<ffff00000859f358>] recursive_loop+0x38/0x48
+[  305.497325] [<ffff00000859f3dc>] lkdtm_OVERFLOW+0x14/0x20
+[  305.497506] [<ffff00000859f314>] lkdtm_do_action+0x1c/0x28
+[  305.497786] [<ffff00000859f178>] direct_entry+0xe0/0x170
+[  305.498095] [<ffff000008345568>] full_proxy_write+0x60/0xa8
+[  305.498387] [<ffff0000081fb7f4>] __vfs_write+0x1c/0x128
+[  305.498679] [<ffff0000081fcc68>] vfs_write+0xa0/0x1b0
+[  305.498926] [<ffff0000081fe0fc>] SyS_write+0x44/0xa0
+[  305.499182] Exception stack(0xffff00000a5ebec0 to 0xffff00000a5ec000)
+[  305.499429] bec0: 0000000000000001 000000001c4cf5e0 0000000000000009 000000001c4cf5e0
+[  305.499674] bee0: 574f4c465245564f 0000000000000000 0000000000000000 8000000080808080
+[  305.499904] bf00: 0000000000000040 0000000000000038 fefefeff1b4bc2ff 7f7f7f7f7f7fff7f
+[  305.500189] bf20: 0101010101010101 0000000000000000 000000000047a4c8 0000000000000038
+[  305.500712] bf40: 0000000000000000 0000ffffa2601280 0000ffffc63f6068 00000000004b5000
+[  305.501241] bf60: 0000000000000001 000000001c4cf5e0 0000000000000009 000000001c4cf5e0
+[  305.501791] bf80: 0000000000000020 0000000000000000 00000000004b5000 000000001c4cc458
+[  305.502314] bfa0: 0000000000000000 0000ffffc63f7950 000000000040a3c4 0000ffffc63f70e0
+[  305.502762] bfc0: 0000ffffa2601268 0000000080000000 0000000000000001 0000000000000040
+[  305.503207] bfe0: 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+[  305.503680] [<ffff000008082fb0>] el0_svc_naked+0x24/0x28
+[  305.504720] Kernel Offset: disabled
+[  305.505189] CPU features: 0x002082
+[  305.505473] Memory Limit: none
+[  305.506181] ---[ end Kernel panic - not syncing: kernel stack overflow
+
+This patch was co-authored by Ard Biesheuvel and Mark Rutland.
+
+Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Reviewed-by: Will Deacon <will.deacon@arm.com>
+Tested-by: Laura Abbott <labbott@redhat.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: James Morse <james.morse@arm.com>
+

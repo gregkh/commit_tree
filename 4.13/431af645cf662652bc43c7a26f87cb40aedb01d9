@@ -1,0 +1,51 @@
+xprtrdma: Fix client lock-up after application signal fires
+
+After a signal, the RPC client aborts synchronous RPCs running on
+behalf of the signaled application.
+
+The server is still executing those RPCs, and will write the results
+back into the client's memory when it's done. By the time the server
+writes the results, that memory is likely being used for other
+purposes. Therefore xprtrdma has to immediately invalidate all
+memory regions used by those aborted RPCs to prevent the server's
+writes from clobbering that re-used memory.
+
+With FMR memory registration, invalidation takes a relatively long
+time. In fact, the invalidation is often still running when the
+server tries to write the results into the memory regions that are
+being invalidated.
+
+This sets up a race between two processes:
+
+1.  After the signal, xprt_rdma_free calls ro_unmap_safe.
+2.  While ro_unmap_safe is still running, the server replies and
+    rpcrdma_reply_handler runs, calling ro_unmap_sync.
+
+Both processes invoke ib_unmap_fmr on the same FMR.
+
+The mlx4 driver allows two ib_unmap_fmr calls on the same FMR at
+the same time, but HCAs generally don't tolerate this. Sometimes
+this can result in a system crash.
+
+If the HCA happens to survive, rpcrdma_reply_handler continues. It
+removes the rpc_rqst from rq_list and releases the transport_lock.
+This enables xprt_rdma_free to run in another process, and the
+rpc_rqst is released while rpcrdma_reply_handler is still waiting
+for the ib_unmap_fmr call to finish.
+
+But further down in rpcrdma_reply_handler, the transport_lock is
+taken again, and "rqst" is dereferenced. If "rqst" has already been
+released, this triggers a general protection fault. Since bottom-
+halves are disabled, the system locks up.
+
+Address both issues by reversing the order of the xprt_lookup_rqst
+call and the ro_unmap_sync call. Introduce a separate lookup
+mechanism for rpcrdma_req's to enable calling ro_unmap_sync before
+xprt_lookup_rqst. Now the handler takes the transport_lock once
+and holds it for the XID lookup and RPC completion.
+
+BugLink: https://bugzilla.linux-nfs.org/show_bug.cgi?id=305
+Fixes: 68791649a725 ('xprtrdma: Invalidate in the RPC reply ... ')
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+

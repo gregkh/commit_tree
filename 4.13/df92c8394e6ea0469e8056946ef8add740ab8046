@@ -1,0 +1,81 @@
+tcp: fix xmit timer to only be reset if data ACKed/SACKed
+
+Fix a TCP loss recovery performance bug raised recently on the netdev
+list, in two threads:
+
+(i)  July 26, 2017: netdev thread "TCP fast retransmit issues"
+(ii) July 26, 2017: netdev thread:
+     "[PATCH V2 net-next] TLP: Don't reschedule PTO when there's one
+     outstanding TLP retransmission"
+
+The basic problem is that incoming TCP packets that did not indicate
+forward progress could cause the xmit timer (TLP or RTO) to be rearmed
+and pushed back in time. In certain corner cases this could result in
+the following problems noted in these threads:
+
+ - Repeated ACKs coming in with bogus SACKs corrupted by middleboxes
+   could cause TCP to repeatedly schedule TLPs forever. We kept
+   sending TLPs after every ~200ms, which elicited bogus SACKs, which
+   caused more TLPs, ad infinitum; we never fired an RTO to fill in
+   the holes.
+
+ - Incoming data segments could, in some cases, cause us to reschedule
+   our RTO or TLP timer further out in time, for no good reason. This
+   could cause repeated inbound data to result in stalls in outbound
+   data, in the presence of packet loss.
+
+This commit fixes these bugs by changing the TLP and RTO ACK
+processing to:
+
+ (a) Only reschedule the xmit timer once per ACK.
+
+ (b) Only reschedule the xmit timer if tcp_clean_rtx_queue() deems the
+     ACK indicates sufficient forward progress (a packet was
+     cumulatively ACKed, or we got a SACK for a packet that was sent
+     before the most recent retransmit of the write queue head).
+
+This brings us back into closer compliance with the RFCs, since, as
+the comment for tcp_rearm_rto() notes, we should only restart the RTO
+timer after forward progress on the connection. Previously we were
+restarting the xmit timer even in these cases where there was no
+forward progress.
+
+As a side benefit, this commit simplifies and speeds up the TCP timer
+arming logic. We had been calling inet_csk_reset_xmit_timer() three
+times on normal ACKs that cumulatively acknowledged some data:
+
+1) Once near the top of tcp_ack() to switch from TLP timer to RTO:
+        if (icsk->icsk_pending == ICSK_TIME_LOSS_PROBE)
+               tcp_rearm_rto(sk);
+
+2) Once in tcp_clean_rtx_queue(), to update the RTO:
+        if (flag & FLAG_ACKED) {
+               tcp_rearm_rto(sk);
+
+3) Once in tcp_ack() after tcp_fastretrans_alert() to switch from RTO
+   to TLP:
+        if (icsk->icsk_pending == ICSK_TIME_RETRANS)
+               tcp_schedule_loss_probe(sk);
+
+This commit, by only rescheduling the xmit timer once per ACK,
+simplifies the code and reduces CPU overhead.
+
+This commit was tested in an A/B test with Google web server
+traffic. SNMP stats and request latency metrics were within noise
+levels, substantiating that for normal web traffic patterns this is a
+rare issue. This commit was also tested with packetdrill tests to
+verify that it fixes the timer behavior in the corner cases discussed
+in the netdev threads mentioned above.
+
+This patch is a bug fix patch intended to be queued for -stable
+relases.
+
+Fixes: 6ba8a3b19e76 ("tcp: Tail loss probe (TLP)")
+Reported-by: Klavs Klavsen <kl@vsen.dk>
+Reported-by: Mao Wenan <maowenan@huawei.com>
+Signed-off-by: Neal Cardwell <ncardwell@google.com>
+Signed-off-by: Yuchung Cheng <ycheng@google.com>
+Signed-off-by: Nandita Dukkipati <nanditad@google.com>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

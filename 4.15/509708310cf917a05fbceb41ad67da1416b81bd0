@@ -1,0 +1,158 @@
+r8169: Add support for interrupt coalesce tuning (ethtool -C)
+
+Kirr: In particular with
+
+	ethtool -C <ifname> rx-usecs 0 rx-frames 0
+
+now it is possible to disable RX delays when NIC usage requires low-latency.
+
+See this thread for context:
+
+	https://www.spinics.net/lists/netdev/msg217665.html
+
+My specific case is that:
+
+We have many computers with gigabit Realtek NICs. For 2 such computers
+connected to a gigabit store-and-forward switch the minimum round-trip
+time for small pings (`ping -i 0 -w 3 -s 56 -q peer`) is ~ 30μs.
+
+However it turned out that when Ethernet frame length transitions 127 ->
+128 bytes (`ping -i 0 -w 3 -s {81 -> 82} -q peer`) the lowest RTT
+transitions step-wise to ~ 270μs.
+
+As David Light said this is RX interrupt mitigation done by NIC which creates
+the latency. For workloads when low-latency is required with e.g. Intel,
+BCM etc NIC drivers one just uses `ethtool -C rx-usecs ...` to reduce
+the time NIC delays before interrupting CPU, but it turned out
+`ethtool -C` is not supported by r8169 driver.
+
+Like Stéphane ANCELOT I've traced the problem down to IntrMitigate being
+hardcoded to != 0 for our chips (we have 8168 based NICs):
+
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/net/ethernet/realtek/r8169.c#n5460
+static void rtl_hw_start_8169(struct net_device *dev) {
+        ...
+        /*
+         * Undocumented corner. Supposedly:
+         * (TxTimer << 12) | (TxPackets << 8) | (RxTimer << 4) | RxPackets
+         */
+        RTL_W16(IntrMitigate, 0x0000);
+
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/net/ethernet/realtek/r8169.c#n6346
+static void rtl_hw_start_8168(struct net_device *dev) {
+        ...
+        RTL_W16(IntrMitigate, 0x5151);
+
+and then I've also found
+
+	https://www.spinics.net/lists/netdev/msg217665.html
+
+and original Francois' patch:
+
+	https://www.spinics.net/lists/netdev/msg217984.html
+	https://www.spinics.net/lists/netdev/msg218207.html
+
+So could we please finally get support for tuning r8169 interrupt
+coalescing in tree? (so that next poor soul who hits the problem does
+not need to go all the way to dig into driver sources and internet
+wildly and finally patch locally
+
+        -RTL_W16(IntrMitigate, 0x5151);
+        +RTL_W16(IntrMitigate, 0x5100);
+
+guessing whether it is right or not and also having to care to deploy
+the patch everywhere it needs to be used, etc...).
+
+To do so I've took original Francois's patch from 2012 and reworked it a bit:
+
+- updated to latest net-next.git;
+- adjusted scaling setup based on feedback from Hayes to pick up scaling
+  vector depending not only on link speed but also on CPlusCmd[0:1] and to
+  adjust CPlusCmd[0:1] correspondingly when setting timings;
+- improved a bit (I think so) error handling.
+
+I've tested the patch on "RTL8168d/8111d" (XID 083000c0) and with it and
+`ethtool -C rx-usecs 0 rx-frames 0` on both ends it improves:
+
+- minimum RTT latency:
+
+        ~270μs ->  ~30μs (small packet),
+        ~330μs -> ~110μs (full 1.5K ethernet frame)
+
+- average RTT latency:
+
+        ~480μs ->  ~50μs (small packet),
+        ~560μs -> ~125μs (full 1.5K ethernet frame)
+
+( before:
+
+        root@neo1:# ping -i 0 -w 3 -s 82 -q neo2
+        PING neo2.kirr.nexedi.com (192.168.102.21) 82(110) bytes of data.
+
+        --- neo2.kirr.nexedi.com ping statistics ---
+        5906 packets transmitted, 5905 received, 0% packet loss, time 2999ms
+        rtt min/avg/max/mdev = 0.274/0.485/0.607/0.026 ms, ipg/ewma 0.508/0.489 ms
+
+        root@neo1:# ping -i 0 -w 3 -s 1472 -q neo2
+        PING neo2.kirr.nexedi.com (192.168.102.21) 1472(1500) bytes of data.
+
+        --- neo2.kirr.nexedi.com ping statistics ---
+        5073 packets transmitted, 5073 received, 0% packet loss, time 2999ms
+        rtt min/avg/max/mdev = 0.330/0.566/0.710/0.028 ms, ipg/ewma 0.591/0.544 ms
+
+  after:
+
+        root@neo1# ping -i 0 -w 3 -s 82 -q neo2
+        PING neo2.kirr.nexedi.com (192.168.102.21) 82(110) bytes of data.
+
+        --- neo2.kirr.nexedi.com ping statistics ---
+        45815 packets transmitted, 45815 received, 0% packet loss, time 3000ms
+        rtt min/avg/max/mdev = 0.036/0.051/0.368/0.010 ms, ipg/ewma 0.065/0.053 ms
+
+        root@neo1:# ping -i 0 -w 3 -s 1472 -q neo2
+        PING neo2.kirr.nexedi.com (192.168.102.21) 1472(1500) bytes of data.
+
+        --- neo2.kirr.nexedi.com ping statistics ---
+        21250 packets transmitted, 21250 received, 0% packet loss, time 3000ms
+        rtt min/avg/max/mdev = 0.112/0.125/0.390/0.007 ms, ipg/ewma 0.141/0.125 ms
+
+  the small -> 1.5K latency growth is understandable as it takes ~15μs
+  to transmit 1.5K on 1Gbps on the wire and with 2 hosts and 1 switch
+  and ICMP ECHO + ECHO reply the packet has to travel 4 ethernet
+  segments which is already 60μs;
+
+  probably something a bit else is also there as e.g. on Linux, even
+  with `cpupower frequency-set -g performance`, on some computers I've
+  noticed the kernel can be spending more time in software-only mode
+  when incoming packets go in less frequently. E.g. this program can
+  demonstrate the effect for ICMP ECHO processing:
+
+  https://lab.nexedi.com/kirr/bcc/blob/43cfc13b/tools/pinglat.py
+
+  (later this was found to be partly due to C-states exit latencies) )
+
+We have this patch running in our testing setup for 1 months already
+without any issues observed.
+
+It remains to be clarified whether RX and TX timers use the same base.
+For now I've set them equally, but Francois's original patch version
+suggests it could be not the same.
+
+I've got no feedback at all to my original posting of this patch and questions
+
+	https://www.spinics.net/lists/netdev/msg457173.html
+
+neither from Francois, nor from any people from Realtek during one month.
+
+So I suggest we simply apply it to net-next.git now.
+
+Cc: Francois Romieu <romieu@fr.zoreil.com>
+Cc: Hayes Wang <hayeswang@realtek.com>
+Cc: Realtek linux nic maintainers <nic_swsd@realtek.com>
+Cc: David Laight <David.Laight@ACULAB.COM>
+Cc: Stéphane ANCELOT <sancelot@free.fr>
+Cc: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Kirill Smelkov <kirr@nexedi.com>
+Tested-by: Holger Hoffstätte <holger@applied-asynchrony.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

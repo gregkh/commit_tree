@@ -1,0 +1,99 @@
+ksm: introduce ksm_max_page_sharing per page deduplication limit
+
+Without a max deduplication limit for each KSM page, the list of the
+rmap_items associated to each stable_node can grow infinitely large.
+
+During the rmap walk each entry can take up to ~10usec to process
+because of IPIs for the TLB flushing (both for the primary MMU and the
+secondary MMUs with the MMU notifier).  With only 16GB of address space
+shared in the same KSM page, that would amount to dozens of seconds of
+kernel runtime.
+
+A ~256 max deduplication factor will reduce the latencies of the rmap
+walks on KSM pages to order of a few msec.  Just doing the
+cond_resched() during the rmap walks is not enough, the list size must
+have a limit too, otherwise the caller could get blocked in (schedule
+friendly) kernel computations for seconds, unexpectedly.
+
+There's room for optimization to significantly reduce the IPI delivery
+cost during the page_referenced(), but at least for page_migration in
+the KSM case (used by hard NUMA bindings, compaction and NUMA balancing)
+it may be inevitable to send lots of IPIs if each rmap_item->mm is
+active on a different CPU and there are lots of CPUs.  Even if we ignore
+the IPI delivery cost, we've still to walk the whole KSM rmap list, so
+we can't allow millions or billions (ulimited) number of entries in the
+KSM stable_node rmap_item lists.
+
+The limit is enforced efficiently by adding a second dimension to the
+stable rbtree.  So there are three types of stable_nodes: the regular
+ones (identical as before, living in the first flat dimension of the
+stable rbtree), the "chains" and the "dups".
+
+Every "chain" and all "dups" linked into a "chain" enforce the invariant
+that they represent the same write protected memory content, even if
+each "dup" will be pointed by a different KSM page copy of that content.
+This way the stable rbtree lookup computational complexity is unaffected
+if compared to an unlimited max_sharing_limit.  It is still enforced
+that there cannot be KSM page content duplicates in the stable rbtree
+itself.
+
+Adding the second dimension to the stable rbtree only after the
+max_page_sharing limit hits, provides for a zero memory footprint
+increase on 64bit archs.  The memory overhead of the per-KSM page
+stable_tree and per virtual mapping rmap_item is unchanged.  Only after
+the max_page_sharing limit hits, we need to allocate a stable_tree
+"chain" and rb_replace() the "regular" stable_node with the newly
+allocated stable_node "chain".  After that we simply add the "regular"
+stable_node to the chain as a stable_node "dup" by linking hlist_dup in
+the stable_node_chain->hlist.  This way the "regular" (flat) stable_node
+is converted to a stable_node "dup" living in the second dimension of
+the stable rbtree.
+
+During stable rbtree lookups the stable_node "chain" is identified as
+stable_node->rmap_hlist_len == STABLE_NODE_CHAIN (aka
+is_stable_node_chain()).
+
+When dropping stable_nodes, the stable_node "dup" is identified as
+stable_node->head == STABLE_NODE_DUP_HEAD (aka is_stable_node_dup()).
+
+The STABLE_NODE_DUP_HEAD must be an unique valid pointer never used
+elsewhere in any stable_node->head/node to avoid a clashes with the
+stable_node->node.rb_parent_color pointer, and different from
+&migrate_nodes.  So the second field of &migrate_nodes is picked and
+verified as always safe with a BUILD_BUG_ON in case the list_head
+implementation changes in the future.
+
+The STABLE_NODE_DUP is picked as a random negative value in
+stable_node->rmap_hlist_len.  rmap_hlist_len cannot become negative when
+it's a "regular" stable_node or a stable_node "dup".
+
+The stable_node_chain->nid is irrelevant.  The stable_node_chain->kpfn
+is aliased in a union with a time field used to rate limit the
+stable_node_chain->hlist prunes.
+
+The garbage collection of the stable_node_chain happens lazily during
+stable rbtree lookups (as for all other kind of stable_nodes), or while
+disabling KSM with "echo 2 >/sys/kernel/mm/ksm/run" while collecting the
+entire stable rbtree.
+
+While the "regular" stable_nodes and the stable_node "dups" must wait
+for their underlying tree_page to be freed before they can be freed
+themselves, the stable_node "chains" can be freed immediately if the
+stable_node->hlist turns empty.  This is because the "chains" are never
+pointed by any page->mapping and they're effectively stable rbtree KSM
+self contained metadata.
+
+[akpm@linux-foundation.org: fix non-NUMA build]
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Tested-by: Petr Holasek <pholasek@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Arjan van de Ven <arjan@linux.intel.com>
+Cc: Evgheni Dereveanchin <ederevea@redhat.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: Gavin Guo <gavin.guo@canonical.com>
+Cc: Jay Vosburgh <jay.vosburgh@canonical.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

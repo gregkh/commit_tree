@@ -1,0 +1,98 @@
+ext4: fix deadlock between inline_data and ext4_expand_extra_isize_ea()
+
+The xattr_sem deadlock problems fixed in commit 2e81a4eeedca: "ext4:
+avoid deadlock when expanding inode size" didn't include the use of
+xattr_sem in fs/ext4/inline.c.  With the addition of project quota
+which added a new extra inode field, this exposed deadlocks in the
+inline_data code similar to the ones fixed by 2e81a4eeedca.
+
+The deadlock can be reproduced via:
+
+   dmesg -n 7
+   mke2fs -t ext4 -O inline_data -Fq -I 256 /dev/vdc 32768
+   mount -t ext4 -o debug_want_extra_isize=24 /dev/vdc /vdc
+   mkdir /vdc/a
+   umount /vdc
+   mount -t ext4 /dev/vdc /vdc
+   echo foo > /vdc/a/foo
+
+and looks like this:
+
+[   11.158815] 
+[   11.160276] =============================================
+[   11.161960] [ INFO: possible recursive locking detected ]
+[   11.161960] 4.10.0-rc3-00015-g011b30a8a3cf #160 Tainted: G        W      
+[   11.161960] ---------------------------------------------
+[   11.161960] bash/2519 is trying to acquire lock:
+[   11.161960]  (&ei->xattr_sem){++++..}, at: [<c1225a4b>] ext4_expand_extra_isize_ea+0x3d/0x4cd
+[   11.161960] 
+[   11.161960] but task is already holding lock:
+[   11.161960]  (&ei->xattr_sem){++++..}, at: [<c1227941>] ext4_try_add_inline_entry+0x3a/0x152
+[   11.161960] 
+[   11.161960] other info that might help us debug this:
+[   11.161960]  Possible unsafe locking scenario:
+[   11.161960] 
+[   11.161960]        CPU0
+[   11.161960]        ----
+[   11.161960]   lock(&ei->xattr_sem);
+[   11.161960]   lock(&ei->xattr_sem);
+[   11.161960] 
+[   11.161960]  *** DEADLOCK ***
+[   11.161960] 
+[   11.161960]  May be due to missing lock nesting notation
+[   11.161960] 
+[   11.161960] 4 locks held by bash/2519:
+[   11.161960]  #0:  (sb_writers#3){.+.+.+}, at: [<c11a2414>] mnt_want_write+0x1e/0x3e
+[   11.161960]  #1:  (&type->i_mutex_dir_key){++++++}, at: [<c119508b>] path_openat+0x338/0x67a
+[   11.161960]  #2:  (jbd2_handle){++++..}, at: [<c123314a>] start_this_handle+0x582/0x622
+[   11.161960]  #3:  (&ei->xattr_sem){++++..}, at: [<c1227941>] ext4_try_add_inline_entry+0x3a/0x152
+[   11.161960] 
+[   11.161960] stack backtrace:
+[   11.161960] CPU: 0 PID: 2519 Comm: bash Tainted: G        W       4.10.0-rc3-00015-g011b30a8a3cf #160
+[   11.161960] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.1-1 04/01/2014
+[   11.161960] Call Trace:
+[   11.161960]  dump_stack+0x72/0xa3
+[   11.161960]  __lock_acquire+0xb7c/0xcb9
+[   11.161960]  ? kvm_clock_read+0x1f/0x29
+[   11.161960]  ? __lock_is_held+0x36/0x66
+[   11.161960]  ? __lock_is_held+0x36/0x66
+[   11.161960]  lock_acquire+0x106/0x18a
+[   11.161960]  ? ext4_expand_extra_isize_ea+0x3d/0x4cd
+[   11.161960]  down_write+0x39/0x72
+[   11.161960]  ? ext4_expand_extra_isize_ea+0x3d/0x4cd
+[   11.161960]  ext4_expand_extra_isize_ea+0x3d/0x4cd
+[   11.161960]  ? _raw_read_unlock+0x22/0x2c
+[   11.161960]  ? jbd2_journal_extend+0x1e2/0x262
+[   11.161960]  ? __ext4_journal_get_write_access+0x3d/0x60
+[   11.161960]  ext4_mark_inode_dirty+0x17d/0x26d
+[   11.161960]  ? ext4_add_dirent_to_inline.isra.12+0xa5/0xb2
+[   11.161960]  ext4_add_dirent_to_inline.isra.12+0xa5/0xb2
+[   11.161960]  ext4_try_add_inline_entry+0x69/0x152
+[   11.161960]  ext4_add_entry+0xa3/0x848
+[   11.161960]  ? __brelse+0x14/0x2f
+[   11.161960]  ? _raw_spin_unlock_irqrestore+0x44/0x4f
+[   11.161960]  ext4_add_nondir+0x17/0x5b
+[   11.161960]  ext4_create+0xcf/0x133
+[   11.161960]  ? ext4_mknod+0x12f/0x12f
+[   11.161960]  lookup_open+0x39e/0x3fb
+[   11.161960]  ? __wake_up+0x1a/0x40
+[   11.161960]  ? lock_acquire+0x11e/0x18a
+[   11.161960]  path_openat+0x35c/0x67a
+[   11.161960]  ? sched_clock_cpu+0xd7/0xf2
+[   11.161960]  do_filp_open+0x36/0x7c
+[   11.161960]  ? _raw_spin_unlock+0x22/0x2c
+[   11.161960]  ? __alloc_fd+0x169/0x173
+[   11.161960]  do_sys_open+0x59/0xcc
+[   11.161960]  SyS_open+0x1d/0x1f
+[   11.161960]  do_int80_syscall_32+0x4f/0x61
+[   11.161960]  entry_INT80_32+0x2f/0x2f
+[   11.161960] EIP: 0xb76ad469
+[   11.161960] EFLAGS: 00000286 CPU: 0
+[   11.161960] EAX: ffffffda EBX: 08168ac8 ECX: 00008241 EDX: 000001b6
+[   11.161960] ESI: b75e46bc EDI: b7755000 EBP: bfbdb108 ESP: bfbdafc0
+[   11.161960]  DS: 007b ES: 007b FS: 0000 GS: 0033 SS: 007b
+
+Cc: stable@vger.kernel.org # 3.10 (requires 2e81a4eeedca as a prereq)
+Reported-by: George Spelvin <linux@sciencehorizons.net>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+

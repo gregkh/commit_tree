@@ -1,0 +1,86 @@
+watchdog/core: Remove the park_in_progress obfuscation
+
+Commit:
+
+  b94f51183b06 ("kernel/watchdog: prevent false hardlockup on overloaded system")
+
+tries to fix the following issue:
+
+proc_write()
+   set_sample_period()    <--- New sample period becoms visible
+			  <----- Broken starts
+   proc_watchdog_update()
+     watchdog_enable_all_cpus()		watchdog_hrtimer_fn()
+     update_watchdog_all_cpus()		   restart_timer(sample_period)
+        watchdog_park_threads()
+
+					thread->park()
+					  disable_nmi()
+			  <----- Broken ends
+
+The reason why this is broken is that the update of the watchdog threshold
+becomes immediately effective and visible for the hrtimer function which
+uses that value to rearm the timer. But the NMI/perf side still uses the
+old value up to the point where it is disabled. If the rate has been
+lowered then the NMI can run fast enough to 'detect' a hard lockup because
+the timer has not fired due to the longer period.
+
+The patch 'fixed' this by adding a variable:
+
+proc_write()
+   set_sample_period()
+					<----- Broken starts
+   proc_watchdog_update()
+     watchdog_enable_all_cpus()		watchdog_hrtimer_fn()
+     update_watchdog_all_cpus()		   restart_timer(sample_period)
+         watchdog_park_threads()
+	  park_in_progress = 1
+					<----- Broken ends
+				        nmi_watchdog()
+					  if (park_in_progress)
+					     return;
+
+The only effect of this variable was to make the window where the breakage
+can hit small enough that it was not longer observable in testing. From a
+correctness point of view it is a pointless bandaid which merily papers
+over the root cause: the unsychronized update of the variable.
+
+Looking deeper into the related code pathes unearthed similar problems in
+the watchdog_start()/stop() functions.
+
+ watchdog_start()
+	perf_nmi_event_start()
+	hrtimer_start()
+
+ watchdog_stop()
+	hrtimer_cancel()
+	perf_nmi_event_stop()
+
+In both cases the call order is wrong because if the tasks gets preempted
+or the VM gets scheduled out long enough after the first call, then there is
+a chance that the next NMI will see a stale hrtimer interrupt count and
+trigger a false positive hard lockup splat.
+
+Get rid of park_in_progress so the code can be gradually deobfuscated and
+pruned from several layers of duct tape papering over the root cause,
+which has been either ignored or not understood at all.
+
+Once this is removed the underlying problem will be fixed by rewriting the
+proc interface to do a proper synchronized update.
+
+Address the start/stop() ordering problem as well by reverting the call
+order, so this part is at least correct now.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Don Zickus <dzickus@redhat.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Chris Metcalf <cmetcalf@mellanox.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sebastian Siewior <bigeasy@linutronix.de>
+Cc: Ulrich Obergfell <uobergfe@redhat.com>
+Link: http://lkml.kernel.org/r/alpine.DEB.2.20.1709052038270.2393@nanos
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

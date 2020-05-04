@@ -1,0 +1,115 @@
+mm, vmscan: prevent kswapd sleeping prematurely due to mismatched classzone_idx
+
+kswapd is woken to reclaim a node based on a failed allocation request
+from any eligible zone.  Once reclaiming in balance_pgdat(), it will
+continue reclaiming until there is an eligible zone available for the
+zone it was woken for.  kswapd tracks what zone it was recently woken
+for in pgdat->kswapd_classzone_idx.  If it has not been woken recently,
+this zone will be 0.
+
+However, the decision on whether to sleep is made on
+kswapd_classzone_idx which is 0 without a recent wakeup request and that
+classzone does not account for lowmem reserves.  This allows kswapd to
+sleep when a low small zone such as ZONE_DMA is balanced for a GFP_DMA
+request even if a stream of allocations cannot use that zone.  While
+kswapd may be woken again shortly in the near future there are two
+consequences -- the pgdat bits that control congestion are cleared
+prematurely and direct reclaim is more likely as kswapd slept
+prematurely.
+
+This patch flips kswapd_classzone_idx to default to MAX_NR_ZONES (an
+invalid index) when there has been no recent wakeups.  If there are no
+wakeups, it'll decide whether to sleep based on the highest possible
+zone available (MAX_NR_ZONES - 1).  It then becomes critical that the
+"pgdat balanced" decisions during reclaim and when deciding to sleep are
+the same.  If there is a mismatch, kswapd can stay awake continually
+trying to balance tiny zones.
+
+simoop was used to evaluate it again.  Two of the preparation patches
+regressed the workload so they are included as the second set of
+results.  Otherwise this patch looks artifically excellent
+
+                                         4.11.0-rc1            4.11.0-rc1            4.11.0-rc1
+                                            vanilla              clear-v2          keepawake-v2
+Amean    p50-Read             21670074.18 (  0.00%) 19786774.76 (  8.69%) 22668332.52 ( -4.61%)
+Amean    p95-Read             25456267.64 (  0.00%) 24101956.27 (  5.32%) 26738688.00 ( -5.04%)
+Amean    p99-Read             29369064.73 (  0.00%) 27691872.71 (  5.71%) 30991404.52 ( -5.52%)
+Amean    p50-Write                1390.30 (  0.00%)     1011.91 ( 27.22%)      924.91 ( 33.47%)
+Amean    p95-Write              412901.57 (  0.00%)    34874.98 ( 91.55%)     1362.62 ( 99.67%)
+Amean    p99-Write             6668722.09 (  0.00%)   575449.60 ( 91.37%)    16854.04 ( 99.75%)
+Amean    p50-Allocation          78714.31 (  0.00%)    84246.26 ( -7.03%)    74729.74 (  5.06%)
+Amean    p95-Allocation         175533.51 (  0.00%)   400058.43 (-127.91%)   101609.74 ( 42.11%)
+Amean    p99-Allocation         247003.02 (  0.00%) 10905600.00 (-4315.17%)   125765.57 ( 49.08%)
+
+With this patch on top, write and allocation latencies are massively
+improved.  The read latencies are slightly impaired but it's worth
+noting that this is mostly due to the IO scheduler and not directly
+related to reclaim.  The vmstats are a bit of a mix but the relevant
+ones are as follows;
+
+                            4.10.0-rc7  4.10.0-rc7  4.10.0-rc7
+                          mmots-20170209 clear-v1r25keepawake-v1r25
+Swap Ins                             0           0           0
+Swap Outs                            0         608           0
+Direct pages scanned           6910672     3132699     6357298
+Kswapd pages scanned          57036946    82488665    56986286
+Kswapd pages reclaimed        55993488    63474329    55939113
+Direct pages reclaimed         6905990     2964843     6352115
+Kswapd efficiency                  98%         76%         98%
+Kswapd velocity              12494.375   17597.507   12488.065
+Direct efficiency                  99%         94%         99%
+Direct velocity               1513.835     668.306    1393.148
+Page writes by reclaim           0.000 4410243.000       0.000
+Page writes file                     0     4409635           0
+Page writes anon                     0         608           0
+Page reclaim immediate         1036792    14175203     1042571
+
+                            4.11.0-rc1  4.11.0-rc1  4.11.0-rc1
+                               vanilla  clear-v2  keepawake-v2
+Swap Ins                             0          12           0
+Swap Outs                            0         838           0
+Direct pages scanned           6579706     3237270     6256811
+Kswapd pages scanned          61853702    79961486    54837791
+Kswapd pages reclaimed        60768764    60755788    53849586
+Direct pages reclaimed         6579055     2987453     6256151
+Kswapd efficiency                  98%         75%         98%
+Page writes by reclaim           0.000 4389496.000       0.000
+Page writes file                     0     4388658           0
+Page writes anon                     0         838           0
+Page reclaim immediate         1073573    14473009      982507
+
+Swap-outs are equivalent to baseline.
+
+Direct reclaim is reduced but not eliminated.  It's worth noting that
+there are two periods of direct reclaim for this workload.  The first is
+when it switches from preparing the files for the actual test itself.
+It's a lot of file IO followed by a lot of allocs that reclaims heavily
+for a brief window.  While direct reclaim is lower with clear-v2, it is
+due to kswapd scanning aggressively and trying to reclaim the world
+which is not the right thing to do.  With the patches applied, there is
+still direct reclaim but the phase change from "creating work files" to
+starting multiple threads that allocate a lot of anonymous memory faster
+than kswapd can reclaim.
+
+Scanning/reclaim efficiency is restored by this patch.
+
+Page writes from reclaim context are back at 0 which is ideal.
+
+Pages immediately reclaimed after IO completes is slightly improved but
+it is expected this will vary slightly.
+
+On UMA, there is almost no change so this is not expected to be a
+universal win.
+
+[mgorman@suse.de: fix ->kswapd_classzone_idx initialization]
+  Link: http://lkml.kernel.org/r/20170406174538.5msrznj6nt6qpbx5@suse.de
+Link: http://lkml.kernel.org/r/20170309075657.25121-4-mgorman@techsingularity.net
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Shantanu Goel <sgoel01@yahoo.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,68 @@
+xfs: log recovery should replay deferred ops in order
+
+As part of testing log recovery with dm_log_writes, Amir Goldstein
+discovered an error in the deferred ops recovery that lead to corruption
+of the filesystem metadata if a reflink+rmap filesystem happened to shut
+down midway through a CoW remap:
+
+"This is what happens [after failed log recovery]:
+
+"Phase 1 - find and verify superblock...
+"Phase 2 - using internal log
+"        - zero log...
+"        - scan filesystem freespace and inode maps...
+"        - found root inode chunk
+"Phase 3 - for each AG...
+"        - scan (but don't clear) agi unlinked lists...
+"        - process known inodes and perform inode discovery...
+"        - agno = 0
+"data fork in regular inode 134 claims CoW block 376
+"correcting nextents for inode 134
+"bad data fork in inode 134
+"would have cleared inode 134"
+
+Hou Tao dissected the log contents of exactly such a crash:
+
+"According to the implementation of xfs_defer_finish(), these ops should
+be completed in the following sequence:
+
+"Have been done:
+"(1) CUI: Oper (160)
+"(2) BUI: Oper (161)
+"(3) CUD: Oper (194), for CUI Oper (160)
+"(4) RUI A: Oper (197), free rmap [0x155, 2, -9]
+
+"Should be done:
+"(5) BUD: for BUI Oper (161)
+"(6) RUI B: add rmap [0x155, 2, 137]
+"(7) RUD: for RUI A
+"(8) RUD: for RUI B
+
+"Actually be done by xlog_recover_process_intents()
+"(5) BUD: for BUI Oper (161)
+"(6) RUI B: add rmap [0x155, 2, 137]
+"(7) RUD: for RUI B
+"(8) RUD: for RUI A
+
+"So the rmap entry [0x155, 2, -9] for COW should be freed firstly,
+then a new rmap entry [0x155, 2, 137] will be added. However, as we can see
+from the log record in post_mount.log (generated after umount) and the trace
+print, the new rmap entry [0x155, 2, 137] are added firstly, then the rmap
+entry [0x155, 2, -9] are freed."
+
+When reconstructing the internal log state from the log items found on
+disk, it's required that deferred ops replay in exactly the same order
+that they would have had the filesystem not gone down.  However,
+replaying unfinished deferred ops can create /more/ deferred ops.  These
+new deferred ops are finished in the wrong order.  This causes fs
+corruption and replay crashes, so let's create a single defer_ops to
+handle the subsequent ops created during replay, then use one single
+transaction at the end of log recovery to ensure that everything is
+replayed in the same order as they're supposed to be.
+
+Reported-by: Amir Goldstein <amir73il@gmail.com>
+Analyzed-by: Hou Tao <houtao1@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Tested-by: Amir Goldstein <amir73il@gmail.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+

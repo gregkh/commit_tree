@@ -1,0 +1,78 @@
+srcu: Parallelize callback handling
+
+Peter Zijlstra proposed using SRCU to reduce mmap_sem contention [1,2],
+however, there are workloads that could result in a high volume of
+concurrent invocations of call_srcu(), which with current SRCU would
+result in excessive lock contention on the srcu_struct structure's
+->queue_lock, which protects SRCU's callback lists.  This commit therefore
+moves SRCU to per-CPU callback lists, thus greatly reducing contention.
+
+Because a given SRCU instance no longer has a single centralized callback
+list, starting grace periods and invoking callbacks are both more complex
+than in the single-list Classic SRCU implementation.  Starting grace
+periods and handling callbacks are now handled using an srcu_node tree
+that is in some ways similar to the rcu_node trees used by RCU-bh,
+RCU-preempt, and RCU-sched (for example, the srcu_node tree shape is
+controlled by exactly the same Kconfig options and boot parameters that
+control the shape of the rcu_node tree).
+
+In addition, the old per-CPU srcu_array structure is now named srcu_data
+and contains an rcu_segcblist structure named ->srcu_cblist for its
+callbacks (and a spinlock to protect this).  The srcu_struct gets
+an srcu_gp_seq that is used to associate callback segments with the
+corresponding completion-time grace-period number.  These completion-time
+grace-period numbers are propagated up the srcu_node tree so that the
+grace-period workqueue handler can determine whether additional grace
+periods are needed on the one hand and where to look for callbacks that
+are ready to be invoked.
+
+The srcu_barrier() function must now wait on all instances of the per-CPU
+->srcu_cblist.  Because each ->srcu_cblist is protected by ->lock,
+srcu_barrier() can remotely add the needed callbacks.  In theory,
+it could also remotely start grace periods, but in practice doing so
+is complex and racy.  And interestingly enough, it is never necessary
+for srcu_barrier() to start a grace period because srcu_barrier() only
+enqueues a callback when a callback is already present--and it turns out
+that a grace period has to have already been started for this pre-existing
+callback.  Furthermore, it is only the callback that srcu_barrier()
+needs to wait on, not any particular grace period.  Therefore, a new
+rcu_segcblist_entrain() function enqueues the srcu_barrier() function's
+callback into the same segment occupied by the last pre-existing callback
+in the list.  The special case where all the pre-existing callbacks are
+on a different list (because they are in the process of being invoked)
+is handled by enqueuing srcu_barrier()'s callback into the RCU_DONE_TAIL
+segment, relying on the done-callbacks check that takes place after all
+callbacks are inovked.
+
+Note that the readers use the same algorithm as before.  Note that there
+is a separate srcu_idx that tells the readers what counter to increment.
+This unfortunately cannot be combined with srcu_gp_seq because they
+need to be incremented at different times.
+
+This commit introduces some ugly #ifdefs in rcutorture.  These will go
+away when I feel good enough about Tree SRCU to ditch Classic SRCU.
+
+Some crude performance comparisons, courtesy of a quickly hacked rcuperf
+asynchronous-grace-period capability:
+
+			Callback Queuing Overhead
+			-------------------------
+	# CPUS		Classic SRCU	Tree SRCU
+	------          ------------    ---------
+	     2              0.349 us     0.342 us
+	    16             31.66  us     0.4   us
+	    41             ---------     0.417 us
+
+The times are the 90th percentiles, a statistic that was chosen to reject
+the overheads of the occasional srcu_barrier() call needed to avoid OOMing
+the test machine.  The rcuperf test hangs when running Classic SRCU at 41
+CPUs, hence the line of dashes.  Despite the hacks to both the rcuperf code
+and that statistics, this is a convincing demonstration of Tree SRCU's
+performance and scalability advantages.
+
+[1] https://lwn.net/Articles/309030/
+[2] https://patchwork.kernel.org/patch/5108281/
+
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+[ paulmck: Fix initialization if synchronize_srcu_expedited() called first. ]
+

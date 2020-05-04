@@ -1,0 +1,66 @@
+xfs: mark speculative prealloc CoW fork extents unwritten
+
+Christoph Hellwig pointed out that there's a potentially nasty race when
+performing simultaneous nearby directio cow writes:
+
+"Thread 1 writes a range from B to c
+
+"                    B --------- C
+                           p
+
+"a little later thread 2 writes from A to B
+
+"        A --------- B
+               p
+
+[editor's note: the 'p' denote cowextsize boundaries, which I added to
+make this more clear]
+
+"but the code preallocates beyond B into the range where thread
+"1 has just written, but ->end_io hasn't been called yet.
+"But once ->end_io is called thread 2 has already allocated
+"up to the extent size hint into the write range of thread 1,
+"so the end_io handler will splice the unintialized blocks from
+"that preallocation back into the file right after B."
+
+We can avoid this race by ensuring that thread 1 cannot accidentally
+remap the blocks that thread 2 allocated (as part of speculative
+preallocation) as part of t2's write preparation in t1's end_io handler.
+The way we make this happen is by taking advantage of the unwritten
+extent flag as an intermediate step.
+
+Recall that when we begin the process of writing data to shared blocks,
+we create a delayed allocation extent in the CoW fork:
+
+D: --RRRRRRSSSRRRRRRRR---
+C: ------DDDDDDD---------
+
+When a thread prepares to CoW some dirty data out to disk, it will now
+convert the delalloc reservation into an /unwritten/ allocated extent in
+the cow fork.  The da conversion code tries to opportunistically
+allocate as much of a (speculatively prealloc'd) extent as possible, so
+we may end up allocating a larger extent than we're actually writing
+out:
+
+D: --RRRRRRSSSRRRRRRRR---
+U: ------UUUUUUU---------
+
+Next, we convert only the part of the extent that we're actively
+planning to write to normal (i.e. not unwritten) status:
+
+D: --RRRRRRSSSRRRRRRRR---
+U: ------UURRUUU---------
+
+If the write succeeds, the end_cow function will now scan the relevant
+range of the CoW fork for real extents and remap only the real extents
+into the data fork:
+
+D: --RRRRRRRRSRRRRRRRR---
+U: ------UU--UUU---------
+
+This ensures that we never obliterate valid data fork extents with
+unwritten blocks from the CoW fork.
+
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+

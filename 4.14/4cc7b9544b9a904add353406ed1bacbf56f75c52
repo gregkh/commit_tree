@@ -1,0 +1,99 @@
+bpf: devmap fix mutex in rcu critical section
+
+Originally we used a mutex to protect concurrent devmap update
+and delete operations from racing with netdev unregister notifier
+callbacks.
+
+The notifier hook is needed because we increment the netdev ref
+count when a dev is added to the devmap. This ensures the netdev
+reference is valid in the datapath. However, we don't want to block
+unregister events, hence the initial mutex and notifier handler.
+
+The concern was in the notifier hook we search the map for dev
+entries that hold a refcnt on the net device being torn down. But,
+in order to do this we require two steps,
+
+  (i) dereference the netdev:  dev = rcu_dereference(map[i])
+ (ii) test ifindex:   dev->ifindex == removing_ifindex
+
+and then finally we can swap in the NULL dev in the map via an
+xchg operation,
+
+  xchg(map[i], NULL)
+
+The danger here is a concurrent update could run a different
+xchg op concurrently leading us to replace the new dev with a
+NULL dev incorrectly.
+
+      CPU 1                        CPU 2
+
+   notifier hook                   bpf devmap update
+
+   dev = rcu_dereference(map[i])
+                                   dev = rcu_dereference(map[i])
+                                   xchg(map[i]), new_dev);
+                                   rcu_call(dev,...)
+   xchg(map[i], NULL)
+
+The above flow would create the incorrect state with the dev
+reference in the update path being lost. To resolve this the
+original code used a mutex around the above block. However,
+updates, deletes, and lookups occur inside rcu critical sections
+so we can't use a mutex in this context safely.
+
+Fortunately, by writing slightly better code we can avoid the
+mutex altogether. If CPU 1 in the above example uses a cmpxchg
+and _only_ replaces the dev reference in the map when it is in
+fact the expected dev the race is removed completely. The two
+cases being illustrated here, first the race condition,
+
+      CPU 1                          CPU 2
+
+   notifier hook                     bpf devmap update
+
+   dev = rcu_dereference(map[i])
+                                     dev = rcu_dereference(map[i])
+                                     xchg(map[i]), new_dev);
+                                     rcu_call(dev,...)
+   odev = cmpxchg(map[i], dev, NULL)
+
+Now we can test the cmpxchg return value, detect odev != dev and
+abort. Or in the good case,
+
+      CPU 1                          CPU 2
+
+   notifier hook                     bpf devmap update
+   dev = rcu_dereference(map[i])
+   odev = cmpxchg(map[i], dev, NULL)
+                                     [...]
+
+Now 'odev == dev' and we can do proper cleanup.
+
+And viola the original race we tried to solve with a mutex is
+corrected and the trace noted by Sasha below is resolved due
+to removal of the mutex.
+
+Note: When walking the devmap and removing dev references as needed
+we depend on the core to fail any calls to dev_get_by_index() using
+the ifindex of the device being removed. This way we do not race with
+the user while searching the devmap.
+
+Additionally, the mutex was also protecting list add/del/read on
+the list of maps in-use. This patch converts this to an RCU list
+and spinlock implementation. This protects the list from concurrent
+alloc/free operations. The notifier hook walks this list so it uses
+RCU read semantics.
+
+BUG: sleeping function called from invalid context at kernel/locking/mutex.c:747
+in_atomic(): 1, irqs_disabled(): 0, pid: 16315, name: syz-executor1
+1 lock held by syz-executor1/16315:
+ #0:  (rcu_read_lock){......}, at: [<ffffffff8c363bc2>] map_delete_elem kernel/bpf/syscall.c:577 [inline]
+ #0:  (rcu_read_lock){......}, at: [<ffffffff8c363bc2>] SYSC_bpf kernel/bpf/syscall.c:1427 [inline]
+ #0:  (rcu_read_lock){......}, at: [<ffffffff8c363bc2>] SyS_bpf+0x1d32/0x4ba0 kernel/bpf/syscall.c:1388
+
+Fixes: 2ddf71e23cc2 ("net: add notifier hooks for devmap bpf map")
+Reported-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

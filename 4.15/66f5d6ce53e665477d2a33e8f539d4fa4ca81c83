@@ -1,0 +1,52 @@
+ipv6: replace rwlock with rcu and spinlock in fib6_table
+
+With all the preparation work before, we are now ready to replace rwlock
+with rcu and spinlock in fib6_table.
+That means now all fib6_node in fib6_table are protected by rcu. And
+when freeing fib6_node, call_rcu() is used to wait for the rcu grace
+period before releasing the memory.
+When accessing fib6_node, corresponding rcu APIs need to be used.
+And all previous sessions protected by the write lock will now be
+protected by the spin lock per table.
+All previous sessions protected by read lock will now be protected by
+rcu_read_lock().
+
+A couple of things to note here:
+1. As part of the work of replacing rwlock with rcu, the linked list of
+fn->leaf now has to be rcu protected as well. So both fn->leaf and
+rt->dst.rt6_next are now __rcu tagged and corresponding rcu APIs are
+used when manipulating them.
+
+2. For fn->rr_ptr, first of all, it also needs to be rcu protected now
+and is tagged with __rcu and rcu APIs are used in corresponding places.
+Secondly, fn->rr_ptr is changed in rt6_select() which is a reader
+thread. This makes the issue a bit complicated. We think a valid
+solution for it is to let rt6_select() grab the tb6_lock if it decides
+to change it. As it is not in the normal operation and only happens when
+there is no valid neighbor cache for the route, we think the performance
+impact should be low.
+
+3. fib6_walk_continue() has to be called with tb6_lock held even in the
+route dumping related functions, e.g. inet6_dump_fib(),
+fib6_tables_dump() and ipv6_route_seq_ops. It is because
+fib6_walk_continue() makes modifications to the walker structure, and so
+are fib6_repair_tree() and fib6_del_route(). In order to do proper
+syncing between them, we need to let fib6_walk_continue() hold the lock.
+We may be able to do further improvement on the way we do the tree walk
+to get rid of the need for holding the spin lock. But not for now.
+
+4. When fib6_del_route() removes a route from the tree, we no longer
+mark rt->dst.rt6_next to NULL to make simultaneous reader be able to
+further traverse the list with rcu. However, rt->dst.rt6_next is only
+valid within this same rcu period. No one should access it later.
+
+5. All the operation of atomic_inc(rt->rt6i_ref) is changed to be
+performed before we publish this route (either by linking it to fn->leaf
+or insert it in the list pointed by fn->leaf) just to be safe because as
+soon as we publish the route, some read thread will be able to access it.
+
+Signed-off-by: Wei Wang <weiwan@google.com>
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

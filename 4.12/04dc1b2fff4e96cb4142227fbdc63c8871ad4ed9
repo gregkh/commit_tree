@@ -1,0 +1,70 @@
+futex,rt_mutex: Fix rt_mutex_cleanup_proxy_lock()
+
+Markus reported that the glibc/nptl/tst-robustpi8 test was failing after
+commit:
+
+  cfafcd117da0 ("futex: Rework futex_lock_pi() to use rt_mutex_*_proxy_lock()")
+
+The following trace shows the problem:
+
+ ld-linux-x86-64-2161  [019] ....   410.760971: SyS_futex: 00007ffbeb76b028: 80000875  op=FUTEX_LOCK_PI
+ ld-linux-x86-64-2161  [019] ...1   410.760972: lock_pi_update_atomic: 00007ffbeb76b028: curval=80000875 uval=80000875 newval=80000875 ret=0
+ ld-linux-x86-64-2165  [011] ....   410.760978: SyS_futex: 00007ffbeb76b028: 80000875  op=FUTEX_UNLOCK_PI
+ ld-linux-x86-64-2165  [011] d..1   410.760979: do_futex: 00007ffbeb76b028: curval=80000875 uval=80000875 newval=80000871 ret=0
+ ld-linux-x86-64-2165  [011] ....   410.760980: SyS_futex: 00007ffbeb76b028: 80000871 ret=0000
+ ld-linux-x86-64-2161  [019] ....   410.760980: SyS_futex: 00007ffbeb76b028: 80000871 ret=ETIMEDOUT
+
+Task 2165 does an UNLOCK_PI, assigning the lock to the waiter task 2161
+which then returns with -ETIMEDOUT. That wrecks the lock state, because now
+the owner isn't aware it acquired the lock and removes the pending robust
+list entry.
+
+If 2161 is killed, the robust list will not clear out this futex and the
+subsequent acquire on this futex will then (correctly) result in -ESRCH
+which is unexpected by glibc, triggers an internal assertion and dies.
+
+Task 2161			Task 2165
+
+rt_mutex_wait_proxy_lock()
+   timeout();
+   /* T2161 is still queued in  the waiter list */
+   return -ETIMEDOUT;
+
+				futex_unlock_pi()
+				spin_lock(hb->lock);
+				rtmutex_unlock()
+				  remove_rtmutex_waiter(T2161);
+				   mark_lock_available();
+				/* Make the next waiter owner of the user space side */
+				futex_uval = 2161;
+				spin_unlock(hb->lock);
+spin_lock(hb->lock);
+rt_mutex_cleanup_proxy_lock()
+  if (rtmutex_owner() !== current)
+     ...
+     return FAIL;
+....
+return -ETIMEOUT;
+
+This means that rt_mutex_cleanup_proxy_lock() needs to call
+try_to_take_rt_mutex() so it can take over the rtmutex correctly which was
+assigned by the waker. If the rtmutex is owned by some other task then this
+call is harmless and just confirmes that the waiter is not able to acquire
+it.
+
+While there, fix what looks like a merge error which resulted in
+rt_mutex_cleanup_proxy_lock() having two calls to
+fixup_rt_mutex_waiters() and rt_mutex_wait_proxy_lock() not having any.
+Both should have one, since both potentially touch the waiter list.
+
+Fixes: 38d589f2fd08 ("futex,rt_mutex: Restructure rt_mutex_finish_proxy_lock()")
+Reported-by: Markus Trippelsdorf <markus@trippelsdorf.de>
+Bug-Spotted-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Florian Weimer <fweimer@redhat.com>
+Cc: Darren Hart <dvhart@infradead.org>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Markus Trippelsdorf <markus@trippelsdorf.de>
+Link: http://lkml.kernel.org/r/20170519154850.mlomgdsd26drq5j6@hirez.programming.kicks-ass.net
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+

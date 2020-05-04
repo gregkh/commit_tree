@@ -1,0 +1,68 @@
+locking/qspinlock, x86: Provide liveness guarantee
+
+On x86 we cannot do fetch_or() with a single instruction and thus end up
+using a cmpxchg loop, this reduces determinism. Replace the fetch_or()
+with a composite operation: tas-pending + load.
+
+Using two instructions of course opens a window we previously did not
+have. Consider the scenario:
+
+	CPU0		CPU1		CPU2
+
+ 1)	lock
+	  trylock -> (0,0,1)
+
+ 2)			lock
+			  trylock /* fail */
+
+ 3)	unlock -> (0,0,0)
+
+ 4)					lock
+					  trylock -> (0,0,1)
+
+ 5)			  tas-pending -> (0,1,1)
+			  load-val <- (0,1,0) from 3
+
+ 6)			  clear-pending-set-locked -> (0,0,1)
+
+			  FAIL: _2_ owners
+
+where 5) is our new composite operation. When we consider each part of
+the qspinlock state as a separate variable (as we can when
+_Q_PENDING_BITS == 8) then the above is entirely possible, because
+tas-pending will only RmW the pending byte, so the later load is able
+to observe prior tail and lock state (but not earlier than its own
+trylock, which operates on the whole word, due to coherence).
+
+To avoid this we need 2 things:
+
+ - the load must come after the tas-pending (obviously, otherwise it
+   can trivially observe prior state).
+
+ - the tas-pending must be a full word RmW instruction, it cannot be an XCHGB for
+   example, such that we cannot observe other state prior to setting
+   pending.
+
+On x86 we can realize this by using "LOCK BTS m32, r32" for
+tas-pending followed by a regular load.
+
+Note that observing later state is not a problem:
+
+ - if we fail to observe a later unlock, we'll simply spin-wait for
+   that store to become visible.
+
+ - if we observe a later xchg_tail(), there is no difference from that
+   xchg_tail() having taken place before the tas-pending.
+
+Suggested-by: Will Deacon <will.deacon@arm.com>
+Reported-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Will Deacon <will.deacon@arm.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: andrea.parri@amarulasolutions.com
+Cc: longman@redhat.com
+Fixes: 59fb586b4a07 ("locking/qspinlock: Remove unbounded cmpxchg() loop from locking slowpath")
+Link: https://lkml.kernel.org/r/20181003130957.183726335@infradead.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

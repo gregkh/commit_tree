@@ -1,0 +1,68 @@
+net: solve a NAPI race
+
+While playing with mlx4 hardware timestamping of RX packets, I found
+that some packets were received by TCP stack with a ~200 ms delay...
+
+Since the timestamp was provided by the NIC, and my probe was added
+in tcp_v4_rcv() while in BH handler, I was confident it was not
+a sender issue, or a drop in the network.
+
+This would happen with a very low probability, but hurting RPC
+workloads.
+
+A NAPI driver normally arms the IRQ after the napi_complete_done(),
+after NAPI_STATE_SCHED is cleared, so that the hard irq handler can grab
+it.
+
+Problem is that if another point in the stack grabs NAPI_STATE_SCHED bit
+while IRQ are not disabled, we might have later an IRQ firing and
+finding this bit set, right before napi_complete_done() clears it.
+
+This can happen with busy polling users, or if gro_flush_timeout is
+used. But some other uses of napi_schedule() in drivers can cause this
+as well.
+
+thread 1                                 thread 2 (could be on same cpu, or not)
+
+// busy polling or napi_watchdog()
+napi_schedule();
+...
+napi->poll()
+
+device polling:
+read 2 packets from ring buffer
+                                          Additional 3rd packet is
+available.
+                                          device hard irq
+
+                                          // does nothing because
+NAPI_STATE_SCHED bit is owned by thread 1
+                                          napi_schedule();
+
+napi_complete_done(napi, 2);
+rearm_irq();
+
+Note that rearm_irq() will not force the device to send an additional
+IRQ for the packet it already signaled (3rd packet in my example)
+
+This patch adds a new NAPI_STATE_MISSED bit, that napi_schedule_prep()
+can set if it could not grab NAPI_STATE_SCHED
+
+Then napi_complete_done() properly reschedules the napi to make sure
+we do not miss something.
+
+Since we manipulate multiple bits at once, use cmpxchg() like in
+sk_busy_loop() to provide proper transactions.
+
+In v2, I changed napi_watchdog() to use a relaxed variant of
+napi_schedule_prep() : No need to set NAPI_STATE_MISSED from this point.
+
+In v3, I added more details in the changelog and clears
+NAPI_STATE_MISSED in busy_poll_stop()
+
+In v4, I added the ideas given by Alexander Duyck in v3 review
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Alexander Duyck <alexander.duyck@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

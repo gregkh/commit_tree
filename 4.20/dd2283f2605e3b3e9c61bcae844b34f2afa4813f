@@ -1,0 +1,205 @@
+mm: mmap: zap pages with read mmap_sem in munmap
+
+Patch series "mm: zap pages with read mmap_sem in munmap for large
+mapping", v11.
+
+Background:
+Recently, when we ran some vm scalability tests on machines with large memory,
+we ran into a couple of mmap_sem scalability issues when unmapping large memory
+space, please refer to https://lkml.org/lkml/2017/12/14/733 and
+https://lkml.org/lkml/2018/2/20/576.
+
+History:
+Then akpm suggested to unmap large mapping section by section and drop mmap_sem
+at a time to mitigate it (see https://lkml.org/lkml/2018/3/6/784).
+
+V1 patch series was submitted to the mailing list per Andrew's suggestion
+(see https://lkml.org/lkml/2018/3/20/786).  Then I received a lot great
+feedback and suggestions.
+
+Then this topic was discussed on LSFMM summit 2018.  In the summit, Michal
+Hocko suggested (also in the v1 patches review) to try "two phases"
+approach.  Zapping pages with read mmap_sem, then doing via cleanup with
+write mmap_sem (for discussion detail, see
+https://lwn.net/Articles/753269/)
+
+Approach:
+Zapping pages is the most time consuming part, according to the suggestion from
+Michal Hocko [1], zapping pages can be done with holding read mmap_sem, like
+what MADV_DONTNEED does. Then re-acquire write mmap_sem to cleanup vmas.
+
+But, we can't call MADV_DONTNEED directly, since there are two major drawbacks:
+  * The unexpected state from PF if it wins the race in the middle of munmap.
+    It may return zero page, instead of the content or SIGSEGV.
+  * Can't handle VM_LOCKED | VM_HUGETLB | VM_PFNMAP and uprobe mappings, which
+    is a showstopper from akpm
+
+But, some part may need write mmap_sem, for example, vma splitting. So,
+the design is as follows:
+        acquire write mmap_sem
+        lookup vmas (find and split vmas)
+        deal with special mappings
+        detach vmas
+        downgrade_write
+
+        zap pages
+        free page tables
+        release mmap_sem
+
+The vm events with read mmap_sem may come in during page zapping, but
+since vmas have been detached before, they, i.e.  page fault, gup, etc,
+will not be able to find valid vma, then just return SIGSEGV or -EFAULT as
+expected.
+
+If the vma has VM_HUGETLB | VM_PFNMAP, they are considered as special
+mappings.  They will be handled by falling back to regular do_munmap()
+with exclusive mmap_sem held in this patch since they may update vm flags.
+
+But, with the "detach vmas first" approach, the vmas have been detached
+when vm flags are updated, so it sounds safe to update vm flags with read
+mmap_sem for this specific case.  So, VM_HUGETLB and VM_PFNMAP will be
+handled by using the optimized path in the following separate patches for
+bisectable sake.
+
+Unmapping uprobe areas may need update mm flags (MMF_RECALC_UPROBES).
+However it is fine to have false-positive MMF_RECALC_UPROBES according to
+uprobes developer.  So, uprobe unmap will not be handled by the regular
+path.
+
+With the "detach vmas first" approach we don't have to re-acquire mmap_sem
+again to clean up vmas to avoid race window which might get the address
+space changed since downgrade_write() doesn't release the lock to lead
+regression, which simply downgrades to read lock.
+
+And, since the lock acquire/release cost is managed to the minimum and
+almost as same as before, the optimization could be extended to any size
+of mapping without incurring significant penalty to small mappings.
+
+For the time being, just do this in munmap syscall path.  Other
+vm_munmap() or do_munmap() call sites (i.e mmap, mremap, etc) remain
+intact due to some implementation difficulties since they acquire write
+mmap_sem from very beginning and hold it until the end, do_munmap() might
+be called in the middle.  But, the optimized do_munmap would like to be
+called without mmap_sem held so that we can do the optimization.  So, if
+we want to do the similar optimization for mmap/mremap path, I'm afraid we
+would have to redesign them.  mremap might be called on very large area
+depending on the usecases, the optimization to it will be considered in
+the future.
+
+This patch (of 3):
+
+When running some mmap/munmap scalability tests with large memory (i.e.
+> 300GB), the below hung task issue may happen occasionally.
+
+INFO: task ps:14018 blocked for more than 120 seconds.
+       Tainted: G            E 4.9.79-009.ali3000.alios7.x86_64 #1
+ "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this
+message.
+ ps              D    0 14018      1 0x00000004
+  ffff885582f84000 ffff885e8682f000 ffff880972943000 ffff885ebf499bc0
+  ffff8828ee120000 ffffc900349bfca8 ffffffff817154d0 0000000000000040
+  00ffffff812f872a ffff885ebf499bc0 024000d000948300 ffff880972943000
+ Call Trace:
+  [<ffffffff817154d0>] ? __schedule+0x250/0x730
+  [<ffffffff817159e6>] schedule+0x36/0x80
+  [<ffffffff81718560>] rwsem_down_read_failed+0xf0/0x150
+  [<ffffffff81390a28>] call_rwsem_down_read_failed+0x18/0x30
+  [<ffffffff81717db0>] down_read+0x20/0x40
+  [<ffffffff812b9439>] proc_pid_cmdline_read+0xd9/0x4e0
+  [<ffffffff81253c95>] ? do_filp_open+0xa5/0x100
+  [<ffffffff81241d87>] __vfs_read+0x37/0x150
+  [<ffffffff812f824b>] ? security_file_permission+0x9b/0xc0
+  [<ffffffff81242266>] vfs_read+0x96/0x130
+  [<ffffffff812437b5>] SyS_read+0x55/0xc0
+  [<ffffffff8171a6da>] entry_SYSCALL_64_fastpath+0x1a/0xc5
+
+It is because munmap holds mmap_sem exclusively from very beginning to all
+the way down to the end, and doesn't release it in the middle.  When
+unmapping large mapping, it may take long time (take ~18 seconds to unmap
+320GB mapping with every single page mapped on an idle machine).
+
+Zapping pages is the most time consuming part, according to the suggestion
+from Michal Hocko [1], zapping pages can be done with holding read
+mmap_sem, like what MADV_DONTNEED does.  Then re-acquire write mmap_sem to
+cleanup vmas.
+
+But, some part may need write mmap_sem, for example, vma splitting. So,
+the design is as follows:
+        acquire write mmap_sem
+        lookup vmas (find and split vmas)
+        deal with special mappings
+        detach vmas
+        downgrade_write
+
+        zap pages
+        free page tables
+        release mmap_sem
+
+The vm events with read mmap_sem may come in during page zapping, but
+since vmas have been detached before, they, i.e.  page fault, gup, etc,
+will not be able to find valid vma, then just return SIGSEGV or -EFAULT as
+expected.
+
+If the vma has VM_HUGETLB | VM_PFNMAP, they are considered as special
+mappings.  They will be handled by without downgrading mmap_sem in this
+patch since they may update vm flags.
+
+But, with the "detach vmas first" approach, the vmas have been detached
+when vm flags are updated, so it sounds safe to update vm flags with read
+mmap_sem for this specific case.  So, VM_HUGETLB and VM_PFNMAP will be
+handled by using the optimized path in the following separate patches for
+bisectable sake.
+
+Unmapping uprobe areas may need update mm flags (MMF_RECALC_UPROBES).
+However it is fine to have false-positive MMF_RECALC_UPROBES according to
+uprobes developer.
+
+With the "detach vmas first" approach we don't have to re-acquire mmap_sem
+again to clean up vmas to avoid race window which might get the address
+space changed since downgrade_write() doesn't release the lock to lead
+regression, which simply downgrades to read lock.
+
+And, since the lock acquire/release cost is managed to the minimum and
+almost as same as before, the optimization could be extended to any size
+of mapping without incurring significant penalty to small mappings.
+
+For the time being, just do this in munmap syscall path.  Other
+vm_munmap() or do_munmap() call sites (i.e mmap, mremap, etc) remain
+intact due to some implementation difficulties since they acquire write
+mmap_sem from very beginning and hold it until the end, do_munmap() might
+be called in the middle.  But, the optimized do_munmap would like to be
+called without mmap_sem held so that we can do the optimization.  So, if
+we want to do the similar optimization for mmap/mremap path, I'm afraid we
+would have to redesign them.  mremap might be called on very large area
+depending on the usecases, the optimization to it will be considered in
+the future.
+
+With the patches, exclusive mmap_sem hold time when munmap a 80GB address
+space on a machine with 32 cores of E5-2680 @ 2.70GHz dropped to us level
+from second.
+
+munmap_test-15002 [008]   594.380138: funcgraph_entry: |
+__vm_munmap() {
+munmap_test-15002 [008]   594.380146: funcgraph_entry:      !2485684 us
+|    unmap_region();
+munmap_test-15002 [008]   596.865836: funcgraph_exit:       !2485692 us
+|  }
+
+Here the execution time of unmap_region() is used to evaluate the time of
+holding read mmap_sem, then the remaining time is used with holding
+exclusive lock.
+
+[1] https://lwn.net/Articles/753269/
+
+Link: http://lkml.kernel.org/r/1537376621-51150-2-git-send-email-yang.shi@linux.alibaba.com
+Signed-off-by: Yang Shi <yang.shi@linux.alibaba.com>Suggested-by: Michal Hocko <mhocko@kernel.org>
+Suggested-by: Kirill A. Shutemov <kirill@shutemov.name>
+Suggested-by: Matthew Wilcox <willy@infradead.org>
+Reviewed-by: Matthew Wilcox <willy@infradead.org>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Laurent Dufour <ldufour@linux.vnet.ibm.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

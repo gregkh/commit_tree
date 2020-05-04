@@ -1,0 +1,79 @@
+net/mlx5e: Add support to neighbour update flow
+
+In order to offload TC encap rules, the driver does a lookup for the IP
+tunnel neighbour according to the output device and the destination IP
+given by the user.
+
+To keep tracking after the validity state of such neighbours, we keep
+the neighbours information (pair of device pointer and destination IP)
+in a hash table maintained at the relevant egress representor and
+register to get NETEVENT_NEIGH_UPDATE events. When getting neighbour update
+netevent, we search for a match among the cached neighbours entries used for
+encapsulation.
+
+In case the neighbour isn't valid, we can't offload the flow into the
+HW. We cache the flow (requested matching and actions) in the driver and
+offload the rule later, when the neighbour is resolved and becomes
+valid.
+
+When a flow is only cached in the driver and not offloaded into HW
+yet, we use EAGAIN return value to mark it internally, the TC ndo still
+returns success.
+
+Listen to kernel neighbour update netevents to trace relevant neighbours
+validity state:
+
+1. If a neighbour becomes valid, offload the related rules to HW.
+
+2. If the neighbour becomes invalid, remove the related rules from HW.
+
+3. If the neighbour mac address was changed, update the encap header.
+   Remove all the offloaded rules using the old encap header from the HW
+   and insert new rules to HW with updated encap header.
+
+Access to the neighbors hash table is protected by RTNL lock of its
+caller or by the table's spinlock.
+
+Details of the locking/synchronization among the different actions
+applied on the neighbour table:
+
+Add/remove operations - protected by RTNL lock of its caller (all TC
+commands are protected by RTNL lock). Add and remove operations are
+initiated only when the user inserts/removes a TC rule into/from the driver.
+
+Lookup/remove operations - since the lookup operation is done from
+netevent notifier block, RTNL lock can't be used (atomic context).
+Use the table's spin lock to protect lookups from TC user removal operation.
+bh is used since netevent can be called from a softirq context.
+
+Lookup/add operations - The hash table access functions are taking
+care of the protection between lookup and add operations.
+
+When adding/removing encap headers and rules to/from the HW, RTNL lock
+is used. It can happen when:
+
+1. The user inserts/removes a TC rule into/from the driver (TC commands
+are protected by RTNL lock of it's caller).
+
+2. The driver gets neighbour notification event, which reports about
+neighbour validity status change. Before adding/removing encap headers
+and rules to/from the HW, RTNL lock is taken.
+
+A neighbour hash table entry should be freed when its encap list is empty.
+Since The neighbour update netevent notification schedules a neighbour
+update work that uses the neighbour hash entry, it can't be freed
+unconditionally when the encap list becomes empty during TC delete rule flow.
+Use reference count to protect from freeing neighbour hash table entry
+while it's still in use.
+
+When the user asks to unregister a netdvice used by one of the neigbours,
+neighbour removal notification is received. Then we take a reference on the
+neighbour and don't free it until the relevant encap entries (and flows) are
+marked as invalid (not offloaded) and removed from HW.
+As long as the encap entry is still valid (checked under RTNL lock) we
+can safely access the neighbour device saved on mlx5e_neigh struct.
+
+Signed-off-by: Hadar Hen Zion <hadarh@mellanox.com>
+Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+

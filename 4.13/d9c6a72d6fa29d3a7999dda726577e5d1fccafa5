@@ -1,0 +1,172 @@
+kmod: add test driver to stress test the module loader
+
+This adds a new stress test driver for kmod: the kernel module loader.
+The new stress test driver, test_kmod, is only enabled as a module right
+now.  It should be possible to load this as built-in and load tests
+early (refer to the force_init_test module parameter), however since a
+lot of test can get a system out of memory fast we leave this disabled
+for now.
+
+Using a system with 1024 MiB of RAM can *easily* get your kernel OOM
+fast with this test driver.
+
+The test_kmod driver exposes API knobs for us to fine tune simple
+request_module() and get_fs_type() calls.  Since these API calls only
+allow each one parameter a test driver for these is rather simple.
+Other factors that can help out test driver though are the number of
+calls we issue and knowing current limitations of each.  This exposes
+configuration as much as possible through userspace to be able to build
+tests directly from userspace.
+
+Since it allows multiple misc devices its will eventually (once we add a
+knob to let us create new devices at will) also be possible to perform
+more tests in parallel, provided you have enough memory.
+
+We only enable tests we know work as of right now.
+
+Demo screenshots:
+
+ # tools/testing/selftests/kmod/kmod.sh
+kmod_test_0001_driver: OK! - loading kmod test
+kmod_test_0001_driver: OK! - Return value: 256 (MODULE_NOT_FOUND), expected MODULE_NOT_FOUND
+kmod_test_0001_fs: OK! - loading kmod test
+kmod_test_0001_fs: OK! - Return value: -22 (-EINVAL), expected -EINVAL
+kmod_test_0002_driver: OK! - loading kmod test
+kmod_test_0002_driver: OK! - Return value: 256 (MODULE_NOT_FOUND), expected MODULE_NOT_FOUND
+kmod_test_0002_fs: OK! - loading kmod test
+kmod_test_0002_fs: OK! - Return value: -22 (-EINVAL), expected -EINVAL
+kmod_test_0003: OK! - loading kmod test
+kmod_test_0003: OK! - Return value: 0 (SUCCESS), expected SUCCESS
+kmod_test_0004: OK! - loading kmod test
+kmod_test_0004: OK! - Return value: 0 (SUCCESS), expected SUCCESS
+kmod_test_0005: OK! - loading kmod test
+kmod_test_0005: OK! - Return value: 0 (SUCCESS), expected SUCCESS
+kmod_test_0006: OK! - loading kmod test
+kmod_test_0006: OK! - Return value: 0 (SUCCESS), expected SUCCESS
+kmod_test_0005: OK! - loading kmod test
+kmod_test_0005: OK! - Return value: 0 (SUCCESS), expected SUCCESS
+kmod_test_0006: OK! - loading kmod test
+kmod_test_0006: OK! - Return value: 0 (SUCCESS), expected SUCCESS
+XXX: add test restult for 0007
+Test completed
+
+You can also request for specific tests:
+
+ # tools/testing/selftests/kmod/kmod.sh -t 0001
+kmod_test_0001_driver: OK! - loading kmod test
+kmod_test_0001_driver: OK! - Return value: 256 (MODULE_NOT_FOUND), expected MODULE_NOT_FOUND
+kmod_test_0001_fs: OK! - loading kmod test
+kmod_test_0001_fs: OK! - Return value: -22 (-EINVAL), expected -EINVAL
+Test completed
+
+Lastly, the current available number of tests:
+
+ # tools/testing/selftests/kmod/kmod.sh --help
+Usage: tools/testing/selftests/kmod/kmod.sh [ -t <4-number-digit> ]
+Valid tests: 0001-0009
+
+0001 - Simple test - 1 thread  for empty string
+0002 - Simple test - 1 thread  for modules/filesystems that do not exist
+0003 - Simple test - 1 thread  for get_fs_type() only
+0004 - Simple test - 2 threads for get_fs_type() only
+0005 - multithreaded tests with default setup - request_module() only
+0006 - multithreaded tests with default setup - get_fs_type() only
+0007 - multithreaded tests with default setup test request_module() and get_fs_type()
+0008 - multithreaded - push kmod_concurrent over max_modprobes for request_module()
+0009 - multithreaded - push kmod_concurrent over max_modprobes for get_fs_type()
+
+The following test cases currently fail, as such they are not currently
+enabled by default:
+
+ # tools/testing/selftests/kmod/kmod.sh -t 0008
+ # tools/testing/selftests/kmod/kmod.sh -t 0009
+
+To be sure to run them as intended please unload both of the modules:
+
+  o test_module
+  o xfs
+
+And ensure they are not loaded on your system prior to testing them.  If
+you use these paritions for your rootfs you can change the default test
+driver used for get_fs_type() by exporting it into your environment.  For
+example of other test defaults you can override refer to kmod.sh
+allow_user_defaults().
+
+Behind the scenes this is how we fine tune at a test case prior to
+hitting a trigger to run it:
+
+cat /sys/devices/virtual/misc/test_kmod0/config
+echo -n "2" > /sys/devices/virtual/misc/test_kmod0/config_test_case
+echo -n "ext4" > /sys/devices/virtual/misc/test_kmod0/config_test_fs
+echo -n "80" > /sys/devices/virtual/misc/test_kmod0/config_num_threads
+cat /sys/devices/virtual/misc/test_kmod0/config
+echo -n "1" > /sys/devices/virtual/misc/test_kmod0/config_num_threads
+
+Finally to trigger:
+
+echo -n "1" > /sys/devices/virtual/misc/test_kmod0/trigger_config
+
+The kmod.sh script uses the above constructs to build different test cases.
+
+A bit of interpretation of the current failures follows, first two
+premises:
+
+a) When request_module() is used userspace figures out an optimized
+   version of module order for us.  Once it finds the modules it needs, as
+   per depmod symbol dep map, it will finit_module() the respective
+   modules which are needed for the original request_module() request.
+
+b) We have an optimization in place whereby if a kernel uses
+   request_module() on a module already loaded we never bother userspace
+   as the module already is loaded.  This is all handled by kernel/kmod.c.
+
+A few things to consider to help identify root causes of issues:
+
+0) kmod 19 has a broken heuristic for modules being assumed to be
+   built-in to your kernel and will return 0 even though request_module()
+   failed.  Upgrade to a newer version of kmod.
+
+1) A get_fs_type() call for "xfs" will request_module() for "fs-xfs",
+   not for "xfs".  The optimization in kernel described in b) fails to
+   catch if we have a lot of consecutive get_fs_type() calls.  The reason
+   is the optimization in place does not look for aliases.  This means two
+   consecutive get_fs_type() calls will bump kmod_concurrent, whereas
+   request_module() will not.
+
+This one explanation why test case 0009 fails at least once for
+get_fs_type().
+
+2) If a module fails to load --- for whatever reason (kmod_concurrent
+   limit reached, file not yet present due to rootfs switch, out of
+   memory) we have a period of time during which module request for the
+   same name either with request_module() or get_fs_type() will *also*
+   fail to load even if the file for the module is ready.
+
+This explains why *multiple* NULLs are possible on test 0009.
+
+3) finit_module() consumes quite a bit of memory.
+
+4) Filesystems typically also have more dependent modules than other
+   modules, its important to note though that even though a get_fs_type()
+   call does not incur additional kmod_concurrent bumps, since userspace
+   loads dependencies it finds it needs via finit_module_fd(), it *will*
+   take much more memory to load a module with a lot of dependencies.
+
+Because of 3) and 4) we will easily run into out of memory failures with
+certain tests.  For instance test 0006 fails on qemu with 1024 MiB of RAM.
+It panics a box after reaping all userspace processes and still not
+having enough memory to reap.
+
+[arnd@arndb.de: add dependencies for test module]
+  Link: http://lkml.kernel.org/r/20170630154834.3689272-1-arnd@arndb.de
+Link: http://lkml.kernel.org/r/20170628223155.26472-3-mcgrof@kernel.org
+Signed-off-by: Luis R. Rodriguez <mcgrof@kernel.org>
+Cc: Jessica Yu <jeyu@redhat.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Rusty Russell <rusty@rustcorp.com.au>
+Cc: Michal Marek <mmarek@suse.com>
+Cc: Petr Mladek <pmladek@suse.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

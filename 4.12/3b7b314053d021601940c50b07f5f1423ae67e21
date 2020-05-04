@@ -1,0 +1,107 @@
+slub: make sysfs file removal asynchronous
+
+Commit bf5eb3de3847 ("slub: separate out sysfs_slab_release() from
+sysfs_slab_remove()") made slub sysfs file removals synchronous to
+kmem_cache shutdown.
+
+Unfortunately, this created a possible ABBA deadlock between slab_mutex
+and sysfs draining mechanism triggering the following lockdep warning.
+
+  ======================================================
+  [ INFO: possible circular locking dependency detected ]
+  4.10.0-test+ #48 Not tainted
+  -------------------------------------------------------
+  rmmod/1211 is trying to acquire lock:
+   (s_active#120){++++.+}, at: [<ffffffff81308073>] kernfs_remove+0x23/0x40
+
+  but task is already holding lock:
+   (slab_mutex){+.+.+.}, at: [<ffffffff8120f691>] kmem_cache_destroy+0x41/0x2d0
+
+  which lock already depends on the new lock.
+
+  the existing dependency chain (in reverse order) is:
+
+  -> #1 (slab_mutex){+.+.+.}:
+	 lock_acquire+0xf6/0x1f0
+	 __mutex_lock+0x75/0x950
+	 mutex_lock_nested+0x1b/0x20
+	 slab_attr_store+0x75/0xd0
+	 sysfs_kf_write+0x45/0x60
+	 kernfs_fop_write+0x13c/0x1c0
+	 __vfs_write+0x28/0x120
+	 vfs_write+0xc8/0x1e0
+	 SyS_write+0x49/0xa0
+	 entry_SYSCALL_64_fastpath+0x1f/0xc2
+
+  -> #0 (s_active#120){++++.+}:
+	 __lock_acquire+0x10ed/0x1260
+	 lock_acquire+0xf6/0x1f0
+	 __kernfs_remove+0x254/0x320
+	 kernfs_remove+0x23/0x40
+	 sysfs_remove_dir+0x51/0x80
+	 kobject_del+0x18/0x50
+	 __kmem_cache_shutdown+0x3e6/0x460
+	 kmem_cache_destroy+0x1fb/0x2d0
+	 kvm_exit+0x2d/0x80 [kvm]
+	 vmx_exit+0x19/0xa1b [kvm_intel]
+	 SyS_delete_module+0x198/0x1f0
+	 entry_SYSCALL_64_fastpath+0x1f/0xc2
+
+  other info that might help us debug this:
+
+   Possible unsafe locking scenario:
+
+	 CPU0                    CPU1
+	 ----                    ----
+    lock(slab_mutex);
+				 lock(s_active#120);
+				 lock(slab_mutex);
+    lock(s_active#120);
+
+   *** DEADLOCK ***
+
+  2 locks held by rmmod/1211:
+   #0:  (cpu_hotplug.dep_map){++++++}, at: [<ffffffff810a7877>] get_online_cpus+0x37/0x80
+   #1:  (slab_mutex){+.+.+.}, at: [<ffffffff8120f691>] kmem_cache_destroy+0x41/0x2d0
+
+  stack backtrace:
+  CPU: 3 PID: 1211 Comm: rmmod Not tainted 4.10.0-test+ #48
+  Hardware name: Hewlett-Packard HP Compaq Pro 6300 SFF/339A, BIOS K01 v02.05 05/07/2012
+  Call Trace:
+   print_circular_bug+0x1be/0x210
+   __lock_acquire+0x10ed/0x1260
+   lock_acquire+0xf6/0x1f0
+   __kernfs_remove+0x254/0x320
+   kernfs_remove+0x23/0x40
+   sysfs_remove_dir+0x51/0x80
+   kobject_del+0x18/0x50
+   __kmem_cache_shutdown+0x3e6/0x460
+   kmem_cache_destroy+0x1fb/0x2d0
+   kvm_exit+0x2d/0x80 [kvm]
+   vmx_exit+0x19/0xa1b [kvm_intel]
+   SyS_delete_module+0x198/0x1f0
+   ? SyS_delete_module+0x5/0x1f0
+   entry_SYSCALL_64_fastpath+0x1f/0xc2
+
+It'd be the cleanest to deal with the issue by removing sysfs files
+without holding slab_mutex before the rest of shutdown; however, given
+the current code structure, it is pretty difficult to do so.
+
+This patch punts sysfs file removal to a work item.  Before commit
+bf5eb3de3847, the removal was punted to a RCU delayed work item which is
+executed after release.  Now, we're punting to a different work item on
+shutdown which still maintains the goal removing the sysfs files earlier
+when destroying kmem_caches.
+
+Link: http://lkml.kernel.org/r/20170620204512.GI21326@htj.duckdns.org
+Fixes: bf5eb3de3847 ("slub: separate out sysfs_slab_release() from sysfs_slab_remove()")
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Tested-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,181 @@
+printk: use printk_safe buffers in printk
+
+Use printk_safe per-CPU buffers in printk recursion-prone blocks:
+-- around logbuf_lock protected sections in vprintk_emit() and
+   console_unlock()
+-- around down_trylock_console_sem() and up_console_sem()
+
+Note that this solution addresses deadlocks caused by printk()
+recursive calls only. That is vprintk_emit() and console_unlock().
+The rest will be converted in a followup patch.
+
+Another thing to note is that we now keep lockdep enabled in printk,
+because we are protected against the printk recursion caused by
+lockdep in vprintk_emit() by the printk-safe mechanism - we first
+switch to per-CPU buffers and only then access the deadlock-prone
+locks.
+
+Examples:
+
+1) printk() from logbuf_lock spin_lock section
+
+Assume the following code:
+  printk()
+    raw_spin_lock(&logbuf_lock);
+    WARN_ON(1);
+    raw_spin_unlock(&logbuf_lock);
+
+which now produces:
+
+ ------------[ cut here ]------------
+ WARNING: CPU: 0 PID: 366 at kernel/printk/printk.c:1811 vprintk_emit
+ CPU: 0 PID: 366 Comm: bash
+ Call Trace:
+   warn_slowpath_null+0x1d/0x1f
+   vprintk_emit+0x1cd/0x438
+   vprintk_default+0x1d/0x1f
+   printk+0x48/0x50
+  [..]
+
+2) printk() from semaphore sem->lock spin_lock section
+
+Assume the following code
+
+  printk()
+    console_trylock()
+      down_trylock()
+        raw_spin_lock_irqsave(&sem->lock, flags);
+        WARN_ON(1);
+        raw_spin_unlock_irqrestore(&sem->lock, flags);
+
+which now produces:
+
+ ------------[ cut here ]------------
+ WARNING: CPU: 1 PID: 363 at kernel/locking/semaphore.c:141 down_trylock
+ CPU: 1 PID: 363 Comm: bash
+ Call Trace:
+   warn_slowpath_null+0x1d/0x1f
+   down_trylock+0x3d/0x62
+   ? vprintk_emit+0x3f9/0x414
+   console_trylock+0x31/0xeb
+   vprintk_emit+0x3f9/0x414
+   vprintk_default+0x1d/0x1f
+   printk+0x48/0x50
+  [..]
+
+3) printk() from console_unlock()
+
+Assume the following code:
+
+  printk()
+    console_unlock()
+      raw_spin_lock(&logbuf_lock);
+      WARN_ON(1);
+      raw_spin_unlock(&logbuf_lock);
+
+which now produces:
+
+ ------------[ cut here ]------------
+ WARNING: CPU: 1 PID: 329 at kernel/printk/printk.c:2384 console_unlock
+ CPU: 1 PID: 329 Comm: bash
+ Call Trace:
+   warn_slowpath_null+0x18/0x1a
+   console_unlock+0x12d/0x559
+   ? trace_hardirqs_on_caller+0x16d/0x189
+   ? trace_hardirqs_on+0xd/0xf
+   vprintk_emit+0x363/0x374
+   vprintk_default+0x18/0x1a
+   printk+0x43/0x4b
+  [..]
+
+4) printk() from try_to_wake_up()
+
+Assume the following code:
+
+  printk()
+    console_unlock()
+      up()
+        try_to_wake_up()
+          raw_spin_lock_irqsave(&p->pi_lock, flags);
+          WARN_ON(1);
+          raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+
+which now produces:
+
+ ------------[ cut here ]------------
+ WARNING: CPU: 3 PID: 363 at kernel/sched/core.c:2028 try_to_wake_up
+ CPU: 3 PID: 363 Comm: bash
+ Call Trace:
+   warn_slowpath_null+0x1d/0x1f
+   try_to_wake_up+0x7f/0x4f7
+   wake_up_process+0x15/0x17
+   __up.isra.0+0x56/0x63
+   up+0x32/0x42
+   __up_console_sem+0x37/0x55
+   console_unlock+0x21e/0x4c2
+   vprintk_emit+0x41c/0x462
+   vprintk_default+0x1d/0x1f
+   printk+0x48/0x50
+  [..]
+
+5) printk() from call_console_drivers()
+
+Assume the following code:
+  printk()
+    console_unlock()
+      call_console_drivers()
+      ...
+          WARN_ON(1);
+
+which now produces:
+
+ ------------[ cut here ]------------
+ WARNING: CPU: 2 PID: 305 at kernel/printk/printk.c:1604 call_console_drivers
+ CPU: 2 PID: 305 Comm: bash
+ Call Trace:
+   warn_slowpath_null+0x18/0x1a
+   call_console_drivers.isra.6.constprop.16+0x3a/0xb0
+   console_unlock+0x471/0x48e
+   vprintk_emit+0x1f4/0x206
+   vprintk_default+0x18/0x1a
+   vprintk_func+0x6e/0x70
+   printk+0x3e/0x46
+  [..]
+
+6) unsupported placeholder in printk() format now prints an actual
+   warning from vscnprintf(), instead of
+   	'BUG: recent printk recursion!'.
+
+ ------------[ cut here ]------------
+ WARNING: CPU: 5 PID: 337 at lib/vsprintf.c:1900 format_decode
+ Please remove unsupported %
+  in format string
+ CPU: 5 PID: 337 Comm: bash
+ Call Trace:
+   dump_stack+0x4f/0x65
+   __warn+0xc2/0xdd
+   warn_slowpath_fmt+0x4b/0x53
+   format_decode+0x22c/0x308
+   vsnprintf+0x89/0x3b7
+   vscnprintf+0xd/0x26
+   vprintk_emit+0xb4/0x238
+   vprintk_default+0x1d/0x1f
+   vprintk_func+0x6c/0x73
+   printk+0x43/0x4b
+  [..]
+
+Link: http://lkml.kernel.org/r/20161227141611.940-7-sergey.senozhatsky@gmail.com
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Calvin Owens <calvinowens@fb.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Peter Hurley <peter@hurleysoftware.com>
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+

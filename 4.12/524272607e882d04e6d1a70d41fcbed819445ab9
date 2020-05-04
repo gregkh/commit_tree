@@ -1,0 +1,65 @@
+btrfs: Handle delalloc error correctly to avoid ordered extent hang
+
+[BUG]
+If run_delalloc_range() returns error and there is already some ordered
+extents created, btrfs will be hanged with the following backtrace:
+
+Call Trace:
+ __schedule+0x2d4/0xae0
+ schedule+0x3d/0x90
+ btrfs_start_ordered_extent+0x160/0x200 [btrfs]
+ ? wake_atomic_t_function+0x60/0x60
+ btrfs_run_ordered_extent_work+0x25/0x40 [btrfs]
+ btrfs_scrubparity_helper+0x1c1/0x620 [btrfs]
+ btrfs_flush_delalloc_helper+0xe/0x10 [btrfs]
+ process_one_work+0x2af/0x720
+ ? process_one_work+0x22b/0x720
+ worker_thread+0x4b/0x4f0
+ kthread+0x10f/0x150
+ ? process_one_work+0x720/0x720
+ ? kthread_create_on_node+0x40/0x40
+ ret_from_fork+0x2e/0x40
+
+[CAUSE]
+
+|<------------------ delalloc range --------------------------->|
+| OE 1 | OE 2 | ... | OE n |
+|<>|                       |<---------- cleanup range --------->|
+ ||
+ \_=> First page handled by end_extent_writepage() in __extent_writepage()
+
+The problem is caused by error handler of run_delalloc_range(), which
+doesn't handle any created ordered extents, leaving them waiting on
+btrfs_finish_ordered_io() to finish.
+
+However after run_delalloc_range() returns error, __extent_writepage()
+won't submit bio, so btrfs_writepage_end_io_hook() won't be triggered
+except the first page, and btrfs_finish_ordered_io() won't be triggered
+for created ordered extents either.
+
+So OE 2~n will hang forever, and if OE 1 is larger than one page, it
+will also hang.
+
+[FIX]
+Introduce btrfs_cleanup_ordered_extents() function to cleanup created
+ordered extents and finish them manually.
+
+The function is based on existing
+btrfs_endio_direct_write_update_ordered() function, and modify it to
+act just like btrfs_writepage_endio_hook() but handles specified range
+other than one page.
+
+After fix, delalloc error will be handled like:
+
+|<------------------ delalloc range --------------------------->|
+| OE 1 | OE 2 | ... | OE n |
+|<>|<--------  ----------->|<------ old error handler --------->|
+ ||          ||
+ ||          \_=> Cleaned up by cleanup_ordered_extents()
+ \_=> First page handled by end_extent_writepage() in __extent_writepage()
+
+Signed-off-by: Qu Wenruo <quwenruo@cn.fujitsu.com>
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: Liu Bo <bo.li.liu@oracle.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+

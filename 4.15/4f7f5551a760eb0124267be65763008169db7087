@@ -1,0 +1,76 @@
+ipmi: Stop timers before cleaning up the module
+
+System may crash after unloading ipmi_si.ko module
+because a timer may remain and fire after the module cleaned up resources.
+
+cleanup_one_si() contains the following processing.
+
+        /*
+         * Make sure that interrupts, the timer and the thread are
+         * stopped and will not run again.
+         */
+        if (to_clean->irq_cleanup)
+                to_clean->irq_cleanup(to_clean);
+        wait_for_timer_and_thread(to_clean);
+
+        /*
+         * Timeouts are stopped, now make sure the interrupts are off
+         * in the BMC.  Note that timers and CPU interrupts are off,
+         * so no need for locks.
+         */
+        while (to_clean->curr_msg || (to_clean->si_state != SI_NORMAL)) {
+                poll(to_clean);
+                schedule_timeout_uninterruptible(1);
+        }
+
+si_state changes as following in the while loop calling poll(to_clean).
+
+  SI_GETTING_MESSAGES
+    => SI_CHECKING_ENABLES
+     => SI_SETTING_ENABLES
+      => SI_GETTING_EVENTS
+       => SI_NORMAL
+
+As written in the code comments above,
+timers are expected to stop before the polling loop and not to run again.
+But the timer is set again in the following process
+when si_state becomes SI_SETTING_ENABLES.
+
+  => poll
+     => smi_event_handler
+       => handle_transaction_done
+          // smi_info->si_state == SI_SETTING_ENABLES
+         => start_getting_events
+           => start_new_msg
+            => smi_mod_timer
+              => mod_timer
+
+As a result, before the timer set in start_new_msg() expires,
+the polling loop may see si_state becoming SI_NORMAL
+and the module clean-up finishes.
+
+For example, hard LOCKUP and panic occurred as following.
+smi_timeout was called after smi_event_handler,
+kcs_event and hangs at port_inb()
+trying to access I/O port after release.
+
+    [exception RIP: port_inb+19]
+    RIP: ffffffffc0473053  RSP: ffff88069fdc3d80  RFLAGS: 00000006
+    RAX: ffff8806800f8e00  RBX: ffff880682bd9400  RCX: 0000000000000000
+    RDX: 0000000000000ca3  RSI: 0000000000000ca3  RDI: ffff8806800f8e40
+    RBP: ffff88069fdc3d80   R8: ffffffff81d86dfc   R9: ffffffff81e36426
+    R10: 00000000000509f0  R11: 0000000000100000  R12: 0000000000]:000000
+    R13: 0000000000000000  R14: 0000000000000246  R15: ffff8806800f8e00
+    ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0000
+ --- <NMI exception stack> ---
+
+To fix the problem I defined a flag, timer_can_start,
+as member of struct smi_info.
+The flag is enabled immediately after initializing the timer
+and disabled immediately before waiting for timer deletion.
+
+Fixes: 0cfec916e86d ("ipmi: Start the timer and thread on internal msgs")
+Signed-off-by: Yamazaki Masamitsu <m-yamazaki@ah.jp.nec.com>
+[Adjusted for recent changes in the driver.]
+Signed-off-by: Corey Minyard <cminyard@mvista.com>
+

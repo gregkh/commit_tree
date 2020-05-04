@@ -1,0 +1,110 @@
+driver core: Functional dependencies tracking support
+
+Currently, there is a problem with taking functional dependencies
+between devices into account.
+
+What I mean by a "functional dependency" is when the driver of device
+B needs device A to be functional and (generally) its driver to be
+present in order to work properly.  This has certain consequences
+for power management (suspend/resume and runtime PM ordering) and
+shutdown ordering of these devices.  In general, it also implies that
+the driver of A needs to be working for B to be probed successfully
+and it cannot be unbound from the device before the B's driver.
+
+Support for representing those functional dependencies between
+devices is added here to allow the driver core to track them and act
+on them in certain cases where applicable.
+
+The argument for doing that in the driver core is that there are
+quite a few distinct use cases involving device dependencies, they
+are relatively hard to get right in a driver (if one wants to
+address all of them properly) and it only gets worse if multiplied
+by the number of drivers potentially needing to do it.  Morever, at
+least one case (asynchronous system suspend/resume) cannot be handled
+in a single driver at all, because it requires the driver of A to
+wait for B to suspend (during system suspend) and the driver of B to
+wait for A to resume (during system resume).
+
+For this reason, represent dependencies between devices as "links",
+with the help of struct device_link objects each containing pointers
+to the "linked" devices, a list node for each of them, status
+information, flags, and an RCU head for synchronization.
+
+Also add two new list heads, representing the lists of links to the
+devices that depend on the given one (consumers) and to the devices
+depended on by it (suppliers), and a "driver presence status" field
+(needed for figuring out initial states of device links) to struct
+device.
+
+The entire data structure consisting of all of the lists of link
+objects for all devices is protected by a mutex (for link object
+addition/removal and for list walks during device driver probing
+and removal) and by SRCU (for list walking in other case that will
+be introduced by subsequent change sets).  If CONFIG_SRCU is not
+selected, however, an rwsem is used for protecting the entire data
+structure.
+
+In addition, each link object has an internal status field whose
+value reflects whether or not drivers are bound to the devices
+pointed to by the link or probing/removal of their drivers is in
+progress etc.  That field is only modified under the device links
+mutex, but it may be read outside of it in some cases (introduced by
+subsequent change sets), so modifications of it are annotated with
+WRITE_ONCE().
+
+New links are added by calling device_link_add() which takes three
+arguments: pointers to the devices in question and flags.  In
+particular, if DL_FLAG_STATELESS is set in the flags, the link status
+is not to be taken into account for this link and the driver core
+will not manage it.  In turn, if DL_FLAG_AUTOREMOVE is set in the
+flags, the driver core will remove the link automatically when the
+consumer device driver unbinds from it.
+
+One of the actions carried out by device_link_add() is to reorder
+the lists used for device shutdown and system suspend/resume to
+put the consumer device along with all of its children and all of
+its consumers (and so on, recursively) to the ends of those lists
+in order to ensure the right ordering between all of the supplier
+and consumer devices.
+
+For this reason, it is not possible to create a link between two
+devices if the would-be supplier device already depends on the
+would-be consumer device as either a direct descendant of it or a
+consumer of one of its direct descendants or one of its consumers
+and so on.
+
+There are two types of link objects, persistent and non-persistent.
+The persistent ones stay around until one of the target devices is
+deleted, while the non-persistent ones are removed automatically when
+the consumer driver unbinds from its device (ie. they are assumed to
+be valid only as long as the consumer device has a driver bound to
+it).  Persistent links are created by default and non-persistent
+links are created when the DL_FLAG_AUTOREMOVE flag is passed
+to device_link_add().
+
+Both persistent and non-persistent device links can be deleted
+with an explicit call to device_link_del().
+
+Links created without the DL_FLAG_STATELESS flag set are managed
+by the driver core using a simple state machine.  There are 5 states
+each link can be in: DORMANT (unused), AVAILABLE (the supplier driver
+is present and functional), CONSUMER_PROBE (the consumer driver is
+probing), ACTIVE (both supplier and consumer drivers are present and
+functional), and SUPPLIER_UNBIND (the supplier driver is unbinding).
+The driver core updates the link state automatically depending on
+what happens to the linked devices and for each link state specific
+actions are taken in addition to that.
+
+For example, if the supplier driver unbinds from its device, the
+driver core will also unbind the drivers of all of its consumers
+automatically under the assumption that they cannot function
+properly without the supplier.  Analogously, the driver core will
+only allow the consumer driver to bind to its device if the
+supplier driver is present and functional (ie. the link is in
+the AVAILABLE state).  If that's not the case, it will rely on
+the existing deferred probing mechanism to wait for the supplier
+driver to become available.
+
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

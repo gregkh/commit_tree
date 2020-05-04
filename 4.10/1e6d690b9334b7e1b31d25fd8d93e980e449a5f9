@@ -1,0 +1,66 @@
+md/r5cache: caching phase of r5cache
+
+As described in previous patch, write back cache operates in two
+phases: caching and writing-out. The caching phase works as:
+1. write data to journal
+   (r5c_handle_stripe_dirtying, r5c_cache_data)
+2. call bio_endio
+   (r5c_handle_data_cached, r5c_return_dev_pending_writes).
+
+Then the writing-out phase is as:
+1. Mark the stripe as write-out (r5c_make_stripe_write_out)
+2. Calcualte parity (reconstruct or RMW)
+3. Write parity (and maybe some other data) to journal device
+4. Write data and parity to RAID disks
+
+This patch implements caching phase. The cache is integrated with
+stripe cache of raid456. It leverages code of r5l_log to write
+data to journal device.
+
+Writing-out phase of the cache is implemented in the next patch.
+
+With r5cache, write operation does not wait for parity calculation
+and write out, so the write latency is lower (1 write to journal
+device vs. read and then write to raid disks). Also, r5cache will
+reduce RAID overhead (multipile IO due to read-modify-write of
+parity) and provide more opportunities of full stripe writes.
+
+This patch adds 2 flags to stripe_head.state:
+ - STRIPE_R5C_PARTIAL_STRIPE,
+ - STRIPE_R5C_FULL_STRIPE,
+
+Instead of inactive_list, stripes with cached data are tracked in
+r5conf->r5c_full_stripe_list and r5conf->r5c_partial_stripe_list.
+STRIPE_R5C_FULL_STRIPE and STRIPE_R5C_PARTIAL_STRIPE are flags for
+stripes in these lists. Note: stripes in r5c_full/partial_stripe_list
+are not considered as "active".
+
+For RMW, the code allocates an extra page for each data block
+being updated.  This is stored in r5dev->orig_page and the old data
+is read into it.  Then the prexor calculation subtracts ->orig_page
+from the parity block, and the reconstruct calculation adds the
+->page data back into the parity block.
+
+r5cache naturally excludes SkipCopy. When the array has write back
+cache, async_copy_data() will not skip copy.
+
+There are some known limitations of the cache implementation:
+
+1. Write cache only covers full page writes (R5_OVERWRITE). Writes
+   of smaller granularity are write through.
+2. Only one log io (sh->log_io) for each stripe at anytime. Later
+   writes for the same stripe have to wait. This can be improved by
+   moving log_io to r5dev.
+3. With writeback cache, read path must enter state machine, which
+   is a significant bottleneck for some workloads.
+4. There is no per stripe checkpoint (with r5l_payload_flush) in
+   the log, so recovery code has to replay more than necessary data
+   (sometimes all the log from last_checkpoint). This reduces
+   availability of the array.
+
+This patch includes a fix proposed by ZhengYuan Liu
+<liuzhengyuan@kylinos.cn>
+
+Signed-off-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Shaohua Li <shli@fb.com>
+

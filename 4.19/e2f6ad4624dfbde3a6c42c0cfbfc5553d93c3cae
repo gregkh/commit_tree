@@ -1,0 +1,113 @@
+xfs: make xfs_writepage_map extent map centric
+
+xfs_writepage_map() iterates over the bufferheads on a page to decide
+what sort of IO to do and what actions to take.  However, when it comes
+to reflink and deciding when it needs to execute a COW operation, we no
+longer look at the bufferhead state but instead we ignore than and look
+up internal state held in the COW fork extent list.
+
+This means xfs_writepage_map() is somewhat confused. It does stuff, then
+ignores it, then tries to handle the impedence mismatch by shovelling the
+results inside the existing mapping code.  It works, but it's a bit of a
+mess and it makes it hard to fix the cached map bug that the writepage
+code currently has.
+
+To unify the two different mechanisms, we first have to choose a direction.
+That's already been set - we're de-emphasising bufferheads so they are no
+longer a control structure as we need to do taht to allow for eventual
+removal.  Hence we need to move away from looking at bufferhead state to
+determine what operations we need to perform.
+
+We can't completely get rid of bufferheads yet - they do contain some
+state that is absolutely necessary, such as whether that part of the page
+contains valid data or not (buffer_uptodate()).  Other state in the
+bufferhead is redundant:
+
+	BH_dirty - the page is dirty, so we can ignore this and just
+		write it
+	BH_delay - we have delalloc extent info in the DATA fork extent
+		tree
+	BH_unwritten - same as BH_delay
+	BH_mapped - indicates we've already used it once for IO and it is
+		mapped to a disk address. Needs to be ignored for COW
+		blocks.
+
+The BH_mapped flag is an interesting case - it's supposed to indicate that
+it's already mapped to disk and so we can just use it "as is".  In theory,
+we don't even have to do an extent lookup to find where to write it too,
+but we have to do that anyway to determine we are actually writing over a
+valid extent.  Hence it's not even serving the purpose of avoiding a an
+extent lookup during writeback, and so we can pretty much ignore it.
+Especially as we have to ignore it for COW operations...
+
+Therefore, use the extent map as the source of information to tell us
+what actions we need to take and what sort of IO we should perform.  The
+first step is to have xfs_map_blocks() set the io type according to what
+it looks up.  This means it can easily handle both normal overwrite and
+COW cases.  The only thing we also need to add is the ability to return
+hole mappings.
+
+We need to return and cache hole mappings now for the case of multiple
+blocks per page.  We no longer use the BH_mapped to indicate a block over
+a hole, so we have to get that info from xfs_map_blocks().  We cache it so
+that holes that span two pages don't need separate lookups.  This allows us
+to avoid ever doing write IO over a hole, too.
+
+Now that we have xfs_map_blocks() returning both a cached map and the type
+of IO we need to perform, we can rewrite xfs_writepage_map() to drop all
+the bufferhead control. It's also much simplified because it doesn't need
+to explicitly handle COW operations.  Instead of iterating bufferheads, it
+iterates blocks within the page and then looks up what per-block state is
+required from the appropriate bufferhead.  It then validates the cached
+map, and if it's not valid, we get a new map.  If we don't get a valid map
+or it's over a hole, we skip the block.
+
+At this point, we have to remap the bufferhead via xfs_map_at_offset().
+As previously noted, we had to do this even if the buffer was already
+mapped as the mapping would be stale for XFS_IO_DELALLOC, XFS_IO_UNWRITTEN
+and XFS_IO_COW IO types.  With xfs_map_blocks() now controlling the type,
+even XFS_IO_OVERWRITE types need remapping, as converted-but-not-yet-
+written delalloc extents beyond EOF can be reported at XFS_IO_OVERWRITE.
+Bufferheads that span such regions still need their BH_Delay flags cleared
+and their block numbers calculated, so we now unconditionally map each
+bufferhead before submission.
+
+But wait! There's more - remember the old "treat unwritten extents as
+holes on read" hack?  Yeah, that means we can have a dirty page with
+unmapped, unwritten bufferheads that contain data!  What makes these so
+special is that the unwritten "hole" bufferheads do not have a valid block
+device pointer, so if we attempt to write them xfs_add_to_ioend() blows
+up. So we make xfs_map_at_offset() do the "realtime or data device"
+lookup from the inode and ignore what was or wasn't put into the
+bufferhead when the buffer was instantiated.
+
+The astute reader will have realised by now that this code treats
+unwritten extents in multiple-blocks-per-page situations differently.
+If we get any combination of unwritten blocks on a dirty page that contain
+valid data in the page, we're going to convert them to real extents.  This
+can actually be a win, because it means that pages with interleaving
+unwritten and written blocks will get converted to a single written extent
+with zeros replacing the interspersed unwritten blocks.  This is actually
+good for reducing extent list and conversion overhead, and it means we
+issue a contiguous IO instead of lots of little ones.  The downside is
+that we use up a little extra IO bandwidth.  Neither of these seem like a
+bad thing given that spinning disks are seek sensitive, and SSDs/pmem have
+bandwidth to burn and the lower Io latency/CPU overhead of fewer, larger
+IOs will result in better performance on them...
+
+As a result of all this, the only state we actually care about from the
+bufferhead is a single flag - BH_Uptodate. We still use the bufferhead to
+pass some information to the bio via xfs_add_to_ioend(), but that is
+trivial to separate and pass explicitly.  This means we really only need
+1 bit of state per block per page from the buffered write path in the
+writeback path.  Everything else we do with the bufferhead is purely to
+make the buffered IO front end continue to work correctly. i.e we've
+pretty much marginalised bufferheads in the writeback path completely.
+
+Signed-off-By: Dave Chinner <dchinner@redhat.com>
+[hch: forward port, refactor and split off bits into other commits]
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+

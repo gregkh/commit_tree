@@ -1,0 +1,71 @@
+bpf: Introduce BPF_PROG_TYPE_SK_REUSEPORT
+
+This patch adds a BPF_PROG_TYPE_SK_REUSEPORT which can select
+a SO_REUSEPORT sk from a BPF_MAP_TYPE_REUSEPORT_ARRAY.  Like other
+non SK_FILTER/CGROUP_SKB program, it requires CAP_SYS_ADMIN.
+
+BPF_PROG_TYPE_SK_REUSEPORT introduces "struct sk_reuseport_kern"
+to store the bpf context instead of using the skb->cb[48].
+
+At the SO_REUSEPORT sk lookup time, it is in the middle of transiting
+from a lower layer (ipv4/ipv6) to a upper layer (udp/tcp).  At this
+point,  it is not always clear where the bpf context can be appended
+in the skb->cb[48] to avoid saving-and-restoring cb[].  Even putting
+aside the difference between ipv4-vs-ipv6 and udp-vs-tcp.  It is not
+clear if the lower layer is only ipv4 and ipv6 in the future and
+will it not touch the cb[] again before transiting to the upper
+layer.
+
+For example, in udp_gro_receive(), it uses the 48 byte NAPI_GRO_CB
+instead of IP[6]CB and it may still modify the cb[] after calling
+the udp[46]_lib_lookup_skb().  Because of the above reason, if
+sk->cb is used for the bpf ctx, saving-and-restoring is needed
+and likely the whole 48 bytes cb[] has to be saved and restored.
+
+Instead of saving, setting and restoring the cb[], this patch opts
+to create a new "struct sk_reuseport_kern" and setting the needed
+values in there.
+
+The new BPF_PROG_TYPE_SK_REUSEPORT and "struct sk_reuseport_(kern|md)"
+will serve all ipv4/ipv6 + udp/tcp combinations.  There is no protocol
+specific usage at this point and it is also inline with the current
+sock_reuseport.c implementation (i.e. no protocol specific requirement).
+
+In "struct sk_reuseport_md", this patch exposes data/data_end/len
+with semantic similar to other existing usages.  Together
+with "bpf_skb_load_bytes()" and "bpf_skb_load_bytes_relative()",
+the bpf prog can peek anywhere in the skb.  The "bind_inany" tells
+the bpf prog that the reuseport group is bind-ed to a local
+INANY address which cannot be learned from skb.
+
+The new "bind_inany" is added to "struct sock_reuseport" which will be
+used when running the new "BPF_PROG_TYPE_SK_REUSEPORT" bpf prog in order
+to avoid repeating the "bind INANY" test on
+"sk_v6_rcv_saddr/sk->sk_rcv_saddr" every time a bpf prog is run.  It can
+only be properly initialized when a "sk->sk_reuseport" enabled sk is
+adding to a hashtable (i.e. during "reuseport_alloc()" and
+"reuseport_add_sock()").
+
+The new "sk_select_reuseport()" is the main helper that the
+bpf prog will use to select a SO_REUSEPORT sk.  It is the only function
+that can use the new BPF_MAP_TYPE_REUSEPORT_ARRAY.  As mentioned in
+the earlier patch, the validity of a selected sk is checked in
+run time in "sk_select_reuseport()".  Doing the check in
+verification time is difficult and inflexible (consider the map-in-map
+use case).  The runtime check is to compare the selected sk's reuseport_id
+with the reuseport_id that we want.  This helper will return -EXXX if the
+selected sk cannot serve the incoming request (e.g. reuseport_id
+not match).  The bpf prog can decide if it wants to do SK_DROP as its
+discretion.
+
+When the bpf prog returns SK_PASS, the kernel will check if a
+valid sk has been selected (i.e. "reuse_kern->selected_sk != NULL").
+If it does , it will use the selected sk.  If not, the kernel
+will select one from "reuse->socks[]" (as before this patch).
+
+The SK_DROP and SK_PASS handling logic will be in the next patch.
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+

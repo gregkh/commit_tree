@@ -1,0 +1,53 @@
+KVM: PPC: Book3S HV: Close race with testing for signals on guest entry
+
+At present, interrupts are hard-disabled fairly late in the guest
+entry path, in the assembly code.  Since we check for pending signals
+for the vCPU(s) task(s) earlier in the guest entry path, it is
+possible for a signal to be delivered before we enter the guest but
+not be noticed until after we exit the guest for some other reason.
+
+Similarly, it is possible for the scheduler to request a reschedule
+while we are in the guest entry path, and we won't notice until after
+we have run the guest, potentially for a whole timeslice.
+
+Furthermore, with a radix guest on POWER9, we can take the interrupt
+with the MMU on.  In this case we end up leaving interrupts
+hard-disabled after the guest exit, and they are likely to stay
+hard-disabled until we exit to userspace or context-switch to
+another process.  This was masking the fact that we were also not
+setting the RI (recoverable interrupt) bit in the MSR, meaning
+that if we had taken an interrupt, it would have crashed the host
+kernel with an unrecoverable interrupt message.
+
+To close these races, we need to check for signals and reschedule
+requests after hard-disabling interrupts, and then keep interrupts
+hard-disabled until we enter the guest.  If there is a signal or a
+reschedule request from another CPU, it will send an IPI, which will
+cause a guest exit.
+
+This puts the interrupt disabling before we call kvmppc_start_thread()
+for all the secondary threads of this core that are going to run vCPUs.
+The reason for that is that once we have started the secondary threads
+there is no easy way to back out without going through at least part
+of the guest entry path.  However, kvmppc_start_thread() includes some
+code for radix guests which needs to call smp_call_function(), which
+must be called with interrupts enabled.  To solve this problem, this
+patch moves that code into a separate function that is called earlier.
+
+When the guest exit is caused by an external interrupt, a hypervisor
+doorbell or a hypervisor maintenance interrupt, we now handle these
+using the replay facility.  __kvmppc_vcore_entry() now returns the
+trap number that caused the exit on this thread, and instead of the
+assembly code jumping to the handler entry, we return to C code with
+interrupts still hard-disabled and set the irq_happened flag in the
+PACA, so that when we do local_irq_enable() the appropriate handler
+gets called.
+
+With all this, we now have the interrupt soft-enable flag clear while
+we are in the guest.  This is useful because code in the real-mode
+hypercall handlers that checks whether interrupts are enabled will
+now see that they are disabled, which is correct, since interrupts
+are hard-disabled in the real-mode code.
+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+

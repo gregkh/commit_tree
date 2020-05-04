@@ -1,0 +1,58 @@
+rcu: Suppress false-positive splats from mid-init task resume
+
+Consider the following sequence of events in a PREEMPT=y kernel:
+
+1.	All CPUs corresponding to a given leaf rcu_node structure are
+	offline.
+
+2.	The first phase of the rcu_gp_init() function's grace-period
+	initialization runs, and sets that rcu_node structure's
+	->qsmaskinit to zero, as it should.
+
+3.	One of the CPUs corresponding to that rcu_node structure comes
+	back online.  Note that because this CPU came online after the
+	grace period started, this grace period can safely ignore this
+	newly onlined CPU.
+
+4.	A task running on the newly onlined CPU enters an RCU-preempt
+	read-side critical section, and is then preempted.  Because
+	the corresponding rcu_node structure's ->qsmask is zero,
+	rcu_preempt_ctxt_queue() leaves the rcu_node structure's
+	->gp_tasks field NULL, as it should.
+
+5.	The rcu_gp_init() function continues running the second phase of
+	grace-period initialization.  The ->qsmask field of the parent of
+	the aforementioned leaf rcu_node structure is set to not expect
+	a quiescent state from the leaf, as is only right and proper.
+
+	However, when rcu_gp_init() reaches the leaf, it invokes
+	rcu_preempt_check_blocked_tasks(), which sees that the leaf's
+	->blkd_tasks list is non-empty, and therefore sets the leaf's
+	->gp_tasks field to reference the first task on that list.
+
+6.	The grace period ends before the preempted task resumes, which
+	is perfectly fine, given that this grace period was under no
+	obligation to wait for that task to exit its late-starting
+	RCU-preempt read-side critical section.  Unfortunately, the
+	leaf's ->gp_tasks field is non-NULL, so rcu_gp_cleanup() splats.
+	After all, it appears to rcu_gp_cleanup() that the grace period
+	failed to wait for a task that was supposed to be blocking that
+	grace period.
+
+This commit avoids this false-positive splat by adding a check of both
+->qsmaskinit and ->wait_blkd_tasks to rcu_preempt_check_blocked_tasks().
+If both ->qsmaskinit and ->wait_blkd_tasks are zero, then the task must
+have entered its RCU-preempt read-side critical section late (after all,
+the CPU that it is running on was not online at that time), which means
+that the upper-level rcu_node structure won't be waiting for anything
+on the leaf anyway.
+
+If ->wait_blkd_tasks is non-zero, then there is at least one task on
+ths rcu_node structure's ->blkd_tasks list whose RCU read-side
+critical section predates the current grace period.  If ->qsmaskinit
+is non-zero, there is at least one CPU that was online at the start
+of the current grace period.  Thus, if both are zero, there is nothing
+to wait for.
+
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+

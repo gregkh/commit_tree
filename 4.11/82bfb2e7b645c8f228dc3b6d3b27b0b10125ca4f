@@ -1,0 +1,73 @@
+Btrfs: incremental send, fix unnecessary hole writes for sparse files
+
+When using the NO_HOLES feature, during an incremental send we often issue
+write operations for holes when we should not, because that range is already
+a hole in the destination snapshot. While that does not change the contents
+of the file at the receiver, it avoids preservation of file holes, leading
+to wasted disk space and extra IO during send/receive.
+
+A couple examples where the holes are not preserved follows.
+
+ $ mkfs.btrfs -O no-holes -f /dev/sdb
+ $ mount /dev/sdb /mnt
+ $ xfs_io -f -c "pwrite -S 0xaa 0 4K" /mnt/foo
+ $ xfs_io -f -c "pwrite -S 0xaa 0 4K" -c "pwrite -S 0xbb 1028K 4K" /mnt/bar
+ $ btrfs subvolume snapshot -r /mnt /mnt/snap1
+
+ # Now add one new extent to our first test file, increasing its size and
+ # leaving a 1Mb hole between the first extent and this new extent.
+ $ xfs_io -c "pwrite -S 0xbb 1028K 4K" /mnt/foo
+
+ # Now overwrite the last extent of our second test file.
+ $ xfs_io -c "pwrite -S 0xcc 1028K 4K" /mnt/bar
+
+ $ btrfs subvolume snapshot -r /mnt /mnt/snap2
+
+ $ xfs_io -r -c "fiemap -v" /mnt/snap2/foo
+ /mnt/snap2/foo:
+ EXT: FILE-OFFSET      BLOCK-RANGE      TOTAL FLAGS
+   0: [0..7]:          25088..25095         8 0x2000
+   1: [8..2055]:       hole              2048
+   2: [2056..2063]:    24576..24583         8 0x2001
+
+ $ xfs_io -r -c "fiemap -v" /mnt/snap2/bar
+ /mnt/snap2/bar:
+ EXT: FILE-OFFSET      BLOCK-RANGE      TOTAL FLAGS
+   0: [0..7]:          25096..25103         8 0x2000
+   1: [8..2055]:       hole              2048
+   2: [2056..2063]:    24584..24591         8 0x2001
+
+  $ btrfs send /mnt/snap1 -f /tmp/1.snap
+  $ btrfs send -p /mnt/snap1 /mnt/snap2 -f /tmp/2.snap
+
+  $ umount /mnt
+  # It's not relevant to enable no-holes in the new filesystem.
+  $ mkfs.btrfs -O no-holes -f /dev/sdc
+  $ mount /dev/sdc /mnt
+  $ btrfs receive /mnt -f /tmp/1.snap
+  $ btrfs receive /mnt -f /tmp/2.snap
+
+  $ xfs_io -r -c "fiemap -v" /mnt/snap2/foo
+  /mnt/snap2/foo:
+  EXT: FILE-OFFSET      BLOCK-RANGE      TOTAL FLAGS
+    0: [0..7]:          24576..24583         8 0x2000
+    1: [8..2063]:       25624..27679      2056   0x1
+
+  $ xfs_io -r -c "fiemap -v" /mnt/snap2/bar
+  /mnt/snap2/bar:
+  EXT: FILE-OFFSET      BLOCK-RANGE      TOTAL FLAGS
+    0: [0..7]:          24584..24591         8 0x2000
+    1: [8..2063]:       27680..29735      2056   0x1
+
+The holes do not exist in the second filesystem and they were replaced
+with extents filled with the byte 0x00, making each file take 1032Kb of
+space instead of 8Kb.
+
+So fix this by not issuing the write operations consisting of buffers
+filled with the byte 0x00 when the destination snapshot already has a
+hole for the respective range.
+
+A test case for fstests will follow soon.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+

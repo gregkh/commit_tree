@@ -1,0 +1,267 @@
+net: sched: act_ife: disable bh when taking ife_mod_lock
+
+Lockdep reports deadlock for following locking scenario in ife action:
+
+Task one:
+1) Executes ife action update.
+2) Takes tcfa_lock.
+3) Waits on ife_mod_lock which is already taken by task two.
+
+Task two:
+
+1) Executes any path that obtains ife_mod_lock without disabling bh (any
+path that takes ife_mod_lock while holding tcfa_lock has bh disabled) like
+loading a meta module, or creating new action.
+2) Takes ife_mod_lock.
+3) Task is preempted by rate estimator timer.
+4) Timer callback waits on tcfa_lock which is taken by task one.
+
+In described case tasks deadlock because they take same two locks in
+different order. To prevent potential deadlock reported by lockdep, always
+disable bh when obtaining ife_mod_lock.
+
+Lockdep warning:
+
+[  508.101192] =====================================================
+[  508.107708] WARNING: SOFTIRQ-safe -> SOFTIRQ-unsafe lock order detected
+[  508.114728] 4.18.0-rc8+ #646 Not tainted
+[  508.119050] -----------------------------------------------------
+[  508.125559] tc/5460 [HC0[0]:SC0[2]:HE1:SE0] is trying to acquire:
+[  508.132025] 000000005a938c68 (ife_mod_lock){++++}, at: find_ife_oplist+0x1e/0xc0 [act_ife]
+[  508.140996]
+               and this task is already holding:
+[  508.147548] 00000000d46f6c56 (&(&p->tcfa_lock)->rlock){+.-.}, at: tcf_ife_init+0x6ae/0xf40 [act_ife]
+[  508.157371] which would create a new lock dependency:
+[  508.162828]  (&(&p->tcfa_lock)->rlock){+.-.} -> (ife_mod_lock){++++}
+[  508.169572]
+               but this new dependency connects a SOFTIRQ-irq-safe lock:
+[  508.178197]  (&(&p->tcfa_lock)->rlock){+.-.}
+[  508.178201]
+               ... which became SOFTIRQ-irq-safe at:
+[  508.189771]   _raw_spin_lock+0x2c/0x40
+[  508.193906]   est_fetch_counters+0x41/0xb0
+[  508.198391]   est_timer+0x83/0x3c0
+[  508.202180]   call_timer_fn+0x16a/0x5d0
+[  508.206400]   run_timer_softirq+0x399/0x920
+[  508.210967]   __do_softirq+0x157/0x97d
+[  508.215102]   irq_exit+0x152/0x1c0
+[  508.218888]   smp_apic_timer_interrupt+0xc0/0x4e0
+[  508.223976]   apic_timer_interrupt+0xf/0x20
+[  508.228540]   cpuidle_enter_state+0xf8/0x5d0
+[  508.233198]   do_idle+0x28a/0x350
+[  508.236881]   cpu_startup_entry+0xc7/0xe0
+[  508.241296]   start_secondary+0x2e8/0x3f0
+[  508.245678]   secondary_startup_64+0xa5/0xb0
+[  508.250347]
+               to a SOFTIRQ-irq-unsafe lock:  (ife_mod_lock){++++}
+[  508.256531]
+               ... which became SOFTIRQ-irq-unsafe at:
+[  508.267279] ...
+[  508.267283]   _raw_write_lock+0x2c/0x40
+[  508.273653]   register_ife_op+0x118/0x2c0 [act_ife]
+[  508.278926]   do_one_initcall+0xf7/0x4d9
+[  508.283214]   do_init_module+0x18b/0x44e
+[  508.287521]   load_module+0x4167/0x5730
+[  508.291739]   __do_sys_finit_module+0x16d/0x1a0
+[  508.296654]   do_syscall_64+0x7a/0x3f0
+[  508.300788]   entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  508.306302]
+               other info that might help us debug this:
+
+[  508.315286]  Possible interrupt unsafe locking scenario:
+
+[  508.322771]        CPU0                    CPU1
+[  508.327681]        ----                    ----
+[  508.332604]   lock(ife_mod_lock);
+[  508.336300]                                local_irq_disable();
+[  508.342608]                                lock(&(&p->tcfa_lock)->rlock);
+[  508.349793]                                lock(ife_mod_lock);
+[  508.355990]   <Interrupt>
+[  508.358974]     lock(&(&p->tcfa_lock)->rlock);
+[  508.363803]
+                *** DEADLOCK ***
+
+[  508.370715] 2 locks held by tc/5460:
+[  508.374680]  #0: 00000000e27e4fa4 (rtnl_mutex){+.+.}, at: rtnetlink_rcv_msg+0x583/0x7b0
+[  508.383366]  #1: 00000000d46f6c56 (&(&p->tcfa_lock)->rlock){+.-.}, at: tcf_ife_init+0x6ae/0xf40 [act_ife]
+[  508.393648]
+               the dependencies between SOFTIRQ-irq-safe lock and the holding lock:
+[  508.403505] -> (&(&p->tcfa_lock)->rlock){+.-.} ops: 1001553 {
+[  508.409646]    HARDIRQ-ON-W at:
+[  508.413136]                     _raw_spin_lock_bh+0x34/0x40
+[  508.419059]                     gnet_stats_start_copy_compat+0xa2/0x230
+[  508.426021]                     gnet_stats_start_copy+0x16/0x20
+[  508.432333]                     tcf_action_copy_stats+0x95/0x1d0
+[  508.438735]                     tcf_action_dump_1+0xb0/0x4e0
+[  508.444795]                     tcf_action_dump+0xca/0x200
+[  508.450673]                     tcf_exts_dump+0xd9/0x320
+[  508.456392]                     fl_dump+0x1b7/0x4a0 [cls_flower]
+[  508.462798]                     tcf_fill_node+0x380/0x530
+[  508.468601]                     tfilter_notify+0xdf/0x1c0
+[  508.474404]                     tc_new_tfilter+0x84a/0xc90
+[  508.480270]                     rtnetlink_rcv_msg+0x5bd/0x7b0
+[  508.486419]                     netlink_rcv_skb+0x184/0x220
+[  508.492394]                     netlink_unicast+0x31b/0x460
+[  508.507411]                     netlink_sendmsg+0x3fb/0x840
+[  508.513390]                     sock_sendmsg+0x7b/0xd0
+[  508.518907]                     ___sys_sendmsg+0x4c6/0x610
+[  508.524797]                     __sys_sendmsg+0xd7/0x150
+[  508.530510]                     do_syscall_64+0x7a/0x3f0
+[  508.536201]                     entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  508.543301]    IN-SOFTIRQ-W at:
+[  508.546834]                     _raw_spin_lock+0x2c/0x40
+[  508.552522]                     est_fetch_counters+0x41/0xb0
+[  508.558571]                     est_timer+0x83/0x3c0
+[  508.563912]                     call_timer_fn+0x16a/0x5d0
+[  508.569699]                     run_timer_softirq+0x399/0x920
+[  508.575840]                     __do_softirq+0x157/0x97d
+[  508.581538]                     irq_exit+0x152/0x1c0
+[  508.586882]                     smp_apic_timer_interrupt+0xc0/0x4e0
+[  508.593533]                     apic_timer_interrupt+0xf/0x20
+[  508.599686]                     cpuidle_enter_state+0xf8/0x5d0
+[  508.605895]                     do_idle+0x28a/0x350
+[  508.611147]                     cpu_startup_entry+0xc7/0xe0
+[  508.617097]                     start_secondary+0x2e8/0x3f0
+[  508.623029]                     secondary_startup_64+0xa5/0xb0
+[  508.629245]    INITIAL USE at:
+[  508.632686]                    _raw_spin_lock_bh+0x34/0x40
+[  508.638557]                    gnet_stats_start_copy_compat+0xa2/0x230
+[  508.645491]                    gnet_stats_start_copy+0x16/0x20
+[  508.651719]                    tcf_action_copy_stats+0x95/0x1d0
+[  508.657992]                    tcf_action_dump_1+0xb0/0x4e0
+[  508.663937]                    tcf_action_dump+0xca/0x200
+[  508.669716]                    tcf_exts_dump+0xd9/0x320
+[  508.675337]                    fl_dump+0x1b7/0x4a0 [cls_flower]
+[  508.681650]                    tcf_fill_node+0x380/0x530
+[  508.687366]                    tfilter_notify+0xdf/0x1c0
+[  508.693031]                    tc_new_tfilter+0x84a/0xc90
+[  508.698820]                    rtnetlink_rcv_msg+0x5bd/0x7b0
+[  508.704869]                    netlink_rcv_skb+0x184/0x220
+[  508.710758]                    netlink_unicast+0x31b/0x460
+[  508.716627]                    netlink_sendmsg+0x3fb/0x840
+[  508.722510]                    sock_sendmsg+0x7b/0xd0
+[  508.727931]                    ___sys_sendmsg+0x4c6/0x610
+[  508.733729]                    __sys_sendmsg+0xd7/0x150
+[  508.739346]                    do_syscall_64	+0x7a/0x3f0
+[  508.744943]                    entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  508.751930]  }
+[  508.753964]  ... key      at: [<ffffffff916b3e20>] __key.61145+0x0/0x40
+[  508.760946]  ... acquired at:
+[  508.764294]    _raw_read_lock+0x2f/0x40
+[  508.768513]    find_ife_oplist+0x1e/0xc0 [act_ife]
+[  508.773692]    tcf_ife_init+0x82f/0xf40 [act_ife]
+[  508.778785]    tcf_action_init_1+0x510/0x750
+[  508.783468]    tcf_action_init+0x1e8/0x340
+[  508.787938]    tcf_action_add+0xc5/0x240
+[  508.792241]    tc_ctl_action+0x203/0x2a0
+[  508.796550]    rtnetlink_rcv_msg+0x5bd/0x7b0
+[  508.801200]    netlink_rcv_skb+0x184/0x220
+[  508.805674]    netlink_unicast+0x31b/0x460
+[  508.810129]    netlink_sendmsg+0x3fb/0x840
+[  508.814611]    sock_sendmsg+0x7b/0xd0
+[  508.818665]    ___sys_sendmsg+0x4c6/0x610
+[  508.823029]    __sys_sendmsg+0xd7/0x150
+[  508.827246]    do_syscall_64+0x7a/0x3f0
+[  508.831483]    entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+               the dependencies between the lock to be acquired
+[  508.838945]  and SOFTIRQ-irq-unsafe lock:
+[  508.851177] -> (ife_mod_lock){++++} ops: 95 {
+[  508.855920]    HARDIRQ-ON-W at:
+[  508.859478]                     _raw_write_lock+0x2c/0x40
+[  508.865264]                     register_ife_op+0x118/0x2c0 [act_ife]
+[  508.872071]                     do_one_initcall+0xf7/0x4d9
+[  508.877947]                     do_init_module+0x18b/0x44e
+[  508.883819]                     load_module+0x4167/0x5730
+[  508.889595]                     __do_sys_finit_module+0x16d/0x1a0
+[  508.896043]                     do_syscall_64+0x7a/0x3f0
+[  508.901734]                     entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  508.908827]    HARDIRQ-ON-R at:
+[  508.912359]                     _raw_read_lock+0x2f/0x40
+[  508.918043]                     find_ife_oplist+0x1e/0xc0 [act_ife]
+[  508.924692]                     tcf_ife_init+0x82f/0xf40 [act_ife]
+[  508.931252]                     tcf_action_init_1+0x510/0x750
+[  508.937393]                     tcf_action_init+0x1e8/0x340
+[  508.943366]                     tcf_action_add+0xc5/0x240
+[  508.949130]                     tc_ctl_action+0x203/0x2a0
+[  508.954922]                     rtnetlink_rcv_msg+0x5bd/0x7b0
+[  508.961024]                     netlink_rcv_skb+0x184/0x220
+[  508.966970]                     netlink_unicast+0x31b/0x460
+[  508.972915]                     netlink_sendmsg+0x3fb/0x840
+[  508.978859]                     sock_sendmsg+0x7b/0xd0
+[  508.984400]                     ___sys_sendmsg+0x4c6/0x610
+[  508.990264]                     __sys_sendmsg+0xd7/0x150
+[  508.995952]                     do_syscall_64+0x7a/0x3f0
+[  509.001643]                     entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  509.008722]    SOFTIRQ-ON-W at:\
+[  509.012242]                     _raw_write_lock+0x2c/0x40
+[  509.018013]                     register_ife_op+0x118/0x2c0 [act_ife]
+[  509.024841]                     do_one_initcall+0xf7/0x4d9
+[  509.030720]                     do_init_module+0x18b/0x44e
+[  509.036604]                     load_module+0x4167/0x5730
+[  509.042397]                     __do_sys_finit_module+0x16d/0x1a0
+[  509.048865]                     do_syscall_64+0x7a/0x3f0
+[  509.054551]                     entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  509.061636]    SOFTIRQ-ON-R at:
+[  509.065145]                     _raw_read_lock+0x2f/0x40
+[  509.070854]                     find_ife_oplist+0x1e/0xc0 [act_ife]
+[  509.077515]                     tcf_ife_init+0x82f/0xf40 [act_ife]
+[  509.084051]                     tcf_action_init_1+0x510/0x750
+[  509.090172]                     tcf_action_init+0x1e8/0x340
+[  509.096124]                     tcf_action_add+0xc5/0x240
+[  509.101891]                     tc_ctl_action+0x203/0x2a0
+[  509.107671]                     rtnetlink_rcv_msg+0x5bd/0x7b0
+[  509.113811]                     netlink_rcv_skb+0x184/0x220
+[  509.119768]                     netlink_unicast+0x31b/0x460
+[  509.125716]                     netlink_sendmsg+0x3fb/0x840
+[  509.131668]                     sock_sendmsg+0x7b/0xd0
+[  509.137167]                     ___sys_sendmsg+0x4c6/0x610
+[  509.143010]                     __sys_sendmsg+0xd7/0x150
+[  509.148718]                     do_syscall_64+0x7a/0x3f0
+[  509.154443]                     entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  509.161533]    INITIAL USE at:
+[  509.164956]                    _raw_read_lock+0x2f/0x40
+[  509.170574]                    find_ife_oplist+0x1e/0xc0 [act_ife]
+[  509.177134]                    tcf_ife_init+0x82f/0xf40 [act_ife]
+[  509.183619]                    tcf_action_init_1+0x510/0x750
+[  509.189674]                    tcf_action_init+0x1e8/0x340
+[  509.195534]                    tcf_action_add+0xc5/0x240
+[  509.201229]                    tc_ctl_action+0x203/0x2a0
+[  509.206920]                    rtnetlink_rcv_msg+0x5bd/0x7b0
+[  509.212936]                    netlink_rcv_skb+0x184/0x220
+[  509.218818]                    netlink_unicast+0x31b/0x460
+[  509.224699]                    netlink_sendmsg+0x3fb/0x840
+[  509.230581]                    sock_sendmsg+0x7b/0xd0
+[  509.235984]                    ___sys_sendmsg+0x4c6/0x610
+[  509.241791]                    __sys_sendmsg+0xd7/0x150
+[  509.247425]                    do_syscall_64+0x7a/0x3f0
+[  509.253007]                    entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  509.259975]  }
+[  509.261998]  ... key      at: [<ffffffffc1554258>] ife_mod_lock+0x18/0xffffffffffff8dc0 [act_ife]
+[  509.271569]  ... acquired at:
+[  509.274912]    _raw_read_lock+0x2f/0x40
+[  509.279134]    find_ife_oplist+0x1e/0xc0 [act_ife]
+[  509.284324]    tcf_ife_init+0x82f/0xf40 [act_ife]
+[  509.289425]    tcf_action_init_1+0x510/0x750
+[  509.294068]    tcf_action_init+0x1e8/0x340
+[  509.298553]    tcf_action_add+0xc5/0x240
+[  509.302854]    tc_ctl_action+0x203/0x2a0
+[  509.307153]    rtnetlink_rcv_msg+0x5bd/0x7b0
+[  509.311805]    netlink_rcv_skb+0x184/0x220
+[  509.316282]    netlink_unicast+0x31b/0x460
+[  509.320769]    netlink_sendmsg+0x3fb/0x840
+[  509.325248]    sock_sendmsg+0x7b/0xd0
+[  509.329290]    ___sys_sendmsg+0x4c6/0x610
+[  509.333687]    __sys_sendmsg+0xd7/0x150
+[  509.337902]    do_syscall_64+0x7a/0x3f0
+[  509.342116]    entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  509.349601]
+               stack backtrace:
+[  509.354663] CPU: 6 PID: 5460 Comm: tc Not tainted 4.18.0-rc8+ #646
+[  509.361216] Hardware name: Supermicro SYS-2028TP-DECR/X10DRT-P, BIOS 2.0b 03/30/2017
+
+Fixes: ef6980b6becb ("introduce IFE action")
+Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

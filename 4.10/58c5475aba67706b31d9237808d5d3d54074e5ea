@@ -1,0 +1,142 @@
+x86/efi: Retrieve and assign Apple device properties
+
+Apple's EFI drivers supply device properties which are needed to support
+Macs optimally. They contain vital information which cannot be obtained
+any other way (e.g. Thunderbolt Device ROM). They're also used to convey
+the current device state so that OS drivers can pick up where EFI
+drivers left (e.g. GPU mode setting).
+
+There's an EFI driver dubbed "AAPL,PathProperties" which implements a
+per-device key/value store. Other EFI drivers populate it using a custom
+protocol. The macOS bootloader /System/Library/CoreServices/boot.efi
+retrieves the properties with the same protocol. The kernel extension
+AppleACPIPlatform.kext subsequently merges them into the I/O Kit
+registry (see ioreg(8)) where they can be queried by other kernel
+extensions and user space.
+
+This commit extends the efistub to retrieve the device properties before
+ExitBootServices is called. It assigns them to devices in an fs_initcall
+so that they can be queried with the API in <linux/property.h>.
+
+Note that the device properties will only be available if the kernel is
+booted with the efistub. Distros should adjust their installers to
+always use the efistub on Macs. grub with the "linux" directive will not
+work unless the functionality of this commit is duplicated in grub.
+(The "linuxefi" directive should work but is not included upstream as of
+this writing.)
+
+The custom protocol has GUID 91BD12FE-F6C3-44FB-A5B7-5122AB303AE0 and
+looks like this:
+
+typedef struct {
+	unsigned long version; /* 0x10000 */
+	efi_status_t (*get) (
+		IN	struct apple_properties_protocol *this,
+		IN	struct efi_dev_path *device,
+		IN	efi_char16_t *property_name,
+		OUT	void *buffer,
+		IN OUT	u32 *buffer_len);
+		/* EFI_SUCCESS, EFI_NOT_FOUND, EFI_BUFFER_TOO_SMALL */
+	efi_status_t (*set) (
+		IN	struct apple_properties_protocol *this,
+		IN	struct efi_dev_path *device,
+		IN	efi_char16_t *property_name,
+		IN	void *property_value,
+		IN	u32 property_value_len);
+		/* allocates copies of property name and value */
+		/* EFI_SUCCESS, EFI_OUT_OF_RESOURCES */
+	efi_status_t (*del) (
+		IN	struct apple_properties_protocol *this,
+		IN	struct efi_dev_path *device,
+		IN	efi_char16_t *property_name);
+		/* EFI_SUCCESS, EFI_NOT_FOUND */
+	efi_status_t (*get_all) (
+		IN	struct apple_properties_protocol *this,
+		OUT	void *buffer,
+		IN OUT	u32 *buffer_len);
+		/* EFI_SUCCESS, EFI_BUFFER_TOO_SMALL */
+} apple_properties_protocol;
+
+Thanks to Pedro Vilaça for this blog post which was helpful in reverse
+engineering Apple's EFI drivers and bootloader:
+https://reverse.put.as/2016/06/25/apple-efi-firmware-passwords-and-the-scbo-myth/
+
+If someone at Apple is reading this, please note there's a memory leak
+in your implementation of the del() function as the property struct is
+freed but the name and value allocations are not.
+
+Neither the macOS bootloader nor Apple's EFI drivers check the protocol
+version, but we do to avoid breakage if it's ever changed. It's been the
+same since at least OS X 10.6 (2009).
+
+The get_all() function conveniently fills a buffer with all properties
+in marshalled form which can be passed to the kernel as a setup_data
+payload. The number of device properties is dynamic and can change
+between a first invocation of get_all() (to determine the buffer size)
+and a second invocation (to retrieve the actual buffer), hence the
+peculiar loop which does not finish until the buffer size settles.
+The macOS bootloader does the same.
+
+The setup_data payload is later on unmarshalled in an fs_initcall. The
+idea is that most buses instantiate devices in "subsys" initcall level
+and drivers are usually bound to these devices in "device" initcall
+level, so we assign the properties in-between, i.e. in "fs" initcall
+level.
+
+This assumes that devices to which properties pertain are instantiated
+from a "subsys" initcall or earlier. That should always be the case
+since on macOS, AppleACPIPlatformExpert::matchEFIDevicePath() only
+supports ACPI and PCI nodes and we've fully scanned those buses during
+"subsys" initcall level.
+
+The second assumption is that properties are only needed from a "device"
+initcall or later. Seems reasonable to me, but should this ever not work
+out, an alternative approach would be to store the property sets e.g. in
+a btree early during boot. Then whenever device_add() is called, an EFI
+Device Path would have to be constructed for the newly added device,
+and looked up in the btree. That way, the property set could be assigned
+to the device immediately on instantiation. And this would also work for
+devices instantiated in a deferred fashion. It seems like this approach
+would be more complicated and require more code. That doesn't seem
+justified without a specific use case.
+
+For comparison, the strategy on macOS is to assign properties to objects
+in the ACPI namespace (AppleACPIPlatformExpert::mergeEFIProperties()).
+That approach is definitely wrong as it fails for devices not present in
+the namespace: The NHI EFI driver supplies properties for attached
+Thunderbolt devices, yet on Macs with Thunderbolt 1 only one device
+level behind the host controller is described in the namespace.
+Consequently macOS cannot assign properties for chained devices. With
+Thunderbolt 2 they started to describe three device levels behind host
+controllers in the namespace but this grossly inflates the SSDT and
+still fails if the user daisy-chained more than three devices.
+
+We copy the property names and values from the setup_data payload to
+swappable virtual memory and afterwards make the payload available to
+the page allocator. This is just for the sake of good housekeeping, it
+wouldn't occupy a meaningful amount of physical memory (4444 bytes on my
+machine). Only the payload is freed, not the setup_data header since
+otherwise we'd break the list linkage and we cannot safely update the
+predecessor's ->next link because there's no locking for the list.
+
+The payload is currently not passed on to kexec'ed kernels, same for PCI
+ROMs retrieved by setup_efi_pci(). This can be added later if there is
+demand by amending setup_efi_state(). The payload can then no longer be
+made available to the page allocator of course.
+
+Tested-by: Lukas Wunner <lukas@wunner.de> [MacBookPro9,1]
+Tested-by: Pierre Moreau <pierre.morrow@free.fr> [MacBookPro11,3]
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Signed-off-by: Matt Fleming <matt@codeblueprint.co.uk>
+Cc: Andreas Noever <andreas.noever@gmail.com>
+Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Pedro Vilaça <reverser@put.as>
+Cc: Peter Jones <pjones@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: grub-devel@gnu.org
+Cc: linux-efi@vger.kernel.org
+Link: http://lkml.kernel.org/r/20161112213237.8804-9-matt@codeblueprint.co.uk
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

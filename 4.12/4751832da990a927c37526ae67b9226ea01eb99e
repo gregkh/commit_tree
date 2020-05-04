@@ -1,0 +1,78 @@
+btrfs: fiemap: Cache and merge fiemap extent before submit it to user
+
+[BUG]
+Cycle mount btrfs can cause fiemap to return different result.
+Like:
+ # mount /dev/vdb5 /mnt/btrfs
+ # dd if=/dev/zero bs=16K count=4 oflag=dsync of=/mnt/btrfs/file
+ # xfs_io -c "fiemap -v" /mnt/btrfs/file
+ /mnt/test/file:
+ EXT: FILE-OFFSET      BLOCK-RANGE      TOTAL FLAGS
+   0: [0..127]:        25088..25215       128   0x1
+ # umount /mnt/btrfs
+ # mount /dev/vdb5 /mnt/btrfs
+ # xfs_io -c "fiemap -v" /mnt/btrfs/file
+ /mnt/test/file:
+ EXT: FILE-OFFSET      BLOCK-RANGE      TOTAL FLAGS
+   0: [0..31]:         25088..25119        32   0x0
+   1: [32..63]:        25120..25151        32   0x0
+   2: [64..95]:        25152..25183        32   0x0
+   3: [96..127]:       25184..25215        32   0x1
+But after above fiemap, we get correct merged result if we call fiemap
+again.
+ # xfs_io -c "fiemap -v" /mnt/btrfs/file
+ /mnt/test/file:
+ EXT: FILE-OFFSET      BLOCK-RANGE      TOTAL FLAGS
+   0: [0..127]:        25088..25215       128   0x1
+
+[REASON]
+Btrfs will try to merge extent map when inserting new extent map.
+
+btrfs_fiemap(start=0 len=(u64)-1)
+|- extent_fiemap(start=0 len=(u64)-1)
+   |- get_extent_skip_holes(start=0 len=64k)
+   |  |- btrfs_get_extent_fiemap(start=0 len=64k)
+   |     |- btrfs_get_extent(start=0 len=64k)
+   |        |  Found on-disk (ino, EXTENT_DATA, 0)
+   |        |- add_extent_mapping()
+   |        |- Return (em->start=0, len=16k)
+   |
+   |- fiemap_fill_next_extent(logic=0 phys=X len=16k)
+   |
+   |- get_extent_skip_holes(start=0 len=64k)
+   |  |- btrfs_get_extent_fiemap(start=0 len=64k)
+   |     |- btrfs_get_extent(start=16k len=48k)
+   |        |  Found on-disk (ino, EXTENT_DATA, 16k)
+   |        |- add_extent_mapping()
+   |        |  |- try_merge_map()
+   |        |     Merge with previous em start=0 len=16k
+   |        |     resulting em start=0 len=32k
+   |        |- Return (em->start=0, len=32K)    << Merged result
+   |- Stripe off the unrelated range (0~16K) of return em
+   |- fiemap_fill_next_extent(logic=16K phys=X+16K len=16K)
+      ^^^ Causing split fiemap extent.
+
+And since in add_extent_mapping(), em is already merged, in next
+fiemap() call, we will get merged result.
+
+[FIX]
+Here we introduce a new structure, fiemap_cache, which records previous
+fiemap extent.
+
+And will always try to merge current fiemap_cache result before calling
+fiemap_fill_next_extent().
+Only when we failed to merge current fiemap extent with cached one, we
+will call fiemap_fill_next_extent() to submit cached one.
+
+So by this method, we can merge all fiemap extents.
+
+It can also be done in fs/ioctl.c, however the problem is if
+fieinfo->fi_extents_max == 0, we have no space to cache previous fiemap
+extent.
+So I choose to merge it in btrfs.
+
+Signed-off-by: Qu Wenruo <quwenruo@cn.fujitsu.com>
+Reviewed-by: Liu Bo <bo.li.liu@oracle.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

@@ -1,0 +1,42 @@
+virtio_balloon: fix deadlock on OOM
+
+fill_balloon doing memory allocations under balloon_lock
+can cause a deadlock when leak_balloon is called from
+virtballoon_oom_notify and tries to take same lock.
+
+To fix, split page allocation and enqueue and do allocations outside the lock.
+
+Here's a detailed analysis of the deadlock by Tetsuo Handa:
+
+In leak_balloon(), mutex_lock(&vb->balloon_lock) is called in order to
+serialize against fill_balloon(). But in fill_balloon(),
+alloc_page(GFP_HIGHUSER[_MOVABLE] | __GFP_NOMEMALLOC | __GFP_NORETRY) is
+called with vb->balloon_lock mutex held. Since GFP_HIGHUSER[_MOVABLE]
+implies __GFP_DIRECT_RECLAIM | __GFP_IO | __GFP_FS, despite __GFP_NORETRY
+is specified, this allocation attempt might indirectly depend on somebody
+else's __GFP_DIRECT_RECLAIM memory allocation. And such indirect
+__GFP_DIRECT_RECLAIM memory allocation might call leak_balloon() via
+virtballoon_oom_notify() via blocking_notifier_call_chain() callback via
+out_of_memory() when it reached __alloc_pages_may_oom() and held oom_lock
+mutex. Since vb->balloon_lock mutex is already held by fill_balloon(), it
+will cause OOM lockup.
+
+  Thread1                                       Thread2
+    fill_balloon()
+      takes a balloon_lock
+      balloon_page_enqueue()
+        alloc_page(GFP_HIGHUSER_MOVABLE)
+          direct reclaim (__GFP_FS context)       takes a fs lock
+            waits for that fs lock                  alloc_page(GFP_NOFS)
+                                                      __alloc_pages_may_oom()
+                                                        takes the oom_lock
+                                                        out_of_memory()
+                                                          blocking_notifier_call_chain()
+                                                            leak_balloon()
+                                                              tries to take that balloon_lock and deadlocks
+
+Reported-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Wei Wang <wei.w.wang@intel.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+

@@ -1,0 +1,54 @@
+KVM: PPC: Book3S HV: Invalidate TLB on radix guest vcpu movement
+
+With radix, the guest can do TLB invalidations itself using the tlbie
+(global) and tlbiel (local) TLB invalidation instructions.  Linux guests
+use local TLB invalidations for translations that have only ever been
+accessed on one vcpu.  However, that doesn't mean that the translations
+have only been accessed on one physical cpu (pcpu) since vcpus can move
+around from one pcpu to another.  Thus a tlbiel might leave behind stale
+TLB entries on a pcpu where the vcpu previously ran, and if that task
+then moves back to that previous pcpu, it could see those stale TLB
+entries and thus access memory incorrectly.  The usual symptom of this
+is random segfaults in userspace programs in the guest.
+
+To cope with this, we detect when a vcpu is about to start executing on
+a thread in a core that is a different core from the last time it
+executed.  If that is the case, then we mark the core as needing a
+TLB flush and then send an interrupt to any thread in the core that is
+currently running a vcpu from the same guest.  This will get those vcpus
+out of the guest, and the first one to re-enter the guest will do the
+TLB flush.  The reason for interrupting the vcpus executing on the old
+core is to cope with the following scenario:
+
+	CPU 0			CPU 1			CPU 4
+	(core 0)			(core 0)			(core 1)
+
+	VCPU 0 runs task X      VCPU 1 runs
+	core 0 TLB gets
+	entries from task X
+	VCPU 0 moves to CPU 4
+							VCPU 0 runs task X
+							Unmap pages of task X
+							tlbiel
+
+				(still VCPU 1)			task X moves to VCPU 1
+				task X runs
+				task X sees stale TLB
+				entries
+
+That is, as soon as the VCPU starts executing on the new core, it
+could unmap and tlbiel some page table entries, and then the task
+could migrate to one of the VCPUs running on the old core and
+potentially see stale TLB entries.
+
+Since the TLB is shared between all the threads in a core, we only
+use the bit of kvm->arch.need_tlb_flush corresponding to the first
+thread in the core.  To ensure that we don't have a window where we
+can miss a flush, this moves the clearing of the bit from before the
+actual flush to after it.  This way, two threads might both do the
+flush, but we prevent the situation where one thread can enter the
+guest before the flush is finished.
+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+

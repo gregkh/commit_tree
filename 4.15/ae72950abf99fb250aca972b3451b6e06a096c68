@@ -1,0 +1,78 @@
+xprtrdma: Add data structure to manage RDMA Send arguments
+
+Problem statement:
+
+Recently Sagi Grimberg <sagi@grimberg.me> observed that kernel RDMA-
+enabled storage initiators don't handle delayed Send completion
+correctly. If Send completion is delayed beyond the end of a ULP
+transaction, the ULP may release resources that are still being used
+by the HCA to complete a long-running Send operation.
+
+This is a common design trait amongst our initiators. Most Send
+operations are faster than the ULP transaction they are part of.
+Waiting for a completion for these is typically unnecessary.
+
+Infrequently, a network partition or some other problem crops up
+where an ordering problem can occur. In NFS parlance, the RPC Reply
+arrives and completes the RPC, but the HCA is still retrying the
+Send WR that conveyed the RPC Call. In this case, the HCA can try
+to use memory that has been invalidated or DMA unmapped, and the
+connection is lost. If that memory has been re-used for something
+else (possibly not related to NFS), and the Send retransmission
+exposes that data on the wire.
+
+Thus we cannot assume that it is safe to release Send-related
+resources just because a ULP reply has arrived.
+
+After some analysis, we have determined that the completion
+housekeeping will not be difficult for xprtrdma:
+
+ - Inline Send buffers are registered via the local DMA key, and
+   are already left DMA mapped for the lifetime of a transport
+   connection, thus no additional handling is necessary for those
+ - Gathered Sends involving page cache pages _will_ need to
+   DMA unmap those pages after the Send completes. But like
+   inline send buffers, they are registered via the local DMA key,
+   and thus will not need to be invalidated
+
+In addition, RPC completion will need to wait for Send completion
+in the latter case. However, nearly always, the Send that conveys
+the RPC Call will have completed long before the RPC Reply
+arrives, and thus no additional latency will be accrued.
+
+Design notes:
+
+In this patch, the rpcrdma_sendctx object is introduced, and a
+lock-free circular queue is added to manage a set of them per
+transport.
+
+The RPC client's send path already prevents sending more than one
+RPC Call at the same time. This allows us to treat the consumer
+side of the queue (rpcrdma_sendctx_get_locked) as if there is a
+single consumer thread.
+
+The producer side of the queue (rpcrdma_sendctx_put_locked) is
+invoked only from the Send completion handler, which is a single
+thread of execution (soft IRQ).
+
+The only care that needs to be taken is with the tail index, which
+is shared between the producer and consumer. Only the producer
+updates the tail index. The consumer compares the head with the
+tail to ensure that the a sendctx that is in use is never handed
+out again (or, expressed more conventionally, the queue is empty).
+
+When the sendctx queue empties completely, there are enough Sends
+outstanding that posting more Send operations can result in a Send
+Queue overflow. In this case, the ULP is told to wait and try again.
+This introduces strong Send Queue accounting to xprtrdma.
+
+As a final touch, Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+suggested a mechanism that does not require signaling every Send.
+We signal once every N Sends, and perform SGE unmapping of N Send
+operations during that one completion.
+
+Reported-by: Sagi Grimberg <sagi@grimberg.me>
+Suggested-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+

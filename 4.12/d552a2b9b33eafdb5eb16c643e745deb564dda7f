@@ -1,0 +1,138 @@
+GFS2: Non-recursive delete
+
+Implement truncate/delete as a non-recursive algorithm. The older
+algorithm was implemented with recursion to strip off each layer
+at a time (going by height, starting with the maximum height.
+This version tries to do the same thing but without recursion,
+and without needing to allocate new structures or lists in memory.
+
+For example, say you want to truncate a very large file to 1 byte,
+and its end-of-file metapath is: 0.505.463.428. The starting
+metapath would be 0.0.0.0. Since it's a truncate to non-zero, it
+needs to preserve that byte, and all metadata pointing to it.
+So it would start at 0.0.0.0, look up all its metadata buffers,
+then free all data blocks pointed to at the highest level.
+After that buffer is "swept", it moves on to 0.0.0.1, then
+0.0.0.2, etc., reading in buffers and sweeping them clean.
+When it gets to the end of the 0.0.0 metadata buffer (for 4K
+blocks the last valid one is 0.0.0.508), it backs up to the
+previous height and starts working on 0.0.1.0, then 0.0.1.1,
+and so forth. After it reaches the end and sweeps 0.0.1.508,
+it continues with 0.0.2.0, and so on. When that height is
+exhausted, and it reaches 0.0.508.508 it backs up another level,
+to 0.1.0.0, then 0.1.0.1, through 0.1.0.508. So it has to keep
+marching backwards and forwards through the metadata until it's
+all swept clean. Once it has all the data blocks freed, it
+lowers the strip height, and begins the process all over again,
+but with one less height. This time it sweeps 0.0.0 through
+0.505.463. When that's clean, it lowers the strip height again
+and works to free 0.505. Eventually it strips the lowest height, 0.
+For a delete or truncate to 0, all metadata for all heights of
+0.0.0.0 would be freed. For a truncate to 1 byte, 0.0.0.0 would
+be preserved.
+
+This isn't much different from normal integer incrementing,
+where an integer gets incremented from 0000 (0.0.0.0) to 3021
+(3.0.2.1). So 0000 gets increments to 0001, 0002, up to 0009,
+then on to 0010, 0011 up to 0099, then 0100 and so forth. It's
+just that each "digit" goes from 0 to 508 (for a total of 509
+pointers) rather than from 0 to 9.
+
+Note that the dinode will only have 483 pointers due to the
+dinode structure itself.
+
+Also note: this is just an example. These numbers (509 and 483)
+are based on a standard 4K block size. Smaller block sizes will
+yield smaller numbers of indirect pointers accordingly.
+
+The truncation process is accomplished with the help of two
+major functions and a few helper functions.
+
+Functions do_strip and recursive_scan are obsolete, so removed.
+
+New function sweep_bh_for_rgrps cleans a buffer_head pointed to
+by the given metapath and height. By cleaning, I mean it frees
+all blocks starting at the offset passed in metapath. It starts
+at the first block in the buffer pointed to by the metapath and
+identifies its resource group (rgrp). From there it frees all
+subsequent block pointers that lie within that rgrp. If it's
+already inside a transaction, it stays within it as long as it
+can. In other words, it doesn't close a transaction until it knows
+it's freed what it can from the resource group. In this way,
+multiple buffers may be cleaned in a single transaction, as long
+as those blocks in the buffer all lie within the same rgrp.
+
+If it's not in a transaction, it starts one. If the buffer_head
+has references to blocks within multiple rgrps, it frees all the
+blocks inside the first rgrp it finds, then closes the
+transaction. Then it repeats the cycle: identifies the next
+unfreed block, uses it to find its rgrp, then starts a new
+transaction for that set. It repeats this process repeatedly
+until the buffer_head contains no more references to any blocks
+past the given metapath.
+
+Function trunc_dealloc has been reworked into a finite state
+automaton. It has basically 3 active states:
+DEALLOC_MP_FULL, DEALLOC_MP_LOWER, and DEALLOC_FILL_MP:
+
+The DEALLOC_MP_FULL state implies the metapath has a full set
+of buffers out to the "shrink height", and therefore, it can
+call function sweep_bh_for_rgrps to free the blocks within the
+highest height of the metapath. If it's just swept the lowest
+level (or an error has occurred) the state machine is ended.
+Otherwise it proceeds to the DEALLOC_MP_LOWER state.
+
+The DEALLOC_MP_LOWER state implies we are finished with a given
+buffer_head, which may now be released, and therefore we are
+then missing some buffer information from the metapath. So we
+need to find more buffers to read in. In most cases, this is
+just a matter of releasing the buffer_head and moving to the
+next pointer from the previous height, so it may be read in and
+swept as well. If it can't find another non-null pointer to
+process, it checks whether it's reached the end of a height
+and needs to lower the strip height, or whether it still needs
+move forward through the previous height's metadata. In this
+state, all zero-pointers are skipped. From this state, it can
+only loop around (once more backing up another height) or,
+once a valid metapath is found (one that has non-zero
+pointers), proceed to state DEALLOC_FILL_MP.
+
+The DEALLOC_FILL_MP state implies that we have a metapath
+but not all its buffers are read in. So we must proceed to read
+in buffer_heads until the metapath has a valid buffer for every
+height. If the previous state backed us up 3 heights, we may
+need to read in a buffer, increment the height, then repeat the
+process until buffers have been read in for all required heights.
+If it's successful reading a buffer, and it's at the highest
+height we need, it proceeds back to the DEALLOC_MP_FULL state.
+If it's unable to fill in a buffer, (encounters a hole, etc.)
+it tries to find another non-zero block pointer. If they're all
+zero, it lowers the height and returns to the DEALLOC_MP_LOWER
+state. If it finds a good non-null pointer, it loops around and
+reads it in, while keeping the metapath in lock-step with the
+pointers it examines.
+
+The state machine runs until the truncation request is
+satisfied. Then any transactions are ended, the quota and
+statfs data are updated, and the function is complete.
+
+Helper function metaptr1 was introduced to be an easy way to
+determine the start of a buffer_head's indirect pointers.
+
+Helper function lookup_mp_height was introduced to find a
+metapath index and read in the buffer that corresponds to it.
+In this way, function lookup_metapath becomes a simple loop to
+call it for every height.
+
+Helper function fillup_metapath is similar to lookup_metapath
+except it can do partial lookups. If the state machine
+backed up multiple levels (like 2999 wrapping to 3000) it
+needs to find out the next starting point and start issuing
+metadata reads at that point.
+
+Helper function hptrs is a shortcut to determine how many
+pointers should be expected in a buffer. Height 0 is the dinode
+which has fewer pointers than the others.
+
+Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+

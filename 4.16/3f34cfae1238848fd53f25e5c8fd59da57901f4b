@@ -1,0 +1,90 @@
+netfilter: on sockopt() acquire sock lock only in the required scope
+
+Syzbot reported several deadlocks in the netfilter area caused by
+rtnl lock and socket lock being acquired with a different order on
+different code paths, leading to backtraces like the following one:
+
+======================================================
+WARNING: possible circular locking dependency detected
+4.15.0-rc9+ #212 Not tainted
+------------------------------------------------------
+syzkaller041579/3682 is trying to acquire lock:
+  (sk_lock-AF_INET6){+.+.}, at: [<000000008775e4dd>] lock_sock
+include/net/sock.h:1463 [inline]
+  (sk_lock-AF_INET6){+.+.}, at: [<000000008775e4dd>]
+do_ipv6_setsockopt.isra.8+0x3c5/0x39d0 net/ipv6/ipv6_sockglue.c:167
+
+but task is already holding lock:
+  (rtnl_mutex){+.+.}, at: [<000000004342eaa9>] rtnl_lock+0x17/0x20
+net/core/rtnetlink.c:74
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #1 (rtnl_mutex){+.+.}:
+        __mutex_lock_common kernel/locking/mutex.c:756 [inline]
+        __mutex_lock+0x16f/0x1a80 kernel/locking/mutex.c:893
+        mutex_lock_nested+0x16/0x20 kernel/locking/mutex.c:908
+        rtnl_lock+0x17/0x20 net/core/rtnetlink.c:74
+        register_netdevice_notifier+0xad/0x860 net/core/dev.c:1607
+        tee_tg_check+0x1a0/0x280 net/netfilter/xt_TEE.c:106
+        xt_check_target+0x22c/0x7d0 net/netfilter/x_tables.c:845
+        check_target net/ipv6/netfilter/ip6_tables.c:538 [inline]
+        find_check_entry.isra.7+0x935/0xcf0
+net/ipv6/netfilter/ip6_tables.c:580
+        translate_table+0xf52/0x1690 net/ipv6/netfilter/ip6_tables.c:749
+        do_replace net/ipv6/netfilter/ip6_tables.c:1165 [inline]
+        do_ip6t_set_ctl+0x370/0x5f0 net/ipv6/netfilter/ip6_tables.c:1691
+        nf_sockopt net/netfilter/nf_sockopt.c:106 [inline]
+        nf_setsockopt+0x67/0xc0 net/netfilter/nf_sockopt.c:115
+        ipv6_setsockopt+0x115/0x150 net/ipv6/ipv6_sockglue.c:928
+        udpv6_setsockopt+0x45/0x80 net/ipv6/udp.c:1422
+        sock_common_setsockopt+0x95/0xd0 net/core/sock.c:2978
+        SYSC_setsockopt net/socket.c:1849 [inline]
+        SyS_setsockopt+0x189/0x360 net/socket.c:1828
+        entry_SYSCALL_64_fastpath+0x29/0xa0
+
+-> #0 (sk_lock-AF_INET6){+.+.}:
+        lock_acquire+0x1d5/0x580 kernel/locking/lockdep.c:3914
+        lock_sock_nested+0xc2/0x110 net/core/sock.c:2780
+        lock_sock include/net/sock.h:1463 [inline]
+        do_ipv6_setsockopt.isra.8+0x3c5/0x39d0 net/ipv6/ipv6_sockglue.c:167
+        ipv6_setsockopt+0xd7/0x150 net/ipv6/ipv6_sockglue.c:922
+        udpv6_setsockopt+0x45/0x80 net/ipv6/udp.c:1422
+        sock_common_setsockopt+0x95/0xd0 net/core/sock.c:2978
+        SYSC_setsockopt net/socket.c:1849 [inline]
+        SyS_setsockopt+0x189/0x360 net/socket.c:1828
+        entry_SYSCALL_64_fastpath+0x29/0xa0
+
+other info that might help us debug this:
+
+  Possible unsafe locking scenario:
+
+        CPU0                    CPU1
+        ----                    ----
+   lock(rtnl_mutex);
+                                lock(sk_lock-AF_INET6);
+                                lock(rtnl_mutex);
+   lock(sk_lock-AF_INET6);
+
+  *** DEADLOCK ***
+
+1 lock held by syzkaller041579/3682:
+  #0:  (rtnl_mutex){+.+.}, at: [<000000004342eaa9>] rtnl_lock+0x17/0x20
+net/core/rtnetlink.c:74
+
+The problem, as Florian noted, is that nf_setsockopt() is always
+called with the socket held, even if the lock itself is required only
+for very tight scopes and only for some operation.
+
+This patch addresses the issues moving the lock_sock() call only
+where really needed, namely in ipv*_getorigdst(), so that nf_setsockopt()
+does not need anymore to acquire both locks.
+
+Fixes: 22265a5c3c10 ("netfilter: xt_TEE: resolve oif using netdevice notifiers")
+Reported-by: syzbot+a4c2dc980ac1af699b36@syzkaller.appspotmail.com
+Suggested-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+

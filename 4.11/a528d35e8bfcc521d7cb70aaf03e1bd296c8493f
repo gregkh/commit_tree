@@ -1,0 +1,321 @@
+statx: Add a system call to make enhanced file info available
+
+Add a system call to make extended file information available, including
+file creation and some attribute flags where available through the
+underlying filesystem.
+
+The getattr inode operation is altered to take two additional arguments: a
+u32 request_mask and an unsigned int flags that indicate the
+synchronisation mode.  This change is propagated to the vfs_getattr*()
+function.
+
+Functions like vfs_stat() are now inline wrappers around new functions
+vfs_statx() and vfs_statx_fd() to reduce stack usage.
+
+========
+OVERVIEW
+========
+
+The idea was initially proposed as a set of xattrs that could be retrieved
+with getxattr(), but the general preference proved to be for a new syscall
+with an extended stat structure.
+
+A number of requests were gathered for features to be included.  The
+following have been included:
+
+ (1) Make the fields a consistent size on all arches and make them large.
+
+ (2) Spare space, request flags and information flags are provided for
+     future expansion.
+
+ (3) Better support for the y2038 problem [Arnd Bergmann] (tv_sec is an
+     __s64).
+
+ (4) Creation time: The SMB protocol carries the creation time, which could
+     be exported by Samba, which will in turn help CIFS make use of
+     FS-Cache as that can be used for coherency data (stx_btime).
+
+     This is also specified in NFSv4 as a recommended attribute and could
+     be exported by NFSD [Steve French].
+
+ (5) Lightweight stat: Ask for just those details of interest, and allow a
+     netfs (such as NFS) to approximate anything not of interest, possibly
+     without going to the server [Trond Myklebust, Ulrich Drepper, Andreas
+     Dilger] (AT_STATX_DONT_SYNC).
+
+ (6) Heavyweight stat: Force a netfs to go to the server, even if it thinks
+     its cached attributes are up to date [Trond Myklebust]
+     (AT_STATX_FORCE_SYNC).
+
+And the following have been left out for future extension:
+
+ (7) Data version number: Could be used by userspace NFS servers [Aneesh
+     Kumar].
+
+     Can also be used to modify fill_post_wcc() in NFSD which retrieves
+     i_version directly, but has just called vfs_getattr().  It could get
+     it from the kstat struct if it used vfs_xgetattr() instead.
+
+     (There's disagreement on the exact semantics of a single field, since
+     not all filesystems do this the same way).
+
+ (8) BSD stat compatibility: Including more fields from the BSD stat such
+     as creation time (st_btime) and inode generation number (st_gen)
+     [Jeremy Allison, Bernd Schubert].
+
+ (9) Inode generation number: Useful for FUSE and userspace NFS servers
+     [Bernd Schubert].
+
+     (This was asked for but later deemed unnecessary with the
+     open-by-handle capability available and caused disagreement as to
+     whether it's a security hole or not).
+
+(10) Extra coherency data may be useful in making backups [Andreas Dilger].
+
+     (No particular data were offered, but things like last backup
+     timestamp, the data version number and the DOS archive bit would come
+     into this category).
+
+(11) Allow the filesystem to indicate what it can/cannot provide: A
+     filesystem can now say it doesn't support a standard stat feature if
+     that isn't available, so if, for instance, inode numbers or UIDs don't
+     exist or are fabricated locally...
+
+     (This requires a separate system call - I have an fsinfo() call idea
+     for this).
+
+(12) Store a 16-byte volume ID in the superblock that can be returned in
+     struct xstat [Steve French].
+
+     (Deferred to fsinfo).
+
+(13) Include granularity fields in the time data to indicate the
+     granularity of each of the times (NFSv4 time_delta) [Steve French].
+
+     (Deferred to fsinfo).
+
+(14) FS_IOC_GETFLAGS value.  These could be translated to BSD's st_flags.
+     Note that the Linux IOC flags are a mess and filesystems such as Ext4
+     define flags that aren't in linux/fs.h, so translation in the kernel
+     may be a necessity (or, possibly, we provide the filesystem type too).
+
+     (Some attributes are made available in stx_attributes, but the general
+     feeling was that the IOC flags were to ext[234]-specific and shouldn't
+     be exposed through statx this way).
+
+(15) Mask of features available on file (eg: ACLs, seclabel) [Brad Boyer,
+     Michael Kerrisk].
+
+     (Deferred, probably to fsinfo.  Finding out if there's an ACL or
+     seclabal might require extra filesystem operations).
+
+(16) Femtosecond-resolution timestamps [Dave Chinner].
+
+     (A __reserved field has been left in the statx_timestamp struct for
+     this - if there proves to be a need).
+
+(17) A set multiple attributes syscall to go with this.
+
+===============
+NEW SYSTEM CALL
+===============
+
+The new system call is:
+
+	int ret = statx(int dfd,
+			const char *filename,
+			unsigned int flags,
+			unsigned int mask,
+			struct statx *buffer);
+
+The dfd, filename and flags parameters indicate the file to query, in a
+similar way to fstatat().  There is no equivalent of lstat() as that can be
+emulated with statx() by passing AT_SYMLINK_NOFOLLOW in flags.  There is
+also no equivalent of fstat() as that can be emulated by passing a NULL
+filename to statx() with the fd of interest in dfd.
+
+Whether or not statx() synchronises the attributes with the backing store
+can be controlled by OR'ing a value into the flags argument (this typically
+only affects network filesystems):
+
+ (1) AT_STATX_SYNC_AS_STAT tells statx() to behave as stat() does in this
+     respect.
+
+ (2) AT_STATX_FORCE_SYNC will require a network filesystem to synchronise
+     its attributes with the server - which might require data writeback to
+     occur to get the timestamps correct.
+
+ (3) AT_STATX_DONT_SYNC will suppress synchronisation with the server in a
+     network filesystem.  The resulting values should be considered
+     approximate.
+
+mask is a bitmask indicating the fields in struct statx that are of
+interest to the caller.  The user should set this to STATX_BASIC_STATS to
+get the basic set returned by stat().  It should be noted that asking for
+more information may entail extra I/O operations.
+
+buffer points to the destination for the data.  This must be 256 bytes in
+size.
+
+======================
+MAIN ATTRIBUTES RECORD
+======================
+
+The following structures are defined in which to return the main attribute
+set:
+
+	struct statx_timestamp {
+		__s64	tv_sec;
+		__s32	tv_nsec;
+		__s32	__reserved;
+	};
+
+	struct statx {
+		__u32	stx_mask;
+		__u32	stx_blksize;
+		__u64	stx_attributes;
+		__u32	stx_nlink;
+		__u32	stx_uid;
+		__u32	stx_gid;
+		__u16	stx_mode;
+		__u16	__spare0[1];
+		__u64	stx_ino;
+		__u64	stx_size;
+		__u64	stx_blocks;
+		__u64	__spare1[1];
+		struct statx_timestamp	stx_atime;
+		struct statx_timestamp	stx_btime;
+		struct statx_timestamp	stx_ctime;
+		struct statx_timestamp	stx_mtime;
+		__u32	stx_rdev_major;
+		__u32	stx_rdev_minor;
+		__u32	stx_dev_major;
+		__u32	stx_dev_minor;
+		__u64	__spare2[14];
+	};
+
+The defined bits in request_mask and stx_mask are:
+
+	STATX_TYPE		Want/got stx_mode & S_IFMT
+	STATX_MODE		Want/got stx_mode & ~S_IFMT
+	STATX_NLINK		Want/got stx_nlink
+	STATX_UID		Want/got stx_uid
+	STATX_GID		Want/got stx_gid
+	STATX_ATIME		Want/got stx_atime{,_ns}
+	STATX_MTIME		Want/got stx_mtime{,_ns}
+	STATX_CTIME		Want/got stx_ctime{,_ns}
+	STATX_INO		Want/got stx_ino
+	STATX_SIZE		Want/got stx_size
+	STATX_BLOCKS		Want/got stx_blocks
+	STATX_BASIC_STATS	[The stuff in the normal stat struct]
+	STATX_BTIME		Want/got stx_btime{,_ns}
+	STATX_ALL		[All currently available stuff]
+
+stx_btime is the file creation time, stx_mask is a bitmask indicating the
+data provided and __spares*[] are where as-yet undefined fields can be
+placed.
+
+Time fields are structures with separate seconds and nanoseconds fields
+plus a reserved field in case we want to add even finer resolution.  Note
+that times will be negative if before 1970; in such a case, the nanosecond
+fields will also be negative if not zero.
+
+The bits defined in the stx_attributes field convey information about a
+file, how it is accessed, where it is and what it does.  The following
+attributes map to FS_*_FL flags and are the same numerical value:
+
+	STATX_ATTR_COMPRESSED		File is compressed by the fs
+	STATX_ATTR_IMMUTABLE		File is marked immutable
+	STATX_ATTR_APPEND		File is append-only
+	STATX_ATTR_NODUMP		File is not to be dumped
+	STATX_ATTR_ENCRYPTED		File requires key to decrypt in fs
+
+Within the kernel, the supported flags are listed by:
+
+	KSTAT_ATTR_FS_IOC_FLAGS
+
+[Are any other IOC flags of sufficient general interest to be exposed
+through this interface?]
+
+New flags include:
+
+	STATX_ATTR_AUTOMOUNT		Object is an automount trigger
+
+These are for the use of GUI tools that might want to mark files specially,
+depending on what they are.
+
+Fields in struct statx come in a number of classes:
+
+ (0) stx_dev_*, stx_blksize.
+
+     These are local system information and are always available.
+
+ (1) stx_mode, stx_nlinks, stx_uid, stx_gid, stx_[amc]time, stx_ino,
+     stx_size, stx_blocks.
+
+     These will be returned whether the caller asks for them or not.  The
+     corresponding bits in stx_mask will be set to indicate whether they
+     actually have valid values.
+
+     If the caller didn't ask for them, then they may be approximated.  For
+     example, NFS won't waste any time updating them from the server,
+     unless as a byproduct of updating something requested.
+
+     If the values don't actually exist for the underlying object (such as
+     UID or GID on a DOS file), then the bit won't be set in the stx_mask,
+     even if the caller asked for the value.  In such a case, the returned
+     value will be a fabrication.
+
+     Note that there are instances where the type might not be valid, for
+     instance Windows reparse points.
+
+ (2) stx_rdev_*.
+
+     This will be set only if stx_mode indicates we're looking at a
+     blockdev or a chardev, otherwise will be 0.
+
+ (3) stx_btime.
+
+     Similar to (1), except this will be set to 0 if it doesn't exist.
+
+=======
+TESTING
+=======
+
+The following test program can be used to test the statx system call:
+
+	samples/statx/test-statx.c
+
+Just compile and run, passing it paths to the files you want to examine.
+The file is built automatically if CONFIG_SAMPLES is enabled.
+
+Here's some example output.  Firstly, an NFS directory that crosses to
+another FSID.  Note that the AUTOMOUNT attribute is set because transiting
+this directory will cause d_automount to be invoked by the VFS.
+
+	[root@andromeda ~]# /tmp/test-statx -A /warthog/data
+	statx(/warthog/data) = 0
+	results=7ff
+	  Size: 4096            Blocks: 8          IO Block: 1048576  directory
+	Device: 00:26           Inode: 1703937     Links: 125
+	Access: (3777/drwxrwxrwx)  Uid:     0   Gid:  4041
+	Access: 2016-11-24 09:02:12.219699527+0000
+	Modify: 2016-11-17 10:44:36.225653653+0000
+	Change: 2016-11-17 10:44:36.225653653+0000
+	Attributes: 0000000000001000 (-------- -------- -------- -------- -------- -------- ---m---- --------)
+
+Secondly, the result of automounting on that directory.
+
+	[root@andromeda ~]# /tmp/test-statx /warthog/data
+	statx(/warthog/data) = 0
+	results=7ff
+	  Size: 4096            Blocks: 8          IO Block: 1048576  directory
+	Device: 00:27           Inode: 2           Links: 125
+	Access: (3777/drwxrwxrwx)  Uid:     0   Gid:  4041
+	Access: 2016-11-24 09:02:12.219699527+0000
+	Modify: 2016-11-17 10:44:36.225653653+0000
+	Change: 2016-11-17 10:44:36.225653653+0000
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

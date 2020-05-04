@@ -1,0 +1,54 @@
+Btrfs: fix loss of prealloc extents past i_size after fsync log replay
+
+Currently if we allocate extents beyond an inode's i_size (through the
+fallocate system call) and then fsync the file, we log the extents but
+after a power failure we replay them and then immediately drop them.
+This behaviour happens since about 2009, commit c71bf099abdd ("Btrfs:
+Avoid orphan inodes cleanup while replaying log"), because it marks
+the inode as an orphan instead of dropping any extents beyond i_size
+before replaying logged extents, so after the log replay, and while
+the mount operation is still ongoing, we find the inode marked as an
+orphan and then perform a truncation (drop extents beyond the inode's
+i_size). Because the processing of orphan inodes is still done
+right after replaying the log and before the mount operation finishes,
+the intention of that commit does not make any sense (at least as
+of today). However reverting that behaviour is not enough, because
+we can not simply discard all extents beyond i_size and then replay
+logged extents, because we risk dropping extents beyond i_size created
+in past transactions, for example:
+
+  add prealloc extent beyond i_size
+  fsync - clears the flag BTRFS_INODE_NEEDS_FULL_SYNC from the inode
+  transaction commit
+  add another prealloc extent beyond i_size
+  fsync - triggers the fast fsync path
+  power failure
+
+In that scenario, we would drop the first extent and then replay the
+second one. To fix this just make sure that all prealloc extents
+beyond i_size are logged, and if we find too many (which is far from
+a common case), fallback to a full transaction commit (like we do when
+logging regular extents in the fast fsync path).
+
+Trivial reproducer:
+
+ $ mkfs.btrfs -f /dev/sdb
+ $ mount /dev/sdb /mnt
+ $ xfs_io -f -c "pwrite -S 0xab 0 256K" /mnt/foo
+ $ sync
+ $ xfs_io -c "falloc -k 256K 1M" /mnt/foo
+ $ xfs_io -c "fsync" /mnt/foo
+ <power failure>
+
+ # mount to replay log
+ $ mount /dev/sdb /mnt
+ # at this point the file only has one extent, at offset 0, size 256K
+
+A test case for fstests follows soon, covering multiple scenarios that
+involve adding prealloc extents with previous shrinking truncates and
+without such truncates.
+
+Fixes: c71bf099abdd ("Btrfs: Avoid orphan inodes cleanup while replaying log")
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

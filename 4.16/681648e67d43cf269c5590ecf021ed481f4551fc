@@ -1,0 +1,42 @@
+rds: tcp: correctly sequence cleanup on netns deletion.
+
+Commit 8edc3affc077 ("rds: tcp: Take explicit refcounts on struct net")
+introduces a regression in rds-tcp netns cleanup. The cleanup_net(),
+(and thus rds_tcp_dev_event notification) is only called from put_net()
+when all netns refcounts go to 0, but this cannot happen if the
+rds_connection itself is holding a c_net ref that it expects to
+release in rds_tcp_kill_sock.
+
+Instead, the rds_tcp_kill_sock callback should make sure to
+tear down state carefully, ensuring that the socket teardown
+is only done after all data-structures and workqs that depend
+on it are quiesced.
+
+The original motivation for commit 8edc3affc077 ("rds: tcp: Take explicit
+refcounts on struct net") was to resolve a race condition reported by
+syzkaller where workqs for tx/rx/connect were triggered after the
+namespace was deleted. Those worker threads should have been
+cancelled/flushed before socket tear-down and indeed,
+rds_conn_path_destroy() does try to sequence this by doing
+     /* cancel cp_send_w */
+     /* cancel cp_recv_w */
+     /* flush cp_down_w */
+     /* free data structures */
+Here the "flush cp_down_w" will trigger rds_conn_shutdown and thus
+invoke rds_tcp_conn_path_shutdown() to close the tcp socket, so that
+we ought to have satisfied the requirement that "socket-close is
+done after all other dependent state is quiesced". However,
+rds_conn_shutdown has a bug in that it *always* triggers the reconnect
+workq (and if connection is successful, we always restart tx/rx
+workqs so with the right timing, we risk the race conditions reported
+by syzkaller).
+
+Netns deletion is like module teardown- no need to restart a
+reconnect in this case. We can use the c_destroy_in_prog bit
+to avoid restarting the reconnect.
+
+Fixes: 8edc3affc077 ("rds: tcp: Take explicit refcounts on struct net")
+Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+Acked-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

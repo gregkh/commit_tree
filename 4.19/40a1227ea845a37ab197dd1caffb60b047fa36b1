@@ -1,0 +1,76 @@
+tcp: Avoid TCP syncookie rejected by SO_REUSEPORT socket
+
+Although the actual cookie check "__cookie_v[46]_check()" does
+not involve sk specific info, it checks whether the sk has recent
+synq overflow event in "tcp_synq_no_recent_overflow()".  The
+tcp_sk(sk)->rx_opt.ts_recent_stamp is updated every second
+when it has sent out a syncookie (through "tcp_synq_overflow()").
+
+The above per sk "recent synq overflow event timestamp" works well
+for non SO_REUSEPORT use case.  However, it may cause random
+connection request reject/discard when SO_REUSEPORT is used with
+syncookie because it fails the "tcp_synq_no_recent_overflow()"
+test.
+
+When SO_REUSEPORT is used, it usually has multiple listening
+socks serving TCP connection requests destinated to the same local IP:PORT.
+There are cases that the TCP-ACK-COOKIE may not be received
+by the same sk that sent out the syncookie.  For example,
+if reuse->socks[] began with {sk0, sk1},
+1) sk1 sent out syncookies and tcp_sk(sk1)->rx_opt.ts_recent_stamp
+   was updated.
+2) the reuse->socks[] became {sk1, sk2} later.  e.g. sk0 was first closed
+   and then sk2 was added.  Here, sk2 does not have ts_recent_stamp set.
+   There are other ordering that will trigger the similar situation
+   below but the idea is the same.
+3) When the TCP-ACK-COOKIE comes back, sk2 was selected.
+   "tcp_synq_no_recent_overflow(sk2)" returns true. In this case,
+   all syncookies sent by sk1 will be handled (and rejected)
+   by sk2 while sk1 is still alive.
+
+The userspace may create and remove listening SO_REUSEPORT sockets
+as it sees fit.  E.g. Adding new thread (and SO_REUSEPORT sock) to handle
+incoming requests, old process stopping and new process starting...etc.
+With or without SO_ATTACH_REUSEPORT_[CB]BPF,
+the sockets leaving and joining a reuseport group makes picking
+the same sk to check the syncookie very difficult (if not impossible).
+
+The later patches will allow bpf prog more flexibility in deciding
+where a sk should be located in a bpf map and selecting a particular
+SO_REUSEPORT sock as it sees fit.  e.g. Without closing any sock,
+replace the whole bpf reuseport_array in one map_update() by using
+map-in-map.  Getting the syncookie check working smoothly across
+socks in the same "reuse->socks[]" is important.
+
+A partial solution is to set the newly added sk's ts_recent_stamp
+to the max ts_recent_stamp of a reuseport group but that will require
+to iterate through reuse->socks[]  OR
+pessimistically set it to "now - TCP_SYNCOOKIE_VALID" when a sk is
+joining a reuseport group.  However, neither of them will solve the
+existing sk getting moved around the reuse->socks[] and that
+sk may not have ts_recent_stamp updated, unlikely under continuous
+synflood but not impossible.
+
+This patch opts to treat the reuseport group as a whole when
+considering the last synq overflow timestamp since
+they are serving the same IP:PORT from the userspace
+(and BPF program) perspective.
+
+"synq_overflow_ts" is added to "struct sock_reuseport".
+The tcp_synq_overflow() and tcp_synq_no_recent_overflow()
+will update/check reuse->synq_overflow_ts if the sk is
+in a reuseport group.  Similar to the reuseport decision in
+__inet_lookup_listener(), both sk->sk_reuseport and
+sk->sk_reuseport_cb are tested for SO_REUSEPORT usage.
+Update on "synq_overflow_ts" happens at roughly once
+every second.
+
+A synflood test was done with a 16 rx-queues and 16 reuseport sockets.
+No meaningful performance change is observed.  Before and
+after the change is ~9Mpps in IPv4.
+
+Cc: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+

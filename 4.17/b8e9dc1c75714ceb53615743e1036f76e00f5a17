@@ -1,0 +1,71 @@
+netfilter: nf_tables: nft_compat: fix refcount leak on xt module
+
+Taehee Yoo reported following bug:
+    iptables-compat -I OUTPUT -m cpu --cpu 0
+    iptables-compat -F
+    lsmod |grep xt_cpu
+    xt_cpu                 16384  1
+
+Quote:
+"When above command is given, a netlink message has two expressions that
+are the cpu compat and the nft_counter.
+The nft_expr_type_get() in the nf_tables_expr_parse() successes
+first expression then, calls select_ops callback.
+(allocates memory and holds module)
+But, second nft_expr_type_get() in the nf_tables_expr_parse()
+returns -EAGAIN because of request_module().
+In that point, by the 'goto err1',
+the 'module_put(info[i].ops->type->owner)' is called.
+There is no release routine."
+
+The core problem is that unlike all other expression,
+nft_compat select_ops has side effects.
+
+1. it allocates dynamic memory which holds an nft ops struct.
+   In all other expressions, ops has static storage duration.
+2. It grabs references to the xt module that it is supposed to
+   invoke.
+
+Depending on where things go wrong, error unwinding doesn't
+always do the right thing.
+
+In the above scenario, a new nft_compat_expr is created and
+xt_cpu module gets loaded with a refcount of 1.
+
+Due to to -EAGAIN, the netlink messages get re-parsed.
+When that happens, nft_compat finds that xt_cpu is already present
+and increments module refcount again.
+
+This fixes the problem by making select_ops to have no visible
+side effects and removes all extra module_get/put.
+
+When select_ops creates a new nft_compat expression, the new
+expression has a refcount of 0, and the xt module gets its refcount
+incremented.
+
+When error happens, the next call finds existing entry, but will no
+longer increase the reference count -- the presence of existing
+nft_xt means we already hold a module reference.
+
+Because nft_xt_put is only called from nft_compat destroy hook,
+it will never see the initial zero reference count.
+->destroy can only be called after ->init(), and that will increase the
+refcount.
+
+Lastly, we now free nft_xt struct with kfree_rcu.
+Else, we get use-after free in nf_tables_rule_destroy:
+
+  while (expr != nft_expr_last(rule) && expr->ops) {
+    nf_tables_expr_destroy(ctx, expr);
+    expr = nft_expr_next(expr); // here
+
+nft_expr_next() dereferences expr->ops. This is safe
+for all users, as ops have static storage duration.
+In nft_compat case however, its ->destroy callback can
+free the memory that hold the ops structure.
+
+Tested-by: Taehee Yoo <ap420073@gmail.com>
+Reported-by: Taehee Yoo <ap420073@gmail.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+

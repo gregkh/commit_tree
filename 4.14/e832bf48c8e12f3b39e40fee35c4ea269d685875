@@ -1,0 +1,79 @@
+audit: Reduce overhead using a coarse clock
+
+Commit 2115bb250f26 ("audit: Use timespec64 to represent audit timestamps")
+noted that audit timestamps were not y2038 safe and used a 64-bit
+timestamp. In itself, this makes sense but the conversion was from
+CURRENT_TIME to ktime_get_real_ts64() which is a heavier call to record
+an accurate timestamp which is required in some, but not all, cases. The
+impact is that when auditd is running without any rules that all syscalls
+have higher overhead. This is visible in the sysbench-thread benchmark as
+a 11.5% performance hit. That benchmark is dumb as rocks but it's also
+visible in redis as an 8-10% hit on all operations which is of greater
+concern. It is somewhat stupid of audit to track syscalls without any
+rules related to syscalls but that is how it behaves.
+
+The overhead can be directly measured with perf comparing 4.9 with 4.12
+
+4.9
+     7.76%  sysbench         [kernel.vmlinux]    [k] __schedule
+     7.62%  sysbench         [kernel.vmlinux]    [k] _raw_spin_lock
+     7.37%  sysbench         libpthread-2.22.so  [.] __lll_lock_elision
+     7.29%  sysbench         [kernel.vmlinux]    [.] syscall_return_via_sysret
+     6.59%  sysbench         [kernel.vmlinux]    [k] native_sched_clock
+     5.21%  sysbench         libc-2.22.so        [.] __sched_yield
+     4.38%  sysbench         [kernel.vmlinux]    [k] entry_SYSCALL_64
+     4.28%  sysbench         [kernel.vmlinux]    [k] do_syscall_64
+     3.49%  sysbench         libpthread-2.22.so  [.] __lll_unlock_elision
+     3.13%  sysbench         [kernel.vmlinux]    [k] __audit_syscall_exit
+     2.87%  sysbench         [kernel.vmlinux]    [k] update_curr
+     2.73%  sysbench         [kernel.vmlinux]    [k] pick_next_task_fair
+     2.31%  sysbench         [kernel.vmlinux]    [k] syscall_trace_enter
+     2.20%  sysbench         [kernel.vmlinux]    [k] __audit_syscall_entry
+.....
+     0.00%  swapper          [kernel.vmlinux]    [k] read_tsc
+
+4.12
+     7.84%  sysbench         [kernel.vmlinux]    [k] __schedule
+     7.05%  sysbench         [kernel.vmlinux]    [k] _raw_spin_lock
+     6.57%  sysbench         libpthread-2.22.so  [.] __lll_lock_elision
+     6.50%  sysbench         [kernel.vmlinux]    [.] syscall_return_via_sysret
+     5.95%  sysbench         [kernel.vmlinux]    [k] read_tsc
+     5.71%  sysbench         [kernel.vmlinux]    [k] native_sched_clock
+     4.78%  sysbench         libc-2.22.so        [.] __sched_yield
+     4.30%  sysbench         [kernel.vmlinux]    [k] entry_SYSCALL_64
+     3.94%  sysbench         [kernel.vmlinux]    [k] do_syscall_64
+     3.37%  sysbench         libpthread-2.22.so  [.] __lll_unlock_elision
+     3.32%  sysbench         [kernel.vmlinux]    [k] __audit_syscall_exit
+     2.91%  sysbench         [kernel.vmlinux]    [k] __getnstimeofday64
+
+Note the additional overhead from read_tsc which goes from 0% to 5.95%.
+This is on a single-socket E3-1230 but similar overheads have been measured
+on an older machine which the patch also eliminates.
+
+The patch in question has no explanation as to why a fully-accurate timestamp
+is required and is likely an oversight.  Using a coarser, but monotically
+increasing, timestamp the overhead can be eliminated.  While it can be
+worked around by configuring or disabling audit, it's tricky enough to
+detect that a kernel fix is justified. With this patch, we see the following;
+
+sysbenchthread
+                              4.9.0                 4.12.0                 4.12.0
+                            vanilla                vanilla            coarse-v1r1
+Amean     1         1.49 (   0.00%)        1.66 ( -11.42%)        1.51 (  -1.34%)
+Amean     3         1.48 (   0.00%)        1.65 ( -11.45%)        1.50 (  -0.96%)
+Amean     5         1.49 (   0.00%)        1.67 ( -12.31%)        1.51 (  -1.83%)
+Amean     7         1.49 (   0.00%)        1.66 ( -11.72%)        1.50 (  -0.67%)
+Amean     12        1.48 (   0.00%)        1.65 ( -11.57%)        1.52 (  -2.89%)
+Amean     16        1.49 (   0.00%)        1.65 ( -11.13%)        1.51 (  -1.73%)
+
+The benchmark is reporting the time required for different thread counts to
+lock/unlock a private mutex which, while dense, demonstrates the syscall
+overhead. This is showing that 4.12 took a 11-12% hit but the overhead is
+almost eliminated by the patch. While the variance is not reported here,
+it's well within the noise with the patch applied.
+
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Arnd Bergmann <arnd@arndb.de>
+Acked-by: Deepa Dinamani <deepa.kernel@gmail.com>
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+

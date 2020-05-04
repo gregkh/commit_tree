@@ -1,0 +1,53 @@
+genirq: Keep chip buslock across irq_request/release_resources()
+
+Moving the irq_request/release_resources() callbacks out of the spinlocked,
+irq disabled and bus locked region, unearthed an interesting abuse of the
+irq_bus_lock/irq_bus_sync_unlock() callbacks.
+
+The OMAP GPIO driver does merily power management inside of them. The
+irq_request_resources() callback of this GPIO irqchip calls a function
+which reads a GPIO register. That read aborts now because the clock of the
+GPIO block is not magically enabled via the irq_bus_lock() callback.
+
+Move the callbacks under the bus lock again to prevent this. In the
+free_irq() path this requires to drop the bus_lock before calling
+synchronize_irq() and reaquiring it before calling the
+irq_release_resources() callback.
+
+The bus lock can't be held because:
+
+   1) The data which has been changed between bus_lock/un_lock is cached in
+      the irq chip driver private data and needs to go out to the irq chip
+      via the slow bus (usually SPI or I2C) before calling
+      synchronize_irq().
+
+      That's the reason why this bus_lock/unlock magic exists in the first
+      place, as you cannot do SPI/I2C transactions while holding desc->lock
+      with interrupts disabled.
+
+   2) synchronize_irq() will actually deadlock, if there is a handler on
+      flight. These chips use threaded handlers for obvious reasons, as
+      they allow to do SPI/I2C communication. When the threaded handler
+      returns then bus_lock needs to be taken in irq_finalize_oneshot() as
+      we need to talk to the actual irq chip once more. After that the
+      threaded handler is marked done, which makes synchronize_irq() return.
+
+      So if we hold bus_lock accross the synchronize_irq() call, the
+      handler cannot mark itself done because it blocks on the bus
+      lock. That in turn makes synchronize_irq() wait forever on the
+      threaded handler to complete....
+
+Add the missing unlock of desc->request_mutex in the error path of
+__free_irq() and add a bunch of comments to explain the locking and
+protection rules.
+
+Fixes: 46e48e257360 ("genirq: Move irq resource handling out of spinlocked region")
+Reported-and-tested-by: Sebastian Reichel <sebastian.reichel@collabora.co.uk>
+Reported-and-tested-by: Tony Lindgren <tony@atomide.com>
+Reported-by: Pavel Machek <pavel@ucw.cz>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Not-longer-ranted-at-by: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Linus Walleij <linus.walleij@linaro.org>
+Cc: Grygorii Strashko <grygorii.strashko@ti.com>
+Cc: Marc Zyngier <marc.zyngier@arm.com>
+

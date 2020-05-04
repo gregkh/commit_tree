@@ -1,0 +1,90 @@
+strparser: initialize all callbacks
+
+commit bbb03029a899 ("strparser: Generalize strparser") added more
+function pointers to 'struct strp_callbacks'; however, kcm_attach() was
+not updated to initialize them.  This could cause the ->lock() and/or
+->unlock() function pointers to be set to garbage values, causing a
+crash in strp_work().
+
+Fix the bug by moving the callback structs into static memory, so
+unspecified members are zeroed.  Also constify them while we're at it.
+
+This bug was found by syzkaller, which encountered the following splat:
+
+    IP: 0x55
+    PGD 3b1ca067
+    P4D 3b1ca067
+    PUD 3b12f067
+    PMD 0
+
+    Oops: 0010 [#1] SMP KASAN
+    Dumping ftrace buffer:
+       (ftrace buffer empty)
+    Modules linked in:
+    CPU: 2 PID: 1194 Comm: kworker/u8:1 Not tainted 4.13.0-rc4-next-20170811 #2
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs 01/01/2011
+    Workqueue: kstrp strp_work
+    task: ffff88006bb0e480 task.stack: ffff88006bb10000
+    RIP: 0010:0x55
+    RSP: 0018:ffff88006bb17540 EFLAGS: 00010246
+    RAX: dffffc0000000000 RBX: ffff88006ce4bd60 RCX: 0000000000000000
+    RDX: 1ffff1000d9c97bd RSI: 0000000000000000 RDI: ffff88006ce4bc48
+    RBP: ffff88006bb17558 R08: ffffffff81467ab2 R09: 0000000000000000
+    R10: ffff88006bb17438 R11: ffff88006bb17940 R12: ffff88006ce4bc48
+    R13: ffff88003c683018 R14: ffff88006bb17980 R15: ffff88003c683000
+    FS:  0000000000000000(0000) GS:ffff88006de00000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: 0000000000000055 CR3: 000000003c145000 CR4: 00000000000006e0
+    DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+    DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+    Call Trace:
+     process_one_work+0xbf3/0x1bc0 kernel/workqueue.c:2098
+     worker_thread+0x223/0x1860 kernel/workqueue.c:2233
+     kthread+0x35e/0x430 kernel/kthread.c:231
+     ret_from_fork+0x2a/0x40 arch/x86/entry/entry_64.S:431
+    Code:  Bad RIP value.
+    RIP: 0x55 RSP: ffff88006bb17540
+    CR2: 0000000000000055
+    ---[ end trace f0e4920047069cee ]---
+
+Here is a C reproducer (requires CONFIG_BPF_SYSCALL=y and
+CONFIG_AF_KCM=y):
+
+    #include <linux/bpf.h>
+    #include <linux/kcm.h>
+    #include <linux/types.h>
+    #include <stdint.h>
+    #include <sys/ioctl.h>
+    #include <sys/socket.h>
+    #include <sys/syscall.h>
+    #include <unistd.h>
+
+    static const struct bpf_insn bpf_insns[3] = {
+        { .code = 0xb7 }, /* BPF_MOV64_IMM(0, 0) */
+        { .code = 0x95 }, /* BPF_EXIT_INSN() */
+    };
+
+    static const union bpf_attr bpf_attr = {
+        .prog_type = 1,
+        .insn_cnt = 2,
+        .insns = (uintptr_t)&bpf_insns,
+        .license = (uintptr_t)"",
+    };
+
+    int main(void)
+    {
+        int bpf_fd = syscall(__NR_bpf, BPF_PROG_LOAD,
+                             &bpf_attr, sizeof(bpf_attr));
+        int inet_fd = socket(AF_INET, SOCK_STREAM, 0);
+        int kcm_fd = socket(AF_KCM, SOCK_DGRAM, 0);
+
+        ioctl(kcm_fd, SIOCKCMATTACH,
+              &(struct kcm_attach) { .fd = inet_fd, .bpf_fd = bpf_fd });
+    }
+
+Fixes: bbb03029a899 ("strparser: Generalize strparser")
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Tom Herbert <tom@quantonium.net>
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

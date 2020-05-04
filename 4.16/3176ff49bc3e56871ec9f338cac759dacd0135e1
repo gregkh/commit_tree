@@ -1,0 +1,156 @@
+drm/i915/guc: Move GuC workqueue allocations outside of the mutex
+
+This gets rid of the following lockdep splat:
+
+======================================================
+WARNING: possible circular locking dependency detected
+4.15.0-rc2-CI-Patchwork_7428+ #1 Not tainted
+------------------------------------------------------
+debugfs_test/1351 is trying to acquire lock:
+ (&dev->struct_mutex){+.+.}, at: [<000000009d90d1a3>] i915_mutex_lock_interruptible+0x47/0x130 [i915]
+
+but task is already holding lock:
+ (&mm->mmap_sem){++++}, at: [<000000005df01c1e>] __do_page_fault+0x106/0x560
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #6 (&mm->mmap_sem){++++}:
+       __might_fault+0x63/0x90
+       _copy_to_user+0x1e/0x70
+       filldir+0x8c/0xf0
+       dcache_readdir+0xeb/0x160
+       iterate_dir+0xe6/0x150
+       SyS_getdents+0xa0/0x130
+       entry_SYSCALL_64_fastpath+0x1c/0x89
+
+-> #5 (&sb->s_type->i_mutex_key#5){++++}:
+       lockref_get+0x9/0x20
+
+-> #4 ((completion)&req.done){+.+.}:
+       wait_for_common+0x54/0x210
+       devtmpfs_create_node+0x130/0x150
+       device_add+0x5ad/0x5e0
+       device_create_groups_vargs+0xd4/0xe0
+       device_create+0x35/0x40
+       msr_device_create+0x22/0x40
+       cpuhp_invoke_callback+0xc5/0xbf0
+       cpuhp_thread_fun+0x167/0x210
+       smpboot_thread_fn+0x17f/0x270
+       kthread+0x173/0x1b0
+       ret_from_fork+0x24/0x30
+
+-> #3 (cpuhp_state-up){+.+.}:
+       cpuhp_issue_call+0x132/0x1c0
+       __cpuhp_setup_state_cpuslocked+0x12f/0x2a0
+       __cpuhp_setup_state+0x3a/0x50
+       page_writeback_init+0x3a/0x5c
+       start_kernel+0x393/0x3e2
+       secondary_startup_64+0xa5/0xb0
+
+-> #2 (cpuhp_state_mutex){+.+.}:
+       __mutex_lock+0x81/0x9b0
+       __cpuhp_setup_state_cpuslocked+0x4b/0x2a0
+       __cpuhp_setup_state+0x3a/0x50
+       page_alloc_init+0x1f/0x26
+       start_kernel+0x139/0x3e2
+       secondary_startup_64+0xa5/0xb0
+
+-> #1 (cpu_hotplug_lock.rw_sem){++++}:
+       cpus_read_lock+0x34/0xa0
+       apply_workqueue_attrs+0xd/0x40
+       __alloc_workqueue_key+0x2c7/0x4e1
+       intel_guc_submission_init+0x10c/0x650 [i915]
+       intel_uc_init_hw+0x29e/0x460 [i915]
+       i915_gem_init_hw+0xca/0x290 [i915]
+       i915_gem_init+0x115/0x3a0 [i915]
+       i915_driver_load+0x9a8/0x16c0 [i915]
+       i915_pci_probe+0x2e/0x90 [i915]
+       pci_device_probe+0x9c/0x120
+       driver_probe_device+0x2a3/0x480
+       __driver_attach+0xd9/0xe0
+       bus_for_each_dev+0x57/0x90
+       bus_add_driver+0x168/0x260
+       driver_register+0x52/0xc0
+       do_one_initcall+0x39/0x150
+       do_init_module+0x56/0x1ef
+       load_module+0x231c/0x2d70
+       SyS_finit_module+0xa5/0xe0
+       entry_SYSCALL_64_fastpath+0x1c/0x89
+
+-> #0 (&dev->struct_mutex){+.+.}:
+       lock_acquire+0xaf/0x200
+       __mutex_lock+0x81/0x9b0
+       i915_mutex_lock_interruptible+0x47/0x130 [i915]
+       i915_gem_fault+0x201/0x760 [i915]
+       __do_fault+0x15/0x70
+       __handle_mm_fault+0x85b/0xe40
+       handle_mm_fault+0x14f/0x2f0
+       __do_page_fault+0x2d1/0x560
+       page_fault+0x22/0x30
+
+other info that might help us debug this:
+
+Chain exists of:
+  &dev->struct_mutex --> &sb->s_type->i_mutex_key#5 --> &mm->mmap_sem
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&mm->mmap_sem);
+                               lock(&sb->s_type->i_mutex_key#5);
+                               lock(&mm->mmap_sem);
+  lock(&dev->struct_mutex);
+
+ *** DEADLOCK ***
+
+1 lock held by debugfs_test/1351:
+ #0:  (&mm->mmap_sem){++++}, at: [<000000005df01c1e>] __do_page_fault+0x106/0x560
+
+stack backtrace:
+CPU: 2 PID: 1351 Comm: debugfs_test Not tainted 4.15.0-rc2-CI-Patchwork_7428+ #1
+Hardware name:                  /NUC6i5SYB, BIOS SYSKLi35.86A.0057.2017.0119.1758 01/19/2017
+Call Trace:
+ dump_stack+0x5f/0x86
+ print_circular_bug+0x230/0x3b0
+ check_prev_add+0x439/0x7b0
+ ? lockdep_init_map_crosslock+0x20/0x20
+ ? unwind_get_return_address+0x16/0x30
+ ? __lock_acquire+0x1385/0x15a0
+ __lock_acquire+0x1385/0x15a0
+ lock_acquire+0xaf/0x200
+ ? i915_mutex_lock_interruptible+0x47/0x130 [i915]
+ __mutex_lock+0x81/0x9b0
+ ? i915_mutex_lock_interruptible+0x47/0x130 [i915]
+ ? i915_mutex_lock_interruptible+0x47/0x130 [i915]
+ ? i915_mutex_lock_interruptible+0x47/0x130 [i915]
+ i915_mutex_lock_interruptible+0x47/0x130 [i915]
+ ? __pm_runtime_resume+0x4f/0x80
+ i915_gem_fault+0x201/0x760 [i915]
+ __do_fault+0x15/0x70
+ __handle_mm_fault+0x85b/0xe40
+ handle_mm_fault+0x14f/0x2f0
+ __do_page_fault+0x2d1/0x560
+ page_fault+0x22/0x30
+RIP: 0033:0x7f98d6f49116
+RSP: 002b:00007ffd6ffc3278 EFLAGS: 00010283
+RAX: 00007f98d39a2bc0 RBX: 0000000000000000 RCX: 0000000000001680
+RDX: 0000000000001680 RSI: 00007ffd6ffc3400 RDI: 00007f98d39a2bc0
+RBP: 00007ffd6ffc33a0 R08: 0000000000000000 R09: 00000000000005a0
+R10: 000055e847c2a830 R11: 0000000000000002 R12: 0000000000000001
+R13: 000055e847c1d040 R14: 00007ffd6ffc3400 R15: 00007f98d6752ba0
+
+v2: Init preempt_work unconditionally (Chris)
+v3: Mention that we need the enable_guc=1 for lockdep splat (Chris)
+
+Testcase: igt/debugfs_test/read_all_entries # with i915.enable_guc=1
+Signed-off-by: Michał Winiarski <michal.winiarski@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171213221352.7173-2-michal.winiarski@intel.com
+

@@ -1,0 +1,92 @@
+Introduce v3 namespaced file capabilities
+
+Root in a non-initial user ns cannot be trusted to write a traditional
+security.capability xattr.  If it were allowed to do so, then any
+unprivileged user on the host could map his own uid to root in a private
+namespace, write the xattr, and execute the file with privilege on the
+host.
+
+However supporting file capabilities in a user namespace is very
+desirable.  Not doing so means that any programs designed to run with
+limited privilege must continue to support other methods of gaining and
+dropping privilege.  For instance a program installer must detect
+whether file capabilities can be assigned, and assign them if so but set
+setuid-root otherwise.  The program in turn must know how to drop
+partial capabilities, and do so only if setuid-root.
+
+This patch introduces v3 of the security.capability xattr.  It builds a
+vfs_ns_cap_data struct by appending a uid_t rootid to struct
+vfs_cap_data.  This is the absolute uid_t (that is, the uid_t in user
+namespace which mounted the filesystem, usually init_user_ns) of the
+root id in whose namespaces the file capabilities may take effect.
+
+When a task asks to write a v2 security.capability xattr, if it is
+privileged with respect to the userns which mounted the filesystem, then
+nothing should change.  Otherwise, the kernel will transparently rewrite
+the xattr as a v3 with the appropriate rootid.  This is done during the
+execution of setxattr() to catch user-space-initiated capability writes.
+Subsequently, any task executing the file which has the noted kuid as
+its root uid, or which is in a descendent user_ns of such a user_ns,
+will run the file with capabilities.
+
+Similarly when asking to read file capabilities, a v3 capability will
+be presented as v2 if it applies to the caller's namespace.
+
+If a task writes a v3 security.capability, then it can provide a uid for
+the xattr so long as the uid is valid in its own user namespace, and it
+is privileged with CAP_SETFCAP over its namespace.  The kernel will
+translate that rootid to an absolute uid, and write that to disk.  After
+this, a task in the writer's namespace will not be able to use those
+capabilities (unless rootid was 0), but a task in a namespace where the
+given uid is root will.
+
+Only a single security.capability xattr may exist at a time for a given
+file.  A task may overwrite an existing xattr so long as it is
+privileged over the inode.  Note this is a departure from previous
+semantics, which required privilege to remove a security.capability
+xattr.  This check can be re-added if deemed useful.
+
+This allows a simple setxattr to work, allows tar/untar to work, and
+allows us to tar in one namespace and untar in another while preserving
+the capability, without risking leaking privilege into a parent
+namespace.
+
+Example using tar:
+
+ $ cp /bin/sleep sleepx
+ $ mkdir b1 b2
+ $ lxc-usernsexec -m b:0:100000:1 -m b:1:$(id -u):1 -- chown 0:0 b1
+ $ lxc-usernsexec -m b:0:100001:1 -m b:1:$(id -u):1 -- chown 0:0 b2
+ $ lxc-usernsexec -m b:0:100000:1000 -- tar --xattrs-include=security.capability --xattrs -cf b1/sleepx.tar sleepx
+ $ lxc-usernsexec -m b:0:100001:1000 -- tar --xattrs-include=security.capability --xattrs -C b2 -xf b1/sleepx.tar
+ $ lxc-usernsexec -m b:0:100001:1000 -- getcap b2/sleepx
+   b2/sleepx = cap_sys_admin+ep
+ # /opt/ltp/testcases/bin/getv3xattr b2/sleepx
+   v3 xattr, rootid is 100001
+
+A patch to linux-test-project adding a new set of tests for this
+functionality is in the nsfscaps branch at github.com/hallyn/ltp
+
+Changelog:
+   Nov 02 2016: fix invalid check at refuse_fcap_overwrite()
+   Nov 07 2016: convert rootid from and to fs user_ns
+   (From ebiederm: mar 28 2017)
+     commoncap.c: fix typos - s/v4/v3
+     get_vfs_caps_from_disk: clarify the fs_ns root access check
+     nsfscaps: change the code split for cap_inode_setxattr()
+   Apr 09 2017:
+       don't return v3 cap for caps owned by current root.
+      return a v2 cap for a true v2 cap in non-init ns
+   Apr 18 2017:
+      . Change the flow of fscap writing to support s_user_ns writing.
+      . Remove refuse_fcap_overwrite().  The value of the previous
+        xattr doesn't matter.
+   Apr 24 2017:
+      . incorporate Eric's incremental diff
+      . move cap_convert_nscap to setxattr and simplify its usage
+   May 8, 2017:
+      . fix leaking dentry refcount in cap_inode_getsecurity
+
+Signed-off-by: Serge Hallyn <serge@hallyn.com>
+Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+

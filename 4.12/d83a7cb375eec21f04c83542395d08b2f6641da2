@@ -1,0 +1,96 @@
+livepatch: change to a per-task consistency model
+
+Change livepatch to use a basic per-task consistency model.  This is the
+foundation which will eventually enable us to patch those ~10% of
+security patches which change function or data semantics.  This is the
+biggest remaining piece needed to make livepatch more generally useful.
+
+This code stems from the design proposal made by Vojtech [1] in November
+2014.  It's a hybrid of kGraft and kpatch: it uses kGraft's per-task
+consistency and syscall barrier switching combined with kpatch's stack
+trace switching.  There are also a number of fallback options which make
+it quite flexible.
+
+Patches are applied on a per-task basis, when the task is deemed safe to
+switch over.  When a patch is enabled, livepatch enters into a
+transition state where tasks are converging to the patched state.
+Usually this transition state can complete in a few seconds.  The same
+sequence occurs when a patch is disabled, except the tasks converge from
+the patched state to the unpatched state.
+
+An interrupt handler inherits the patched state of the task it
+interrupts.  The same is true for forked tasks: the child inherits the
+patched state of the parent.
+
+Livepatch uses several complementary approaches to determine when it's
+safe to patch tasks:
+
+1. The first and most effective approach is stack checking of sleeping
+   tasks.  If no affected functions are on the stack of a given task,
+   the task is patched.  In most cases this will patch most or all of
+   the tasks on the first try.  Otherwise it'll keep trying
+   periodically.  This option is only available if the architecture has
+   reliable stacks (HAVE_RELIABLE_STACKTRACE).
+
+2. The second approach, if needed, is kernel exit switching.  A
+   task is switched when it returns to user space from a system call, a
+   user space IRQ, or a signal.  It's useful in the following cases:
+
+   a) Patching I/O-bound user tasks which are sleeping on an affected
+      function.  In this case you have to send SIGSTOP and SIGCONT to
+      force it to exit the kernel and be patched.
+   b) Patching CPU-bound user tasks.  If the task is highly CPU-bound
+      then it will get patched the next time it gets interrupted by an
+      IRQ.
+   c) In the future it could be useful for applying patches for
+      architectures which don't yet have HAVE_RELIABLE_STACKTRACE.  In
+      this case you would have to signal most of the tasks on the
+      system.  However this isn't supported yet because there's
+      currently no way to patch kthreads without
+      HAVE_RELIABLE_STACKTRACE.
+
+3. For idle "swapper" tasks, since they don't ever exit the kernel, they
+   instead have a klp_update_patch_state() call in the idle loop which
+   allows them to be patched before the CPU enters the idle state.
+
+   (Note there's not yet such an approach for kthreads.)
+
+All the above approaches may be skipped by setting the 'immediate' flag
+in the 'klp_patch' struct, which will disable per-task consistency and
+patch all tasks immediately.  This can be useful if the patch doesn't
+change any function or data semantics.  Note that, even with this flag
+set, it's possible that some tasks may still be running with an old
+version of the function, until that function returns.
+
+There's also an 'immediate' flag in the 'klp_func' struct which allows
+you to specify that certain functions in the patch can be applied
+without per-task consistency.  This might be useful if you want to patch
+a common function like schedule(), and the function change doesn't need
+consistency but the rest of the patch does.
+
+For architectures which don't have HAVE_RELIABLE_STACKTRACE, the user
+must set patch->immediate which causes all tasks to be patched
+immediately.  This option should be used with care, only when the patch
+doesn't change any function or data semantics.
+
+In the future, architectures which don't have HAVE_RELIABLE_STACKTRACE
+may be allowed to use per-task consistency if we can come up with
+another way to patch kthreads.
+
+The /sys/kernel/livepatch/<patch>/transition file shows whether a patch
+is in transition.  Only a single patch (the topmost patch on the stack)
+can be in transition at a given time.  A patch can remain in transition
+indefinitely, if any of the tasks are stuck in the initial patch state.
+
+A transition can be reversed and effectively canceled by writing the
+opposite value to the /sys/kernel/livepatch/<patch>/enabled file while
+the transition is in progress.  Then all the tasks will attempt to
+converge back to the original patch state.
+
+[1] https://lkml.kernel.org/r/20141107140458.GA21774@suse.cz
+
+Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Acked-by: Miroslav Benes <mbenes@suse.cz>
+Acked-by: Ingo Molnar <mingo@kernel.org>        # for the scheduler changes
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+

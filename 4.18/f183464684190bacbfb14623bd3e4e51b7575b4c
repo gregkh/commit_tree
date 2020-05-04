@@ -1,0 +1,53 @@
+bdi: Move cgroup bdi_writeback to a dedicated low concurrency workqueue
+
+From 0aa2e9b921d6db71150633ff290199554f0842a8 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 23 May 2018 10:29:00 -0700
+
+cgwb_release() punts the actual release to cgwb_release_workfn() on
+system_wq.  Depending on the number of cgroups or block devices, there
+can be a lot of cgwb_release_workfn() in flight at the same time.
+
+We're periodically seeing close to 256 kworkers getting stuck with the
+following stack trace and overtime the entire system gets stuck.
+
+  [<ffffffff810ee40c>] _synchronize_rcu_expedited.constprop.72+0x2fc/0x330
+  [<ffffffff810ee634>] synchronize_rcu_expedited+0x24/0x30
+  [<ffffffff811ccf23>] bdi_unregister+0x53/0x290
+  [<ffffffff811cd1e9>] release_bdi+0x89/0xc0
+  [<ffffffff811cd645>] wb_exit+0x85/0xa0
+  [<ffffffff811cdc84>] cgwb_release_workfn+0x54/0xb0
+  [<ffffffff810a68d0>] process_one_work+0x150/0x410
+  [<ffffffff810a71fd>] worker_thread+0x6d/0x520
+  [<ffffffff810ad3dc>] kthread+0x12c/0x160
+  [<ffffffff81969019>] ret_from_fork+0x29/0x40
+  [<ffffffffffffffff>] 0xffffffffffffffff
+
+The events leading to the lockup are...
+
+1. A lot of cgwb_release_workfn() is queued at the same time and all
+   system_wq kworkers are assigned to execute them.
+
+2. They all end up calling synchronize_rcu_expedited().  One of them
+   wins and tries to perform the expedited synchronization.
+
+3. However, that invovles queueing rcu_exp_work to system_wq and
+   waiting for it.  Because #1 is holding all available kworkers on
+   system_wq, rcu_exp_work can't be executed.  cgwb_release_workfn()
+   is waiting for synchronize_rcu_expedited() which in turn is waiting
+   for cgwb_release_workfn() to free up some of the kworkers.
+
+We shouldn't be scheduling hundreds of cgwb_release_workfn() at the
+same time.  There's nothing to be gained from that.  This patch
+updates cgwb release path to use a dedicated percpu workqueue with
+@max_active of 1.
+
+While this resolves the problem at hand, it might be a good idea to
+isolate rcu_exp_work to its own workqueue too as it can be used from
+various paths and is prone to this sort of indirect A-A deadlocks.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

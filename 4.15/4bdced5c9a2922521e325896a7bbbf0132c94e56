@@ -1,0 +1,101 @@
+sched/rt: Simplify the IPI based RT balancing logic
+
+When a CPU lowers its priority (schedules out a high priority task for a
+lower priority one), a check is made to see if any other CPU has overloaded
+RT tasks (more than one). It checks the rto_mask to determine this and if so
+it will request to pull one of those tasks to itself if the non running RT
+task is of higher priority than the new priority of the next task to run on
+the current CPU.
+
+When we deal with large number of CPUs, the original pull logic suffered
+from large lock contention on a single CPU run queue, which caused a huge
+latency across all CPUs. This was caused by only having one CPU having
+overloaded RT tasks and a bunch of other CPUs lowering their priority. To
+solve this issue, commit:
+
+  b6366f048e0c ("sched/rt: Use IPI to trigger RT task push migration instead of pulling")
+
+changed the way to request a pull. Instead of grabbing the lock of the
+overloaded CPU's runqueue, it simply sent an IPI to that CPU to do the work.
+
+Although the IPI logic worked very well in removing the large latency build
+up, it still could suffer from a large number of IPIs being sent to a single
+CPU. On a 80 CPU box, I measured over 200us of processing IPIs. Worse yet,
+when I tested this on a 120 CPU box, with a stress test that had lots of
+RT tasks scheduling on all CPUs, it actually triggered the hard lockup
+detector! One CPU had so many IPIs sent to it, and due to the restart
+mechanism that is triggered when the source run queue has a priority status
+change, the CPU spent minutes! processing the IPIs.
+
+Thinking about this further, I realized there's no reason for each run queue
+to send its own IPI. As all CPUs with overloaded tasks must be scanned
+regardless if there's one or many CPUs lowering their priority, because
+there's no current way to find the CPU with the highest priority task that
+can schedule to one of these CPUs, there really only needs to be one IPI
+being sent around at a time.
+
+This greatly simplifies the code!
+
+The new approach is to have each root domain have its own irq work, as the
+rto_mask is per root domain. The root domain has the following fields
+attached to it:
+
+  rto_push_work	 - the irq work to process each CPU set in rto_mask
+  rto_lock	 - the lock to protect some of the other rto fields
+  rto_loop_start - an atomic that keeps contention down on rto_lock
+		    the first CPU scheduling in a lower priority task
+		    is the one to kick off the process.
+  rto_loop_next	 - an atomic that gets incremented for each CPU that
+		    schedules in a lower priority task.
+  rto_loop	 - a variable protected by rto_lock that is used to
+		    compare against rto_loop_next
+  rto_cpu	 - The cpu to send the next IPI to, also protected by
+		    the rto_lock.
+
+When a CPU schedules in a lower priority task and wants to make sure
+overloaded CPUs know about it. It increments the rto_loop_next. Then it
+atomically sets rto_loop_start with a cmpxchg. If the old value is not "0",
+then it is done, as another CPU is kicking off the IPI loop. If the old
+value is "0", then it will take the rto_lock to synchronize with a possible
+IPI being sent around to the overloaded CPUs.
+
+If rto_cpu is greater than or equal to nr_cpu_ids, then there's either no
+IPI being sent around, or one is about to finish. Then rto_cpu is set to the
+first CPU in rto_mask and an IPI is sent to that CPU. If there's no CPUs set
+in rto_mask, then there's nothing to be done.
+
+When the CPU receives the IPI, it will first try to push any RT tasks that is
+queued on the CPU but can't run because a higher priority RT task is
+currently running on that CPU.
+
+Then it takes the rto_lock and looks for the next CPU in the rto_mask. If it
+finds one, it simply sends an IPI to that CPU and the process continues.
+
+If there's no more CPUs in the rto_mask, then rto_loop is compared with
+rto_loop_next. If they match, everything is done and the process is over. If
+they do not match, then a CPU scheduled in a lower priority task as the IPI
+was being passed around, and the process needs to start again. The first CPU
+in rto_mask is sent the IPI.
+
+This change removes this duplication of work in the IPI logic, and greatly
+lowers the latency caused by the IPIs. This removed the lockup happening on
+the 120 CPU machine. It also simplifies the code tremendously. What else
+could anyone ask for?
+
+Thanks to Peter Zijlstra for simplifying the rto_loop_start atomic logic and
+supplying me with the rto_start_trylock() and rto_start_unlock() helper
+functions.
+
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Clark Williams <williams@redhat.com>
+Cc: Daniel Bristot de Oliveira <bristot@redhat.com>
+Cc: John Kacur <jkacur@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Scott Wood <swood@redhat.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20170424114732.1aac6dc4@gandalf.local.home
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

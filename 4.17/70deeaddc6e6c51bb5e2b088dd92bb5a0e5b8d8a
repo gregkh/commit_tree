@@ -1,0 +1,156 @@
+drm/i915/guc: Fix lockdep due to log relay channel handling under struct_mutex
+
+This patch fixes lockdep issue due to circular locking dependency of
+struct_mutex, i_mutex_key, mmap_sem, relay_channels_mutex.
+For GuC log relay channel we create debugfs file that requires i_mutex_key
+lock and we are doing that under struct_mutex. So we introduced newer
+dependency as:
+    &dev->struct_mutex --> &sb->s_type->i_mutex_key#3 --> &mm->mmap_sem
+However, there is dependency from mmap_sem to struct_mutex. Hence we
+separate the relay create/destroy operation from under struct_mutex.
+Also added runtime check of relay buffer status.
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+
+======================================================
+WARNING: possible circular locking dependency detected
+4.15.0-rc6-CI-Patchwork_7614+ #1 Not tainted
+------------------------------------------------------
+debugfs_test/1388 is trying to acquire lock:
+ (&dev->struct_mutex){+.+.}, at: [<00000000d5e1d915>] i915_mutex_lock_interruptible+0x47/0x130 [i915]
+
+but task is already holding lock:
+ (&mm->mmap_sem){++++}, at: [<0000000029a9c131>] __do_page_fault+0x106/0x560
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #3 (&mm->mmap_sem){++++}:
+       _copy_to_user+0x1e/0x70
+       filldir+0x8c/0xf0
+       dcache_readdir+0xeb/0x160
+       iterate_dir+0xdc/0x140
+       SyS_getdents+0xa0/0x130
+       entry_SYSCALL_64_fastpath+0x1c/0x89
+
+-> #2 (&sb->s_type->i_mutex_key#3){++++}:
+       start_creating+0x59/0x110
+       __debugfs_create_file+0x2e/0xe0
+       relay_create_buf_file+0x62/0x80
+       relay_late_setup_files+0x84/0x250
+       guc_log_late_setup+0x4f/0x110 [i915]
+       i915_guc_log_register+0x32/0x40 [i915]
+       i915_driver_load+0x7b6/0x1720 [i915]
+       i915_pci_probe+0x2e/0x90 [i915]
+       pci_device_probe+0x9c/0x120
+       driver_probe_device+0x2a3/0x480
+       __driver_attach+0xd9/0xe0
+       bus_for_each_dev+0x57/0x90
+       bus_add_driver+0x168/0x260
+       driver_register+0x52/0xc0
+       do_one_initcall+0x39/0x150
+       do_init_module+0x56/0x1ef
+       load_module+0x231c/0x2d70
+       SyS_finit_module+0xa5/0xe0
+       entry_SYSCALL_64_fastpath+0x1c/0x89
+
+-> #1 (relay_channels_mutex){+.+.}:
+       relay_open+0x12c/0x2b0
+       intel_guc_log_runtime_create+0xab/0x230 [i915]
+       intel_guc_init+0x81/0x120 [i915]
+       intel_uc_init+0x29/0xa0 [i915]
+       i915_gem_init+0x182/0x530 [i915]
+       i915_driver_load+0xaa9/0x1720 [i915]
+       i915_pci_probe+0x2e/0x90 [i915]
+       pci_device_probe+0x9c/0x120
+       driver_probe_device+0x2a3/0x480
+       __driver_attach+0xd9/0xe0
+       bus_for_each_dev+0x57/0x90
+       bus_add_driver+0x168/0x260
+       driver_register+0x52/0xc0
+       do_one_initcall+0x39/0x150
+       do_init_module+0x56/0x1ef
+       load_module+0x231c/0x2d70
+       SyS_finit_module+0xa5/0xe0
+       entry_SYSCALL_64_fastpath+0x1c/0x89
+
+-> #0 (&dev->struct_mutex){+.+.}:
+       __mutex_lock+0x81/0x9b0
+       i915_mutex_lock_interruptible+0x47/0x130 [i915]
+       i915_gem_fault+0x201/0x790 [i915]
+       __do_fault+0x15/0x70
+       __handle_mm_fault+0x677/0xdc0
+       handle_mm_fault+0x14f/0x2f0
+       __do_page_fault+0x2d1/0x560
+       page_fault+0x4c/0x60
+
+other info that might help us debug this:
+
+Chain exists of:
+  &dev->struct_mutex --> &sb->s_type->i_mutex_key#3 --> &mm->mmap_sem
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&mm->mmap_sem);
+                               lock(&sb->s_type->i_mutex_key#3);
+                               lock(&mm->mmap_sem);
+  lock(&dev->struct_mutex);
+
+ *** DEADLOCK ***
+
+1 lock held by debugfs_test/1388:
+ #0:  (&mm->mmap_sem){++++}, at: [<0000000029a9c131>] __do_page_fault+0x106/0x560
+
+stack backtrace:
+CPU: 2 PID: 1388 Comm: debugfs_test Not tainted 4.15.0-rc6-CI-Patchwork_7614+ #1
+Hardware name: To Be Filled By O.E.M. To Be Filled By O.E.M./J4205-ITX, BIOS P1.10 09/29/2016
+Call Trace:
+ dump_stack+0x5f/0x86
+ print_circular_bug.isra.18+0x1d0/0x2c0
+ __lock_acquire+0x14ae/0x1b60
+ ? lock_acquire+0xaf/0x200
+ lock_acquire+0xaf/0x200
+ ? i915_mutex_lock_interruptible+0x47/0x130 [i915]
+ __mutex_lock+0x81/0x9b0
+ ? i915_mutex_lock_interruptible+0x47/0x130 [i915]
+ ? i915_mutex_lock_interruptible+0x47/0x130 [i915]
+ ? i915_mutex_lock_interruptible+0x47/0x130 [i915]
+ i915_mutex_lock_interruptible+0x47/0x130 [i915]
+ ? __pm_runtime_resume+0x4f/0x80
+ i915_gem_fault+0x201/0x790 [i915]
+ __do_fault+0x15/0x70
+ ? _raw_spin_unlock+0x29/0x40
+ __handle_mm_fault+0x677/0xdc0
+ handle_mm_fault+0x14f/0x2f0
+ __do_page_fault+0x2d1/0x560
+ ? page_fault+0x36/0x60
+ page_fault+0x4c/0x60
+
+v2: Added lock protection to guc->log.runtime.relay_chan (Chris)
+    Fixed locking inside guc_flush_logs uncovered by new lockdep.
+
+v3: Locking guc_read_update_log_buffer entirely with relay_lock. (Chris)
+    Prepared intel_guc_init_early. Moved relay_lock inside relay_create
+    relay_destroy, relay_file_create, guc_read_update_log_buffer. (Michal)
+    Removed struct_mutex lock around guc_log_flush and removed usage
+    of guc_log_has_relay() from runtime_create path as it needs
+    struct_mutex lock.
+
+v4: Handle NULL relay sub buffer pointer earlier in read_update_log_buffer
+    (Chris). Fixed comment suffix **/. (Michal)
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=104693
+Testcase: igt/debugfs_test/read_all_entries # with enable_guc=1 and guc_log_level=1
+Signed-off-by: Sagar Arun Kamble <sagar.a.kamble@intel.com>
+Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Marta Lofstedt <marta.lofstedt@intel.com>
+Cc: Michal Winiarski <michal.winiarski@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/1516808821-3638-3-git-send-email-sagar.a.kamble@intel.com
+

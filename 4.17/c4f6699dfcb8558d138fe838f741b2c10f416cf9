@@ -1,0 +1,85 @@
+bpf: introduce BPF_RAW_TRACEPOINT
+
+Introduce BPF_PROG_TYPE_RAW_TRACEPOINT bpf program type to access
+kernel internal arguments of the tracepoints in their raw form.
+
+>From bpf program point of view the access to the arguments look like:
+struct bpf_raw_tracepoint_args {
+       __u64 args[0];
+};
+
+int bpf_prog(struct bpf_raw_tracepoint_args *ctx)
+{
+  // program can read args[N] where N depends on tracepoint
+  // and statically verified at program load+attach time
+}
+
+kprobe+bpf infrastructure allows programs access function arguments.
+This feature allows programs access raw tracepoint arguments.
+
+Similar to proposed 'dynamic ftrace events' there are no abi guarantees
+to what the tracepoints arguments are and what their meaning is.
+The program needs to type cast args properly and use bpf_probe_read()
+helper to access struct fields when argument is a pointer.
+
+For every tracepoint __bpf_trace_##call function is prepared.
+In assembler it looks like:
+(gdb) disassemble __bpf_trace_xdp_exception
+Dump of assembler code for function __bpf_trace_xdp_exception:
+   0xffffffff81132080 <+0>:     mov    %ecx,%ecx
+   0xffffffff81132082 <+2>:     jmpq   0xffffffff811231f0 <bpf_trace_run3>
+
+where
+
+TRACE_EVENT(xdp_exception,
+        TP_PROTO(const struct net_device *dev,
+                 const struct bpf_prog *xdp, u32 act),
+
+The above assembler snippet is casting 32-bit 'act' field into 'u64'
+to pass into bpf_trace_run3(), while 'dev' and 'xdp' args are passed as-is.
+All of ~500 of __bpf_trace_*() functions are only 5-10 byte long
+and in total this approach adds 7k bytes to .text.
+
+This approach gives the lowest possible overhead
+while calling trace_xdp_exception() from kernel C code and
+transitioning into bpf land.
+Since tracepoint+bpf are used at speeds of 1M+ events per second
+this is valuable optimization.
+
+The new BPF_RAW_TRACEPOINT_OPEN sys_bpf command is introduced
+that returns anon_inode FD of 'bpf-raw-tracepoint' object.
+
+The user space looks like:
+// load bpf prog with BPF_PROG_TYPE_RAW_TRACEPOINT type
+prog_fd = bpf_prog_load(...);
+// receive anon_inode fd for given bpf_raw_tracepoint with prog attached
+raw_tp_fd = bpf_raw_tracepoint_open("xdp_exception", prog_fd);
+
+Ctrl-C of tracing daemon or cmdline tool that uses this feature
+will automatically detach bpf program, unload it and
+unregister tracepoint probe.
+
+On the kernel side the __bpf_raw_tp_map section of pointers to
+tracepoint definition and to __bpf_trace_*() probe function is used
+to find a tracepoint with "xdp_exception" name and
+corresponding __bpf_trace_xdp_exception() probe function
+which are passed to tracepoint_probe_register() to connect probe
+with tracepoint.
+
+Addition of bpf_raw_tracepoint doesn't interfere with ftrace and perf
+tracepoint mechanisms. perf_event_open() can be used in parallel
+on the same tracepoint.
+Multiple bpf_raw_tracepoint_open("xdp_exception", prog_fd) are permitted.
+Each with its own bpf program. The kernel will execute
+all tracepoint probes and all attached bpf programs.
+
+In the future bpf_raw_tracepoints can be extended with
+query/introspection logic.
+
+__bpf_raw_tp_map section logic was contributed by Steven Rostedt
+
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Acked-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+

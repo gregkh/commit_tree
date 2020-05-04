@@ -1,0 +1,66 @@
+tools, perf: add and use optimized ring_buffer_{read_head, write_tail} helpers
+
+Currently, on x86-64, perf uses LFENCE and MFENCE (rmb() and mb(),
+respectively) when processing events from the perf ring buffer which
+is unnecessarily expensive as we can do more lightweight in particular
+given this is critical fast-path in perf.
+
+According to Peter rmb()/mb() were added back then via a94d342b9cb0
+("tools/perf: Add required memory barriers") at a time where kernel
+still supported chips that needed it, but nowadays support for these
+has been ditched completely, therefore we can fix them up as well.
+
+While for x86-64, replacing rmb() and mb() with smp_*() variants would
+result in just a compiler barrier for the former and LOCK + ADD for
+the latter (__sync_synchronize() uses slower MFENCE by the way), Peter
+suggested we can use smp_{load_acquire,store_release}() instead for
+architectures where its implementation doesn't resolve in slower smp_mb().
+Thus, e.g. in x86-64 we would be able to avoid CPU barrier entirely due
+to TSO. For architectures where the latter needs to use smp_mb() e.g.
+on arm, we stick to cheaper smp_rmb() variant for fetching the head.
+
+This work adds helpers ring_buffer_read_head() and ring_buffer_write_tail()
+for tools infrastructure that either switches to smp_load_acquire() for
+architectures where it is cheaper or uses READ_ONCE() + smp_rmb() barrier
+for those where it's not in order to fetch the data_head from the perf
+control page, and it uses smp_store_release() to write the data_tail.
+Latter is smp_mb() + WRITE_ONCE() combination or a cheaper variant if
+architecture allows for it. Those that rely on smp_rmb() and smp_mb() can
+further improve performance in a follow up step by implementing the two
+under tools/arch/*/include/asm/barrier.h such that they don't have to
+fallback to rmb() and mb() in tools/include/asm/barrier.h.
+
+Switch perf to use ring_buffer_read_head() and ring_buffer_write_tail()
+so it can make use of the optimizations. Later, we convert libbpf as
+well to use the same helpers.
+
+Side note [0]: the topic has been raised of whether one could simply use
+the C11 gcc builtins [1] for the smp_load_acquire() and smp_store_release()
+instead:
+
+  __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+  __atomic_store_n(ptr, val, __ATOMIC_RELEASE);
+
+Kernel and (presumably) tooling shipped along with the kernel has a
+minimum requirement of being able to build with gcc-4.6 and the latter
+does not have C11 builtins. While generally the C11 memory models don't
+align with the kernel's, the C11 load-acquire and store-release alone
+/could/ suffice, however. Issue is that this is implementation dependent
+on how the load-acquire and store-release is done by the compiler and
+the mapping of supported compilers must align to be compatible with the
+kernel's implementation, and thus needs to be verified/tracked on a
+case by case basis whether they match (unless an architecture uses them
+also from kernel side). The implementations for smp_load_acquire() and
+smp_store_release() in this patch have been adapted from the kernel side
+ones to have a concrete and compatible mapping in place.
+
+  [0] http://patchwork.ozlabs.org/patch/985422/
+  [1] https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Cc: Will Deacon <will.deacon@arm.com>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

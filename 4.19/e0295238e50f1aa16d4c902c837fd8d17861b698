@@ -1,0 +1,117 @@
+mm/list_lru.c: combine code under the same define
+
+Patch series "Improve shrink_slab() scalability (old complexity was O(n^2), new is O(n))", v8.
+
+This patcheset solves the problem with slow shrink_slab() occuring on
+the machines having many shrinkers and memory cgroups (i.e., with many
+containers).  The problem is complexity of shrink_slab() is O(n^2) and
+it grows too fast with the growth of containers numbers.
+
+Let us have 200 containers, and every container has 10 mounts and 10
+cgroups.  All container tasks are isolated, and they don't touch foreign
+containers mounts.
+
+In case of global reclaim, a task has to iterate all over the memcgs and
+to call all the memcg-aware shrinkers for all of them.  This means, the
+task has to visit 200 * 10 = 2000 shrinkers for every memcg, and since
+there are 2000 memcgs, the total calls of do_shrink_slab() are 2000 *
+2000 = 4000000.
+
+4 million calls are not a number operations, which can takes 1 cpu
+cycle.  E.g., super_cache_count() accesses at least two lists, and makes
+arifmetical calculations.  Even, if there are no charged objects, we do
+these calculations, and replaces cpu caches by read memory.  I observed
+nodes spending almost 100% time in kernel, in case of intensive writing
+and global reclaim.  The writer consumes pages fast, but it's need to
+shrink_slab() before the reclaimer reached shrink pages function (and
+frees SWAP_CLUSTER_MAX pages).  Even if there is no writing, the
+iterations just waste the time, and slows reclaim down.
+
+Let's see the small test below:
+
+  $echo 1 > /sys/fs/cgroup/memory/memory.use_hierarchy
+  $mkdir /sys/fs/cgroup/memory/ct
+  $echo 4000M > /sys/fs/cgroup/memory/ct/memory.kmem.limit_in_bytes
+  $for i in `seq 0 4000`;
+          do mkdir /sys/fs/cgroup/memory/ct/$i;
+          echo $$ > /sys/fs/cgroup/memory/ct/$i/cgroup.procs;
+          mkdir -p s/$i; mount -t tmpfs $i s/$i; touch s/$i/file;
+  done
+
+Then, let's see drop caches time (5 sequential calls):
+
+  $time echo 3 > /proc/sys/vm/drop_caches
+
+  0.00user 13.78system 0:13.78elapsed 99%CPU
+  0.00user 5.59system 0:05.60elapsed 99%CPU
+  0.00user 5.48system 0:05.48elapsed 99%CPU
+  0.00user 8.35system 0:08.35elapsed 99%CPU
+  0.00user 8.34system 0:08.35elapsed 99%CPU
+
+The last four calls don't actually shrink anything.  So, the iterations
+over slab shrinkers take 5.48 seconds.  Not so good for scalability.
+
+The patchset solves the problem by making shrink_slab() of O(n)
+complexity.  There are following functional actions:
+
+1) Assign id to every registered memcg-aware shrinker.
+
+2) Maintain per-memcgroup bitmap of memcg-aware shrinkers, and set a
+   shrinker-related bit after the first element is added to lru list
+   (also, when removed child memcg elements are reparanted).
+
+3) Split memcg-aware shrinkers and !memcg-aware shrinkers, and call a
+   shrinker if its bit is set in memcg's shrinker bitmap.  (Also, there is
+   a functionality to clear the bit, after last element is shrinked).
+
+This gives significant performance increase.  The result after patchset
+is applied:
+
+  $time echo 3 > /proc/sys/vm/drop_caches
+
+  0.00user 1.10system 0:01.10elapsed 99%CPU
+  0.00user 0.00system 0:00.01elapsed 64%CPU
+  0.00user 0.01system 0:00.01elapsed 82%CPU
+  0.00user 0.00system 0:00.01elapsed 64%CPU
+  0.00user 0.01system 0:00.01elapsed 82%CPU
+
+The results show the performance increases at least in 548 times.
+
+So, the patchset makes shrink_slab() of less complexity and improves the
+performance in such types of load I pointed.  This will give a profit in
+case of !global reclaim case, since there also will be less
+do_shrink_slab() calls.
+
+This patch (of 17):
+
+These two pairs of blocks of code are under the same #ifdef #else
+#endif.
+
+Link: http://lkml.kernel.org/r/153063052519.1818.9393587113056959488.stgit@localhost.localdomain
+Signed-off-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Acked-by: Vladimir Davydov <vdavydov.dev@gmail.com>
+Tested-by: Shakeel Butt <shakeelb@google.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Philippe Ombredanne <pombredanne@nexb.com>
+Cc: Sahitya Tummala <stummala@codeaurora.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+Cc: Roman Gushchin <guro@fb.com>
+Cc: Matthias Kaehlcke <mka@chromium.org>
+Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Waiman Long <longman@redhat.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Josef Bacik <jbacik@fb.com>
+Cc: Guenter Roeck <linux@roeck-us.net>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Li RongQing <lirongqing@baidu.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

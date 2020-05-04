@@ -1,0 +1,47 @@
+btrfs: fix refcount_t usage when deleting btrfs_delayed_nodes
+
+refcounts have a generic implementation and an asm optimized one.  The
+generic version has extra debugging to make sure that once a refcount
+goes to zero, refcount_inc won't increase it.
+
+The btrfs delayed inode code wasn't expecting this, and we're tripping
+over the warnings when the generic refcounts are used.  We ended up with
+this race:
+
+Process A                                         Process B
+                                                  btrfs_get_delayed_node()
+						  spin_lock(root->inode_lock)
+						  radix_tree_lookup()
+__btrfs_release_delayed_node()
+refcount_dec_and_test(&delayed_node->refs)
+our refcount is now zero
+						  refcount_add(2) <---
+						  warning here, refcount
+                                                  unchanged
+
+spin_lock(root->inode_lock)
+radix_tree_delete()
+
+With the generic refcounts, we actually warn again when process B above
+tries to release his refcount because refcount_add() turned into a
+no-op.
+
+We saw this in production on older kernels without the asm optimized
+refcounts.
+
+The fix used here is to use refcount_inc_not_zero() to detect when the
+object is in the middle of being freed and return NULL.  This is almost
+always the right answer anyway, since we usually end up pitching the
+delayed_node if it didn't have fresh data in it.
+
+This also changes __btrfs_release_delayed_node() to remove the extra
+check for zero refcounts before radix tree deletion.
+btrfs_get_delayed_node() was the only path that was allowing refcounts
+to go from zero to one.
+
+Fixes: 6de5f18e7b0da ("btrfs: fix refcount_t usage when deleting btrfs_delayed_node")
+CC: <stable@vger.kernel.org> # 4.12+
+Signed-off-by: Chris Mason <clm@fb.com>
+Reviewed-by: Liu Bo <bo.li.liu@oracle.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

@@ -1,0 +1,38 @@
+fasync: Fix deadlock between task-context and interrupt-context kill_fasync()
+
+I observed the following deadlock between them:
+
+[task 1]                          [task 2]                         [task 3]
+kill_fasync()                     mm_update_next_owner()           copy_process()
+ spin_lock_irqsave(&fa->fa_lock)   read_lock(&tasklist_lock)        write_lock_irq(&tasklist_lock)
+  send_sigio()                    <IRQ>                             ...
+   read_lock(&fown->lock)         kill_fasync()                     ...
+    read_lock(&tasklist_lock)      spin_lock_irqsave(&fa->fa_lock)  ...
+
+Task 1 can't acquire read locked tasklist_lock, since there is
+already task 3 expressed its wish to take the lock exclusive.
+Task 2 holds the read locked lock, but it can't take the spin lock.
+
+Also, there is possible another deadlock (which I haven't observed):
+
+[task 1]                            [task 2]
+f_getown()                          kill_fasync()
+ read_lock(&f_own->lock)             spin_lock_irqsave(&fa->fa_lock,)
+ <IRQ>                               send_sigio()                     write_lock_irq(&f_own->lock)
+  kill_fasync()                       read_lock(&fown->lock)
+   spin_lock_irqsave(&fa->fa_lock,)
+
+Actually, we do not need exclusive fa->fa_lock in kill_fasync_rcu(),
+as it guarantees fa->fa_file->f_owner integrity only. It may seem,
+that it used to give a task a small possibility to receive two sequential
+signals, if there are two parallel kill_fasync() callers, and task
+handles the first signal fastly, but the behaviour won't become
+different, since there is exclusive sighand lock in do_send_sig_info().
+
+The patch converts fa_lock into rwlock_t, and this fixes two above
+deadlocks, as rwlock is allowed to be taken from interrupt handler
+by qrwlock design.
+
+Signed-off-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+

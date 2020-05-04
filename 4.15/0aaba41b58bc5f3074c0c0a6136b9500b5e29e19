@@ -1,0 +1,110 @@
+s390: remove all code using the access register mode
+
+The vdso code for the getcpu() and the clock_gettime() call use the access
+register mode to access the per-CPU vdso data page with the current code.
+
+An alternative to the complicated AR mode is to use the secondary space
+mode. This makes the vdso faster and quite a bit simpler. The downside is
+that the uaccess code has to be changed quite a bit.
+
+Which instructions are used depends on the machine and what kind of uaccess
+operation is requested. The instruction dictates which ASCE value needs
+to be loaded into %cr1 and %cr7.
+
+The different cases:
+
+* User copy with MVCOS for z10 and newer machines
+  The MVCOS instruction can copy between the primary space (aka user) and
+  the home space (aka kernel) directly. For set_fs(KERNEL_DS) the kernel
+  ASCE is loaded into %cr1. For set_fs(USER_DS) the user space is already
+  loaded in %cr1.
+
+* User copy with MVCP/MVCS for older machines
+  To be able to execute the MVCP/MVCS instructions the kernel needs to
+  switch to primary mode. The control register %cr1 has to be set to the
+  kernel ASCE and %cr7 to either the kernel ASCE or the user ASCE dependent
+  on set_fs(KERNEL_DS) vs set_fs(USER_DS).
+
+* Data access in the user address space for strnlen / futex
+  To use "normal" instruction with data from the user address space the
+  secondary space mode is used. The kernel needs to switch to primary mode,
+  %cr1 has to contain the kernel ASCE and %cr7 either the user ASCE or the
+  kernel ASCE, dependent on set_fs.
+
+To load a new value into %cr1 or %cr7 is an expensive operation, the kernel
+tries to be lazy about it. E.g. for multiple user copies in a row with
+MVCP/MVCS the replacement of the vdso ASCE in %cr7 with the user ASCE is
+done only once. On return to user space a CPU bit is checked that loads the
+vdso ASCE again.
+
+To enable and disable the data access via the secondary space two new
+functions are added, enable_sacf_uaccess and disable_sacf_uaccess. The fact
+that a context is in secondary space uaccess mode is stored in the
+mm_segment_t value for the task. The code of an interrupt may use set_fs
+as long as it returns to the previous state it got with get_fs with another
+call to set_fs. The code in finish_arch_post_lock_switch simply has to do a
+set_fs with the current mm_segment_t value for the task.
+
+For CPUs with MVCOS:
+
+CPU running in                        | %cr1 ASCE | %cr7 ASCE |
+--------------------------------------|-----------|-----------|
+user space                            |  user     |  vdso     |
+kernel, USER_DS, normal-mode          |  user     |  vdso     |
+kernel, USER_DS, normal-mode, lazy    |  user     |  user     |
+kernel, USER_DS, sacf-mode            |  kernel   |  user     |
+kernel, KERNEL_DS, normal-mode        |  kernel   |  vdso     |
+kernel, KERNEL_DS, normal-mode, lazy  |  kernel   |  kernel   |
+kernel, KERNEL_DS, sacf-mode          |  kernel   |  kernel   |
+
+For CPUs without MVCOS:
+
+CPU running in                        | %cr1 ASCE | %cr7 ASCE |
+--------------------------------------|-----------|-----------|
+user space                            |  user     |  vdso     |
+kernel, USER_DS, normal-mode          |  user     |  vdso     |
+kernel, USER_DS, normal-mode lazy     |  kernel   |  user     |
+kernel, USER_DS, sacf-mode            |  kernel   |  user     |
+kernel, KERNEL_DS, normal-mode        |  kernel   |  vdso     |
+kernel, KERNEL_DS, normal-mode, lazy  |  kernel   |  kernel   |
+kernel, KERNEL_DS, sacf-mode          |  kernel   |  kernel   |
+
+The lines with "lazy" refer to the state after a copy via the secondary
+space with a delayed reload of %cr1 and %cr7.
+
+There are three hardware address spaces that can cause a DAT exception,
+primary, secondary and home space. The exception can be related to
+four different fault types: user space fault, vdso fault, kernel fault,
+and the gmap faults.
+
+Dependent on the set_fs state and normal vs. sacf mode there are a number
+of fault combinations:
+
+1) user address space fault via the primary ASCE
+2) gmap address space fault via the primary ASCE
+3) kernel address space fault via the primary ASCE for machines with
+   MVCOS and set_fs(KERNEL_DS)
+4) vdso address space faults via the secondary ASCE with an invalid
+   address while running in secondary space in problem state
+5) user address space fault via the secondary ASCE for user-copy
+   based on the secondary space mode, e.g. futex_ops or strnlen_user
+6) kernel address space fault via the secondary ASCE for user-copy
+   with secondary space mode with set_fs(KERNEL_DS)
+7) kernel address space fault via the primary ASCE for user-copy
+   with secondary space mode with set_fs(USER_DS) on machines without
+   MVCOS.
+8) kernel address space fault via the home space ASCE
+
+Replace user_space_fault() with a new function get_fault_type() that
+can distinguish all four different fault types.
+
+With these changes the futex atomic ops from the kernel and the
+strnlen_user will get a little bit slower, as well as the old style
+uaccess with MVCP/MVCS. All user accesses based on MVCOS will be as
+fast as before. On the positive side, the user space vdso code is a
+lot faster and Linux ceases to use the complicated AR mode.
+
+Reviewed-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+

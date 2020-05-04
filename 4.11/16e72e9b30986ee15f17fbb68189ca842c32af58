@@ -1,0 +1,103 @@
+powerpc: do not make the entire heap executable
+
+On 32-bit powerpc the ELF PLT sections of binaries (built with
+--bss-plt, or with a toolchain which defaults to it) look like this:
+
+  [17] .sbss             NOBITS          0002aff8 01aff8 000014 00  WA  0   0  4
+  [18] .plt              NOBITS          0002b00c 01aff8 000084 00 WAX  0   0  4
+  [19] .bss              NOBITS          0002b090 01aff8 0000a4 00  WA  0   0  4
+
+Which results in an ELF load header:
+
+  Type           Offset   VirtAddr   PhysAddr   FileSiz MemSiz  Flg Align
+  LOAD           0x019c70 0x00029c70 0x00029c70 0x01388 0x014c4 RWE 0x10000
+
+This is all correct, the load region containing the PLT is marked as
+executable.  Note that the PLT starts at 0002b00c but the file mapping
+ends at 0002aff8, so the PLT falls in the 0 fill section described by
+the load header, and after a page boundary.
+
+Unfortunately the generic ELF loader ignores the X bit in the load
+headers when it creates the 0 filled non-file backed mappings.  It
+assumes all of these mappings are RW BSS sections, which is not the case
+for PPC.
+
+gcc/ld has an option (--secure-plt) to not do this, this is said to
+incur a small performance penalty.
+
+Currently, to support 32-bit binaries with PLT in BSS kernel maps
+*entire brk area* with executable rights for all binaries, even
+--secure-plt ones.
+
+Stop doing that.
+
+Teach the ELF loader to check the X bit in the relevant load header and
+create 0 filled anonymous mappings that are executable if the load
+header requests that.
+
+Test program showing the difference in /proc/$PID/maps:
+
+int main() {
+	char buf[16*1024];
+	char *p = malloc(123); /* make "[heap]" mapping appear */
+	int fd = open("/proc/self/maps", O_RDONLY);
+	int len = read(fd, buf, sizeof(buf));
+	write(1, buf, len);
+	printf("%p\n", p);
+	return 0;
+}
+
+Compiled using: gcc -mbss-plt -m32 -Os test.c -otest
+
+Unpatched ppc64 kernel:
+00100000-00120000 r-xp 00000000 00:00 0                                  [vdso]
+0fe10000-0ffd0000 r-xp 00000000 fd:00 67898094                           /usr/lib/libc-2.17.so
+0ffd0000-0ffe0000 r--p 001b0000 fd:00 67898094                           /usr/lib/libc-2.17.so
+0ffe0000-0fff0000 rw-p 001c0000 fd:00 67898094                           /usr/lib/libc-2.17.so
+10000000-10010000 r-xp 00000000 fd:00 100674505                          /home/user/test
+10010000-10020000 r--p 00000000 fd:00 100674505                          /home/user/test
+10020000-10030000 rw-p 00010000 fd:00 100674505                          /home/user/test
+10690000-106c0000 rwxp 00000000 00:00 0                                  [heap]
+f7f70000-f7fa0000 r-xp 00000000 fd:00 67898089                           /usr/lib/ld-2.17.so
+f7fa0000-f7fb0000 r--p 00020000 fd:00 67898089                           /usr/lib/ld-2.17.so
+f7fb0000-f7fc0000 rw-p 00030000 fd:00 67898089                           /usr/lib/ld-2.17.so
+ffa90000-ffac0000 rw-p 00000000 00:00 0                                  [stack]
+0x10690008
+
+Patched ppc64 kernel:
+00100000-00120000 r-xp 00000000 00:00 0                                  [vdso]
+0fe10000-0ffd0000 r-xp 00000000 fd:00 67898094                           /usr/lib/libc-2.17.so
+0ffd0000-0ffe0000 r--p 001b0000 fd:00 67898094                           /usr/lib/libc-2.17.so
+0ffe0000-0fff0000 rw-p 001c0000 fd:00 67898094                           /usr/lib/libc-2.17.so
+10000000-10010000 r-xp 00000000 fd:00 100674505                          /home/user/test
+10010000-10020000 r--p 00000000 fd:00 100674505                          /home/user/test
+10020000-10030000 rw-p 00010000 fd:00 100674505                          /home/user/test
+10180000-101b0000 rw-p 00000000 00:00 0                                  [heap]
+                  ^^^^ this has changed
+f7c60000-f7c90000 r-xp 00000000 fd:00 67898089                           /usr/lib/ld-2.17.so
+f7c90000-f7ca0000 r--p 00020000 fd:00 67898089                           /usr/lib/ld-2.17.so
+f7ca0000-f7cb0000 rw-p 00030000 fd:00 67898089                           /usr/lib/ld-2.17.so
+ff860000-ff890000 rw-p 00000000 00:00 0                                  [stack]
+0x10180008
+
+The patch was originally posted in 2012 by Jason Gunthorpe
+and apparently ignored:
+
+https://lkml.org/lkml/2012/9/30/138
+
+Lightly run-tested.
+
+Link: http://lkml.kernel.org/r/20161215131950.23054-1-dvlasenk@redhat.com
+Signed-off-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+Signed-off-by: Denys Vlasenko <dvlasenk@redhat.com>
+Acked-by: Kees Cook <keescook@chromium.org>
+Acked-by: Michael Ellerman <mpe@ellerman.id.au>
+Tested-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: Paul Mackerras <paulus@samba.org>
+Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Florian Weimer <fweimer@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

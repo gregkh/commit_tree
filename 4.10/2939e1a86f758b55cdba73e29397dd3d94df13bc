@@ -1,0 +1,62 @@
+btrfs: limit async_work allocation and worker func duration
+
+Problem statement: unprivileged user who has read-write access to more than
+one btrfs subvolume may easily consume all kernel memory (eventually
+triggering oom-killer).
+
+Reproducer (./mkrmdir below essentially loops over mkdir/rmdir):
+
+[root@kteam1 ~]# cat prep.sh
+
+DEV=/dev/sdb
+mkfs.btrfs -f $DEV
+mount $DEV /mnt
+for i in `seq 1 16`
+do
+	mkdir /mnt/$i
+	btrfs subvolume create /mnt/SV_$i
+	ID=`btrfs subvolume list /mnt |grep "SV_$i$" |cut -d ' ' -f 2`
+	mount -t btrfs -o subvolid=$ID $DEV /mnt/$i
+	chmod a+rwx /mnt/$i
+done
+
+[root@kteam1 ~]# sh prep.sh
+
+[maxim@kteam1 ~]$ for i in `seq 1 16`; do ./mkrmdir /mnt/$i 2000 2000 & done
+
+[root@kteam1 ~]# for i in `seq 1 4`; do grep "kmalloc-128" /proc/slabinfo | grep -v dma; sleep 60; done
+kmalloc-128        10144  10144    128   32    1 : tunables    0    0    0 : slabdata    317    317      0
+kmalloc-128       9992352 9992352    128   32    1 : tunables    0    0    0 : slabdata 312261 312261      0
+kmalloc-128       24226752 24226752    128   32    1 : tunables    0    0    0 : slabdata 757086 757086      0
+kmalloc-128       42754240 42754240    128   32    1 : tunables    0    0    0 : slabdata 1336070 1336070      0
+
+The huge numbers above come from insane number of async_work-s allocated
+and queued by btrfs_wq_run_delayed_node.
+
+The problem is caused by btrfs_wq_run_delayed_node() queuing more and more
+works if the number of delayed items is above BTRFS_DELAYED_BACKGROUND. The
+worker func (btrfs_async_run_delayed_root) processes at least
+BTRFS_DELAYED_BATCH items (if they are present in the list). So, the machinery
+works as expected while the list is almost empty. As soon as it is getting
+bigger, worker func starts to process more than one item at a time, it takes
+longer, and the chances to have async_works queued more than needed is getting
+higher.
+
+The problem above is worsened by another flaw of delayed-inode implementation:
+if async_work was queued in a throttling branch (number of items >=
+BTRFS_DELAYED_WRITEBACK), corresponding worker func won't quit until
+the number of items < BTRFS_DELAYED_BACKGROUND / 2. So, it is possible that
+the func occupies CPU infinitely (up to 30sec in my experiments): while the
+func is trying to drain the list, the user activity may add more and more
+items to the list.
+
+The patch fixes both problems in straightforward way: refuse queuing too
+many works in btrfs_wq_run_delayed_node and bail out of worker func if
+at least BTRFS_DELAYED_WRITEBACK items are processed.
+
+Changed in v2: remove support of thresh == NO_THRESHOLD.
+
+Signed-off-by: Maxim Patlasov <mpatlasov@virtuozzo.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+Cc: stable@vger.kernel.org # v3.15+
+

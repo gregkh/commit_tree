@@ -1,0 +1,146 @@
+drm/i915/userptr: Drop struct_mutex before cleanup
+
+Purely to silence lockdep, as we know that no bo can exist at this time
+and so the inversion is impossible. Nevertheless, lockdep currently
+warns on unload:
+
+[  137.522565] WARNING: possible circular locking dependency detected
+[  137.522568] 4.14.0-rc4-CI-CI_DRM_3209+ #1 Tainted: G     U
+[  137.522570] ------------------------------------------------------
+[  137.522572] drv_module_relo/1532 is trying to acquire lock:
+[  137.522574]  ("i915-userptr-acquire"){+.+.}, at: [<ffffffff8109a831>] flush_workqueue+0x91/0x540
+[  137.522581]
+               but task is already holding lock:
+[  137.522583]  (&dev->struct_mutex){+.+.}, at: [<ffffffffa014fb3f>] i915_gem_fini+0x3f/0xc0 [i915]
+[  137.522605]
+               which lock already depends on the new lock.
+
+[  137.522608]
+               the existing dependency chain (in reverse order) is:
+[  137.522611]
+               -> #3 (&dev->struct_mutex){+.+.}:
+[  137.522615]        __lock_acquire+0x1420/0x15e0
+[  137.522618]        lock_acquire+0xb0/0x200
+[  137.522621]        __mutex_lock+0x86/0x9b0
+[  137.522623]        mutex_lock_interruptible_nested+0x1b/0x20
+[  137.522640]        i915_mutex_lock_interruptible+0x51/0x130 [i915]
+[  137.522657]        i915_gem_fault+0x20b/0x720 [i915]
+[  137.522660]        __do_fault+0x1e/0x80
+[  137.522662]        __handle_mm_fault+0xa08/0xed0
+[  137.522664]        handle_mm_fault+0x156/0x300
+[  137.522666]        __do_page_fault+0x2c5/0x570
+[  137.522668]        do_page_fault+0x28/0x250
+[  137.522671]        page_fault+0x22/0x30
+[  137.522672]
+               -> #2 (&mm->mmap_sem){++++}:
+[  137.522677]        __lock_acquire+0x1420/0x15e0
+[  137.522679]        lock_acquire+0xb0/0x200
+[  137.522682]        down_read+0x3e/0x70
+[  137.522699]        __i915_gem_userptr_get_pages_worker+0x141/0x240 [i915]
+[  137.522701]        process_one_work+0x233/0x660
+[  137.522704]        worker_thread+0x4e/0x3b0
+[  137.522706]        kthread+0x152/0x190
+[  137.522708]        ret_from_fork+0x27/0x40
+[  137.522710]
+               -> #1 ((&work->work)){+.+.}:
+[  137.522714]        __lock_acquire+0x1420/0x15e0
+[  137.522717]        lock_acquire+0xb0/0x200
+[  137.522719]        process_one_work+0x206/0x660
+[  137.522721]        worker_thread+0x4e/0x3b0
+[  137.522723]        kthread+0x152/0x190
+[  137.522725]        ret_from_fork+0x27/0x40
+[  137.522727]
+               -> #0 ("i915-userptr-acquire"){+.+.}:
+[  137.522731]        check_prev_add+0x430/0x840
+[  137.522733]        __lock_acquire+0x1420/0x15e0
+[  137.522735]        lock_acquire+0xb0/0x200
+[  137.522738]        flush_workqueue+0xb4/0x540
+[  137.522740]        drain_workqueue+0xd4/0x1b0
+[  137.522742]        destroy_workqueue+0x1c/0x200
+[  137.522758]        i915_gem_cleanup_userptr+0x15/0x20 [i915]
+[  137.522770]        i915_gem_fini+0x5f/0xc0 [i915]
+[  137.522782]        i915_driver_unload+0x122/0x180 [i915]
+[  137.522794]        i915_pci_remove+0x19/0x30 [i915]
+[  137.522797]        pci_device_remove+0x39/0xb0
+[  137.522800]        device_release_driver_internal+0x15d/0x220
+[  137.522803]        driver_detach+0x40/0x80
+[  137.522805]        bus_remove_driver+0x58/0xd0
+[  137.522807]        driver_unregister+0x2c/0x40
+[  137.522809]        pci_unregister_driver+0x36/0xb0
+[  137.522828]        i915_exit+0x1a/0x8b [i915]
+[  137.522831]        SyS_delete_module+0x18c/0x1e0
+[  137.522834]        entry_SYSCALL_64_fastpath+0x1c/0xb1
+[  137.522835]
+               other info that might help us debug this:
+
+[  137.522838] Chain exists of:
+                 "i915-userptr-acquire" --> &mm->mmap_sem --> &dev->struct_mutex
+
+[  137.522844]  Possible unsafe locking scenario:
+
+[  137.522846]        CPU0                    CPU1
+[  137.522848]        ----                    ----
+[  137.522850]   lock(&dev->struct_mutex);
+[  137.522852]                                lock(&mm->mmap_sem);
+[  137.522854]                                lock(&dev->struct_mutex);
+[  137.522857]   lock("i915-userptr-acquire");
+[  137.522859]
+                *** DEADLOCK ***
+
+[  137.522862] 3 locks held by drv_module_relo/1532:
+[  137.522864]  #0:  (&dev->mutex){....}, at: [<ffffffff8161d47b>] device_release_driver_internal+0x2b/0x220
+[  137.522869]  #1:  (&dev->mutex){....}, at: [<ffffffff8161d489>] device_release_driver_internal+0x39/0x220
+[  137.522873]  #2:  (&dev->struct_mutex){+.+.}, at: [<ffffffffa014fb3f>] i915_gem_fini+0x3f/0xc0 [i915]
+[  137.522888]
+               stack backtrace:
+[  137.522891] CPU: 0 PID: 1532 Comm: drv_module_relo Tainted: G     U          4.14.0-rc4-CI-CI_DRM_3209+ #1
+[  137.522894] Hardware name:                  /NUC7i5BNB, BIOS BNKBL357.86A.0048.2017.0704.1415 07/04/2017
+[  137.522897] Call Trace:
+[  137.522900]  dump_stack+0x68/0x9f
+[  137.522902]  print_circular_bug+0x235/0x3c0
+[  137.522905]  ? lockdep_init_map_crosslock+0x20/0x20
+[  137.522908]  check_prev_add+0x430/0x840
+[  137.522919]  ? i915_gem_fini+0x5f/0xc0 [i915]
+[  137.522922]  ? __kernel_text_address+0x12/0x40
+[  137.522925]  ? __save_stack_trace+0x66/0xd0
+[  137.522928]  __lock_acquire+0x1420/0x15e0
+[  137.522930]  ? __lock_acquire+0x1420/0x15e0
+[  137.522933]  ? lockdep_init_map_crosslock+0x20/0x20
+[  137.522936]  ? __this_cpu_preempt_check+0x13/0x20
+[  137.522938]  lock_acquire+0xb0/0x200
+[  137.522940]  ? flush_workqueue+0x91/0x540
+[  137.522943]  flush_workqueue+0xb4/0x540
+[  137.522945]  ? flush_workqueue+0x91/0x540
+[  137.522948]  ? __mutex_unlock_slowpath+0x43/0x2c0
+[  137.522951]  ? trace_hardirqs_on_caller+0xe3/0x1b0
+[  137.522954]  drain_workqueue+0xd4/0x1b0
+[  137.522956]  ? drain_workqueue+0xd4/0x1b0
+[  137.522958]  destroy_workqueue+0x1c/0x200
+[  137.522975]  i915_gem_cleanup_userptr+0x15/0x20 [i915]
+[  137.522987]  i915_gem_fini+0x5f/0xc0 [i915]
+[  137.523000]  i915_driver_unload+0x122/0x180 [i915]
+[  137.523015]  i915_pci_remove+0x19/0x30 [i915]
+[  137.523018]  pci_device_remove+0x39/0xb0
+[  137.523021]  device_release_driver_internal+0x15d/0x220
+[  137.523023]  driver_detach+0x40/0x80
+[  137.523026]  bus_remove_driver+0x58/0xd0
+[  137.523028]  driver_unregister+0x2c/0x40
+[  137.523030]  pci_unregister_driver+0x36/0xb0
+[  137.523049]  i915_exit+0x1a/0x8b [i915]
+[  137.523052]  SyS_delete_module+0x18c/0x1e0
+[  137.523055]  entry_SYSCALL_64_fastpath+0x1c/0xb1
+[  137.523057] RIP: 0033:0x7f7bd0609287
+[  137.523059] RSP: 002b:00007ffef694bc18 EFLAGS: 00000246 ORIG_RAX: 00000000000000b0
+[  137.523062] RAX: ffffffffffffffda RBX: ffffffff81493f33 RCX: 00007f7bd0609287
+[  137.523065] RDX: 0000000000000001 RSI: 0000000000000800 RDI: 0000564f999f9fc8
+[  137.523067] RBP: ffffc90005c4ff88 R08: 0000000000000000 R09: 0000000000000080
+[  137.523069] R10: 00007f7bd20ef8c0 R11: 0000000000000246 R12: 0000000000000000
+[  137.523072] R13: 00007ffef694be00 R14: 0000000000000000 R15: 0000000000000000
+[  137.523075]  ? __this_cpu_preempt_check+0x13/0x20
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171011141857.14161-1-chris@chris-wilson.co.uk
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+

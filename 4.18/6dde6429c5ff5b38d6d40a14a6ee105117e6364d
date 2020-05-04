@@ -1,0 +1,133 @@
+perf stat: Remove duplicate event counting
+
+'perf stat' shows a mismatch in perf stat regarding counter names on
+s390:
+
+Run command:
+
+   [root@s35lp76 perf]# ./perf stat -e tx_nc_tend  -v --
+                ~/mytesttx 1 >/tmp/111
+   tx_nc_tend: 1 573146 573146
+   tx_nc_tend: 1 573146 573146
+
+   Performance counter stats for '/root/mytesttx 1':
+
+                 3      tx_nc_tend
+
+       0.001037252 seconds time elapsed
+
+   [root@s35lp76 perf]#
+
+shows transaction counter tx_nc_tend with value 3 but it was triggered
+only once as seen by the output of mytesttx.
+
+When looking up the event name tx_nc_tend the following function
+sequence is called:
+
+parse_events_multi_pmu_add()
++--> perf_pmu__scan() being called with NULL argument
+     +--> pmu_read_sysfs() scans directory ../devices/ for
+                           all PMUs
+          +--> perf_pmu__find() tries to find a PMU in the
+                           global pmu list.
+               +--> pmu_lookup() called to read all file
+                                 entries when not in global
+                                 list.
+
+pmu_lookup() causes the issue. It calls
++---> pmu_aliases() to read all the entries in the PMU directory.
+                    On s390 this is named
+                    /sys/devices/cpum_cf/events.
+      +--> pmu_aliases_parse() reads all files and creates an
+                       alias for each file name.
+
+                       So we end up with first entry created by
+                       reading the sysfs file
+                       [root@s35lp76 perf]# cat /sys/devices/cpum_cf
+                                                /events/TX_NC_TEND
+                       event=0x008d
+                       [root@s35lp76 perf]#
+
+                       Debug output shows this entry
+                       tx_nc_tend -> 'cpum_cf'/'event=0x008d
+                       '/
+                       After all files in this directory have been
+                       read and aliases created this function is called:
+      +--> pmu_add_cpu_aliases()
+                       This function looks up the CPU tables
+                       created by the json files.
+                       With json files for s390 now available all
+                       the aliases are added to
+                       the PMU alias list a second time.
+                       The second entry is added by
+                       reading the json file converted by jevent
+                       resulting in file pmu-events/pmu-events.c:
+
+                       {
+                         .name = "tx_nc_tend",
+                         .event = "event=0x8d",
+                         .desc = "Unit: cpum_cf Completed TEND \
+                                  instructions \
+                                  in non-constrained TX mode",
+                         .topic = "extended",
+                         .long_desc = "A TEND instruction has \
+                                       completed  in a \
+                                       non-constrained \
+                                       transactional-execution mode",
+                         .pmu = "cpum_cf",
+                        },
+
+                        Debug output shows this entry
+                        tx_nc_tend -> 'cpum_cf'/'event=0x8d'/
+
+Function pmu_aliases_parse() and pmu_add_cpu_aliases() both use
+__perf_pmu__new_alias() to add an alias to the PMU alias list. There is
+no check if an alias already exist
+
+So we end up with 2 entries for tx_nc_tend in the PMU alias list.
+
+Having set up the PMU alias list for this PMU now
+parse_events_multi_add_pmu() reads the complete alias list and adds each
+alias with parse_events_add_pmu() to the global perfev_list.  This
+causes the alias to be added multiple times to the event list.
+
+Fix this by making __perf_pmu__new_alias() to merge alias definitions if
+an alias is already on the alias list.  Also print a debug message when
+the alias has mismatches in some fields.
+
+Output before:
+
+  [root@s35lp76 perf]# ./perf stat -e tx_nc_tend  -v \
+                        -- ~/mytesttx 1 >/tmp/111
+  tx_nc_tend: 1 551446 551446
+
+   Performance counter stats for '/root/mytesttx 1':
+
+                   3      tx_nc_tend
+
+         0.000961134 seconds time elapsed
+
+  [root@s35lp76 perf]#
+
+Output after:
+
+  [root@s35lp76 perf]#  ./perf stat -e tx_nc_tend  -v \
+                        -- ~/mytesttx 1 >/tmp/111
+  tx_nc_tend: 1 551446 551446
+
+   Performance counter stats for '/root/mytesttx 1':
+
+                   1      tx_nc_tend
+
+         0.000961134 seconds time elapsed
+
+  [root@s35lp76 perf]#
+
+Signed-off-by: Thomas Richter <tmricht@linux.ibm.com>
+Reviewed-by: Hendrik Brueckner <brueckner@linux.ibm.com>
+Reviewed-by: Jiri Olsa <jolsa@redhat.com>
+Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Link: http://lkml.kernel.org/r/20180615101105.47047-3-tmricht@linux.ibm.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

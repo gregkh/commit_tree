@@ -1,0 +1,78 @@
+bpf: verifier: make sure callees don't prune with caller differences
+
+Currently for liveness and state pruning the register parentage
+chains don't include states of the callee.  This makes some sense
+as the callee can't access those registers.  However, this means
+that READs done after the callee returns will not propagate into
+the states of the callee.  Callee will then perform pruning
+disregarding differences in caller state.
+
+Example:
+
+   0: (85) call bpf_user_rnd_u32
+   1: (b7) r8 = 0
+   2: (55) if r0 != 0x0 goto pc+1
+   3: (b7) r8 = 1
+   4: (bf) r1 = r8
+   5: (85) call pc+4
+   6: (15) if r8 == 0x1 goto pc+1
+   7: (05) *(u64 *)(r9 - 8) = r3
+   8: (b7) r0 = 0
+   9: (95) exit
+
+   10: (15) if r1 == 0x0 goto pc+0
+   11: (95) exit
+
+Here we acquire unknown state with call to get_random() [1].  Then
+we store this random state in r8 (either 0 or 1) [1 - 3], and make
+a call on line 5.  Callee does nothing but a trivial conditional
+jump (to create a pruning point).  Upon return caller checks the
+state of r8 and either performs an unsafe read or not.
+
+Verifier will first explore the path with r8 == 1, creating a pruning
+point at [11].  The parentage chain for r8 will include only callers
+states so once verifier reaches [6] it will mark liveness only on states
+in the caller, and not [11].  Now when verifier walks the paths with
+r8 == 0 it will reach [11] and since REG_LIVE_READ on r8 was not
+propagated there it will prune the walk entirely (stop walking
+the entire program, not just the callee).  Since [6] was never walked
+with r8 == 0, [7] will be considered dead and replaced with "goto -1"
+causing hang at runtime.
+
+This patch weaves the callee's explored states onto the callers
+parentage chain.  Rough parentage for r8 would have looked like this
+before:
+
+[0] [1] [2] [3] [4] [5]   [10]      [11]      [6]      [7]
+     |           |      ,---|----.    |        |        |
+  sl0:         sl0:    / sl0:     \ sl0:      sl0:     sl0:
+  fr0: r8 <-- fr0: r8<+--fr0: r8   `fr0: r8  ,fr0: r8<-fr0: r8
+                       \ fr1: r8 <- fr1: r8 /
+                        \__________________/
+
+after:
+
+[0] [1] [2] [3] [4] [5]   [10]      [11]      [6]      [7]
+     |           |          |         |        |        |
+   sl0:         sl0:      sl0:       sl0:      sl0:     sl0:
+   fr0: r8 <-- fr0: r8 <- fr0: r8 <- fr0: r8 <-fr0: r8<-fr0: r8
+                          fr1: r8 <- fr1: r8
+
+Now the mark from instruction 6 will travel through callees states.
+
+Note that we don't have to connect r0 because its overwritten by
+callees state on return and r1 - r5 because those are not alive
+any more once a call is made.
+
+v2:
+ - don't connect the callees registers twice (Alexei: suggestion & code)
+ - add more details to the comment (Ed & Alexei)
+v1: don't unnecessarily link caller saved regs (Jiong)
+
+Fixes: f4d7e40a5b71 ("bpf: introduce function calls (verification)")
+Reported-by: David Beckett <david.beckett@netronome.com>
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+Reviewed-by: Edward Cree <ecree@solarflare.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

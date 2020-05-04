@@ -1,0 +1,76 @@
+f2fs: readahead encrypted block during GC
+
+During GC, for each encrypted block, we will read block synchronously
+into meta page, and then submit it into current cold data log area.
+
+So this block read model with 4k granularity can make poor performance,
+like migrating non-encrypted block, let's readahead encrypted block
+as well to improve migration performance.
+
+To implement this, we choose meta page that its index is old block
+address of the encrypted block, and readahead ciphertext into this
+page, later, if readaheaded page is still updated, we will load its
+data into target meta page, and submit the write IO.
+
+Note that for OPU, truncation, deletion, we need to invalid meta
+page after we invalid old block address, to make sure we won't load
+invalid data from target meta page during encrypted block migration.
+
+for ((i = 0; i < 1000; i++))
+do {
+        xfs_io -f /mnt/f2fs/dir/$i -c "pwrite 0 128k" -c "fsync";
+} done
+
+for ((i = 0; i < 1000; i+=2))
+do {
+        rm /mnt/f2fs/dir/$i;
+} done
+
+ret = ioctl(fd, F2FS_IOC_GARBAGE_COLLECT, 0);
+
+Before:
+              gc-6549  [001] d..1 214682.212797: block_rq_insert: 8,32 RA 32768 () 786400 + 64 [gc]
+              gc-6549  [001] d..1 214682.212802: block_unplug: [gc] 1
+              gc-6549  [001] .... 214682.213892: block_bio_queue: 8,32 R 67494144 + 8 [gc]
+              gc-6549  [001] .... 214682.213899: block_getrq: 8,32 R 67494144 + 8 [gc]
+              gc-6549  [001] .... 214682.213902: block_plug: [gc]
+              gc-6549  [001] d..1 214682.213905: block_rq_insert: 8,32 R 4096 () 67494144 + 8 [gc]
+              gc-6549  [001] d..1 214682.213908: block_unplug: [gc] 1
+              gc-6549  [001] .... 214682.226405: block_bio_queue: 8,32 R 67494152 + 8 [gc]
+              gc-6549  [001] .... 214682.226412: block_getrq: 8,32 R 67494152 + 8 [gc]
+              gc-6549  [001] .... 214682.226414: block_plug: [gc]
+              gc-6549  [001] d..1 214682.226417: block_rq_insert: 8,32 R 4096 () 67494152 + 8 [gc]
+              gc-6549  [001] d..1 214682.226420: block_unplug: [gc] 1
+              gc-6549  [001] .... 214682.226904: block_bio_queue: 8,32 R 67494160 + 8 [gc]
+              gc-6549  [001] .... 214682.226910: block_getrq: 8,32 R 67494160 + 8 [gc]
+              gc-6549  [001] .... 214682.226911: block_plug: [gc]
+              gc-6549  [001] d..1 214682.226914: block_rq_insert: 8,32 R 4096 () 67494160 + 8 [gc]
+              gc-6549  [001] d..1 214682.226916: block_unplug: [gc] 1
+
+After:
+              gc-5678  [003] .... 214327.025906: block_bio_queue: 8,32 R 67493824 + 8 [gc]
+              gc-5678  [003] .... 214327.025908: block_bio_backmerge: 8,32 R 67493824 + 8 [gc]
+              gc-5678  [003] .... 214327.025915: block_bio_queue: 8,32 R 67493832 + 8 [gc]
+              gc-5678  [003] .... 214327.025917: block_bio_backmerge: 8,32 R 67493832 + 8 [gc]
+              gc-5678  [003] .... 214327.025923: block_bio_queue: 8,32 R 67493840 + 8 [gc]
+              gc-5678  [003] .... 214327.025925: block_bio_backmerge: 8,32 R 67493840 + 8 [gc]
+              gc-5678  [003] .... 214327.025932: block_bio_queue: 8,32 R 67493848 + 8 [gc]
+              gc-5678  [003] .... 214327.025934: block_bio_backmerge: 8,32 R 67493848 + 8 [gc]
+              gc-5678  [003] .... 214327.025941: block_bio_queue: 8,32 R 67493856 + 8 [gc]
+              gc-5678  [003] .... 214327.025943: block_bio_backmerge: 8,32 R 67493856 + 8 [gc]
+              gc-5678  [003] .... 214327.025953: block_bio_queue: 8,32 R 67493864 + 8 [gc]
+              gc-5678  [003] .... 214327.025955: block_bio_backmerge: 8,32 R 67493864 + 8 [gc]
+              gc-5678  [003] .... 214327.025962: block_bio_queue: 8,32 R 67493872 + 8 [gc]
+              gc-5678  [003] .... 214327.025964: block_bio_backmerge: 8,32 R 67493872 + 8 [gc]
+              gc-5678  [003] .... 214327.025970: block_bio_queue: 8,32 R 67493880 + 8 [gc]
+              gc-5678  [003] .... 214327.025972: block_bio_backmerge: 8,32 R 67493880 + 8 [gc]
+              gc-5678  [003] .... 214327.026000: block_bio_queue: 8,32 WS 34123776 + 2048 [gc]
+              gc-5678  [003] .... 214327.026019: block_getrq: 8,32 WS 34123776 + 2048 [gc]
+              gc-5678  [003] d..1 214327.026021: block_rq_insert: 8,32 R 131072 () 67493632 + 256 [gc]
+              gc-5678  [003] d..1 214327.026023: block_unplug: [gc] 1
+              gc-5678  [003] d..1 214327.026026: block_rq_issue: 8,32 R 131072 () 67493632 + 256 [gc]
+              gc-5678  [003] .... 214327.026046: block_plug: [gc]
+
+Signed-off-by: Chao Yu <yuchao0@huawei.com>
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+

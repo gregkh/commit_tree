@@ -1,0 +1,99 @@
+ACPICA: Events: Add parallel GPE handling support to fix potential redundant _Exx evaluations
+
+There is a risk that a GPE method/handler may be invoked twice. Let's
+consider a case, both GPE0(RAW_HANDLER) and GPE1(_Exx) is triggered.
+ =======================================+=============================
+ IRQ handler (top-half)                 |IRQ polling
+ =======================================+=============================
+ acpi_ev_detect_gpe()                   |
+   LOCK()                               |
+   READ (GPE0-7 enable/status registers)|
+   ^^^^^^^^^^^^ROOT CAUSE^^^^^^^^^^^^^^^|
+   Walk GPE0                            |
+     UNLOCK()                           |LOCK()
+     Invoke GPE0 RAW_HANDLER            |READ (GPE1 enable/status bit)
+                                        |acpi_ev_gpe_dispatch(irq=false)
+                                        |  CLEAR (GPE1 enable bit)
+                                        |  CLEAR (GPE1 status bit)
+     LOCK()                             |UNLOCK()
+   Walk GPE1                            +=============================
+     acpi_ev_gpe_dispatch(irq=true)     |IRQ polling (defer)
+       CLEAR (GPE1 enable bit)          +=============================
+       CLEAR (GPE1 status bit)          |acpi_ev_async_execute_gpe_method()
+   Walk others                          |  Evaluate GPE1 _Exx
+   fi                                   |  acpi_ev_async_enable_gpe()
+   UNLOCK()                             |    LOCK()
+ =======================================+    SET (GPE enable bit)
+ IRQ handler (bottom-half)              |    UNLOCK()
+ =======================================+
+ acpi_ev_async_execute_gpe_method()     |
+   Evaluate GPE1 _Exx                   |
+   acpi_ev_async_enable_gpe()           |
+     LOCK()                             |
+     SET (GPE1 enable bit)              |
+     UNLOCK()                           |
+ =======================================+=============================
+
+If acpi_ev_detect_gpe() is only invoked from the IRQ context, there won't be
+more than one _Lxx/_Exx evaluations for one status bit flagging if the IRQ
+handlers controlled by the underlying IRQ chip/driver (ex. APIC) are run in
+serial. Note that, this is a known potential gap and we had an approach,
+locking entire non-raw-handler processes in the top-half IRQ handler and
+handling all raw-handlers out of the locked loop to be friendly to those
+IRQ chip/driver. But the approach is too complicated while the issue is not
+so real, thus ACPICA treated such issue (if any) as a parallelism/quality
+issue of the underlying IRQ chip/driver to stop putting it on the radar.
+Bug in link #1 is suspiciously reflecting the same cause, and if so, it can
+also be fixed by this simpler approach.
+
+But it will be no excuse an ACPICA problem now if ACPICA starts to poll
+IRQs itself. In the changed scenario, _Exx will be evaluated from the task
+context due to new ACPICA provided "polling after enabling GPEs" mechanism.
+And the above figure uses edge-triggered GPEs demonstrating the possibility
+of evaluating _Exx twice for one status bit flagging.
+
+As a conclusion, there is now an increased chance of evaluating _Lxx/_Exx
+more than once for one status bit flagging.
+
+However this is still not a real problem if the _Lxx/_Exx checks the
+underlying hardware IRQ reasoning and finally just changes the 2nd and the
+follow-up evaluations into no-ops. Note that _Lxx should always be written
+in this way as a level-trigger GPE could have it's status wrongly
+duplicated by the underlying IRQ delivery mechanisms. But _Exx may have
+very low quality BIOS by BIOS to trigger real issues. For example, trigger
+duplicated button notifications.
+
+To solve this issue, we need to stop reading a bunch of enable/status
+register bits, but read only one GPE's enable/status bit. And GPE status
+register's W1C nature ensures that acknowledging one GPE won't affect
+another GPEs' status bits. Thus the hardware GPE architecture has already
+provided us with the mechanism of implementing such parallelism.
+
+So we can lock around one GPE handling process to achieve the parallelism:
+1. If we can incorporate GPE enable bit check in detection and ensure the
+   atomicity of the following process (top-half IRQ handler):
+    READ (enable/status bit)
+    if (enabled && raised)
+      CLEAR (enable bit)
+   and handle the GPE after this process, we can ensure that we will only
+   invoke GPE handler once for one status bit flagging.
+2. In addtion for edge-triggered GPEs, if we can ensure the atomicity of
+   the following process (top-half IRQ handler):
+    READ (enable/status bit)
+    if (enabled && raised)
+      CLEAR (enable bit)
+      CLEAR (status bit)
+   and handle the GPE after this process, we can ensure that we will only
+   invoke GPE handler once for one status bit flagging.
+
+By doing a cleanup in this way, we can remove duplicate GPE handling code
+and ensure that all logics are collected in 1 function. And the function
+will be safe for both IRQ interrupt and IRQ polling, and will be safe for
+us to release and re-acquire acpi_gbl_gpe_lock at any time rather than raw
+handler only during the top-half IRQ handler. Lv Zheng.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=196703 [#1]
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Signed-off-by: Erik Schmauss <erik.schmauss@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

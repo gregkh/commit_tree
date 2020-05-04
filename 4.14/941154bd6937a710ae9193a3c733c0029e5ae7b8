@@ -1,0 +1,59 @@
+watchdog/hardlockup/perf: Prevent CPU hotplug deadlock
+
+The following deadlock is possible in the watchdog hotplug code:
+
+  cpus_write_lock()
+    ...
+      takedown_cpu()
+        smpboot_park_threads()
+          smpboot_park_thread()
+            kthread_park()
+              ->park() := watchdog_disable()
+                watchdog_nmi_disable()
+                  perf_event_release_kernel();
+                    put_event()
+                      _free_event()
+                        ->destroy() := hw_perf_event_destroy()
+                          x86_release_hardware()
+                            release_ds_buffers()
+                              get_online_cpus()
+
+when a per cpu watchdog perf event is destroyed which drops the last
+reference to the PMU hardware. The cleanup code there invokes
+get_online_cpus() which instantly deadlocks because the hotplug percpu
+rwsem is write locked.
+
+To solve this add a deferring mechanism:
+
+  cpus_write_lock()
+			   kthread_park()
+			    watchdog_nmi_disable(deferred)
+			      perf_event_disable(event);
+			      move_event_to_deferred(event);
+			   ....
+  cpus_write_unlock()
+  cleaup_deferred_events()
+    perf_event_release_kernel()
+
+This is still properly serialized against concurrent hotplug via the
+cpu_add_remove_lock, which is held by the task which initiated the hotplug
+event.
+
+This is also used to handle event destruction when the watchdog threads are
+parked via other mechanisms than CPU hotplug.
+
+Analyzed-by: Peter Zijlstra <peterz@infradead.org>
+
+Reported-by: Borislav Petkov <bp@alien8.de>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Don Zickus <dzickus@redhat.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Chris Metcalf <cmetcalf@mellanox.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sebastian Siewior <bigeasy@linutronix.de>
+Cc: Ulrich Obergfell <uobergfe@redhat.com>
+Link: http://lkml.kernel.org/r/20170912194146.884469246@linutronix.de
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

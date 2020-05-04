@@ -1,0 +1,83 @@
+PCI: iproc: Work around Stingray CRS defects
+
+Configuration Request Retry Status ("CRS") completions are a required part
+of PCIe.  A PCIe device may respond to config a request with a CRS
+completion to indicate that it needs more time to initialize.  A Root Port
+that receives a CRS completion may automatically retry the request, or it
+may treat the request as a failed transaction.  For a failed read, it will
+likely synthesize all 1's data, i.e., 0xffffffff, to complete the read to
+the CPU.
+
+CRS Software Visibility ("CRS SV") is an optional feature.  Per PCIe r3.1,
+sec 2.3.2, if supported and enabled, a Root Port that receives a CRS
+completion for a config read of the Vendor ID will synthesize 0x0001 data
+(an invalid Vendor ID) instead of retrying or failing the transaction.  The
+0x0001 data makes the CRS completion visible to software, so it can perform
+other tasks while waiting for the device.
+
+The iProc "Stingray" PCIe controller does not support CRS completions
+correctly.  From the Stingray PCIe Controller spec:
+
+  4.7.3.3. Retry Status On Configuration Cycle
+
+  Endpoints are allowed to generate retry status on configuration cycles.
+  In this case, the RC needs to re-issue the request. The IP does not
+  handle this because the number of configuration cycles needed will
+  probably be less than the total number of non-posted operations needed.
+
+  When a retry status is received on the User RX interface for a
+  configuration request that was sent on the User TX interface, it will be
+  indicated with a completion with the CMPL_STATUS field set to 2=CRS, and
+  the user will have to find the address and data values and send a new
+  transaction on the User TX interface.  When the internal configuration
+  space returns a retry status during a configuration cycle (user_cscfg =
+  1) on the Command/Status interface, the pcie_cscrs will assert with the
+  pcie_csack signal to indicate the CRS status.
+
+  When the CRS Software Visibility Enable register in the Root Control
+  register is enabled, the IP will return the data value to 0x0001 for the
+  Vendor ID value and 0xffff  (all 1’s) for the rest of the data in the
+  request for reads of offset 0 that return with CRS status.  This is true
+  for both the User RX Interface and for the Command/Status interface.
+  When CRS Software Visibility is enabled, the CMPL_STATUS field of the
+  completion on the User RX Interface will not be 2=CRS and the pcie_cscrs
+  signal will not assert on the Command/Status interface.
+
+The Stingray hardware never reissues configuration requests when it
+receives CRS completions.  Contrary to what sec 4.7.3.3 above says, when it
+receives a CRS completion, it synthesizes 0xffff0001 data regardless of the
+address of the read or the value of the CRS SV enable bit.
+
+This is broken in two ways:
+
+  1) When CRS SV is disabled, the Root Port should never synthesize the
+  0x0001 value.  If it receives a CRS completion, it should fail the
+  transaction and synthesize all 1's data.
+
+  2) When CRS SV is enabled, the Root Port should only synthesize 0x0001
+  data if it receives a CRS completion for a read of the Vendor ID.  If it
+  receives a CRS completion for any other read, it should fail the
+  transaction and synthesize all 1's data.
+
+This breaks pci_flr_wait(), which reads the Command register and expects to
+see all 1's data if the read fails because of CRS completions.  On
+Stingray, it sees the incorrect 0xffff0001 data instead.
+
+It also breaks config registers that contain the 0xffff0001 value.  If we
+read such a register, software can't distinguish a CRS completion from the
+actual value read from the device.
+
+On Stingray, if we read 0xffff0001 data, assume this indicates a CRS
+completion and retry the read for 500ms.  If we time out, return all 1's
+(0xffffffff) data.  Note that this corrupts registers that happen to
+contain 0xffff0001.
+
+Stingray advertises CRS SV support in its Root Capabilities register, and
+the CRS SV enable bit is writable (even though the hardware ignores it).
+Mask out PCI_EXP_RTCAP_CRSVIS so software doesn't try to use CRS SV.
+
+Signed-off-by: Oza Pawandeep <oza.oza@broadcom.com>
+[bhelgaas: changelog, add probe-time warning about corruption, don't
+advertise CRS SV support, remove duplicate pci_generic_config_read32(),
+fix alignment based on patch from Arnd Bergmann <arnd@arndb.de>]
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>

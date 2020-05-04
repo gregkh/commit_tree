@@ -1,0 +1,74 @@
+IB/core: Fix race condition in resolving IP to MAC
+
+Currently while resolving IP address to MAC address single delayed work
+is used for resolving multiple such resolve requests. This singled work
+is essentially performs two tasks.
+(a) any retry needed to resolve and
+(b) it executes the callback function for all completed requests
+
+While work is executing callbacks, any new work scheduled on for this
+workqueue is lost because workqueue has completed looking at all pending
+requests and now looking at callbacks, but work is still under
+execution. Any further retry to look at pending requests in
+process_req() after executing callbacks would lead to similar race
+condition (may be reduce the probably further but doesn't eliminate it).
+Retrying to enqueue work that from queue_req() context is not something
+rest of the kernel modules have followed.
+
+Therefore fix in this patch utilizes kernel facility to enqueue multiple
+work items to a workqueue. This ensures that no such requests
+gets lost in synchronization. Request list is still maintained so that
+rdma_cancel_addr() can unlink the request and get the completion with
+error sooner. Neighbour update event handling continues to be handled in
+same way as before.
+Additionally process_req() work entry cancels any pending work for a
+request that gets completed while processing those requests.
+
+Originally ib_addr was ST workqueue, but it became MT work queue with
+patch of [1]. This patch again makes it similar to ST so that
+neighbour update events handler work item doesn't race with
+other work items.
+
+In one such below trace, (though on 4.5 based kernel) it can be seen
+that process_req() never executed the callback, which is likely for an
+event that was schedule by queue_req() when previous callback was
+getting executed by workqueue.
+
+ [<ffffffff816b0dde>] schedule+0x3e/0x90
+ [<ffffffff816b3c45>] schedule_timeout+0x1b5/0x210
+ [<ffffffff81618c37>] ? ip_route_output_flow+0x27/0x70
+ [<ffffffffa027f9c9>] ? addr_resolve+0x149/0x1b0 [ib_addr]
+ [<ffffffff816b228f>] wait_for_completion+0x10f/0x170
+ [<ffffffff810b6140>] ? try_to_wake_up+0x210/0x210
+ [<ffffffffa027f220>] ? rdma_copy_addr+0xa0/0xa0 [ib_addr]
+ [<ffffffffa0280120>] rdma_addr_find_l2_eth_by_grh+0x1d0/0x278 [ib_addr]
+ [<ffffffff81321297>] ? sub_alloc+0x77/0x1c0
+ [<ffffffffa02943b7>] ib_init_ah_from_wc+0x3a7/0x5a0 [ib_core]
+ [<ffffffffa0457aba>] cm_req_handler+0xea/0x580 [ib_cm]
+ [<ffffffff81015982>] ? __switch_to+0x212/0x5e0
+ [<ffffffffa04582fd>] cm_work_handler+0x6d/0x150 [ib_cm]
+ [<ffffffff810a14c1>] process_one_work+0x151/0x4b0
+ [<ffffffff810a1940>] worker_thread+0x120/0x480
+ [<ffffffff816b074b>] ? __schedule+0x30b/0x890
+ [<ffffffff810a1820>] ? process_one_work+0x4b0/0x4b0
+ [<ffffffff810a1820>] ? process_one_work+0x4b0/0x4b0
+ [<ffffffff810a6b1e>] kthread+0xce/0xf0
+ [<ffffffff810a6a50>] ? kthread_freezable_should_stop+0x70/0x70
+ [<ffffffff816b53a2>] ret_from_fork+0x42/0x70
+ [<ffffffff810a6a50>] ? kthread_freezable_should_stop+0x70/0x70
+INFO: task kworker/u144:1:156520 blocked for more than 120 seconds.
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this
+message.
+kworker/u144:1  D ffff883ffe1d7600     0 156520      2 0x00000080
+Workqueue: ib_addr process_req [ib_addr]
+ ffff883f446fbbd8 0000000000000046 ffff881f95280000 ffff881ff24de200
+ ffff883f66120000 ffff883f446f8008 ffff881f95280000 ffff883f6f9208c4
+ ffff883f6f9208c8 00000000ffffffff ffff883f446fbbf8 ffffffff816b0dde
+
+[1] http://lkml.iu.edu/hypermail/linux/kernel/1608.1/05834.html
+
+Signed-off-by: Parav Pandit <parav@mellanox.com>
+Reviewed-by: Mark Bloch <markb@mellanox.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+

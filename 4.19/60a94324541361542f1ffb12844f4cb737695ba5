@@ -1,0 +1,158 @@
+drm/i915/execlists: Drop clear_gtiir() on GPU reset
+
+With the new CSB processing code, we are not vulnerable to delayed
+delivery of a pre-reset interrupt as we use the CSB status pointers in
+the HWSP to decide if we need to parse any CSB events and no longer need
+to wait for the first post-reset interrupt to be assured that the CSB
+mmio registers are valid.
+
+The new icl code to clear registers has a nasty lock inversion:
+[   57.409776] ======================================================
+[   57.409779] WARNING: possible circular locking dependency detected
+[   57.409783] 4.18.0-rc4-CI-CI_DII_1137+ #1 Tainted: G     U  W
+[   57.409785] ------------------------------------------------------
+[   57.409788] swapper/6/0 is trying to acquire lock:
+[   57.409790] 000000004f304ee5 (&engine->timeline.lock/1){-.-.}, at: execlists_submit_request+0x2b/0x1a0 [i915]
+[   57.409841]
+               but task is already holding lock:
+[   57.409844] 00000000aad89594 (&(&rq->lock)->rlock#2){-.-.}, at: notify_ring+0x2b2/0x480 [i915]
+[   57.409869]
+               which lock already depends on the new lock.
+
+[   57.409872]
+               the existing dependency chain (in reverse order) is:
+[   57.409876]
+               -> #2 (&(&rq->lock)->rlock#2){-.-.}:
+[   57.409900]        notify_ring+0x2b2/0x480 [i915]
+[   57.409922]        gen8_cs_irq_handler+0x39/0xa0 [i915]
+[   57.409943]        gen11_irq_handler+0x2f0/0x420 [i915]
+[   57.409949]        __handle_irq_event_percpu+0x42/0x370
+[   57.409952]        handle_irq_event_percpu+0x2b/0x70
+[   57.409956]        handle_irq_event+0x2f/0x50
+[   57.409959]        handle_edge_irq+0xe7/0x190
+[   57.409964]        handle_irq+0x67/0x160
+[   57.409967]        do_IRQ+0x5e/0x120
+[   57.409971]        ret_from_intr+0x0/0x1d
+[   57.409974]        _raw_spin_unlock_irqrestore+0x4e/0x60
+[   57.409979]        tasklet_action_common.isra.5+0x47/0xb0
+[   57.409982]        __do_softirq+0xd9/0x505
+[   57.409985]        irq_exit+0xa9/0xc0
+[   57.409988]        do_IRQ+0x9a/0x120
+[   57.409991]        ret_from_intr+0x0/0x1d
+[   57.409995]        cpuidle_enter_state+0xac/0x360
+[   57.409999]        do_idle+0x1f3/0x250
+[   57.410004]        cpu_startup_entry+0x6a/0x70
+[   57.410010]        start_secondary+0x19d/0x1f0
+[   57.410015]        secondary_startup_64+0xa5/0xb0
+[   57.410018]
+               -> #1 (&(&dev_priv->irq_lock)->rlock){-.-.}:
+[   57.410081]        clear_gtiir+0x30/0x200 [i915]
+[   57.410116]        execlists_reset+0x6e/0x2b0 [i915]
+[   57.410140]        i915_reset_engine+0x111/0x190 [i915]
+[   57.410165]        i915_handle_error+0x11a/0x4a0 [i915]
+[   57.410198]        i915_hangcheck_elapsed+0x378/0x530 [i915]
+[   57.410204]        process_one_work+0x248/0x6c0
+[   57.410207]        worker_thread+0x37/0x380
+[   57.410211]        kthread+0x119/0x130
+[   57.410215]        ret_from_fork+0x3a/0x50
+[   57.410217]
+               -> #0 (&engine->timeline.lock/1){-.-.}:
+[   57.410224]        _raw_spin_lock_irqsave+0x33/0x50
+[   57.410256]        execlists_submit_request+0x2b/0x1a0 [i915]
+[   57.410289]        submit_notify+0x8d/0x124 [i915]
+[   57.410314]        __i915_sw_fence_complete+0x81/0x250 [i915]
+[   57.410339]        dma_i915_sw_fence_wake+0xd/0x20 [i915]
+[   57.410344]        dma_fence_signal_locked+0x79/0x200
+[   57.410368]        notify_ring+0x2ba/0x480 [i915]
+[   57.410392]        gen8_cs_irq_handler+0x39/0xa0 [i915]
+[   57.410416]        gen11_irq_handler+0x2f0/0x420 [i915]
+[   57.410421]        __handle_irq_event_percpu+0x42/0x370
+[   57.410425]        handle_irq_event_percpu+0x2b/0x70
+[   57.410428]        handle_irq_event+0x2f/0x50
+[   57.410432]        handle_edge_irq+0xe7/0x190
+[   57.410436]        handle_irq+0x67/0x160
+[   57.410439]        do_IRQ+0x5e/0x120
+[   57.410445]        ret_from_intr+0x0/0x1d
+[   57.410449]        cpuidle_enter_state+0xac/0x360
+[   57.410453]        do_idle+0x1f3/0x250
+[   57.410456]        cpu_startup_entry+0x6a/0x70
+[   57.410460]        start_secondary+0x19d/0x1f0
+[   57.410464]        secondary_startup_64+0xa5/0xb0
+[   57.410466]
+               other info that might help us debug this:
+
+[   57.410471] Chain exists of:
+                 &engine->timeline.lock/1 --> &(&dev_priv->irq_lock)->rlock --> &(&rq->lock)->rlock#2
+
+[   57.410481]  Possible unsafe locking scenario:
+
+[   57.410485]        CPU0                    CPU1
+[   57.410487]        ----                    ----
+[   57.410490]   lock(&(&rq->lock)->rlock#2);
+[   57.410494]                                lock(&(&dev_priv->irq_lock)->rlock);
+[   57.410498]                                lock(&(&rq->lock)->rlock#2);
+[   57.410503]   lock(&engine->timeline.lock/1);
+[   57.410506]
+                *** DEADLOCK ***
+
+[   57.410511] 4 locks held by swapper/6/0:
+[   57.410514]  #0: 0000000074575789 (&(&dev_priv->irq_lock)->rlock){-.-.}, at: gen11_irq_handler+0x8a/0x420 [i915]
+[   57.410542]  #1: 000000009b29b30e (rcu_read_lock){....}, at: notify_ring+0x1a/0x480 [i915]
+[   57.410573]  #2: 00000000aad89594 (&(&rq->lock)->rlock#2){-.-.}, at: notify_ring+0x2b2/0x480 [i915]
+[   57.410601]  #3: 000000009b29b30e (rcu_read_lock){....}, at: submit_notify+0x35/0x124 [i915]
+[   57.410635]
+               stack backtrace:
+[   57.410640] CPU: 6 PID: 0 Comm: swapper/6 Tainted: G     U  W         4.18.0-rc4-CI-CI_DII_1137+ #1
+[   57.410644] Hardware name: Intel Corporation Ice Lake Client Platform/IceLake U DDR4 SODIMM PD RVP, BIOS ICLSFWR1.R00.2222.A01.1805300339 05/30/2018
+[   57.410650] Call Trace:
+[   57.410652]  <IRQ>
+[   57.410657]  dump_stack+0x67/0x9b
+[   57.410662]  print_circular_bug.isra.16+0x1c8/0x2b0
+[   57.410666]  __lock_acquire+0x1897/0x1b50
+[   57.410671]  ? lock_acquire+0xa6/0x210
+[   57.410674]  lock_acquire+0xa6/0x210
+[   57.410706]  ? execlists_submit_request+0x2b/0x1a0 [i915]
+[   57.410711]  _raw_spin_lock_irqsave+0x33/0x50
+[   57.410741]  ? execlists_submit_request+0x2b/0x1a0 [i915]
+[   57.410769]  execlists_submit_request+0x2b/0x1a0 [i915]
+[   57.410774]  ? _raw_spin_unlock_irqrestore+0x39/0x60
+[   57.410804]  submit_notify+0x8d/0x124 [i915]
+[   57.410828]  __i915_sw_fence_complete+0x81/0x250 [i915]
+[   57.410854]  dma_i915_sw_fence_wake+0xd/0x20 [i915]
+[   57.410858]  dma_fence_signal_locked+0x79/0x200
+[   57.410882]  notify_ring+0x2ba/0x480 [i915]
+[   57.410907]  gen8_cs_irq_handler+0x39/0xa0 [i915]
+[   57.410933]  gen11_irq_handler+0x2f0/0x420 [i915]
+[   57.410938]  __handle_irq_event_percpu+0x42/0x370
+[   57.410943]  handle_irq_event_percpu+0x2b/0x70
+[   57.410947]  handle_irq_event+0x2f/0x50
+[   57.410951]  handle_edge_irq+0xe7/0x190
+[   57.410955]  handle_irq+0x67/0x160
+[   57.410958]  do_IRQ+0x5e/0x120
+[   57.410962]  common_interrupt+0xf/0xf
+[   57.410965]  </IRQ>
+[   57.410969] RIP: 0010:cpuidle_enter_state+0xac/0x360
+[   57.410972] Code: 44 00 00 31 ff e8 84 93 91 ff 45 84 f6 74 12 9c 58 f6 c4 02 0f 85 31 02 00 00 31 ff e8 7d 30 98 ff e8 e8 0e 94 ff fb 4c 29 fb <48> ba cf f7 53 e3 a5 9b c4 20 48 89 d8 48 c1 fb 3f 48 f7 ea b8 ff
+[   57.411015] RSP: 0018:ffffc90000133e90 EFLAGS: 00000216 ORIG_RAX: ffffffffffffffdd
+[   57.411023] RAX: ffff8804ae748040 RBX: 000000000002a97d RCX: 0000000000000000
+[   57.411029] RDX: 0000000000000046 RSI: ffffffff82141263 RDI: ffffffff820f05a7
+[   57.411035] RBP: 0000000000000001 R08: 0000000000000001 R09: 0000000000000000
+[   57.411041] R10: 0000000000000000 R11: 0000000000000000 R12: ffffffff8229f078
+[   57.411045] R13: ffff8804ab2adfa8 R14: 0000000000000000 R15: 0000000d5de092e3
+[   57.411052]  do_idle+0x1f3/0x250
+[   57.411055]  cpu_startup_entry+0x6a/0x70
+[   57.411059]  start_secondary+0x19d/0x1f0
+[   57.411064]  secondary_startup_64+0xa5/0xb0
+
+The easiest remedy is to remove the defunct code.
+
+Fixes: ff047a87cfac ("drm/i915/icl: Correctly clear lost ctx-switch interrupts across reset for Gen11")
+References: fd8526e50902 ("drm/i915/execlists: Trust the CSB")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Michel Thierry <michel.thierry@intel.com>
+Cc: Oscar Mateo <oscar.mateo@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Reviewed-by: Michel Thierry <michel.thierry@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180713203529.1973-3-chris@chris-wilson.co.uk
+

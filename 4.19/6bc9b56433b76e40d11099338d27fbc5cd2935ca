@@ -1,0 +1,84 @@
+mm: fix race on soft-offlining free huge pages
+
+Patch series "mm: soft-offline: fix race against page allocation".
+
+Xishi recently reported the issue about race on reusing the target pages
+of soft offlining.  Discussion and analysis showed that we need make
+sure that setting PG_hwpoison should be done in the right place under
+zone->lock for soft offline.  1/2 handles free hugepage's case, and 2/2
+hanldes free buddy page's case.
+
+This patch (of 2):
+
+There's a race condition between soft offline and hugetlb_fault which
+causes unexpected process killing and/or hugetlb allocation failure.
+
+The process killing is caused by the following flow:
+
+  CPU 0               CPU 1              CPU 2
+
+  soft offline
+    get_any_page
+    // find the hugetlb is free
+                      mmap a hugetlb file
+                      page fault
+                        ...
+                          hugetlb_fault
+                            hugetlb_no_page
+                              alloc_huge_page
+                              // succeed
+      soft_offline_free_page
+      // set hwpoison flag
+                                         mmap the hugetlb file
+                                         page fault
+                                           ...
+                                             hugetlb_fault
+                                               hugetlb_no_page
+                                                 find_lock_page
+                                                   return VM_FAULT_HWPOISON
+                                           mm_fault_error
+                                             do_sigbus
+                                             // kill the process
+
+The hugetlb allocation failure comes from the following flow:
+
+  CPU 0                          CPU 1
+
+                                 mmap a hugetlb file
+                                 // reserve all free page but don't fault-in
+  soft offline
+    get_any_page
+    // find the hugetlb is free
+      soft_offline_free_page
+      // set hwpoison flag
+        dissolve_free_huge_page
+        // fail because all free hugepages are reserved
+                                 page fault
+                                   ...
+                                     hugetlb_fault
+                                       hugetlb_no_page
+                                         alloc_huge_page
+                                           ...
+                                             dequeue_huge_page_node_exact
+                                             // ignore hwpoisoned hugepage
+                                             // and finally fail due to no-mem
+
+The root cause of this is that current soft-offline code is written based
+on an assumption that PageHWPoison flag should be set at first to avoid
+accessing the corrupted data.  This makes sense for memory_failure() or
+hard offline, but does not for soft offline because soft offline is about
+corrected (not uncorrected) error and is safe from data lost.  This patch
+changes soft offline semantics where it sets PageHWPoison flag only after
+containment of the error page completes successfully.
+
+Link: http://lkml.kernel.org/r/1531452366-11661-2-git-send-email-n-horiguchi@ah.jp.nec.com
+Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Reported-by: Xishi Qiu <xishi.qiuxishi@alibaba-inc.com>
+Suggested-by: Xishi Qiu <xishi.qiuxishi@alibaba-inc.com>
+Tested-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: <zy.zhengyi@alibaba-inc.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

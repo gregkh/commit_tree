@@ -1,0 +1,74 @@
+bpf: don't select potentially stale ri->map from buggy xdp progs
+
+We can potentially run into a couple of issues with the XDP
+bpf_redirect_map() helper. The ri->map in the per CPU storage
+can become stale in several ways, mostly due to misuse, where
+we can then trigger a use after free on the map:
+
+i) prog A is calling bpf_redirect_map(), returning XDP_REDIRECT
+and running on a driver not supporting XDP_REDIRECT yet. The
+ri->map on that CPU becomes stale when the XDP program is unloaded
+on the driver, and a prog B loaded on a different driver which
+supports XDP_REDIRECT return code. prog B would have to omit
+calling to bpf_redirect_map() and just return XDP_REDIRECT, which
+would then access the freed map in xdp_do_redirect() since not
+cleared for that CPU.
+
+ii) prog A is calling bpf_redirect_map(), returning a code other
+than XDP_REDIRECT. prog A is then detached, which triggers release
+of the map. prog B is attached which, similarly as in i), would
+just return XDP_REDIRECT without having called bpf_redirect_map()
+and thus be accessing the freed map in xdp_do_redirect() since
+not cleared for that CPU.
+
+iii) prog A is attached to generic XDP, calling the bpf_redirect_map()
+helper and returning XDP_REDIRECT. xdp_do_generic_redirect() is
+currently not handling ri->map (will be fixed by Jesper), so it's
+not being reset. Later loading a e.g. native prog B which would,
+say, call bpf_xdp_redirect() and then returns XDP_REDIRECT would
+find in xdp_do_redirect() that a map was set and uses that causing
+use after free on map access.
+
+Fix thus needs to avoid accessing stale ri->map pointers, naive
+way would be to call a BPF function from drivers that just resets
+it to NULL for all XDP return codes but XDP_REDIRECT and including
+XDP_REDIRECT for drivers not supporting it yet (and let ri->map
+being handled in xdp_do_generic_redirect()). There is a less
+intrusive way w/o letting drivers call a reset for each BPF run.
+
+The verifier knows we're calling into bpf_xdp_redirect_map()
+helper, so it can do a small insn rewrite transparent to the prog
+itself in the sense that it fills R4 with a pointer to the own
+bpf_prog. We have that pointer at verification time anyway and
+R4 is allowed to be used as per calling convention we scratch
+R0 to R5 anyway, so they become inaccessible and program cannot
+read them prior to a write. Then, the helper would store the prog
+pointer in the current CPUs struct redirect_info. Later in
+xdp_do_*_redirect() we check whether the redirect_info's prog
+pointer is the same as passed xdp_prog pointer, and if that's
+the case then all good, since the prog holds a ref on the map
+anyway, so it is always valid at that point in time and must
+have a reference count of at least 1. If in the unlikely case
+they are not equal, it means we got a stale pointer, so we clear
+and bail out right there. Also do reset map and the owning prog
+in bpf_xdp_redirect(), so that bpf_xdp_redirect_map() and
+bpf_xdp_redirect() won't get mixed up, only the last call should
+take precedence. A tc bpf_redirect() doesn't use map anywhere
+yet, so no need to clear it there since never accessed in that
+layer.
+
+Note that in case the prog is released, and thus the map as
+well we're still under RCU read critical section at that time
+and have preemption disabled as well. Once we commit with the
+__dev_map_insert_ctx() from xdp_do_redirect_map() and set the
+map to ri->map_to_flush, we still wait for a xdp_do_flush_map()
+to finish in devmap dismantle time once flush_needed bit is set,
+so that is fine.
+
+Fixes: 97f91a7cf04f ("bpf: add bpf_redirect_map helper routine")
+Reported-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

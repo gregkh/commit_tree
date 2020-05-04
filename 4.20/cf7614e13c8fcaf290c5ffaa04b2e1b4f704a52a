@@ -1,0 +1,91 @@
+rcu: Refactor rcu_{nmi,irq}_{enter,exit}()
+
+When entering or exiting irq or NMI handlers, the current code uses
+->dynticks_nmi_nesting to detect if it is in the outermost handler,
+that is, the one interrupting or returning to an RCU-idle context (the
+idle loop or nohz_full usermode execution).  When entering the outermost
+handler via an interrupt (as opposed to NMI), it is necessary to invoke
+rcu_dynticks_task_exit() just before the CPU is marked non-idle from an
+RCU perspective and to invoke rcu_cleanup_after_idle() just after the
+CPU is marked non-idle.  Similarly, when exiting the outermost handler
+via an interrupt, it is necessary to invoke rcu_prepare_for_idle() just
+before marking the CPU idle and to invoke rcu_dynticks_task_enter()
+just after marking the CPU idle.
+
+The decision to execute these four functions is currently taken in
+rcu_irq_enter() and rcu_irq_exit() as follows:
+
+   rcu_irq_enter()
+      /* A conditional branch with ->dynticks_nmi_nesting */
+      rcu_nmi_enter()
+         /* A conditional branch with ->dynticks */
+      /* A conditional branch with ->dynticks_nmi_nesting */
+
+   rcu_irq_exit()
+      /* A conditional branch with ->dynticks_nmi_nesting */
+      rcu_nmi_exit()
+         /* A conditional branch with ->dynticks_nmi_nesting */
+      /* A conditional branch with ->dynticks_nmi_nesting */
+
+   rcu_nmi_enter()
+      /* A conditional branch with ->dynticks */
+
+   rcu_nmi_exit()
+      /* A conditional branch with ->dynticks_nmi_nesting */
+
+This works, but the conditional branches in rcu_irq_enter() and
+rcu_irq_exit() are redundant with those in rcu_nmi_enter() and
+rcu_nmi_exit(), respectively.  Redundant branches are not something
+we want in the to/from-idle fastpaths, so this commit refactors
+rcu_{nmi,irq}_{enter,exit}() so they use a common inlined function passed
+a constant argument as follows:
+
+   rcu_irq_enter() inlining rcu_nmi_enter_common(irq=true)
+      /* A conditional branch with ->dynticks */
+
+   rcu_irq_exit() inlining rcu_nmi_exit_common(irq=true)
+      /* A conditional branch with ->dynticks_nmi_nesting */
+
+   rcu_nmi_enter() inlining rcu_nmi_enter_common(irq=false)
+      /* A conditional branch with ->dynticks */
+
+   rcu_nmi_exit() inlining rcu_nmi_exit_common(irq=false)
+      /* A conditional branch with ->dynticks_nmi_nesting */
+
+The combination of the constant function argument and the inlining allows
+the compiler to discard the conditionals that previously controlled
+execution of rcu_dynticks_task_exit(), rcu_cleanup_after_idle(),
+rcu_prepare_for_idle(), and rcu_dynticks_task_enter().  This reduces both
+the to-idle and from-idle path lengths by two conditional branches each,
+and improves readability as well.
+
+This commit also changes order of execution from this:
+
+	rcu_dynticks_task_exit();
+	rcu_dynticks_eqs_exit();
+	trace_rcu_dyntick();
+	rcu_cleanup_after_idle();
+
+To this:
+
+	rcu_dynticks_task_exit();
+	rcu_dynticks_eqs_exit();
+	rcu_cleanup_after_idle();
+	trace_rcu_dyntick();
+
+In other words, the calls to rcu_cleanup_after_idle() and
+trace_rcu_dyntick() are reversed.  This has no functional effect because
+the real concern is whether a given call is before or after the call to
+rcu_dynticks_eqs_exit(), and this patch does not change that.  Before the
+call to rcu_dynticks_eqs_exit(), RCU is not yet watching the current
+CPU and after that call RCU is watching.
+
+A similar switch in calling order happens on the idle-entry path, with
+similar lack of effect for the same reasons.
+
+Suggested-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Signed-off-by: Byungchul Park <byungchul.park@lge.com>
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+[ paulmck: Applied Steven Rostedt feedback. ]
+Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+

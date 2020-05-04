@@ -1,0 +1,67 @@
+workqueue: replace pool->manager_arb mutex with a flag
+
+Josef reported a HARDIRQ-safe -> HARDIRQ-unsafe lock order detected by
+lockdep:
+
+ [ 1270.472259] WARNING: HARDIRQ-safe -> HARDIRQ-unsafe lock order detected
+ [ 1270.472783] 4.14.0-rc1-xfstests-12888-g76833e8 #110 Not tainted
+ [ 1270.473240] -----------------------------------------------------
+ [ 1270.473710] kworker/u5:2/5157 [HC0[0]:SC0[0]:HE0:SE1] is trying to acquire:
+ [ 1270.474239]  (&(&lock->wait_lock)->rlock){+.+.}, at: [<ffffffff8da253d2>] __mutex_unlock_slowpath+0xa2/0x280
+ [ 1270.474994]
+ [ 1270.474994] and this task is already holding:
+ [ 1270.475440]  (&pool->lock/1){-.-.}, at: [<ffffffff8d2992f6>] worker_thread+0x366/0x3c0
+ [ 1270.476046] which would create a new lock dependency:
+ [ 1270.476436]  (&pool->lock/1){-.-.} -> (&(&lock->wait_lock)->rlock){+.+.}
+ [ 1270.476949]
+ [ 1270.476949] but this new dependency connects a HARDIRQ-irq-safe lock:
+ [ 1270.477553]  (&pool->lock/1){-.-.}
+ ...
+ [ 1270.488900] to a HARDIRQ-irq-unsafe lock:
+ [ 1270.489327]  (&(&lock->wait_lock)->rlock){+.+.}
+ ...
+ [ 1270.494735]  Possible interrupt unsafe locking scenario:
+ [ 1270.494735]
+ [ 1270.495250]        CPU0                    CPU1
+ [ 1270.495600]        ----                    ----
+ [ 1270.495947]   lock(&(&lock->wait_lock)->rlock);
+ [ 1270.496295]                                local_irq_disable();
+ [ 1270.496753]                                lock(&pool->lock/1);
+ [ 1270.497205]                                lock(&(&lock->wait_lock)->rlock);
+ [ 1270.497744]   <Interrupt>
+ [ 1270.497948]     lock(&pool->lock/1);
+
+, which will cause a irq inversion deadlock if the above lock scenario
+happens.
+
+The root cause of this safe -> unsafe lock order is the
+mutex_unlock(pool->manager_arb) in manage_workers() with pool->lock
+held.
+
+Unlocking mutex while holding an irq spinlock was never safe and this
+problem has been around forever but it never got noticed because the
+only time the mutex is usually trylocked while holding irqlock making
+actual failures very unlikely and lockdep annotation missed the
+condition until the recent b9c16a0e1f73 ("locking/mutex: Fix
+lockdep_assert_held() fail").
+
+Using mutex for pool->manager_arb has always been a bit of stretch.
+It primarily is an mechanism to arbitrate managership between workers
+which can easily be done with a pool flag.  The only reason it became
+a mutex is that pool destruction path wants to exclude parallel
+managing operations.
+
+This patch replaces the mutex with a new pool flag POOL_MANAGER_ACTIVE
+and make the destruction path wait for the current manager on a wait
+queue.
+
+v2: Drop unnecessary flag clearing before pool destruction as
+    suggested by Boqun.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-by: Lai Jiangshan <jiangshanlai@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Boqun Feng <boqun.feng@gmail.com>
+Cc: stable@vger.kernel.org
+

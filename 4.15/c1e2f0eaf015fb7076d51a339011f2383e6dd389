@@ -1,0 +1,95 @@
+futex: Avoid violating the 10th rule of futex
+
+Julia reported futex state corruption in the following scenario:
+
+   waiter                                  waker                                            stealer (prio > waiter)
+
+   futex(WAIT_REQUEUE_PI, uaddr, uaddr2,
+         timeout=[N ms])
+      futex_wait_requeue_pi()
+         futex_wait_queue_me()
+            freezable_schedule()
+            <scheduled out>
+                                           futex(LOCK_PI, uaddr2)
+                                           futex(CMP_REQUEUE_PI, uaddr,
+                                                 uaddr2, 1, 0)
+                                              /* requeues waiter to uaddr2 */
+                                           futex(UNLOCK_PI, uaddr2)
+                                                 wake_futex_pi()
+                                                    cmp_futex_value_locked(uaddr2, waiter)
+                                                    wake_up_q()
+           <woken by waker>
+           <hrtimer_wakeup() fires,
+            clears sleeper->task>
+                                                                                           futex(LOCK_PI, uaddr2)
+                                                                                              __rt_mutex_start_proxy_lock()
+                                                                                                 try_to_take_rt_mutex() /* steals lock */
+                                                                                                    rt_mutex_set_owner(lock, stealer)
+                                                                                              <preempted>
+         <scheduled in>
+         rt_mutex_wait_proxy_lock()
+            __rt_mutex_slowlock()
+               try_to_take_rt_mutex() /* fails, lock held by stealer */
+               if (timeout && !timeout->task)
+                  return -ETIMEDOUT;
+            fixup_owner()
+               /* lock wasn't acquired, so,
+                  fixup_pi_state_owner skipped */
+
+   return -ETIMEDOUT;
+
+   /* At this point, we've returned -ETIMEDOUT to userspace, but the
+    * futex word shows waiter to be the owner, and the pi_mutex has
+    * stealer as the owner */
+
+   futex_lock(LOCK_PI, uaddr2)
+     -> bails with EDEADLK, futex word says we're owner.
+
+And suggested that what commit:
+
+  73d786bd043e ("futex: Rework inconsistent rt_mutex/futex_q state")
+
+removes from fixup_owner() looks to be just what is needed. And indeed
+it is -- I completely missed that requeue_pi could also result in this
+case. So we need to restore that, except that subsequent patches, like
+commit:
+
+  16ffa12d7425 ("futex: Pull rt_mutex_futex_unlock() out from under hb->lock")
+
+changed all the locking rules. Even without that, the sequence:
+
+-               if (rt_mutex_futex_trylock(&q->pi_state->pi_mutex)) {
+-                       locked = 1;
+-                       goto out;
+-               }
+
+-               raw_spin_lock_irq(&q->pi_state->pi_mutex.wait_lock);
+-               owner = rt_mutex_owner(&q->pi_state->pi_mutex);
+-               if (!owner)
+-                       owner = rt_mutex_next_owner(&q->pi_state->pi_mutex);
+-               raw_spin_unlock_irq(&q->pi_state->pi_mutex.wait_lock);
+-               ret = fixup_pi_state_owner(uaddr, q, owner);
+
+already suggests there were races; otherwise we'd never have to look
+at next_owner.
+
+So instead of doing 3 consecutive wait_lock sections with who knows
+what races, we do it all in a single section. Additionally, the usage
+of pi_state->owner in fixup_owner() was only safe because only the
+rt_mutex owner would modify it, which this additional case wrecks.
+
+Luckily the values can only change away and not to the value we're
+testing, this means we can do a speculative test and double check once
+we have the wait_lock.
+
+Fixes: 73d786bd043e ("futex: Rework inconsistent rt_mutex/futex_q state")
+Reported-by: Julia Cartwright <julia@ni.com>
+Reported-by: Gratian Crisan <gratian.crisan@ni.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Julia Cartwright <julia@ni.com>
+Tested-by: Gratian Crisan <gratian.crisan@ni.com>
+Cc: Darren Hart <dvhart@infradead.org>
+Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/20171208124939.7livp7no2ov65rrc@hirez.programming.kicks-ass.net
+

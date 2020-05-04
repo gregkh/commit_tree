@@ -1,0 +1,90 @@
+md-cluster: use sync way to handle METADATA_UPDATED msg
+
+Previously, when node received METADATA_UPDATED msg, it just
+need to wakeup mddev->thread, then md_reload_sb will be called
+eventually.
+
+We taken the asynchronous way to avoid a deadlock issue, the
+deadlock issue could happen when one node is receiving the
+METADATA_UPDATED msg (wants reconfig_mutex) and trying to run
+the path:
+
+md_check_recovery -> mddev_trylock(hold reconfig_mutex)
+                  -> md_update_sb-metadata_update_start
+		     (want EX on token however token is
+		      got by the sending node)
+
+Since we will support resizing for clustered raid, and we
+need the metadata update handling to be synchronous so that
+the initiating node can detect failure, so we need to change
+the way for handling METADATA_UPDATED msg.
+
+But, we obviously need to avoid above deadlock with the
+sync way. To make this happen, we considered to not hold
+reconfig_mutex to call md_reload_sb, if some other thread
+has already taken reconfig_mutex and waiting for the 'token',
+then process_recvd_msg() can safely call md_reload_sb()
+without taking the mutex. This is because we can be certain
+that no other thread will take the mutex, and we also certain
+that the actions performed by md_reload_sb() won't interfere
+with anything that the other thread is in the middle of.
+
+To make this more concrete, we added a new cinfo->state bit
+        MD_CLUSTER_HOLDING_MUTEX_FOR_RECVD
+
+Which is set in lock_token() just before dlm_lock_sync() is
+called, and cleared just after. As lock_token() is always
+called with reconfig_mutex() held (the specific case is the
+resync_info_update which is distinguished well in previous
+patch), if process_recvd_msg() finds that the new bit is set,
+then the mutex must be held by some other thread, and it will
+keep waiting.
+
+So process_metadata_update() can call md_reload_sb() if either
+mddev_trylock() succeeds, or if MD_CLUSTER_HOLDING_MUTEX_FOR_RECVD
+is set. The tricky bit is what to do if neither of these apply.
+We need to wait. Fortunately mddev_unlock() always calls wake_up()
+on mddev->thread->wqueue. So we can get lock_token() to call
+wake_up() on that when it sets the bit.
+
+There are also some related changes inside this commit:
+1. remove RELOAD_SB related codes since there are not valid anymore.
+2. mddev is added into md_cluster_info then we can get mddev inside
+   lock_token.
+3. add new parameter for lock_token to distinguish reconfig_mutex
+   is held or not.
+
+And, we need to set MD_CLUSTER_HOLDING_MUTEX_FOR_RECVD in below:
+1. set it before unregister thread, otherwise a deadlock could
+   appear if stop a resyncing array.
+   This is because md_unregister_thread(&cinfo->recv_thread) is
+   blocked by recv_daemon -> process_recvd_msg
+			  -> process_metadata_update.
+   To resolve the issue, MD_CLUSTER_HOLDING_MUTEX_FOR_RECVD is
+   also need to be set before unregister thread.
+2. set it in metadata_update_start to fix another deadlock.
+	a. Node A sends METADATA_UPDATED msg (held Token lock).
+	b. Node B wants to do resync, and is blocked since it can't
+	   get Token lock, but MD_CLUSTER_HOLDING_MUTEX_FOR_RECVD is
+	   not set since the callchain
+	   (md_do_sync -> sync_request
+        	       -> resync_info_update
+		       -> sendmsg
+		       -> lock_comm -> lock_token)
+	   doesn't hold reconfig_mutex.
+	c. Node B trys to update sb (held reconfig_mutex), but stopped
+	   at wait_event() in metadata_update_start since we have set
+	   MD_CLUSTER_SEND_LOCK flag in lock_comm (step 2).
+	d. Then Node B receives METADATA_UPDATED msg from A, of course
+	   recv_daemon is blocked forever.
+   Since metadata_update_start always calls lock_token with reconfig_mutex,
+   we need to set MD_CLUSTER_HOLDING_MUTEX_FOR_RECVD here as well, and
+   lock_token don't need to set it twice unless lock_token is invoked from
+   lock_comm.
+
+Finally, thanks to Neil for his great idea and help!
+
+Reviewed-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Guoqing Jiang <gqjiang@suse.com>
+Signed-off-by: Shaohua Li <shli@fb.com>
+

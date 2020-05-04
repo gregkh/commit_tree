@@ -1,0 +1,148 @@
+bpf: allow for correlation of maps and helpers in dump
+
+Currently a dump of an xlated prog (post verifier stage) doesn't
+correlate used helpers as well as maps. The prog info lists
+involved map ids, however there's no correlation of where in the
+program they are used as of today. Likewise, bpftool does not
+correlate helper calls with the target functions.
+
+The latter can be done w/o any kernel changes through kallsyms,
+and also has the advantage that this works with inlined helpers
+and BPF calls.
+
+Example, via interpreter:
+
+  # tc filter show dev foo ingress
+  filter protocol all pref 49152 bpf chain 0
+  filter protocol all pref 49152 bpf chain 0 handle 0x1 foo.o:[ingress] \
+                      direct-action not_in_hw id 1 tag c74773051b364165   <-- prog id:1
+
+  * Output before patch (calls/maps remain unclear):
+
+  # bpftool prog dump xlated id 1             <-- dump prog id:1
+   0: (b7) r1 = 2
+   1: (63) *(u32 *)(r10 -4) = r1
+   2: (bf) r2 = r10
+   3: (07) r2 += -4
+   4: (18) r1 = 0xffff95c47a8d4800
+   6: (85) call unknown#73040
+   7: (15) if r0 == 0x0 goto pc+18
+   8: (bf) r2 = r10
+   9: (07) r2 += -4
+  10: (bf) r1 = r0
+  11: (85) call unknown#73040
+  12: (15) if r0 == 0x0 goto pc+23
+  [...]
+
+  * Output after patch:
+
+  # bpftool prog dump xlated id 1
+   0: (b7) r1 = 2
+   1: (63) *(u32 *)(r10 -4) = r1
+   2: (bf) r2 = r10
+   3: (07) r2 += -4
+   4: (18) r1 = map[id:2]                     <-- map id:2
+   6: (85) call bpf_map_lookup_elem#73424     <-- helper call
+   7: (15) if r0 == 0x0 goto pc+18
+   8: (bf) r2 = r10
+   9: (07) r2 += -4
+  10: (bf) r1 = r0
+  11: (85) call bpf_map_lookup_elem#73424
+  12: (15) if r0 == 0x0 goto pc+23
+  [...]
+
+  # bpftool map show id 2                     <-- show/dump/etc map id:2
+  2: hash_of_maps  flags 0x0
+        key 4B  value 4B  max_entries 3  memlock 4096B
+
+Example, JITed, same prog:
+
+  # tc filter show dev foo ingress
+  filter protocol all pref 49152 bpf chain 0
+  filter protocol all pref 49152 bpf chain 0 handle 0x1 foo.o:[ingress] \
+                  direct-action not_in_hw id 3 tag c74773051b364165 jited
+
+  # bpftool prog show id 3
+  3: sched_cls  tag c74773051b364165
+        loaded_at Dec 19/13:48  uid 0
+        xlated 384B  jited 257B  memlock 4096B  map_ids 2
+
+  # bpftool prog dump xlated id 3
+   0: (b7) r1 = 2
+   1: (63) *(u32 *)(r10 -4) = r1
+   2: (bf) r2 = r10
+   3: (07) r2 += -4
+   4: (18) r1 = map[id:2]                      <-- map id:2
+   6: (85) call __htab_map_lookup_elem#77408   <-+ inlined rewrite
+   7: (15) if r0 == 0x0 goto pc+2                |
+   8: (07) r0 += 56                              |
+   9: (79) r0 = *(u64 *)(r0 +0)                <-+
+  10: (15) if r0 == 0x0 goto pc+24
+  11: (bf) r2 = r10
+  12: (07) r2 += -4
+  [...]
+
+Example, same prog, but kallsyms disabled (in that case we are
+also not allowed to pass any relative offsets, etc, so prog
+becomes pointer sanitized on dump):
+
+  # sysctl kernel.kptr_restrict=2
+  kernel.kptr_restrict = 2
+
+  # bpftool prog dump xlated id 3
+   0: (b7) r1 = 2
+   1: (63) *(u32 *)(r10 -4) = r1
+   2: (bf) r2 = r10
+   3: (07) r2 += -4
+   4: (18) r1 = map[id:2]
+   6: (85) call bpf_unspec#0
+   7: (15) if r0 == 0x0 goto pc+2
+  [...]
+
+Example, BPF calls via interpreter:
+
+  # bpftool prog dump xlated id 1
+   0: (85) call pc+2#__bpf_prog_run_args32
+   1: (b7) r0 = 1
+   2: (95) exit
+   3: (b7) r0 = 2
+   4: (95) exit
+
+Example, BPF calls via JIT:
+
+  # sysctl net.core.bpf_jit_enable=1
+  net.core.bpf_jit_enable = 1
+  # sysctl net.core.bpf_jit_kallsyms=1
+  net.core.bpf_jit_kallsyms = 1
+
+  # bpftool prog dump xlated id 1
+   0: (85) call pc+2#bpf_prog_3b185187f1855c4c_F
+   1: (b7) r0 = 1
+   2: (95) exit
+   3: (b7) r0 = 2
+   4: (95) exit
+
+And finally, an example for tail calls that is now working
+as well wrt correlation:
+
+  # bpftool prog dump xlated id 2
+  [...]
+  10: (b7) r2 = 8
+  11: (85) call bpf_trace_printk#-41312
+  12: (bf) r1 = r6
+  13: (18) r2 = map[id:1]
+  15: (b7) r3 = 0
+  16: (85) call bpf_tail_call#12
+  17: (b7) r1 = 42
+  18: (6b) *(u16 *)(r6 +46) = r1
+  19: (b7) r0 = 0
+  20: (95) exit
+
+  # bpftool map show id 1
+  1: prog_array  flags 0x0
+        key 4B  value 4B  max_entries 1  memlock 4096B
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

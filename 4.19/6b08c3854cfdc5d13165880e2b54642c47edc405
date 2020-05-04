@@ -1,0 +1,66 @@
+PCI: pciehp: Support interrupts sent from D3hot
+
+If a hotplug port is able to send an interrupt, one would naively assume
+that it is accessible at that moment.  After all, if it wouldn't be
+accessible, i.e. if its parent is in D3hot and the link to the hotplug
+port is thus down, how should an interrupt come through?
+
+It turns out that assumption is wrong at least for Thunderbolt:  Even
+though its parents are in D3hot, a Thunderbolt hotplug port is able to
+signal interrupts.  Because the port's config space is inaccessible and
+resuming the parents may sleep, the hard IRQ handler has to defer
+runtime resuming the parents and reading the Slot Status register to the
+IRQ thread.
+
+If the hotplug port uses a level-triggered INTx interrupt, it needs to
+be masked until the IRQ thread has cleared the signaled events.  For
+simplicity, this commit also masks edge-triggered MSI/MSI-X interrupts.
+Note that if the interrupt is shared (which can only happen for INTx),
+other devices are starved from receiving interrupts until the IRQ thread
+is scheduled, has runtime resumed the hotplug port's parents and has
+read and cleared the Slot Status register.
+
+That delay is dominated by the 10 ms D3hot->D0 transition time of each
+parent port.  The worst case is a Thunderbolt downstream port at the
+end of a daisy chain:  There may be up to six Thunderbolt controllers
+in-between it and the root port, each comprising an upstream and
+downstream port, plus its own upstream port.  That's 13 x 10 = 130 ms.
+Possible mitigations are polling the interrupt while it's disabled or
+reducing the d3_delay of Thunderbolt ports if possible.
+
+Open code masking of the interrupt instead of requesting it with the
+IRQF_ONESHOT flag to minimize the period during which it is masked.
+(IRQF_ONESHOT unmasks the IRQ only after the IRQ thread has finished.)
+
+PCIe r4.0 sec 6.7.3.4 states that "If wake generation is required by the
+associated form factor specification, a hotplug capable Downstream Port
+must support generation of a wakeup event (using the PME mechanism) on
+hotplug events that occur when the system is in a sleep state or the
+Port is in device state D1, D2, or D3Hot."
+
+This would seem to imply that PME needs to be enabled on the hotplug
+port when it is runtime suspended.  pci_enable_wake() currently doesn't
+enable PME on bridges, it may be necessary to add an exemption for
+hotplug bridges there.  On "Light Ridge" Thunderbolt controllers, the
+PME_Status bit is not set when an interrupt occurs while the hotplug
+port is in D3hot, even if PME is enabled.  (I've tested this on a Mac
+and we hardcode the OSC_PCI_EXPRESS_PME_CONTROL bit to 0 on Macs in
+negotiate_os_control(), modifying it to 1 didn't change the behavior.)
+
+(Side note:  Section 6.7.3.4 also states that "PME and Hot-Plug Event
+interrupts (when both are implemented) always share the same MSI or
+MSI-X vector".  That would only seem to apply to Root Ports, however
+the section never mentions Root Ports, only Downstream Ports.  This is
+explained in the definition of "Downstream Port" in the "Terms and
+Acronyms" section of the PCIe Base Spec:  "The Ports on a Switch that
+are not the Upstream Port are Downstream Ports.  All Ports on a Root
+Complex are Downstream Ports.")
+
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Cc: Mika Westerberg <mika.westerberg@linux.intel.com>
+Cc: Ashok Raj <ashok.raj@intel.com>
+Cc: Keith Busch <keith.busch@intel.com>
+Cc: Yinghai Lu <yinghai@kernel.org>

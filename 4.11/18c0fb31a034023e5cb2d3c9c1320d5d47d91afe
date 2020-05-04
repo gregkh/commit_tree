@@ -1,0 +1,47 @@
+xprtrdma: Properly recover FRWRs with in-flight FASTREG WRs
+
+Sriharsha (sriharsha.basavapatna@broadcom.com) reports an occasional
+double DMA unmap of an FRWR MR when a connection is lost. I see one
+way this can happen.
+
+When a request requires more than one segment or chunk,
+rpcrdma_marshal_req loops, invoking ->frwr_op_map for each segment
+(MR) in each chunk. Each call posts a FASTREG Work Request to
+register one MR.
+
+Now suppose that the transport connection is lost part-way through
+marshaling this request. As part of recovering and resetting that
+req, rpcrdma_marshal_req invokes ->frwr_op_unmap_safe, which hands
+all the req's registered FRWRs to the MR recovery thread.
+
+But note: FRWR registration is asynchronous. So it's possible that
+some of these "already registered" FRWRs are fully registered, and
+some are still waiting for their FASTREG WR to complete.
+
+When the connection is lost, the "already registered" frmrs are
+marked FRMR_IS_VALID, and the "still waiting" WRs flush. Then
+frwr_wc_fastreg marks these frmrs FRMR_FLUSHED_FR.
+
+But thanks to ->frwr_op_unmap_safe, the MR recovery thread is doing
+an unreg / alloc_mr, a DMA unmap, and marking each of these frwrs
+FRMR_IS_INVALID, at the same time frwr_wc_fastreg might be running.
+
+- If the recovery thread runs last, then the frmr is marked
+FRMR_IS_INVALID, and life continues.
+
+- If frwr_wc_fastreg runs last, the frmr is marked FRMR_FLUSHED_FR,
+but the recovery thread has already DMA unmapped that MR. When
+->frwr_op_map later re-uses this frmr, it sees it is not marked
+FRMR_IS_INVALID, and tries to recover it before using it, resulting
+in a second DMA unmap of the same MR.
+
+The fix is to guarantee in-flight FASTREG WRs have flushed before MR
+recovery runs on those FRWRs. Thus we depend on ro_unmap_safe
+(called from xprt_rdma_send_request on retransmit, or from
+xprt_rdma_free) to clean up old registrations as needed.
+
+Reported-by: Sriharsha Basavapatna <sriharsha.basavapatna@broadcom.com>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Tested-by: Sriharsha Basavapatna <sriharsha.basavapatna@broadcom.com>
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+

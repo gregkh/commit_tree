@@ -1,0 +1,109 @@
+mac80211: Fix PTK rekey freezes and clear text leak
+
+Rekeying PTK keys without "Extended Key ID for Individually Addressed
+Frames" did use a procedure not suitable to replace in-use keys and
+could caused the following issues:
+
+ 1) Freeze caused by incoming frames:
+    If the local STA installed the key prior to the remote STA we still
+    had the old key active in the hardware when mac80211 switched over
+    to the new key.
+    Therefore there was a window where the card could hand over frames
+    decoded with the old key to mac80211 and bump the new PN (IV) value
+    to an incorrect high number. When it happened the local replay
+    detection silently started to drop all frames sent with the new key.
+
+ 2) Freeze caused by outgoing frames:
+    If mac80211 was providing the PN (IV) and handed over a clear text
+    frame for encryption to the hardware prior to a key change the
+    driver/card could have processed the queued frame after switching
+    to the new key. This bumped the PN value on the remote STA to an
+    incorrect high number, tricking the remote STA to discard all frames
+    we sent later.
+
+ 3) Freeze caused by RX aggregation reorder buffer:
+    An aggregation session started with the old key and ending after the
+    switch to the new key also bumped the PN to an incorrect high number,
+    freezing the connection quite similar to 1).
+
+ 4) Freeze caused by repeating lost frames in an aggregation session:
+    A driver could repeat a lost frame and encrypt it with the new key
+    while in a TX aggregation session without updating the PN for the
+    new key. This also could freeze connections similar to 2).
+
+ 5) Clear text leak:
+    Removing encryption offload from the card cleared the encryption
+    offload flag only after the card had deleted the key and we did not
+    stop TX during the rekey. The driver/card could therefore get
+    unencrypted frames from mac80211 while no longer be instructed to
+    encrypt them.
+
+To prevent those issues the key install logic has been changed:
+ - Mac80211 divers known to be able to rekey PTK0 keys have to set
+   @NL80211_EXT_FEATURE_CAN_REPLACE_PTK0,
+ - mac80211 stops queuing frames depending on the key during the replace
+ - the key is first replaced in the hardware and after that in mac80211
+ - and mac80211 stops/blocks new aggregation sessions during the rekey.
+
+For drivers not setting
+@NL80211_EXT_FEATURE_CAN_REPLACE_PTK0 the user space must avoid PTK
+rekeys if "Extended Key ID for Individually Addressed Frames" is not
+being used. Rekeys for mac80211 drivers without this flag will generate a
+warning and use an extra call to ieee80211_flush_queues() to both
+highlight and try to prevent the issues with not updated drivers.
+
+The core of the fix changes the key install procedure from:
+ - atomic switch over to the new key in mac80211
+ - remove the old key in the hardware (stops encryption offloading, fall
+   back to software encryption with a potential clear text packet leak
+   in between)
+ - delete the inactive old key in mac80211
+ - enable hardware encryption offloading for the new key
+to:
+ - if it's a PTK mark the old key as tainted to drop TX frames with the
+   outgoing key
+ - replace the key in hardware with the new one
+ - atomic switch over to the new (not marked as tainted) key in
+   mac80211 (which also resumes TX)
+ - delete the inactive old key in mac80211
+
+With the new sequence the hardware will be unable to decrypt frames
+encrypted with the old key prior to switching to the new key in mac80211
+and thus prevent PNs from packets decrypted with the old key to be
+accounted against the new key.
+
+For that to work the drivers have to provide a clear boundary.
+Mac80211 drivers setting @NL80211_EXT_FEATURE_CAN_REPLACE_PTK0 confirm
+to provide it and mac80211 will then be able to correctly rekey in-use
+PTK keys with those drivers.
+
+The mac80211 requirements for drivers to set the flag have been added to
+the "Hardware crypto acceleration" documentation section. It drills down
+to:
+The drivers must not hand over frames decrypted with the old key to
+mac80211 once the call to set_key() with %DISABLE_KEY has been
+completed. It's allowed to either drop or continue to use the old key
+for any outgoing frames which are already in the queues, but it must not
+send out any of them unencrypted or encrypted with the new key.
+
+Even with the new boundary in place aggregation sessions with the
+reorder buffer are problematic:
+RX aggregation session started prior and completed after the rekey could
+still dump frames received with the old key at mac80211 after it
+switched over to the new key. This is side stepped by stopping all (RX
+and TX) aggregation sessions when replacing a PTK key and hardware key
+offloading.
+Stopping TX aggregation sessions avoids the need to get
+the PNs (IVs) updated in frames prepared for the old key and
+(re)transmitted after the switch to the new key. As a bonus it improves
+the compatibility when the remote STA is not handling rekeys as it
+should.
+
+When using software crypto aggregation sessions are not stopped.
+Mac80211 won't be able to decode the dangerous frames and discard them
+without special handling.
+
+Signed-off-by: Alexander Wetzel <alexander@wetzel-home.de>
+[trim overly long rekey warning]
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+

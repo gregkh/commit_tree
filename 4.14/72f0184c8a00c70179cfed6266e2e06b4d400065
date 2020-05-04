@@ -1,0 +1,122 @@
+mm, memcg: remove hotplug locking from try_charge
+
+The following lockdep splat has been noticed during LTP testing
+
+  ======================================================
+  WARNING: possible circular locking dependency detected
+  4.13.0-rc3-next-20170807 #12 Not tainted
+  ------------------------------------------------------
+  a.out/4771 is trying to acquire lock:
+   (cpu_hotplug_lock.rw_sem){++++++}, at: [<ffffffff812b4668>] drain_all_stock.part.35+0x18/0x140
+
+  but task is already holding lock:
+   (&mm->mmap_sem){++++++}, at: [<ffffffff8106eb35>] __do_page_fault+0x175/0x530
+
+  which lock already depends on the new lock.
+
+  the existing dependency chain (in reverse order) is:
+
+  -> #3 (&mm->mmap_sem){++++++}:
+         lock_acquire+0xc9/0x230
+         __might_fault+0x70/0xa0
+         _copy_to_user+0x23/0x70
+         filldir+0xa7/0x110
+         xfs_dir2_sf_getdents.isra.10+0x20c/0x2c0 [xfs]
+         xfs_readdir+0x1fa/0x2c0 [xfs]
+         xfs_file_readdir+0x30/0x40 [xfs]
+         iterate_dir+0x17a/0x1a0
+         SyS_getdents+0xb0/0x160
+         entry_SYSCALL_64_fastpath+0x1f/0xbe
+
+  -> #2 (&type->i_mutex_dir_key#3){++++++}:
+         lock_acquire+0xc9/0x230
+         down_read+0x51/0xb0
+         lookup_slow+0xde/0x210
+         walk_component+0x160/0x250
+         link_path_walk+0x1a6/0x610
+         path_openat+0xe4/0xd50
+         do_filp_open+0x91/0x100
+         file_open_name+0xf5/0x130
+         filp_open+0x33/0x50
+         kernel_read_file_from_path+0x39/0x80
+         _request_firmware+0x39f/0x880
+         request_firmware_direct+0x37/0x50
+         request_microcode_fw+0x64/0xe0
+         reload_store+0xf7/0x180
+         dev_attr_store+0x18/0x30
+         sysfs_kf_write+0x44/0x60
+         kernfs_fop_write+0x113/0x1a0
+         __vfs_write+0x37/0x170
+         vfs_write+0xc7/0x1c0
+         SyS_write+0x58/0xc0
+         do_syscall_64+0x6c/0x1f0
+         return_from_SYSCALL_64+0x0/0x7a
+
+  -> #1 (microcode_mutex){+.+.+.}:
+         lock_acquire+0xc9/0x230
+         __mutex_lock+0x88/0x960
+         mutex_lock_nested+0x1b/0x20
+         microcode_init+0xbb/0x208
+         do_one_initcall+0x51/0x1a9
+         kernel_init_freeable+0x208/0x2a7
+         kernel_init+0xe/0x104
+         ret_from_fork+0x2a/0x40
+
+  -> #0 (cpu_hotplug_lock.rw_sem){++++++}:
+         __lock_acquire+0x153c/0x1550
+         lock_acquire+0xc9/0x230
+         cpus_read_lock+0x4b/0x90
+         drain_all_stock.part.35+0x18/0x140
+         try_charge+0x3ab/0x6e0
+         mem_cgroup_try_charge+0x7f/0x2c0
+         shmem_getpage_gfp+0x25f/0x1050
+         shmem_fault+0x96/0x200
+         __do_fault+0x1e/0xa0
+         __handle_mm_fault+0x9c3/0xe00
+         handle_mm_fault+0x16e/0x380
+         __do_page_fault+0x24a/0x530
+         do_page_fault+0x30/0x80
+         page_fault+0x28/0x30
+
+  other info that might help us debug this:
+
+  Chain exists of:
+    cpu_hotplug_lock.rw_sem --> &type->i_mutex_dir_key#3 --> &mm->mmap_sem
+
+   Possible unsafe locking scenario:
+
+         CPU0                    CPU1
+         ----                    ----
+    lock(&mm->mmap_sem);
+                                 lock(&type->i_mutex_dir_key#3);
+                                 lock(&mm->mmap_sem);
+    lock(cpu_hotplug_lock.rw_sem);
+
+   *** DEADLOCK ***
+
+  2 locks held by a.out/4771:
+   #0:  (&mm->mmap_sem){++++++}, at: [<ffffffff8106eb35>] __do_page_fault+0x175/0x530
+   #1:  (percpu_charge_mutex){+.+...}, at: [<ffffffff812b4c97>] try_charge+0x397/0x6e0
+
+The problem is very similar to the one fixed by commit a459eeb7b852
+("mm, page_alloc: do not depend on cpu hotplug locks inside the
+allocator").  We are taking hotplug locks while we can be sitting on top
+of basically arbitrary locks.  This just calls for problems.
+
+We can get rid of {get,put}_online_cpus, fortunately.  We do not have to
+be worried about races with memory hotplug because drain_local_stock,
+which is called from both the WQ draining and the memory hotplug
+contexts, is always operating on the local cpu stock with IRQs disabled.
+
+The only thing to be careful about is that the target memcg doesn't
+vanish while we are still in drain_all_stock so take a reference on it.
+
+Link: http://lkml.kernel.org/r/20170913090023.28322-1-mhocko@kernel.org
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Reported-by: Artem Savkov <asavkov@redhat.com>
+Tested-by: Artem Savkov <asavkov@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

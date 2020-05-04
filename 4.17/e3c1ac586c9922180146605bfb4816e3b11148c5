@@ -1,0 +1,80 @@
+mm/vmscan: don't mess with pgdat->flags in memcg reclaim
+
+memcg reclaim may alter pgdat->flags based on the state of LRU lists in
+cgroup and its children.  PGDAT_WRITEBACK may force kswapd to sleep
+congested_wait(), PGDAT_DIRTY may force kswapd to writeback filesystem
+pages.  But the worst here is PGDAT_CONGESTED, since it may force all
+direct reclaims to stall in wait_iff_congested().  Note that only kswapd
+have powers to clear any of these bits.  This might just never happen if
+cgroup limits configured that way.  So all direct reclaims will stall as
+long as we have some congested bdi in the system.
+
+Leave all pgdat->flags manipulations to kswapd.  kswapd scans the whole
+pgdat, only kswapd can clear pgdat->flags once node is balanced, thus
+it's reasonable to leave all decisions about node state to kswapd.
+
+Why only kswapd? Why not allow to global direct reclaim change these
+flags? It is because currently only kswapd can clear these flags.  I'm
+less worried about the case when PGDAT_CONGESTED falsely not set, and
+more worried about the case when it falsely set.  If direct reclaimer
+sets PGDAT_CONGESTED, do we have guarantee that after the congestion
+problem is sorted out, kswapd will be woken up and clear the flag? It
+seems like there is no such guarantee.  E.g.  direct reclaimers may
+eventually balance pgdat and kswapd simply won't wake up (see
+wakeup_kswapd()).
+
+Moving pgdat->flags manipulation to kswapd, means that cgroup2 recalim
+now loses its congestion throttling mechanism.  Add per-cgroup
+congestion state and throttle cgroup2 reclaimers if memcg is in
+congestion state.
+
+Currently there is no need in per-cgroup PGDAT_WRITEBACK and PGDAT_DIRTY
+bits since they alter only kswapd behavior.
+
+The problem could be easily demonstrated by creating heavy congestion in
+one cgroup:
+
+    echo "+memory" > /sys/fs/cgroup/cgroup.subtree_control
+    mkdir -p /sys/fs/cgroup/congester
+    echo 512M > /sys/fs/cgroup/congester/memory.max
+    echo $$ > /sys/fs/cgroup/congester/cgroup.procs
+    /* generate a lot of diry data on slow HDD */
+    while true; do dd if=/dev/zero of=/mnt/sdb/zeroes bs=1M count=1024; done &
+    ....
+    while true; do dd if=/dev/zero of=/mnt/sdb/zeroes bs=1M count=1024; done &
+
+and some job in another cgroup:
+
+    mkdir /sys/fs/cgroup/victim
+    echo 128M > /sys/fs/cgroup/victim/memory.max
+
+    # time cat /dev/sda > /dev/null
+    real    10m15.054s
+    user    0m0.487s
+    sys     1m8.505s
+
+According to the tracepoint in wait_iff_congested(), the 'cat' spent 50%
+of the time sleeping there.
+
+With the patch, cat don't waste time anymore:
+
+    # time cat /dev/sda > /dev/null
+    real    5m32.911s
+    user    0m0.411s
+    sys     0m56.664s
+
+[aryabinin@virtuozzo.com: congestion state should be per-node]
+  Link: http://lkml.kernel.org/r/20180406135215.10057-1-aryabinin@virtuozzo.com
+[ayabinin@virtuozzo.com: make congestion state per-cgroup-per-node instead of just per-cgroup[
+  Link: http://lkml.kernel.org/r/20180406180254.8970-2-aryabinin@virtuozzo.com
+Link: http://lkml.kernel.org/r/20180323152029.11084-5-aryabinin@virtuozzo.com
+Signed-off-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

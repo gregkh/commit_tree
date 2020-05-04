@@ -1,0 +1,163 @@
+mm/memcontrol: exclude @root from checks in mem_cgroup_low
+
+Make @root exclusive in mem_cgroup_low; it is never considered low when
+looked at directly and is not checked when traversing the tree.  In
+effect, @root is handled identically to how root_mem_cgroup was
+previously handled by mem_cgroup_low.
+
+If @root is not excluded from the checks, a cgroup underneath @root will
+never be considered low during targeted reclaim of @root, e.g.  due to
+memory.current > memory.high, unless @root is misconfigured to have
+memory.low > memory.high.
+
+Excluding @root enables using memory.low to prioritize memory usage
+between cgroups within a subtree of the hierarchy that is limited by
+memory.high or memory.max, e.g.  when ROOT owns @root's controls but
+delegates the @root directory to a USER so that USER can create and
+administer children of @root.
+
+For example, given cgroup A with children B and C:
+
+    A
+   / \
+  B   C
+
+and
+
+  1. A/memory.current > A/memory.high
+  2. A/B/memory.current < A/B/memory.low
+  3. A/C/memory.current >= A/C/memory.low
+
+As 'A' is high, i.e.  triggers reclaim from 'A', and 'B' is low, we
+should reclaim from 'C' until 'A' is no longer high or until we can no
+longer reclaim from 'C'.  If 'A', i.e.  @root, isn't excluded by
+mem_cgroup_low when reclaming from 'A', then 'B' won't be considered low
+and we will reclaim indiscriminately from both 'B' and 'C'.
+
+Here is the test I used to confirm the bug and the patch.
+
+20:00:55@sjchrist-vm ? ~ $ cat ~/.bin/memcg_low_test
+#!/bin/bash
+
+x62mb=$((62<<20))
+x66mb=$((66<<20))
+x94mb=$((94<<20))
+x98mb=$((98<<20))
+
+setup() {
+    set -e
+
+    if [[ -n $DEBUG ]]; then
+        set -x
+    fi
+
+    trap teardown EXIT HUP INT TERM
+
+    if [[ ! -e /mnt/1gb.swap ]]; then
+        sudo fallocate -l 1G /mnt/1gb.swap > /dev/null
+        sudo mkswap /mnt/1gb.swap > /dev/null
+    fi
+    if ! swapon --show=NAME | grep -q "/mnt/1gb.swap"; then
+        sudo swapon /mnt/1gb.swap
+    fi
+
+    if [[ ! -e /cgroup/cgroup.controllers ]]; then
+        sudo mount -t cgroup2 none /cgroup
+    fi
+
+    grep -q memory /cgroup/cgroup.controllers
+
+    sudo sh -c "echo '+memory' > /cgroup/cgroup.subtree_control"
+
+    sudo mkdir /cgroup/A && sudo chown $USER:$USER /cgroup/A
+    sudo sh -c "echo '+memory' > /cgroup/A/cgroup.subtree_control"
+    sudo sh -c "echo '96m' > /cgroup/A/memory.high"
+
+    mkdir /cgroup/A/0
+    mkdir /cgroup/A/1
+
+    echo 64m > /cgroup/A/0/memory.low
+}
+
+teardown() {
+    set +e
+
+    trap - EXIT HUP INT TERM
+
+    if [[ -z $1 ]]; then
+        printf "\n"
+        printf "%0.s*" {1..35}
+        printf "\nFAILED!\n\n"
+        tail /cgroup/A/**/memory.current
+        printf "%0.s*" {1..35}
+        printf "\n\n"
+    fi
+
+    ps | grep stress | tr -s ' ' | cut -f 2 -d ' ' | xargs -I % kill %
+
+    sleep 2
+
+    if [[ -e /cgroup/A/0 ]]; then
+        rmdir /cgroup/A/0
+    fi
+    if [[ -e /cgroup/A/1 ]]; then
+        rmdir /cgroup/A/1
+    fi
+    if [[ -e /cgroup/A ]]; then
+        sudo rmdir /cgroup/A
+    fi
+}
+
+stress_test() {
+    sudo sh -c "echo $$ > /cgroup/A/$1/cgroup.procs"
+    stress --vm 1 --vm-bytes 64M --vm-keep > /dev/null &
+
+    sudo sh -c "echo $$ > /cgroup/A/$2/cgroup.procs"
+    stress --vm 1 --vm-bytes 64M --vm-keep > /dev/null &
+
+    sudo sh -c "echo $$ > /cgroup/cgroup.procs"
+
+    sleep 1
+
+    # A/0 should be consuming more memory than A/1
+    [[ $(cat /cgroup/A/0/memory.current) -ge $(cat /cgroup/A/1/memory.current) ]]
+
+    # A/0 should be consuming ~64mb
+    [[ $(cat /cgroup/A/0/memory.current) -ge $x62mb ]] && [[ $(cat /cgroup/A/0/memory.current) -le $x66mb ]]
+
+    # A should cumulatively be consuming ~96mb
+    [[ $(cat /cgroup/A/memory.current) -ge $x94mb ]] && [[ $(cat /cgroup/A/memory.current) -le $x98mb ]]
+
+    # Stop the stressors
+    ps | grep stress | tr -s ' ' | cut -f 2 -d ' ' | xargs -I % kill %
+}
+
+teardown 1
+setup
+
+for ((i=1;i<=$1;i++)); do
+    printf "ITERATION $i of $1 - stress_test 0 1"
+    stress_test 0 1
+    printf "\x1b[2K\r"
+
+    printf "ITERATION $i of $1 - stress_test 1 0"
+    stress_test 1 0
+    printf "\x1b[2K\r"
+
+    printf "ITERATION $i of $1 - PASSED\n"
+done
+
+teardown 1
+
+echo PASSED!
+
+20:11:26@sjchrist-vm ? ~ $ memcg_low_test 10
+
+Link: http://lkml.kernel.org/r/1496434412-21005-1-git-send-email-sean.j.christopherson@intel.com
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Acked-by: Vladimir Davydov <vdavydov.dev@gmail.com>
+Acked-by: Balbir Singh <bsingharora@gmail.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

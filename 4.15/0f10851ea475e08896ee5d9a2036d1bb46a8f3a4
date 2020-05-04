@@ -1,0 +1,129 @@
+mm/mmu_notifier: avoid double notification when it is useless
+
+This patch only affects users of mmu_notifier->invalidate_range callback
+which are device drivers related to ATS/PASID, CAPI, IOMMUv2, SVM ...
+and it is an optimization for those users.  Everyone else is unaffected
+by it.
+
+When clearing a pte/pmd we are given a choice to notify the event under
+the page table lock (notify version of *_clear_flush helpers do call the
+mmu_notifier_invalidate_range).  But that notification is not necessary
+in all cases.
+
+This patch removes almost all cases where it is useless to have a call
+to mmu_notifier_invalidate_range before
+mmu_notifier_invalidate_range_end.  It also adds documentation in all
+those cases explaining why.
+
+Below is a more in depth analysis of why this is fine to do this:
+
+For secondary TLB (non CPU TLB) like IOMMU TLB or device TLB (when
+device use thing like ATS/PASID to get the IOMMU to walk the CPU page
+table to access a process virtual address space).  There is only 2 cases
+when you need to notify those secondary TLB while holding page table
+lock when clearing a pte/pmd:
+
+  A) page backing address is free before mmu_notifier_invalidate_range_end
+  B) a page table entry is updated to point to a new page (COW, write fault
+     on zero page, __replace_page(), ...)
+
+Case A is obvious you do not want to take the risk for the device to write
+to a page that might now be used by something completely different.
+
+Case B is more subtle. For correctness it requires the following sequence
+to happen:
+  - take page table lock
+  - clear page table entry and notify (pmd/pte_huge_clear_flush_notify())
+  - set page table entry to point to new page
+
+If clearing the page table entry is not followed by a notify before setting
+the new pte/pmd value then you can break memory model like C11 or C++11 for
+the device.
+
+Consider the following scenario (device use a feature similar to ATS/
+PASID):
+
+Two address addrA and addrB such that |addrA - addrB| >= PAGE_SIZE we
+assume they are write protected for COW (other case of B apply too).
+
+[Time N] -----------------------------------------------------------------
+CPU-thread-0  {try to write to addrA}
+CPU-thread-1  {try to write to addrB}
+CPU-thread-2  {}
+CPU-thread-3  {}
+DEV-thread-0  {read addrA and populate device TLB}
+DEV-thread-2  {read addrB and populate device TLB}
+[Time N+1] ---------------------------------------------------------------
+CPU-thread-0  {COW_step0: {mmu_notifier_invalidate_range_start(addrA)}}
+CPU-thread-1  {COW_step0: {mmu_notifier_invalidate_range_start(addrB)}}
+CPU-thread-2  {}
+CPU-thread-3  {}
+DEV-thread-0  {}
+DEV-thread-2  {}
+[Time N+2] ---------------------------------------------------------------
+CPU-thread-0  {COW_step1: {update page table point to new page for addrA}}
+CPU-thread-1  {COW_step1: {update page table point to new page for addrB}}
+CPU-thread-2  {}
+CPU-thread-3  {}
+DEV-thread-0  {}
+DEV-thread-2  {}
+[Time N+3] ---------------------------------------------------------------
+CPU-thread-0  {preempted}
+CPU-thread-1  {preempted}
+CPU-thread-2  {write to addrA which is a write to new page}
+CPU-thread-3  {}
+DEV-thread-0  {}
+DEV-thread-2  {}
+[Time N+3] ---------------------------------------------------------------
+CPU-thread-0  {preempted}
+CPU-thread-1  {preempted}
+CPU-thread-2  {}
+CPU-thread-3  {write to addrB which is a write to new page}
+DEV-thread-0  {}
+DEV-thread-2  {}
+[Time N+4] ---------------------------------------------------------------
+CPU-thread-0  {preempted}
+CPU-thread-1  {COW_step3: {mmu_notifier_invalidate_range_end(addrB)}}
+CPU-thread-2  {}
+CPU-thread-3  {}
+DEV-thread-0  {}
+DEV-thread-2  {}
+[Time N+5] ---------------------------------------------------------------
+CPU-thread-0  {preempted}
+CPU-thread-1  {}
+CPU-thread-2  {}
+CPU-thread-3  {}
+DEV-thread-0  {read addrA from old page}
+DEV-thread-2  {read addrB from new page}
+
+So here because at time N+2 the clear page table entry was not pair with a
+notification to invalidate the secondary TLB, the device see the new value
+for addrB before seing the new value for addrA.  This break total memory
+ordering for the device.
+
+When changing a pte to write protect or to point to a new write protected
+page with same content (KSM) it is ok to delay invalidate_range callback
+to mmu_notifier_invalidate_range_end() outside the page table lock.  This
+is true even if the thread doing page table update is preempted right
+after releasing page table lock before calling
+mmu_notifier_invalidate_range_end
+
+Thanks to Andrea for thinking of a problematic scenario for COW.
+
+[jglisse@redhat.com: v2]
+  Link: http://lkml.kernel.org/r/20171017031003.7481-2-jglisse@redhat.com
+Link: http://lkml.kernel.org/r/20170901173011.10745-1-jglisse@redhat.com
+Signed-off-by: Jérôme Glisse <jglisse@redhat.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Nadav Amit <nadav.amit@gmail.com>
+Cc: Joerg Roedel <jroedel@suse.de>
+Cc: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+Cc: David Woodhouse <dwmw2@infradead.org>
+Cc: Alistair Popple <alistair@popple.id.au>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+Cc: Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

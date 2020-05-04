@@ -1,0 +1,39 @@
+kvm: x86: do not use KVM_REQ_EVENT for APICv interrupt injection
+
+Since bf9f6ac8d749 ("KVM: Update Posted-Interrupts Descriptor when vCPU
+is blocked", 2015-09-18) the posted interrupt descriptor is checked
+unconditionally for PIR.ON.  Therefore we don't need KVM_REQ_EVENT to
+trigger the scan and, if NMIs or SMIs are not involved, we can avoid
+the complicated event injection path.
+
+Calling kvm_vcpu_kick if PIR.ON=1 is also useless, though it has been
+there since APICv was introduced.
+
+However, without the KVM_REQ_EVENT safety net KVM needs to be much
+more careful about races between vmx_deliver_posted_interrupt and
+vcpu_enter_guest.  First, the IPI for posted interrupts may be issued
+between setting vcpu->mode = IN_GUEST_MODE and disabling interrupts.
+If that happens, kvm_trigger_posted_interrupt returns true, but
+smp_kvm_posted_intr_ipi doesn't do anything about it.  The guest is
+entered with PIR.ON, but the posted interrupt IPI has not been sent
+and the interrupt is only delivered to the guest on the next vmentry
+(if any).  To fix this, disable interrupts before setting vcpu->mode.
+This ensures that the IPI is delayed until the guest enters non-root mode;
+it is then trapped by the processor causing the interrupt to be injected.
+
+Second, the IPI may be issued between kvm_x86_ops->sync_pir_to_irr(vcpu)
+and vcpu->mode = IN_GUEST_MODE.  In this case, kvm_vcpu_kick is called
+but it (correctly) doesn't do anything because it sees vcpu->mode ==
+OUTSIDE_GUEST_MODE.  Again, the guest is entered with PIR.ON but no
+posted interrupt IPI is pending; this time, the fix for this is to move
+the RVI update after IN_GUEST_MODE.
+
+Both issues were mostly masked by the liberal usage of KVM_REQ_EVENT,
+though the second could actually happen with VT-d posted interrupts.
+In both race scenarios KVM_REQ_EVENT would cancel guest entry, resulting
+in another vmentry which would inject the interrupt.
+
+This saves about 300 cycles on the self_ipi_* tests of vmexit.flat.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+

@@ -1,0 +1,62 @@
+KVM: PPC: Book3S HV: Work around transactional memory bugs in POWER9
+
+POWER9 has hardware bugs relating to transactional memory and thread
+reconfiguration (changes to hardware SMT mode).  Specifically, the core
+does not have enough storage to store a complete checkpoint of all the
+architected state for all four threads.  The DD2.2 version of POWER9
+includes hardware modifications designed to allow hypervisor software
+to implement workarounds for these problems.  This patch implements
+those workarounds in KVM code so that KVM guests see a full, working
+transactional memory implementation.
+
+The problems center around the use of TM suspended state, where the
+CPU has a checkpointed state but execution is not transactional.  The
+workaround is to implement a "fake suspend" state, which looks to the
+guest like suspended state but the CPU does not store a checkpoint.
+In this state, any instruction that would cause a transition to
+transactional state (rfid, rfebb, mtmsrd, tresume) or would use the
+checkpointed state (treclaim) causes a "soft patch" interrupt (vector
+0x1500) to the hypervisor so that it can be emulated.  The trechkpt
+instruction also causes a soft patch interrupt.
+
+On POWER9 DD2.2, we avoid returning to the guest in any state which
+would require a checkpoint to be present.  The trechkpt in the guest
+entry path which would normally create that checkpoint is replaced by
+either a transition to fake suspend state, if the guest is in suspend
+state, or a rollback to the pre-transactional state if the guest is in
+transactional state.  Fake suspend state is indicated by a flag in the
+PACA plus a new bit in the PSSCR.  The new PSSCR bit is write-only and
+reads back as 0.
+
+On exit from the guest, if the guest is in fake suspend state, we still
+do the treclaim instruction as we would in real suspend state, in order
+to get into non-transactional state, but we do not save the resulting
+register state since there was no checkpoint.
+
+Emulation of the instructions that cause a softpatch interrupt is
+handled in two paths.  If the guest is in real suspend mode, we call
+kvmhv_p9_tm_emulation_early() to handle the cases where the guest is
+transitioning to transactional state.  This is called before we do the
+treclaim in the guest exit path; because we haven't done treclaim, we
+can get back to the guest with the transaction still active.  If the
+instruction is a case that kvmhv_p9_tm_emulation_early() doesn't
+handle, or if the guest is in fake suspend state, then we proceed to
+do the complete guest exit path and subsequently call
+kvmhv_p9_tm_emulation() in host context with the MMU on.  This handles
+all the cases including the cases that generate program interrupts
+(illegal instruction or TM Bad Thing) and facility unavailable
+interrupts.
+
+The emulation is reasonably straightforward and is mostly concerned
+with checking for exception conditions and updating the state of
+registers such as MSR and CR0.  The treclaim emulation takes care to
+ensure that the TEXASR register gets updated as if it were the guest
+treclaim instruction that had done failure recording, not the treclaim
+done in hypervisor state in the guest exit path.
+
+With this, the KVM_CAP_PPC_HTM capability returns true (1) even if
+transactional memory is not available to host userspace.
+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+

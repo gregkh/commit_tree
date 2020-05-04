@@ -1,0 +1,61 @@
+sched/core: Call __schedule() from do_idle() without enabling preemption
+
+I finally got around to creating trampolines for dynamically allocated
+ftrace_ops with using synchronize_rcu_tasks(). For users of the ftrace
+function hook callbacks, like perf, that allocate the ftrace_ops
+descriptor via kmalloc() and friends, ftrace was not able to optimize
+the functions being traced to use a trampoline because they would also
+need to be allocated dynamically. The problem is that they cannot be
+freed when CONFIG_PREEMPT is set, as there's no way to tell if a task
+was preempted on the trampoline. That was before Paul McKenney
+implemented synchronize_rcu_tasks() that would make sure all tasks
+(except idle) have scheduled out or have entered user space.
+
+While testing this, I triggered this bug:
+
+ BUG: unable to handle kernel paging request at ffffffffa0230077
+ ...
+ RIP: 0010:0xffffffffa0230077
+ ...
+ Call Trace:
+  schedule+0x5/0xe0
+  schedule_preempt_disabled+0x18/0x30
+  do_idle+0x172/0x220
+
+What happened was that the idle task was preempted on the trampoline.
+As synchronize_rcu_tasks() ignores the idle thread, there's nothing
+that lets ftrace know that the idle task was preempted on a trampoline.
+
+The idle task shouldn't need to ever enable preemption. The idle task
+is simply a loop that calls schedule or places the cpu into idle mode.
+In fact, having preemption enabled is inefficient, because it can
+happen when idle is just about to call schedule anyway, which would
+cause schedule to be called twice. Once for when the interrupt came in
+and was returning back to normal context, and then again in the normal
+path that the idle loop is running in, which would be pointless, as it
+had already scheduled.
+
+The only reason schedule_preempt_disable() enables preemption is to be
+able to call sched_submit_work(), which requires preemption enabled. As
+this is a nop when the task is in the RUNNING state, and idle is always
+in the running state, there's no reason that idle needs to enable
+preemption. But that means it cannot use schedule_preempt_disable() as
+other callers of that function require calling sched_submit_work().
+
+Adding a new function local to kernel/sched/ that allows idle to call
+the scheduler without enabling preemption, fixes the
+synchronize_rcu_tasks() issue, as well as removes the pointless spurious
+schedule calls caused by interrupts happening in the brief window where
+preemption is enabled just before it calls schedule.
+
+Reviewed: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20170414084809.3dacde2a@gandalf.local.home
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

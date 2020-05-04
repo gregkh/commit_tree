@@ -1,0 +1,73 @@
+bpf: Hooks for sys_bind
+
+== The problem ==
+
+There is a use-case when all processes inside a cgroup should use one
+single IP address on a host that has multiple IP configured.  Those
+processes should use the IP for both ingress and egress, for TCP and UDP
+traffic. So TCP/UDP servers should be bound to that IP to accept
+incoming connections on it, and TCP/UDP clients should make outgoing
+connections from that IP. It should not require changing application
+code since it's often not possible.
+
+Currently it's solved by intercepting glibc wrappers around syscalls
+such as `bind(2)` and `connect(2)`. It's done by a shared library that
+is preloaded for every process in a cgroup so that whenever TCP/UDP
+server calls `bind(2)`, the library replaces IP in sockaddr before
+passing arguments to syscall. When application calls `connect(2)` the
+library transparently binds the local end of connection to that IP
+(`bind(2)` with `IP_BIND_ADDRESS_NO_PORT` to avoid performance penalty).
+
+Shared library approach is fragile though, e.g.:
+* some applications clear env vars (incl. `LD_PRELOAD`);
+* `/etc/ld.so.preload` doesn't help since some applications are linked
+  with option `-z nodefaultlib`;
+* other applications don't use glibc and there is nothing to intercept.
+
+== The solution ==
+
+The patch provides much more reliable in-kernel solution for the 1st
+part of the problem: binding TCP/UDP servers on desired IP. It does not
+depend on application environment and implementation details (whether
+glibc is used or not).
+
+It adds new eBPF program type `BPF_PROG_TYPE_CGROUP_SOCK_ADDR` and
+attach types `BPF_CGROUP_INET4_BIND` and `BPF_CGROUP_INET6_BIND`
+(similar to already existing `BPF_CGROUP_INET_SOCK_CREATE`).
+
+The new program type is intended to be used with sockets (`struct sock`)
+in a cgroup and provided by user `struct sockaddr`. Pointers to both of
+them are parts of the context passed to programs of newly added types.
+
+The new attach types provides hooks in `bind(2)` system call for both
+IPv4 and IPv6 so that one can write a program to override IP addresses
+and ports user program tries to bind to and apply such a program for
+whole cgroup.
+
+== Implementation notes ==
+
+[1]
+Separate attach types for `AF_INET` and `AF_INET6` are added
+intentionally to prevent reading/writing to offsets that don't make
+sense for corresponding socket family. E.g. if user passes `sockaddr_in`
+it doesn't make sense to read from / write to `user_ip6[]` context
+fields.
+
+[2]
+The write access to `struct bpf_sock_addr_kern` is implemented using
+special field as an additional "register".
+
+There are just two registers in `sock_addr_convert_ctx_access`: `src`
+with value to write and `dst` with pointer to context that can't be
+changed not to break later instructions. But the fields, allowed to
+write to, are not available directly and to access them address of
+corresponding pointer has to be loaded first. To get additional register
+the 1st not used by `src` and `dst` one is taken, its content is saved
+to `bpf_sock_addr_kern.tmp_reg`, then the register is used to load
+address of pointer field, and finally the register's content is restored
+from the temporary field after writing `src` value.
+
+Signed-off-by: Andrey Ignatov <rdna@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+

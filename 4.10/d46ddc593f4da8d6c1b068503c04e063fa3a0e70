@@ -1,0 +1,104 @@
+HID: i2c-hid: Disable IRQ before freeing buffers
+
+The HID report buffers that are initially allocated on i2c_hid_probe()
+might not be big enough to hold the HID reports from a specific device,
+in which case they will be freed and new ones will be allocated in
+i2c_hid_start(), at point which the device's report size is known. But
+at this point ihid->irq is already running, and may call
+i2c_hid_get_input() which passes ihid->inbuf to i2c_master_recv(). Since
+this handler runs in a separate thread, ihid->inbuf may be freed at this
+very moment, and i2c_master_recv() will write on memory which may be
+already owned by a different part of the kernel, corrupting its data.
+
+This problem has been observed on an Asus UX360UA laptop which has an
+I2C touchpad, and results in a complete system freeze or an unusable
+slowness with a lof of "BUG: unable to handle kernel paging request at
+<address>" warnings. Enabling SLUB debugging shows a use-after-free
+warning on memory allocated in i2c_hid_alloc_buffers() and freed in
+i2c_hid_free_buffers():
+
+=============================================================================
+BUG kmalloc-64 (Not tainted): Poison overwritten
+-----------------------------------------------------------------------------
+Disabling lock debugging due to kernel taint
+INFO: 0xffff880264083273-0xffff88026408329e. first byte 0x0 instead of 0x6b
+INFO: Allocated in i2c_hid_alloc_buffers+0x25/0xa0 [i2c_hid] age=35793 cpu=2 pid=430
+	___slab_alloc+0x41e/0x460
+	__slab_alloc+0x20/0x40
+	__kmalloc+0x210/0x280
+	i2c_hid_alloc_buffers+0x25/0xa0 [i2c_hid]
+	i2c_hid_probe+0x12f/0x5e0 [i2c_hid]
+	i2c_device_probe+0x10a/0x1b0
+	driver_probe_device+0x220/0x4a0
+	__device_attach_driver+0x71/0xa0
+	bus_for_each_drv+0x67/0xb0
+	__device_attach+0xdc/0x170
+	device_initial_probe+0x13/0x20
+	bus_probe_device+0x92/0xa0
+	device_add+0x4aa/0x670
+	device_register+0x1a/0x20
+	i2c_new_device+0x18e/0x230
+	acpi_i2c_add_device+0x1a0/0x210
+INFO: Freed in i2c_hid_free_buffers+0x16/0x60 [i2c_hid] age=7552 cpu=1 pid=1473
+	__slab_free+0x221/0x330
+	kfree+0x139/0x160
+	i2c_hid_free_buffers+0x16/0x60 [i2c_hid]
+	i2c_hid_start+0x2a9/0x2df [i2c_hid]
+	mt_probe+0x160/0x22e [hid_multitouch]
+	hid_device_probe+0xd7/0x150 [hid]
+	driver_probe_device+0x220/0x4a0
+	__driver_attach+0x84/0x90
+	bus_for_each_dev+0x6c/0xc0
+	driver_attach+0x1e/0x20
+	bus_add_driver+0x1c3/0x280
+	driver_register+0x60/0xe0
+	__hid_register_driver+0x53/0x90 [hid]
+	0xffffffffc004f01e
+	do_one_initcall+0xb3/0x1f0
+	do_init_module+0x5f/0x1d0
+INFO: Slab 0xffffea0009902080 objects=20 used=20 fp=0x          (null) flags=0x17fff8000004080
+INFO: Object 0xffff880264083260 @offset=4704 fp=0x          (null)
+Bytes b4 ffff880264083250: 8d e6 fe ff 00 00 00 00 5a 5a 5a 5a 5a 5a 5a 5a  ........ZZZZZZZZ
+Object ffff880264083260: 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b  kkkkkkkkkkkkkkkk
+Object ffff880264083270: 6b 6b 6b 00 00 00 00 00 00 00 00 00 00 00 00 00  kkk.............
+Object ffff880264083280: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+Object ffff880264083290: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+Redzone ffff8802640832a0: bb bb bb bb bb bb bb bb                          ........
+Padding ffff8802640833e0: 5a 5a 5a 5a 5a 5a 5a 5a                          ZZZZZZZZ
+CPU: 1 PID: 1503 Comm: python3 Tainted: G    B           4.4.21+ #10
+Hardware name: ASUSTeK COMPUTER INC. UX360UA/UX360UA, BIOS UX360UA.200 05/05/2016
+ 0000000000000086 00000000622d48a2 ffff88026061ba38 ffffffff813f6044
+ ffff880264082010 ffff880264083260 ffff88026061ba78 ffffffff811e8eab
+ 0000000000000008 ffff880200000001 ffff88026408329f ffff88026a007700
+Call Trace:
+ [<ffffffff813f6044>] dump_stack+0x63/0x8f
+ [<ffffffff811e8eab>] print_trailer+0x14b/0x1f0
+ [<ffffffff811e94c1>] check_bytes_and_report+0xc1/0x100
+ [<ffffffff811e96c4>] check_object+0x1c4/0x240
+ [<ffffffff81293fde>] ? ext4_htree_store_dirent+0x3e/0x120
+ [<ffffffff811e9b44>] alloc_debug_processing+0x104/0x180
+ [<ffffffff811eb7be>] ___slab_alloc+0x41e/0x460
+ [<ffffffff81293fde>] ? ext4_htree_store_dirent+0x3e/0x120
+ [<ffffffff8124590b>] ? __getblk_gfp+0x2b/0x60
+ [<ffffffff8129b969>] ? ext4_getblk+0xa9/0x190
+ [<ffffffff811eb820>] __slab_alloc+0x20/0x40
+ [<ffffffff811ed320>] __kmalloc+0x210/0x280
+ [<ffffffff81293fde>] ? ext4_htree_store_dirent+0x3e/0x120
+ [<ffffffff812c1602>] ? ext4fs_dirhash+0xc2/0x2a0
+ [<ffffffff81293fde>] ext4_htree_store_dirent+0x3e/0x120
+ [<ffffffff812a4f47>] htree_dirblock_to_tree+0x187/0x1b0
+ [<ffffffff812a5fd2>] ext4_htree_fill_tree+0xb2/0x2e0
+ [<ffffffff811ebb7a>] ? kmem_cache_alloc_trace+0x1fa/0x220
+ [<ffffffff81293e45>] ? ext4_readdir+0x775/0x8b0
+ [<ffffffff81293cb1>] ext4_readdir+0x5e1/0x8b0
+ [<ffffffff81221c82>] iterate_dir+0x92/0x120
+ [<ffffffff81222118>] SyS_getdents+0x98/0x110
+ [<ffffffff81221d10>] ? iterate_dir+0x120/0x120
+ [<ffffffff818157f2>] entry_SYSCALL_64_fastpath+0x16/0x71
+FIX kmalloc-64: Restoring 0xffff880264083273-0xffff88026408329e=0x6b
+FIX kmalloc-64: Marking all objects used
+
+Signed-off-by: João Paulo Rechi Vita <jprvita@endlessm.com>
+Reviewed-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+

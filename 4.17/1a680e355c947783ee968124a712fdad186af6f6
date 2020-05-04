@@ -1,0 +1,81 @@
+KVM: nVMX: Require immediate-exit when event reinjected to L2 and L1 event pending
+
+In case L2 VMExit to L0 during event-delivery, VMCS02 is filled with
+IDT-vectoring-info which vmx_complete_interrupts() makes sure to
+reinject before next resume of L2.
+
+While handling the VMExit in L0, an IPI could be sent by another L1 vCPU
+to the L1 vCPU which currently runs L2 and exited to L0.
+
+When L0 will reach vcpu_enter_guest() and call inject_pending_event(),
+it will note that a previous event was re-injected to L2 (by
+IDT-vectoring-info) and therefore won't check if there are pending L1
+events which require exit from L2 to L1. Thus, L0 enters L2 without
+immediate VMExit even though there are pending L1 events!
+
+This commit fixes the issue by making sure to check for L1 pending
+events even if a previous event was reinjected to L2 and bailing out
+from inject_pending_event() before evaluating a new pending event in
+case an event was already reinjected.
+
+The bug was observed by the following setup:
+* L0 is a 64CPU machine which runs KVM.
+* L1 is a 16CPU machine which runs KVM.
+* L0 & L1 runs with APICv disabled.
+(Also reproduced with APICv enabled but easier to analyze below info
+with APICv disabled)
+* L1 runs a 16CPU L2 Windows Server 2012 R2 guest.
+During L2 boot, L1 hangs completely and analyzing the hang reveals that
+one L1 vCPU is holding KVM's mmu_lock and is waiting forever on an IPI
+that he has sent for another L1 vCPU. And all other L1 vCPUs are
+currently attempting to grab mmu_lock. Therefore, all L1 vCPUs are stuck
+forever (as L1 runs with kernel-preemption disabled).
+
+Observing /sys/kernel/debug/tracing/trace_pipe reveals the following
+series of events:
+(1) qemu-system-x86-19066 [030] kvm_nested_vmexit: rip:
+0xfffff802c5dca82f reason: EPT_VIOLATION ext_inf1: 0x0000000000000182
+ext_inf2: 0x00000000800000d2 ext_int: 0x00000000 ext_int_err: 0x00000000
+(2) qemu-system-x86-19054 [028] kvm_apic_accept_irq: apicid f
+vec 252 (Fixed|edge)
+(3) qemu-system-x86-19066 [030] kvm_inj_virq: irq 210
+(4) qemu-system-x86-19066 [030] kvm_entry: vcpu 15
+(5) qemu-system-x86-19066 [030] kvm_exit: reason EPT_VIOLATION
+rip 0xffffe00069202690 info 83 0
+(6) qemu-system-x86-19066 [030] kvm_nested_vmexit: rip:
+0xffffe00069202690 reason: EPT_VIOLATION ext_inf1: 0x0000000000000083
+ext_inf2: 0x0000000000000000 ext_int: 0x00000000 ext_int_err: 0x00000000
+(7) qemu-system-x86-19066 [030] kvm_nested_vmexit_inject: reason:
+EPT_VIOLATION ext_inf1: 0x0000000000000083 ext_inf2: 0x0000000000000000
+ext_int: 0x00000000 ext_int_err: 0x00000000
+(8) qemu-system-x86-19066 [030] kvm_entry: vcpu 15
+
+Which can be analyzed as follows:
+(1) L2 VMExit to L0 on EPT_VIOLATION during delivery of vector 0xd2.
+Therefore, vmx_complete_interrupts() will set KVM_REQ_EVENT and reinject
+a pending-interrupt of 0xd2.
+(2) L1 sends an IPI of vector 0xfc (CALL_FUNCTION_VECTOR) to destination
+vCPU 15. This will set relevant bit in LAPIC's IRR and set KVM_REQ_EVENT.
+(3) L0 reach vcpu_enter_guest() which calls inject_pending_event() which
+notes that interrupt 0xd2 was reinjected and therefore calls
+vmx_inject_irq() and returns. Without checking for pending L1 events!
+Note that at this point, KVM_REQ_EVENT was cleared by vcpu_enter_guest()
+before calling inject_pending_event().
+(4) L0 resumes L2 without immediate-exit even though there is a pending
+L1 event (The IPI pending in LAPIC's IRR).
+
+We have already reached the buggy scenario but events could be
+furthered analyzed:
+(5+6) L2 VMExit to L0 on EPT_VIOLATION.  This time not during
+event-delivery.
+(7) L0 decides to forward the VMExit to L1 for further handling.
+(8) L0 resumes into L1. Note that because KVM_REQ_EVENT is cleared, the
+LAPIC's IRR is not examined and therefore the IPI is still not delivered
+into L1!
+
+Signed-off-by: Liran Alon <liran.alon@oracle.com>
+Reviewed-by: Nikita Leshenko <nikita.leshchenko@oracle.com>
+Reviewed-by: Jim Mattson <jmattson@google.com>
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+

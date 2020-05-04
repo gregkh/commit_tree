@@ -1,0 +1,203 @@
+drm/i915: Preallocate our mmu notifier workequeu to unbreak cpu hotplug deadlock
+
+4.14-rc1 gained the fancy new cross-release support in lockdep, which
+seems to have uncovered a few more rules about what is allowed and
+isn't.
+
+This one here seems to indicate that allocating a work-queue while
+holding mmap_sem is a no-go, so let's try to preallocate it.
+
+Of course another way to break this chain would be somewhere in the
+cpu hotplug code, since this isn't the only trace we're finding now
+which goes through msr_create_device.
+
+Full lockdep splat:
+
+======================================================
+WARNING: possible circular locking dependency detected
+4.14.0-rc1-CI-CI_DRM_3118+ #1 Tainted: G     U
+------------------------------------------------------
+prime_mmap/1551 is trying to acquire lock:
+ (cpu_hotplug_lock.rw_sem){++++}, at: [<ffffffff8109dbb7>] apply_workqueue_attrs+0x17/0x50
+
+but task is already holding lock:
+ (&dev_priv->mm_lock){+.+.}, at: [<ffffffffa01a7b2a>] i915_gem_userptr_init__mmu_notifier+0x14a/0x270 [i915]
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #6 (&dev_priv->mm_lock){+.+.}:
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       __mutex_lock+0x86/0x9b0
+       mutex_lock_nested+0x1b/0x20
+       i915_gem_userptr_init__mmu_notifier+0x14a/0x270 [i915]
+       i915_gem_userptr_ioctl+0x222/0x2c0 [i915]
+       drm_ioctl_kernel+0x69/0xb0
+       drm_ioctl+0x2f9/0x3d0
+       do_vfs_ioctl+0x94/0x670
+       SyS_ioctl+0x41/0x70
+       entry_SYSCALL_64_fastpath+0x1c/0xb1
+
+-> #5 (&mm->mmap_sem){++++}:
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       __might_fault+0x68/0x90
+       _copy_to_user+0x23/0x70
+       filldir+0xa5/0x120
+       dcache_readdir+0xf9/0x170
+       iterate_dir+0x69/0x1a0
+       SyS_getdents+0xa5/0x140
+       entry_SYSCALL_64_fastpath+0x1c/0xb1
+
+-> #4 (&sb->s_type->i_mutex_key#5){++++}:
+       down_write+0x3b/0x70
+       handle_create+0xcb/0x1e0
+       devtmpfsd+0x139/0x180
+       kthread+0x152/0x190
+       ret_from_fork+0x27/0x40
+
+-> #3 ((complete)&req.done){+.+.}:
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       wait_for_common+0x58/0x210
+       wait_for_completion+0x1d/0x20
+       devtmpfs_create_node+0x13d/0x160
+       device_add+0x5eb/0x620
+       device_create_groups_vargs+0xe0/0xf0
+       device_create+0x3a/0x40
+       msr_device_create+0x2b/0x40
+       cpuhp_invoke_callback+0xa3/0x840
+       cpuhp_thread_fun+0x7a/0x150
+       smpboot_thread_fn+0x18a/0x280
+       kthread+0x152/0x190
+       ret_from_fork+0x27/0x40
+
+-> #2 (cpuhp_state){+.+.}:
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       cpuhp_issue_call+0x10b/0x170
+       __cpuhp_setup_state_cpuslocked+0x134/0x2a0
+       __cpuhp_setup_state+0x46/0x60
+       page_writeback_init+0x43/0x67
+       pagecache_init+0x3d/0x42
+       start_kernel+0x3a8/0x3fc
+       x86_64_start_reservations+0x2a/0x2c
+       x86_64_start_kernel+0x6d/0x70
+       verify_cpu+0x0/0xfb
+
+-> #1 (cpuhp_state_mutex){+.+.}:
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       __mutex_lock+0x86/0x9b0
+       mutex_lock_nested+0x1b/0x20
+       __cpuhp_setup_state_cpuslocked+0x52/0x2a0
+       __cpuhp_setup_state+0x46/0x60
+       page_alloc_init+0x28/0x30
+       start_kernel+0x145/0x3fc
+       x86_64_start_reservations+0x2a/0x2c
+       x86_64_start_kernel+0x6d/0x70
+       verify_cpu+0x0/0xfb
+
+-> #0 (cpu_hotplug_lock.rw_sem){++++}:
+       check_prev_add+0x430/0x840
+       __lock_acquire+0x1420/0x15e0
+       lock_acquire+0xb0/0x200
+       cpus_read_lock+0x3d/0xb0
+       apply_workqueue_attrs+0x17/0x50
+       __alloc_workqueue_key+0x1d8/0x4d9
+       i915_gem_userptr_init__mmu_notifier+0x1fb/0x270 [i915]
+       i915_gem_userptr_ioctl+0x222/0x2c0 [i915]
+       drm_ioctl_kernel+0x69/0xb0
+       drm_ioctl+0x2f9/0x3d0
+       do_vfs_ioctl+0x94/0x670
+       SyS_ioctl+0x41/0x70
+       entry_SYSCALL_64_fastpath+0x1c/0xb1
+
+other info that might help us debug this:
+
+Chain exists of:
+  cpu_hotplug_lock.rw_sem --> &mm->mmap_sem --> &dev_priv->mm_lock
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&dev_priv->mm_lock);
+                               lock(&mm->mmap_sem);
+                               lock(&dev_priv->mm_lock);
+  lock(cpu_hotplug_lock.rw_sem);
+
+ *** DEADLOCK ***
+
+2 locks held by prime_mmap/1551:
+ #0:  (&mm->mmap_sem){++++}, at: [<ffffffffa01a7b18>] i915_gem_userptr_init__mmu_notifier+0x138/0x270 [i915]
+ #1:  (&dev_priv->mm_lock){+.+.}, at: [<ffffffffa01a7b2a>] i915_gem_userptr_init__mmu_notifier+0x14a/0x270 [i915]
+
+stack backtrace:
+CPU: 4 PID: 1551 Comm: prime_mmap Tainted: G     U          4.14.0-rc1-CI-CI_DRM_3118+ #1
+Hardware name: Dell Inc. XPS 8300  /0Y2MRG, BIOS A06 10/17/2011
+Call Trace:
+ dump_stack+0x68/0x9f
+ print_circular_bug+0x235/0x3c0
+ ? lockdep_init_map_crosslock+0x20/0x20
+ check_prev_add+0x430/0x840
+ __lock_acquire+0x1420/0x15e0
+ ? __lock_acquire+0x1420/0x15e0
+ ? lockdep_init_map_crosslock+0x20/0x20
+ lock_acquire+0xb0/0x200
+ ? apply_workqueue_attrs+0x17/0x50
+ cpus_read_lock+0x3d/0xb0
+ ? apply_workqueue_attrs+0x17/0x50
+ apply_workqueue_attrs+0x17/0x50
+ __alloc_workqueue_key+0x1d8/0x4d9
+ ? __lockdep_init_map+0x57/0x1c0
+ i915_gem_userptr_init__mmu_notifier+0x1fb/0x270 [i915]
+ i915_gem_userptr_ioctl+0x222/0x2c0 [i915]
+ ? i915_gem_userptr_release+0x140/0x140 [i915]
+ drm_ioctl_kernel+0x69/0xb0
+ drm_ioctl+0x2f9/0x3d0
+ ? i915_gem_userptr_release+0x140/0x140 [i915]
+ ? __do_page_fault+0x2a4/0x570
+ do_vfs_ioctl+0x94/0x670
+ ? entry_SYSCALL_64_fastpath+0x5/0xb1
+ ? __this_cpu_preempt_check+0x13/0x20
+ ? trace_hardirqs_on_caller+0xe3/0x1b0
+ SyS_ioctl+0x41/0x70
+ entry_SYSCALL_64_fastpath+0x1c/0xb1
+RIP: 0033:0x7fbb83c39587
+RSP: 002b:00007fff188dc228 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+RAX: ffffffffffffffda RBX: ffffffff81492963 RCX: 00007fbb83c39587
+RDX: 00007fff188dc260 RSI: 00000000c0186473 RDI: 0000000000000003
+RBP: ffffc90001487f88 R08: 0000000000000000 R09: 00007fff188dc2ac
+R10: 00007fbb83efcb58 R11: 0000000000000246 R12: 0000000000000000
+R13: 0000000000000003 R14: 00000000c0186473 R15: 00007fff188dc2ac
+ ? __this_cpu_preempt_check+0x13/0x20
+
+Note that this also has the minor benefit of slightly reducing the
+critical section where we hold mmap_sem.
+
+v2: Set ret correctly when we raced with another thread.
+
+v3: Use Chris' diff. Attach the right lockdep splat.
+
+v4: Repaint in Tvrtko's colors (aka don't report ENOMEM if we race and
+some other thread managed to not also get an ENOMEM and successfully
+install the mmu notifier. Note that the kernel guarantees that small
+allocations succeed, so this never actually happens).
+
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Sasha Levin <alexander.levin@verizon.com>
+Cc: Marta Lofstedt <marta.lofstedt@intel.com>
+Cc: Tejun Heo <tj@kernel.org>
+References: https://intel-gfx-ci.01.org/tree/drm-tip/CI_DRM_3180/shard-hsw3/igt@prime_mmap@test_userptr.html
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=102939
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171009164401.16035-1-daniel.vetter@ffwll.ch
+

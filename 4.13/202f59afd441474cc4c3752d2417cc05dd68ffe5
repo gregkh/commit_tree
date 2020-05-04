@@ -1,0 +1,59 @@
+netfilter: ipt_CLUSTERIP: do not hold dev
+
+It's a terrible thing to hold dev in iptables target. When the dev is
+being removed, unregister_netdevice has to wait for the dev to become
+free. dmesg will keep logging the err:
+
+  kernel:unregister_netdevice: waiting for veth0_in to become free. \
+  Usage count = 1
+
+until iptables rules with this target are removed manually.
+
+The worse thing is when deleting a netns, a virtual nic will be deleted
+instead of reset to init_net in default_device_ops exit/exit_batch. As
+it is earlier than to flush the iptables rules in iptable_filter_net_ops
+exit, unregister_netdevice will block to wait for the nic to become free.
+
+As unregister_netdevice is actually waiting for iptables rules flushing
+while iptables rules have to be flushed after unregister_netdevice. This
+'dead lock' will cause unregister_netdevice to block there forever. As
+the netns is not available to operate at that moment, iptables rules can
+not even be flushed manually either.
+
+The reproducer can be:
+
+  # ip netns add test
+  # ip link add veth0_in type veth peer name veth0_out
+  # ip link set veth0_in netns test
+  # ip netns exec test ip link set lo up
+  # ip netns exec test ip link set veth0_in up
+  # ip netns exec test iptables -I INPUT -d 1.2.3.4 -i veth0_in -j \
+    CLUSTERIP --new --clustermac 89:d4:47:eb:9a:fa --total-nodes 3 \
+    --local-node 1 --hashmode sourceip-sourceport
+  # ip netns del test
+
+This issue can be triggered by all virtual nics with ipt_CLUSTERIP.
+
+This patch is to fix it by not holding dev in ipt_CLUSTERIP, but saving
+the dev->ifindex instead of the dev.
+
+As Pablo Neira Ayuso's suggestion, it will refresh c->ifindex and dev's
+mc by registering a netdevice notifier, just as what xt_TEE does. So it
+removes the old codes updating dev's mc, and also no need to initialize
+c->ifindex with dev->ifindex.
+
+But as one config can be shared by more than one targets, and the netdev
+notifier is per config, not per target. It couldn't get e->ip.iniface
+in the notifier handler. So e->ip.iniface has to be saved into config.
+
+Note that for backwards compatibility, this patch doesn't remove the
+codes checking if the dev exists before creating a config.
+
+v1->v2:
+  - As Pablo Neira Ayuso's suggestion, register a netdevice notifier to
+    manage c->ifindex and dev's mc.
+
+Reported-by: Jianlin Shi <jishi@redhat.com>
+Signed-off-by: Xin Long <lucien.xin@gmail.com>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+

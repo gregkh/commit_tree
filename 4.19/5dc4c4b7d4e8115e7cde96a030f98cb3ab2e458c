@@ -1,0 +1,79 @@
+bpf: Introduce BPF_MAP_TYPE_REUSEPORT_SOCKARRAY
+
+This patch introduces a new map type BPF_MAP_TYPE_REUSEPORT_SOCKARRAY.
+
+To unleash the full potential of a bpf prog, it is essential for the
+userspace to be capable of directly setting up a bpf map which can then
+be consumed by the bpf prog to make decision.  In this case, decide which
+SO_REUSEPORT sk to serve the incoming request.
+
+By adding BPF_MAP_TYPE_REUSEPORT_SOCKARRAY, the userspace has total control
+and visibility on where a SO_REUSEPORT sk should be located in a bpf map.
+The later patch will introduce BPF_PROG_TYPE_SK_REUSEPORT such that
+the bpf prog can directly select a sk from the bpf map.  That will
+raise the programmability of the bpf prog attached to a reuseport
+group (a group of sk serving the same IP:PORT).
+
+For example, in UDP, the bpf prog can peek into the payload (e.g.
+through the "data" pointer introduced in the later patch) to learn
+the application level's connection information and then decide which sk
+to pick from a bpf map.  The userspace can tightly couple the sk's location
+in a bpf map with the application logic in generating the UDP payload's
+connection information.  This connection info contact/API stays within the
+userspace.
+
+Also, when used with map-in-map, the userspace can switch the
+old-server-process's inner map to a new-server-process's inner map
+in one call "bpf_map_update_elem(outer_map, &index, &new_reuseport_array)".
+The bpf prog will then direct incoming requests to the new process instead
+of the old process.  The old process can finish draining the pending
+requests (e.g. by "accept()") before closing the old-fds.  [Note that
+deleting a fd from a bpf map does not necessary mean the fd is closed]
+
+During map_update_elem(),
+Only SO_REUSEPORT sk (i.e. which has already been added
+to a reuse->socks[]) can be used.  That means a SO_REUSEPORT sk that is
+"bind()" for UDP or "bind()+listen()" for TCP.  These conditions are
+ensured in "reuseport_array_update_check()".
+
+A SO_REUSEPORT sk can only be added once to a map (i.e. the
+same sk cannot be added twice even to the same map).  SO_REUSEPORT
+already allows another sk to be created for the same IP:PORT.
+There is no need to re-create a similar usage in the BPF side.
+
+When a SO_REUSEPORT is deleted from the "reuse->socks[]" (e.g. "close()"),
+it will notify the bpf map to remove it from the map also.  It is
+done through "bpf_sk_reuseport_detach()" and it will only be called
+if >=1 of the "reuse->sock[]" has ever been added to a bpf map.
+
+The map_update()/map_delete() has to be in-sync with the
+"reuse->socks[]".  Hence, the same "reuseport_lock" used
+by "reuse->socks[]" has to be used here also. Care has
+been taken to ensure the lock is only acquired when the
+adding sk passes some strict tests. and
+freeing the map does not require the reuseport_lock.
+
+The reuseport_array will also support lookup from the syscall
+side.  It will return a sock_gen_cookie().  The sock_gen_cookie()
+is on-demand (i.e. a sk's cookie is not generated until the very
+first map_lookup_elem()).
+
+The lookup cookie is 64bits but it goes against the logical userspace
+expectation on 32bits sizeof(fd) (and as other fd based bpf maps do also).
+It may catch user in surprise if we enforce value_size=8 while
+userspace still pass a 32bits fd during update.  Supporting different
+value_size between lookup and update seems unintuitive also.
+
+We also need to consider what if other existing fd based maps want
+to return 64bits value from syscall's lookup in the future.
+Hence, reuseport_array supports both value_size 4 and 8, and
+assuming user will usually use value_size=4.  The syscall's lookup
+will return ENOSPC on value_size=4.  It will will only
+return 64bits value from sock_gen_cookie() when user consciously
+choose value_size=8 (as a signal that lookup is desired) which then
+requires a 64bits value in both lookup and update.
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+

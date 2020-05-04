@@ -1,0 +1,67 @@
+MIPS: Consistently declare TLB functions
+
+Since at least the beginning of the git era we've declared our TLB
+exception handling functions inconsistently. They're actually functions,
+but we declare them as arrays of u32 where each u32 is an encoded
+instruction. This has always been the case for arch/mips/mm/tlbex.c, and
+has also been true for arch/mips/kernel/traps.c since commit
+86a1708a9d54 ("MIPS: Make tlb exception handler definitions and
+declarations match.") which aimed for consistency but did so by
+consistently making the our C code inconsistent with our assembly.
+
+This is all usually harmless, but when using GCC 7 or newer to build a
+kernel targeting microMIPS (ie. CONFIG_CPU_MICROMIPS=y) it becomes
+problematic. With microMIPS bit 0 of the program counter indicates the
+ISA mode. When bit 0 is zero instructions are decoded using the standard
+MIPS32 or MIPS64 ISA. When bit 0 is one instructions are decoded using
+microMIPS. This means that function pointers become odd - their least
+significant bit is one for microMIPS code. We work around this in cases
+where we need to access code using loads & stores with our
+msk_isa16_mode() macro which simply clears bit 0 of the value it is
+given:
+
+  #define msk_isa16_mode(x) ((x) & ~0x1)
+
+For example we do this for our TLB load handler in
+build_r4000_tlb_load_handler():
+
+  u32 *p = (u32 *)msk_isa16_mode((ulong)handle_tlbl);
+
+We then write code to p, expecting it to be suitably aligned (our LEAF
+macro aligns functions on 4 byte boundaries, so (ulong)handle_tlbl will
+give a value one greater than a multiple of 4 - ie. the start of a
+function on a 4 byte boundary, with the ISA mode bit 0 set).
+
+This worked fine up to GCC 6, but GCC 7 & onwards is smart enough to
+presume that handle_tlbl which we declared as an array of u32s must be
+aligned sufficiently that bit 0 of its address will never be set, and as
+a result optimize out msk_isa16_mode(). This leads to p having an
+address with bit 0 set, and when we go on to attempt to store code at
+that address we take an address error exception due to the unaligned
+memory access.
+
+This leads to an exception prior to the kernel having configured its own
+exception handlers, so we jump to whatever handlers the bootloader
+configured. In the case of QEMU this results in a silent hang, since it
+has no useful general exception vector.
+
+Fix this by consistently declaring our TLB-related functions as
+functions. For handle_tlbl(), handle_tlbs() & handle_tlbm() we do this
+in asm/tlbex.h & we make use of the existing declaration of
+tlbmiss_handler_setup_pgd() in asm/mmu_context.h. Our TLB handler
+generation code in arch/mips/mm/tlbex.c is adjusted to deal with these
+definitions, in most cases simply by casting the function pointers to
+u32 pointers.
+
+This allows us to include asm/mmu_context.h in arch/mips/mm/tlbex.c to
+get the definitions of tlbmiss_handler_setup_pgd & pgd_current, removing
+some needless duplication. Consistently using msk_isa16_mode() on
+function pointers means we no longer need the
+tlbmiss_handler_setup_pgd_start symbol so that is removed entirely.
+
+Now that we're declaring our functions as functions GCC stops optimizing
+out msk_isa16_mode() & a microMIPS kernel built with either GCC 7.3.0 or
+8.1.0 boots successfully.
+
+Signed-off-by: Paul Burton <paul.burton@mips.com>
+

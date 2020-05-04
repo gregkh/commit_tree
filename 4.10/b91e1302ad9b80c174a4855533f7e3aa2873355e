@@ -1,0 +1,74 @@
+mm: optimize PageWaiters bit use for unlock_page()
+
+In commit 62906027091f ("mm: add PageWaiters indicating tasks are
+waiting for a page bit") Nick Piggin made our page locking no longer
+unconditionally touch the hashed page waitqueue, which not only helps
+performance in general, but is particularly helpful on NUMA machines
+where the hashed wait queues can bounce around a lot.
+
+However, the "clear lock bit atomically and then test the waiters bit"
+sequence turns out to be much more expensive than it needs to be,
+because you get a nasty stall when trying to access the same word that
+just got updated atomically.
+
+On architectures where locking is done with LL/SC, this would be trivial
+to fix with a new primitive that clears one bit and tests another
+atomically, but that ends up not working on x86, where the only atomic
+operations that return the result end up being cmpxchg and xadd.  The
+atomic bit operations return the old value of the same bit we changed,
+not the value of an unrelated bit.
+
+On x86, we could put the lock bit in the high bit of the byte, and use
+"xadd" with that bit (where the overflow ends up not touching other
+bits), and look at the other bits of the result.  However, an even
+simpler model is to just use a regular atomic "and" to clear the lock
+bit, and then the sign bit in eflags will indicate the resulting state
+of the unrelated bit #7.
+
+So by moving the PageWaiters bit up to bit #7, we can atomically clear
+the lock bit and test the waiters bit on x86 too.  And architectures
+with LL/SC (which is all the usual RISC suspects), the particular bit
+doesn't matter, so they are fine with this approach too.
+
+This avoids the extra access to the same atomic word, and thus avoids
+the costly stall at page unlock time.
+
+The only downside is that the interface ends up being a bit odd and
+specialized: clear a bit in a byte, and test the sign bit.  Nick doesn't
+love the resulting name of the new primitive, but I'd rather make the
+name be descriptive and very clear about the limitation imposed by
+trying to work across all relevant architectures than make it be some
+generic thing that doesn't make the odd semantics explicit.
+
+So this introduces the new architecture primitive
+
+    clear_bit_unlock_is_negative_byte();
+
+and adds the trivial implementation for x86.  We have a generic
+non-optimized fallback (that just does a "clear_bit()"+"test_bit(7)"
+combination) which can be overridden by any architecture that can do
+better.  According to Nick, Power has the same hickup x86 has, for
+example, but some other architectures may not even care.
+
+All these optimizations mean that my page locking stress-test (which is
+just executing a lot of small short-lived shell scripts: "make test" in
+the git source tree) no longer makes our page locking look horribly bad.
+Before all these optimizations, just the unlock_page() costs were just
+over 3% of all CPU overhead on "make test".  After this, it's down to
+0.66%, so just a quarter of the cost it used to be.
+
+(The difference on NUMA is bigger, but there this micro-optimization is
+likely less noticeable, since the big issue on NUMA was not the accesses
+to 'struct page', but the waitqueue accesses that were already removed
+by Nick's earlier commit).
+
+Acked-by: Nick Piggin <npiggin@gmail.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Bob Peterson <rpeterso@redhat.com>
+Cc: Steven Whitehouse <swhiteho@redhat.com>
+Cc: Andrew Lutomirski <luto@kernel.org>
+Cc: Andreas Gruenbacher <agruenba@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,59 @@
+media: ngene: compensate for TS buffer offset shifts
+
+A possible hardware bug was discovered when using CA addon hardware
+attached to the ngene hardware, in that the TS input buffer much likely
+will shift and thus become unaligned to 188 byte blocks (a full TS frame)
+when things like CA module initialisation (which happens via differing
+communication paths) take place. This causes the TS NULL removal in
+tsin_exchange() to fail to detect this previously inserted data and thus
+causes userspace applications to receive data they didn't sent beforehand
+and ultimately cause troubles.
+
+On driver load with an inserted CAM, buffers are fine at first (note that
+the driver has to keep the communication running from/to the card by
+inserting TS NULL frames, this is done in tsout_exchange() via
+FillTSBuffer() - that data is simply sent back by the hardware):
+
+  offset | 0    1   2   3   4   5 .... 188 189 190 191 192 193 .... 376
+  data   | 47  1f  ff  10  6f  6f ....  47  1f  ff  10  6f  6f ....  47
+
+After a few seconds, the CA module is recognised and initialised, which is
+signalled by
+
+  dvb_ca_en50221: dvb_ca adapter X: DVB CAM detected and initialised successfully
+
+This is where the first shift happens (this is always four bytes), buffer
+becomes like this:
+
+  offset | 0    1   2   3   4   5 .... 188 189 190 191 192 193 .... 376
+  data   | 6f  6f  6f  6f  47  1f ....  6f  6f  6f  6f  47  1f ....  6f
+
+Next, VDR, TVHeadend or any other CI aware application is started, buffers
+will shift by even more bytes. It is believed this is due to the hardware
+not handling control and data bytes properly distinct, and control data
+having an influence on the actual data stream, which we cannot properly
+detect at the driver level.
+
+Workaround this hardware quirk by adding a detection for the TS sync byte
+0x47 before each TS frame copy, scan for a new SYNC byte and a TS NULL
+packet if buffers become unaligned, take note of that offset and apply
+that when copying data to the DVB ring buffers. The last <188 bytes from
+the hardware buffers are stored in a temp buffer (tsin_buffer), for which
+the remainder will be in the beginning of the next hardware buffer (next
+iteration of tsin_exchange()). That remainder will be appended to the
+temp buffer and finally sent to the DVB ring buffer. The resulting TS
+stream is perfectly fine, and the TS NULL packets inserted by the driver
+which are sent back are properly removed. The resulting offset is being
+clamped to 188 byte segments (one TS packet). Though this can result in
+a repeated TS packet if the overall offset grows beyond this (and it
+will grow only on CA initialisation), this is still way better than
+unaligned TS frames and data sent to userspace that just isn't supposed
+to be there.
+
+This compensation can be toggled by the ci_tsfix modparam, which defaults
+to 1 (enabled). In the case of problems, this can be turned off by setting
+the parameter to 0 to restore the old behaviour.
+
+Signed-off-by: Daniel Scheller <d.scheller@gmx.net>
+Signed-off-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+

@@ -1,0 +1,70 @@
+scsi: zfcp: fix erp_action use-before-initialize in REC action trace
+
+v4.10 commit 6f2ce1c6af37 ("scsi: zfcp: fix rport unblock race with LUN
+recovery") extended accessing parent pointer fields of struct
+zfcp_erp_action for tracing.  If an erp_action has never been enqueued
+before, these parent pointer fields are uninitialized and NULL. Examples
+are zfcp objects freshly added to the parent object's children list,
+before enqueueing their first recovery subsequently. In
+zfcp_erp_try_rport_unblock(), we iterate such list. Accessing erp_action
+fields can cause a NULL pointer dereference.  Since the kernel can read
+from lowcore on s390, it does not immediately cause a kernel page
+fault. Instead it can cause hangs on trying to acquire the wrong
+erp_action->adapter->dbf->rec_lock in zfcp_dbf_rec_action_lvl()
+                      ^bogus^
+while holding already other locks with IRQs disabled.
+
+Real life example from attaching lots of LUNs in parallel on many CPUs:
+
+crash> bt 17723
+PID: 17723  TASK: ...               CPU: 25  COMMAND: "zfcperp0.0.1800"
+ LOWCORE INFO:
+  -psw      : 0x0404300180000000 0x000000000038e424
+  -function : _raw_spin_lock_wait_flags at 38e424
+...
+ #0 [fdde8fc90] zfcp_dbf_rec_action_lvl at 3e0004e9862 [zfcp]
+ #1 [fdde8fce8] zfcp_erp_try_rport_unblock at 3e0004dfddc [zfcp]
+ #2 [fdde8fd38] zfcp_erp_strategy at 3e0004e0234 [zfcp]
+ #3 [fdde8fda8] zfcp_erp_thread at 3e0004e0a12 [zfcp]
+ #4 [fdde8fe60] kthread at 173550
+ #5 [fdde8feb8] kernel_thread_starter at 10add2
+
+zfcp_adapter
+ zfcp_port
+  zfcp_unit <address>, 0x404040d600000000
+  scsi_device NULL, returning early!
+zfcp_scsi_dev.status = 0x40000000
+0x40000000 ZFCP_STATUS_COMMON_RUNNING
+
+crash> zfcp_unit <address>
+struct zfcp_unit {
+  erp_action = {
+    adapter = 0x0,
+    port = 0x0,
+    unit = 0x0,
+  },
+}
+
+zfcp_erp_action is always fully embedded into its container object. Such
+container object is never moved in its object tree (only add or delete).
+Hence, erp_action parent pointers can never change.
+
+To fix the issue, initialize the erp_action parent pointers before
+adding the erp_action container to any list and thus before it becomes
+accessible from outside of its initializing function.
+
+In order to also close the time window between zfcp_erp_setup_act()
+memsetting the entire erp_action to zero and setting the parent pointers
+again, drop the memset and instead explicitly initialize individually
+all erp_action fields except for parent pointers. To be extra careful
+not to introduce any other unintended side effect, even keep zeroing the
+erp_action fields for list and timer. Also double-check with
+WARN_ON_ONCE that erp_action parent pointers never change, so we get to
+know when we would deviate from previous behavior.
+
+Signed-off-by: Steffen Maier <maier@linux.vnet.ibm.com>
+Fixes: 6f2ce1c6af37 ("scsi: zfcp: fix rport unblock race with LUN recovery")
+Cc: <stable@vger.kernel.org> #2.6.32+
+Reviewed-by: Benjamin Block <bblock@linux.vnet.ibm.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+

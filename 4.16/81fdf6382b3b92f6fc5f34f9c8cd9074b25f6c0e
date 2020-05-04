@@ -1,0 +1,323 @@
+Btrfs: fix space leak after fallocate and zero range operations
+
+If we do a buffered write after a zero range operation that has an
+unaligned (with the filesystem's sector size) end which also falls within
+an unwritten (prealloc) extent that is currently beyond the inode's
+i_size, and the zero range operation has the flag FALLOC_FL_KEEP_SIZE,
+we end up leaking data and metadata space. This happens because when
+zeroing a range we call btrfs_truncate_block(), which does delalloc
+(loads the page and partially zeroes its content), and in the buffered
+write path we only clear existing delalloc space reservation for the
+range we are writing into if that range starts at an offset smaller then
+the inode's i_size, which makes sense since we can not have delalloc
+extents beyond the i_size, only unwritten extents are allowed.
+
+Example reproducer:
+
+ $ mkfs.btrfs -f /dev/sdb
+ $ mount /dev/sdb /mnt
+ $ xfs_io -f -c "falloc -k 428K 4K" /mnt/foobar
+ $ xfs_io -c "fzero -k 0 430K" /mnt/foobar
+ $ xfs_io -c "pwrite -S 0xaa 428K 4K" /mnt/foobar
+ $ umount /mnt
+
+After the unmount we get the metadata and data space leaks reported in
+dmesg/syslog:
+
+ [95794.602253] ------------[ cut here ]------------
+ [95794.603322] WARNING: CPU: 0 PID: 31496 at fs/btrfs/inode.c:9561 btrfs_destroy_inode+0x4e/0x206 [btrfs]
+ [95794.605167] Modules linked in: btrfs xfs ppdev ghash_clmulni_intel pcbc aesni_intel aes_x86_64 crypto_simd cryptd glue_helper parport_pc psmouse sg i2c_piix4 parport i2c_core evdev pcspkr button serio_raw sunrpc loop autofs4 ext4 crc16 mbcache jbd2 zstd_decompress zstd_compress xxhash raid10 raid456 async_raid6_recov async_memcpy async_pq async_xor async_tx xor raid6_pq libcrc32c crc32c_generic raid1 raid0 multipath linear md_mod sd_mod virtio_scsi ata_generic crc32c_intel ata_piix floppy virtio_pci virtio_ring virtio libata scsi_mod e1000 [last unloaded: btrfs]
+ [95794.613000] CPU: 0 PID: 31496 Comm: umount Tainted: G        W       4.14.0-rc6-btrfs-next-54+ #1
+ [95794.614448] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.10.2-0-g5f4c7b1-prebuilt.qemu-project.org 04/01/2014
+ [95794.615972] task: ffff880075aa0240 task.stack: ffffc90001734000
+ [95794.617114] RIP: 0010:btrfs_destroy_inode+0x4e/0x206 [btrfs]
+ [95794.618001] RSP: 0018:ffffc90001737d00 EFLAGS: 00010202
+ [95794.618721] RAX: 0000000000000000 RBX: ffff880070fa1418 RCX: ffffc90001737c7c
+ [95794.619645] RDX: 0000000175aa0240 RSI: 0000000000000001 RDI: ffff880070fa1418
+ [95794.620711] RBP: ffffc90001737d38 R08: 0000000000000000 R09: 0000000000000000
+ [95794.621932] R10: ffffc90001737c48 R11: ffff88007123e158 R12: ffff880075b6a000
+ [95794.623124] R13: ffff88006145c000 R14: ffff880070fa1418 R15: ffff880070c3b4a0
+ [95794.624188] FS:  00007fa6793c92c0(0000) GS:ffff88023fc00000(0000) knlGS:0000000000000000
+ [95794.625578] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ [95794.626522] CR2: 000056338670d048 CR3: 00000000610dc005 CR4: 00000000001606f0
+ [95794.627647] Call Trace:
+ [95794.628128]  destroy_inode+0x3d/0x55
+ [95794.628573]  evict+0x177/0x17e
+ [95794.629010]  dispose_list+0x50/0x71
+ [95794.629478]  evict_inodes+0x132/0x141
+ [95794.630289]  generic_shutdown_super+0x3f/0x10b
+ [95794.630864]  kill_anon_super+0x12/0x1c
+ [95794.631383]  btrfs_kill_super+0x16/0x21 [btrfs]
+ [95794.631930]  deactivate_locked_super+0x30/0x68
+ [95794.632539]  deactivate_super+0x36/0x39
+ [95794.633200]  cleanup_mnt+0x49/0x67
+ [95794.633818]  __cleanup_mnt+0x12/0x14
+ [95794.634416]  task_work_run+0x82/0xa6
+ [95794.634902]  prepare_exit_to_usermode+0xe1/0x10c
+ [95794.635525]  syscall_return_slowpath+0x18c/0x1af
+ [95794.636122]  entry_SYSCALL_64_fastpath+0xab/0xad
+ [95794.636834] RIP: 0033:0x7fa678cb99a7
+ [95794.637370] RSP: 002b:00007ffccf0aaed8 EFLAGS: 00000246 ORIG_RAX: 00000000000000a6
+ [95794.638672] RAX: 0000000000000000 RBX: 0000563386706030 RCX: 00007fa678cb99a7
+ [95794.639596] RDX: 0000000000000001 RSI: 0000000000000000 RDI: 000056338670ca90
+ [95794.640703] RBP: 000056338670ca90 R08: 000056338670c740 R09: 0000000000000015
+ [95794.641773] R10: 00000000000006b4 R11: 0000000000000246 R12: 00007fa6791bae64
+ [95794.643150] R13: 0000000000000000 R14: 0000563386706210 R15: 00007ffccf0ab160
+ [95794.644249] Code: ff 4c 8b a8 80 06 00 00 48 8b 87 c0 01 00 00 48 85 c0 74 02 0f ff 48 83 bb e0 02 00 00 00 74 02 0f ff 83 bb 3c ff ff ff 00 74 02 <0f> ff 83 bb 40 ff ff ff 00 74 02 0f ff 48 83 bb f8 fe ff ff 00
+ [95794.646929] ---[ end trace e95877675c6ec007 ]---
+ [95794.647751] ------------[ cut here ]------------
+ [95794.648509] WARNING: CPU: 0 PID: 31496 at fs/btrfs/inode.c:9562 btrfs_destroy_inode+0x59/0x206 [btrfs]
+ [95794.649842] Modules linked in: btrfs xfs ppdev ghash_clmulni_intel pcbc aesni_intel aes_x86_64 crypto_simd cryptd glue_helper parport_pc psmouse sg i2c_piix4 parport i2c_core evdev pcspkr button serio_raw sunrpc loop autofs4 ext4 crc16 mbcache jbd2 zstd_decompress zstd_compress xxhash raid10 raid456 async_raid6_recov async_memcpy async_pq async_xor async_tx xor raid6_pq libcrc32c crc32c_generic raid1 raid0 multipath linear md_mod sd_mod virtio_scsi ata_generic crc32c_intel ata_piix floppy virtio_pci virtio_ring virtio libata scsi_mod e1000 [last unloaded: btrfs]
+ [95794.654659] CPU: 0 PID: 31496 Comm: umount Tainted: G        W       4.14.0-rc6-btrfs-next-54+ #1
+ [95794.655894] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.10.2-0-g5f4c7b1-prebuilt.qemu-project.org 04/01/2014
+ [95794.657546] task: ffff880075aa0240 task.stack: ffffc90001734000
+ [95794.658433] RIP: 0010:btrfs_destroy_inode+0x59/0x206 [btrfs]
+ [95794.659279] RSP: 0018:ffffc90001737d00 EFLAGS: 00010202
+ [95794.660054] RAX: 0000000000000000 RBX: ffff880070fa1418 RCX: ffffc90001737c7c
+ [95794.660753] RDX: 0000000175aa0240 RSI: 0000000000000001 RDI: ffff880070fa1418
+ [95794.661513] RBP: ffffc90001737d38 R08: 0000000000000000 R09: 0000000000000000
+ [95794.662289] R10: ffffc90001737c48 R11: ffff88007123e158 R12: ffff880075b6a000
+ [95794.663393] R13: ffff88006145c000 R14: ffff880070fa1418 R15: ffff880070c3b4a0
+ [95794.664342] FS:  00007fa6793c92c0(0000) GS:ffff88023fc00000(0000) knlGS:0000000000000000
+ [95794.665673] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ [95794.666593] CR2: 000056338670d048 CR3: 00000000610dc005 CR4: 00000000001606f0
+ [95794.667629] Call Trace:
+ [95794.668065]  destroy_inode+0x3d/0x55
+ [95794.668637]  evict+0x177/0x17e
+ [95794.669179]  dispose_list+0x50/0x71
+ [95794.669830]  evict_inodes+0x132/0x141
+ [95794.670416]  generic_shutdown_super+0x3f/0x10b
+ [95794.671103]  kill_anon_super+0x12/0x1c
+ [95794.671786]  btrfs_kill_super+0x16/0x21 [btrfs]
+ [95794.672552]  deactivate_locked_super+0x30/0x68
+ [95794.673393]  deactivate_super+0x36/0x39
+ [95794.674107]  cleanup_mnt+0x49/0x67
+ [95794.674706]  __cleanup_mnt+0x12/0x14
+ [95794.675279]  task_work_run+0x82/0xa6
+ [95794.675795]  prepare_exit_to_usermode+0xe1/0x10c
+ [95794.676507]  syscall_return_slowpath+0x18c/0x1af
+ [95794.677275]  entry_SYSCALL_64_fastpath+0xab/0xad
+ [95794.678006] RIP: 0033:0x7fa678cb99a7
+ [95794.678600] RSP: 002b:00007ffccf0aaed8 EFLAGS: 00000246 ORIG_RAX: 00000000000000a6
+ [95794.679739] RAX: 0000000000000000 RBX: 0000563386706030 RCX: 00007fa678cb99a7
+ [95794.680779] RDX: 0000000000000001 RSI: 0000000000000000 RDI: 000056338670ca90
+ [95794.681837] RBP: 000056338670ca90 R08: 000056338670c740 R09: 0000000000000015
+ [95794.682867] R10: 00000000000006b4 R11: 0000000000000246 R12: 00007fa6791bae64
+ [95794.683891] R13: 0000000000000000 R14: 0000563386706210 R15: 00007ffccf0ab160
+ [95794.684843] Code: c0 01 00 00 48 85 c0 74 02 0f ff 48 83 bb e0 02 00 00 00 74 02 0f ff 83 bb 3c ff ff ff 00 74 02 0f ff 83 bb 40 ff ff ff 00 74 02 <0f> ff 48 83 bb f8 fe ff ff 00 74 02 0f ff 48 83 bb 00 ff ff ff
+ [95794.687156] ---[ end trace e95877675c6ec008 ]---
+ [95794.687876] ------------[ cut here ]------------
+ [95794.688579] WARNING: CPU: 0 PID: 31496 at fs/btrfs/inode.c:9565 btrfs_destroy_inode+0x7d/0x206 [btrfs]
+ [95794.689735] Modules linked in: btrfs xfs ppdev ghash_clmulni_intel pcbc aesni_intel aes_x86_64 crypto_simd cryptd glue_helper parport_pc psmouse sg i2c_piix4 parport i2c_core evdev pcspkr button serio_raw sunrpc loop autofs4 ext4 crc16 mbcache jbd2 zstd_decompress zstd_compress xxhash raid10 raid456 async_raid6_recov async_memcpy async_pq async_xor async_tx xor raid6_pq libcrc32c crc32c_generic raid1 raid0 multipath linear md_mod sd_mod virtio_scsi ata_generic crc32c_intel ata_piix floppy virtio_pci virtio_ring virtio libata scsi_mod e1000 [last unloaded: btrfs]
+ [95794.695015] CPU: 0 PID: 31496 Comm: umount Tainted: G        W       4.14.0-rc6-btrfs-next-54+ #1
+ [95794.696396] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.10.2-0-g5f4c7b1-prebuilt.qemu-project.org 04/01/2014
+ [95794.697956] task: ffff880075aa0240 task.stack: ffffc90001734000
+ [95794.698925] RIP: 0010:btrfs_destroy_inode+0x7d/0x206 [btrfs]
+ [95794.699763] RSP: 0018:ffffc90001737d00 EFLAGS: 00010206
+ [95794.700434] RAX: 0000000000000000 RBX: ffff880070fa1418 RCX: ffffc90001737c7c
+ [95794.701445] RDX: 0000000175aa0240 RSI: 0000000000000001 RDI: ffff880070fa1418
+ [95794.702448] RBP: ffffc90001737d38 R08: 0000000000000000 R09: 0000000000000000
+ [95794.703557] R10: ffffc90001737c48 R11: ffff88007123e158 R12: ffff880075b6a000
+ [95794.704441] R13: ffff88006145c000 R14: ffff880070fa1418 R15: ffff880070c3b4a0
+ [95794.705270] FS:  00007fa6793c92c0(0000) GS:ffff88023fc00000(0000) knlGS:0000000000000000
+ [95794.706341] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ [95794.707001] CR2: 000056338670d048 CR3: 00000000610dc005 CR4: 00000000001606f0
+ [95794.708030] Call Trace:
+ [95794.708466]  destroy_inode+0x3d/0x55
+ [95794.709071]  evict+0x177/0x17e
+ [95794.709497]  dispose_list+0x50/0x71
+ [95794.709973]  evict_inodes+0x132/0x141
+ [95794.710564]  generic_shutdown_super+0x3f/0x10b
+ [95794.711200]  kill_anon_super+0x12/0x1c
+ [95794.711633]  btrfs_kill_super+0x16/0x21 [btrfs]
+ [95794.712139]  deactivate_locked_super+0x30/0x68
+ [95794.712608]  deactivate_super+0x36/0x39
+ [95794.713093]  cleanup_mnt+0x49/0x67
+ [95794.713514]  __cleanup_mnt+0x12/0x14
+ [95794.713933]  task_work_run+0x82/0xa6
+ [95794.714543]  prepare_exit_to_usermode+0xe1/0x10c
+ [95794.715247]  syscall_return_slowpath+0x18c/0x1af
+ [95794.715952]  entry_SYSCALL_64_fastpath+0xab/0xad
+ [95794.716653] RIP: 0033:0x7fa678cb99a7
+ [95794.721100] RSP: 002b:00007ffccf0aaed8 EFLAGS: 00000246 ORIG_RAX: 00000000000000a6
+ [95794.722052] RAX: 0000000000000000 RBX: 0000563386706030 RCX: 00007fa678cb99a7
+ [95794.722856] RDX: 0000000000000001 RSI: 0000000000000000 RDI: 000056338670ca90
+ [95794.723698] RBP: 000056338670ca90 R08: 000056338670c740 R09: 0000000000000015
+ [95794.724736] R10: 00000000000006b4 R11: 0000000000000246 R12: 00007fa6791bae64
+ [95794.725928] R13: 0000000000000000 R14: 0000563386706210 R15: 00007ffccf0ab160
+ [95794.726728] Code: 40 ff ff ff 00 74 02 0f ff 48 83 bb f8 fe ff ff 00 74 02 0f ff 48 83 bb 00 ff ff ff 00 74 02 0f ff 48 83 bb 30 ff ff ff 00 74 02 <0f> ff 48 83 bb 08 ff ff ff 00 74 02 0f ff 4d 85 e4 0f 84 52 01
+ [95794.729203] ---[ end trace e95877675c6ec009 ]---
+ [95794.841054] ------------[ cut here ]------------
+ [95794.841829] WARNING: CPU: 0 PID: 31496 at fs/btrfs/extent-tree.c:5831 btrfs_free_block_groups+0x235/0x36a [btrfs]
+ [95794.843425] Modules linked in: btrfs xfs ppdev ghash_clmulni_intel pcbc aesni_intel aes_x86_64 crypto_simd cryptd glue_helper parport_pc psmouse sg i2c_piix4 parport i2c_core evdev pcspkr button serio_raw sunrpc loop autofs4 ext4 crc16 mbcache jbd2 zstd_decompress zstd_compress xxhash raid10 raid456 async_raid6_recov async_memcpy async_pq async_xor async_tx xor raid6_pq libcrc32c crc32c_generic raid1 raid0 multipath linear md_mod sd_mod virtio_scsi ata_generic crc32c_intel ata_piix floppy virtio_pci virtio_ring virtio libata scsi_mod e1000 [last unloaded: btrfs]
+ [95794.850658] CPU: 0 PID: 31496 Comm: umount Tainted: G        W       4.14.0-rc6-btrfs-next-54+ #1
+ [95794.852590] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.10.2-0-g5f4c7b1-prebuilt.qemu-project.org 04/01/2014
+ [95794.854752] task: ffff880075aa0240 task.stack: ffffc90001734000
+ [95794.855812] RIP: 0010:btrfs_free_block_groups+0x235/0x36a [btrfs]
+ [95794.856811] RSP: 0018:ffffc90001737d70 EFLAGS: 00010206
+ [95794.857805] RAX: 0000000080000000 RBX: ffff88006145c000 RCX: 0000000000000001
+ [95794.859014] RDX: 00000001810af668 RSI: 0000000000000002 RDI: 00000000ffffffff
+ [95794.860270] RBP: ffffc90001737d98 R08: 0000000000000000 R09: ffffffff817e22b9
+ [95794.861525] R10: ffffc90001737c80 R11: 00000000000337fd R12: 0000000000000000
+ [95794.862700] R13: ffff88006145c0c0 R14: ffff88021b61a800 R15: ffff88006145c100
+ [95794.863810] FS:  00007fa6793c92c0(0000) GS:ffff88023fc00000(0000) knlGS:0000000000000000
+ [95794.865149] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ [95794.866099] CR2: 000056338670d048 CR3: 00000000610dc005 CR4: 00000000001606f0
+ [95794.867198] Call Trace:
+ [95794.867626]  close_ctree+0x1db/0x2b8 [btrfs]
+ [95794.868188]  ? evict_inodes+0x132/0x141
+ [95794.869037]  btrfs_put_super+0x15/0x17 [btrfs]
+ [95794.870400]  generic_shutdown_super+0x6a/0x10b
+ [95794.871262]  kill_anon_super+0x12/0x1c
+ [95794.872046]  btrfs_kill_super+0x16/0x21 [btrfs]
+ [95794.872746]  deactivate_locked_super+0x30/0x68
+ [95794.873687]  deactivate_super+0x36/0x39
+ [95794.874639]  cleanup_mnt+0x49/0x67
+ [95794.875504]  __cleanup_mnt+0x12/0x14
+ [95794.876126]  task_work_run+0x82/0xa6
+ [95794.876788]  prepare_exit_to_usermode+0xe1/0x10c
+ [95794.877777]  syscall_return_slowpath+0x18c/0x1af
+ [95794.878381]  entry_SYSCALL_64_fastpath+0xab/0xad
+ [95794.878888] RIP: 0033:0x7fa678cb99a7
+ [95794.879307] RSP: 002b:00007ffccf0aaed8 EFLAGS: 00000246 ORIG_RAX: 00000000000000a6
+ [95794.880204] RAX: 0000000000000000 RBX: 0000563386706030 RCX: 00007fa678cb99a7
+ [95794.881640] RDX: 0000000000000001 RSI: 0000000000000000 RDI: 000056338670ca90
+ [95794.882690] RBP: 000056338670ca90 R08: 000056338670c740 R09: 0000000000000015
+ [95794.883538] R10: 00000000000006b4 R11: 0000000000000246 R12: 00007fa6791bae64
+ [95794.884562] R13: 0000000000000000 R14: 0000563386706210 R15: 00007ffccf0ab160
+ [95794.885664] Code: 89 ef e8 07 ec 32 e1 e8 9d c0 ea e0 48 8d b3 28 02 00 00 48 83 c9 ff 31 d2 48 89 df e8 29 c5 ff ff 48 83 bb 80 02 00 00 00 74 02 <0f> ff 48 83 bb 88 02 00 00 00 74 02 0f ff 48 83 bb d8 02 00 00
+ [95794.887980] ---[ end trace e95877675c6ec00a ]---
+ [95794.888739] ------------[ cut here ]------------
+ [95794.889405] WARNING: CPU: 0 PID: 31496 at fs/btrfs/extent-tree.c:5832 btrfs_free_block_groups+0x241/0x36a [btrfs]
+ [95794.891020] Modules linked in: btrfs xfs ppdev ghash_clmulni_intel pcbc aesni_intel aes_x86_64 crypto_simd cryptd glue_helper parport_pc psmouse sg i2c_piix4 parport i2c_core evdev pcspkr button serio_raw sunrpc loop autofs4 ext4 crc16 mbcache jbd2 zstd_decompress zstd_compress xxhash raid10 raid456 async_raid6_recov async_memcpy async_pq async_xor async_tx xor raid6_pq libcrc32c crc32c_generic raid1 raid0 multipath linear md_mod sd_mod virtio_scsi ata_generic crc32c_intel ata_piix floppy virtio_pci virtio_ring virtio libata scsi_mod e1000 [last unloaded: btrfs]
+ [95794.897551] CPU: 0 PID: 31496 Comm: umount Tainted: G        W       4.14.0-rc6-btrfs-next-54+ #1
+ [95794.898509] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.10.2-0-g5f4c7b1-prebuilt.qemu-project.org 04/01/2014
+ [95794.899685] task: ffff880075aa0240 task.stack: ffffc90001734000
+ [95794.900592] RIP: 0010:btrfs_free_block_groups+0x241/0x36a [btrfs]
+ [95794.901387] RSP: 0018:ffffc90001737d70 EFLAGS: 00010206
+ [95794.902300] RAX: 0000000080000000 RBX: ffff88006145c000 RCX: 0000000000000001
+ [95794.903260] RDX: 00000001810af668 RSI: 0000000000000002 RDI: 00000000ffffffff
+ [95794.904332] RBP: ffffc90001737d98 R08: 0000000000000000 R09: ffffffff817e22b9
+ [95794.905300] R10: ffffc90001737c80 R11: 00000000000337fd R12: 0000000000000000
+ [95794.906439] R13: ffff88006145c0c0 R14: ffff88021b61a800 R15: ffff88006145c100
+ [95794.907459] FS:  00007fa6793c92c0(0000) GS:ffff88023fc00000(0000) knlGS:0000000000000000
+ [95794.908625] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ [95794.909511] CR2: 000056338670d048 CR3: 00000000610dc005 CR4: 00000000001606f0
+ [95794.910630] Call Trace:
+ [95794.911153]  close_ctree+0x1db/0x2b8 [btrfs]
+ [95794.911837]  ? evict_inodes+0x132/0x141
+ [95794.912344]  btrfs_put_super+0x15/0x17 [btrfs]
+ [95794.912975]  generic_shutdown_super+0x6a/0x10b
+ [95794.913788]  kill_anon_super+0x12/0x1c
+ [95794.914424]  btrfs_kill_super+0x16/0x21 [btrfs]
+ [95794.915142]  deactivate_locked_super+0x30/0x68
+ [95794.915831]  deactivate_super+0x36/0x39
+ [95794.916433]  cleanup_mnt+0x49/0x67
+ [95794.917045]  __cleanup_mnt+0x12/0x14
+ [95794.917665]  task_work_run+0x82/0xa6
+ [95794.918309]  prepare_exit_to_usermode+0xe1/0x10c
+ [95794.919021]  syscall_return_slowpath+0x18c/0x1af
+ [95794.919722]  entry_SYSCALL_64_fastpath+0xab/0xad
+ [95794.920426] RIP: 0033:0x7fa678cb99a7
+ [95794.921039] RSP: 002b:00007ffccf0aaed8 EFLAGS: 00000246 ORIG_RAX: 00000000000000a6
+ [95794.922303] RAX: 0000000000000000 RBX: 0000563386706030 RCX: 00007fa678cb99a7
+ [95794.923335] RDX: 0000000000000001 RSI: 0000000000000000 RDI: 000056338670ca90
+ [95794.924364] RBP: 000056338670ca90 R08: 000056338670c740 R09: 0000000000000015
+ [95794.925435] R10: 00000000000006b4 R11: 0000000000000246 R12: 00007fa6791bae64
+ [95794.926533] R13: 0000000000000000 R14: 0000563386706210 R15: 00007ffccf0ab160
+ [95794.927557] Code: 48 8d b3 28 02 00 00 48 83 c9 ff 31 d2 48 89 df e8 29 c5 ff ff 48 83 bb 80 02 00 00 00 74 02 0f ff 48 83 bb 88 02 00 00 00 74 02 <0f> ff 48 83 bb d8 02 00 00 00 74 02 0f ff 48 83 bb e0 02 00 00
+ [95794.930166] ---[ end trace e95877675c6ec00b ]---
+ [95794.930961] ------------[ cut here ]------------
+ [95794.931727] WARNING: CPU: 0 PID: 31496 at fs/btrfs/extent-tree.c:9953 btrfs_free_block_groups+0x2bc/0x36a [btrfs]
+ [95794.932729] Modules linked in: btrfs xfs ppdev ghash_clmulni_intel pcbc aesni_intel aes_x86_64 crypto_simd cryptd glue_helper parport_pc psmouse sg i2c_piix4 parport i2c_core evdev pcspkr button serio_raw sunrpc loop autofs4 ext4 crc16 mbcache jbd2 zstd_decompress zstd_compress xxhash raid10 raid456 async_raid6_recov async_memcpy async_pq async_xor async_tx xor raid6_pq libcrc32c crc32c_generic raid1 raid0 multipath linear md_mod sd_mod virtio_scsi ata_generic crc32c_intel ata_piix floppy virtio_pci virtio_ring virtio libata scsi_mod e1000 [last unloaded: btrfs]
+ [95794.938394] CPU: 0 PID: 31496 Comm: umount Tainted: G        W       4.14.0-rc6-btrfs-next-54+ #1
+ [95794.939842] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.10.2-0-g5f4c7b1-prebuilt.qemu-project.org 04/01/2014
+ [95794.941455] task: ffff880075aa0240 task.stack: ffffc90001734000
+ [95794.942336] RIP: 0010:btrfs_free_block_groups+0x2bc/0x36a [btrfs]
+ [95794.943268] RSP: 0018:ffffc90001737d70 EFLAGS: 00010206
+ [95794.944127] RAX: ffff8802004fd0e8 RBX: ffff88006145c000 RCX: 0000000000000001
+ [95794.945211] RDX: 00000001810af668 RSI: 0000000000000002 RDI: 00000000ffffffff
+ [95794.946316] RBP: ffffc90001737d98 R08: 0000000000000000 R09: ffffffff817e22b9
+ [95794.947271] R10: ffffc90001737c80 R11: 00000000000337fd R12: ffff8802004fd0e8
+ [95794.948219] R13: ffff88006145c0c0 R14: ffff88006145e598 R15: ffff88006145c100
+ [95794.949193] FS:  00007fa6793c92c0(0000) GS:ffff88023fc00000(0000) knlGS:0000000000000000
+ [95794.950495] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ [95794.951338] CR2: 000056338670d048 CR3: 00000000610dc005 CR4: 00000000001606f0
+ [95794.952361] Call Trace:
+ [95794.952811]  close_ctree+0x1db/0x2b8 [btrfs]
+ [95794.953522]  ? evict_inodes+0x132/0x141
+ [95794.954543]  btrfs_put_super+0x15/0x17 [btrfs]
+ [95794.955231]  generic_shutdown_super+0x6a/0x10b
+ [95794.955916]  kill_anon_super+0x12/0x1c
+ [95794.956414]  btrfs_kill_super+0x16/0x21 [btrfs]
+ [95794.956953]  deactivate_locked_super+0x30/0x68
+ [95794.957635]  deactivate_super+0x36/0x39
+ [95794.958256]  cleanup_mnt+0x49/0x67
+ [95794.958701]  __cleanup_mnt+0x12/0x14
+ [95794.959181]  task_work_run+0x82/0xa6
+ [95794.959635]  prepare_exit_to_usermode+0xe1/0x10c
+ [95794.960182]  syscall_return_slowpath+0x18c/0x1af
+ [95794.960731]  entry_SYSCALL_64_fastpath+0xab/0xad
+ [95794.961438] RIP: 0033:0x7fa678cb99a7
+ [95794.961990] RSP: 002b:00007ffccf0aaed8 EFLAGS: 00000246 ORIG_RAX: 00000000000000a6
+ [95794.963111] RAX: 0000000000000000 RBX: 0000563386706030 RCX: 00007fa678cb99a7
+ [95794.963975] RDX: 0000000000000001 RSI: 0000000000000000 RDI: 000056338670ca90
+ [95794.964680] RBP: 000056338670ca90 R08: 000056338670c740 R09: 0000000000000015
+ [95794.965763] R10: 00000000000006b4 R11: 0000000000000246 R12: 00007fa6791bae64
+ [95794.966868] R13: 0000000000000000 R14: 0000563386706210 R15: 00007ffccf0ab160
+ [95794.967800] Code: 00 00 00 4c 8b a3 98 25 00 00 49 83 bc 24 60 ff ff ff 00 75 16 49 83 bc 24 68 ff ff ff 00 75 0b 49 83 bc 24 70 ff ff ff 00 74 16 <0f> ff 49 8d b4 24 18 ff ff ff 31 c9 31 d2 48 89 df e8 93 7a ff
+ [95794.970629] ---[ end trace e95877675c6ec00c ]---
+ [95794.971451] BTRFS info (device sdi): space_info 1 has 7680000 free, is not full
+ [95794.972351] BTRFS info (device sdi): space_info total=8388608, used=704512, pinned=0, reserved=0, may_use=4096, readonly=0
+ [95794.973595] ------------[ cut here ]------------
+ [95794.974353] WARNING: CPU: 0 PID: 31496 at fs/btrfs/extent-tree.c:9953 btrfs_free_block_groups+0x2bc/0x36a [btrfs]
+ [95794.980163] Modules linked in: btrfs xfs ppdev ghash_clmulni_intel pcbc aesni_intel aes_x86_64 crypto_simd cryptd glue_helper parport_pc psmouse sg i2c_piix4 parport i2c_core evdev pcspkr button serio_raw sunrpc loop autofs4 ext4 crc16 mbcache jbd2 zstd_decompress zstd_compress xxhash raid10 raid456 async_raid6_recov async_memcpy async_pq async_xor async_tx xor raid6_pq libcrc32c crc32c_generic raid1 raid0 multipath linear md_mod sd_mod virtio_scsi ata_generic crc32c_intel ata_piix floppy virtio_pci virtio_ring virtio libata scsi_mod e1000 [last unloaded: btrfs]
+ [95794.986461] CPU: 0 PID: 31496 Comm: umount Tainted: G        W       4.14.0-rc6-btrfs-next-54+ #1
+ [95794.987591] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.10.2-0-g5f4c7b1-prebuilt.qemu-project.org 04/01/2014
+ [95794.988929] task: ffff880075aa0240 task.stack: ffffc90001734000
+ [95794.989922] RIP: 0010:btrfs_free_block_groups+0x2bc/0x36a [btrfs]
+ [95794.990715] RSP: 0018:ffffc90001737d70 EFLAGS: 00010206
+ [95794.991431] RAX: ffff88020f6e70e8 RBX: ffff88006145c000 RCX: ffffffff8115a906
+ [95794.992455] RDX: ffffffff8115a902 RSI: ffff880075aa0b40 RDI: ffff880075aa0b40
+ [95794.993535] RBP: ffffc90001737d98 R08: 0000000000000020 R09: fffffffffffffff7
+ [95794.994573] R10: 00000000ffffffc4 R11: ffff8800633b1bc0 R12: ffff88020f6e70e8
+ [95794.996250] R13: 0000000000000038 R14: ffff88006145e598 R15: 0000000000000000
+ [95794.997233] FS:  00007fa6793c92c0(0000) GS:ffff88023fc00000(0000) knlGS:0000000000000000
+ [95794.998592] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ [95794.999484] CR2: 000056338670d048 CR3: 00000000610dc005 CR4: 00000000001606f0
+ [95795.000542] Call Trace:
+ [95795.001138]  close_ctree+0x1db/0x2b8 [btrfs]
+ [95795.001885]  ? evict_inodes+0x132/0x141
+ [95795.002407]  btrfs_put_super+0x15/0x17 [btrfs]
+ [95795.003093]  generic_shutdown_super+0x6a/0x10b
+ [95795.003720]  kill_anon_super+0x12/0x1c
+ [95795.004353]  btrfs_kill_super+0x16/0x21 [btrfs]
+ [95795.005095]  deactivate_locked_super+0x30/0x68
+ [95795.005716]  deactivate_super+0x36/0x39
+ [95795.006388]  cleanup_mnt+0x49/0x67
+ [95795.006939]  __cleanup_mnt+0x12/0x14
+ [95795.007512]  task_work_run+0x82/0xa6
+ [95795.008124]  prepare_exit_to_usermode+0xe1/0x10c
+ [95795.008994]  syscall_return_slowpath+0x18c/0x1af
+ [95795.009831]  entry_SYSCALL_64_fastpath+0xab/0xad
+ [95795.010610] RIP: 0033:0x7fa678cb99a7
+ [95795.011193] RSP: 002b:00007ffccf0aaed8 EFLAGS: 00000246 ORIG_RAX: 00000000000000a6
+ [95795.012327] RAX: 0000000000000000 RBX: 0000563386706030 RCX: 00007fa678cb99a7
+ [95795.013432] RDX: 0000000000000001 RSI: 0000000000000000 RDI: 000056338670ca90
+ [95795.014558] RBP: 000056338670ca90 R08: 000056338670c740 R09: 0000000000000015
+ [95795.015577] R10: 00000000000006b4 R11: 0000000000000246 R12: 00007fa6791bae64
+ [95795.016569] R13: 0000000000000000 R14: 0000563386706210 R15: 00007ffccf0ab160
+ [95795.017662] Code: 00 00 00 4c 8b a3 98 25 00 00 49 83 bc 24 60 ff ff ff 00 75 16 49 83 bc 24 68 ff ff ff 00 75 0b 49 83 bc 24 70 ff ff ff 00 74 16 <0f> ff 49 8d b4 24 18 ff ff ff 31 c9 31 d2 48 89 df e8 93 7a ff
+ [95795.020538] ---[ end trace e95877675c6ec00d ]---
+ [95795.021259] BTRFS info (device sdi): space_info 4 has 1072775168 free, is not full
+ [95795.022390] BTRFS info (device sdi): space_info total=1073741824, used=114688, pinned=0, reserved=0, may_use=786432, readonly=65536
+
+Fix this by ensuring the zero range operation does not call
+btrfs_truncate_block() if the corresponding extent is an unwritten one
+(it's pointless anyway, since reading from an unwritten extent yields
+zeroes).
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Tested-by: Nikolay Borisov <nborisov@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

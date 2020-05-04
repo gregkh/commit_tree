@@ -1,0 +1,72 @@
+net: Introduce net_sem for protection of pernet_list
+
+Currently, the mutex is mostly used to protect pernet operations
+list. It orders setup_net() and cleanup_net() with parallel
+{un,}register_pernet_operations() calls, so ->exit{,batch} methods
+of the same pernet operations are executed for a dying net, as
+were used to call ->init methods, even after the net namespace
+is unlinked from net_namespace_list in cleanup_net().
+
+But there are several problems with scalability. The first one
+is that more than one net can't be created or destroyed
+at the same moment on the node. For big machines with many cpus
+running many containers it's very sensitive.
+
+The second one is that it's need to synchronize_rcu() after net
+is removed from net_namespace_list():
+
+Destroy net_ns:
+cleanup_net()
+  mutex_lock(&net_mutex)
+  list_del_rcu(&net->list)
+  synchronize_rcu()                                  <--- Sleep there for ages
+  list_for_each_entry_reverse(ops, &pernet_list, list)
+    ops_exit_list(ops, &net_exit_list)
+  list_for_each_entry_reverse(ops, &pernet_list, list)
+    ops_free_list(ops, &net_exit_list)
+  mutex_unlock(&net_mutex)
+
+This primitive is not fast, especially on the systems with many processors
+and/or when preemptible RCU is enabled in config. So, all the time, while
+cleanup_net() is waiting for RCU grace period, creation of new net namespaces
+is not possible, the tasks, who makes it, are sleeping on the same mutex:
+
+Create net_ns:
+copy_net_ns()
+  mutex_lock_killable(&net_mutex)                    <--- Sleep there for ages
+
+I observed 20-30 seconds hangs of "unshare -n" on ordinary 8-cpu laptop
+with preemptible RCU enabled after CRIU tests round is finished.
+
+The solution is to convert net_mutex to the rw_semaphore and add fine grain
+locks to really small number of pernet_operations, what really need them.
+
+Then, pernet_operations::init/::exit methods, modifying the net-related data,
+will require down_read() locking only, while down_write() will be used
+for changing pernet_list (i.e., when modules are being loaded and unloaded).
+
+This gives signify performance increase, after all patch set is applied,
+like you may see here:
+
+%for i in {1..10000}; do unshare -n bash -c exit; done
+
+*before*
+real 1m40,377s
+user 0m9,672s
+sys 0m19,928s
+
+*after*
+real 0m17,007s
+user 0m5,311s
+sys 0m11,779
+
+(5.8 times faster)
+
+This patch starts replacing net_mutex to net_sem. It adds rw_semaphore,
+describes the variables it protects, and makes to use, where appropriate.
+net_mutex is still present, and next patches will kick it out step-by-step.
+
+Signed-off-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Acked-by: Andrei Vagin <avagin@virtuozzo.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

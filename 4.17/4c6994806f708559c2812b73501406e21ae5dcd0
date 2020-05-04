@@ -1,0 +1,48 @@
+blk-throttle: fix race between blkcg_bio_issue_check() and cgroup_rmdir()
+
+We've triggered a WARNING in blk_throtl_bio() when throttling writeback
+io, which complains blkg->refcnt is already 0 when calling blkg_get(),
+and then kernel crashes with invalid page request.
+After investigating this issue, we've found it is caused by a race
+between blkcg_bio_issue_check() and cgroup_rmdir(), which is described
+below:
+
+writeback kworker               cgroup_rmdir
+                                  cgroup_destroy_locked
+                                    kill_css
+                                      css_killed_ref_fn
+                                        css_killed_work_fn
+                                          offline_css
+                                            blkcg_css_offline
+  blkcg_bio_issue_check
+    rcu_read_lock
+    blkg_lookup
+                                              spin_trylock(q->queue_lock)
+                                              blkg_destroy
+                                              spin_unlock(q->queue_lock)
+    blk_throtl_bio
+    spin_lock_irq(q->queue_lock)
+    ...
+    spin_unlock_irq(q->queue_lock)
+  rcu_read_unlock
+
+Since rcu can only prevent blkg from releasing when it is being used,
+the blkg->refcnt can be decreased to 0 during blkg_destroy() and schedule
+blkg release.
+Then trying to blkg_get() in blk_throtl_bio() will complains the WARNING.
+And then the corresponding blkg_put() will schedule blkg release again,
+which result in double free.
+This race is introduced by commit ae1188963611 ("blkcg: consolidate blkg
+creation in blkcg_bio_issue_check()"). Before this commit, it will
+lookup first and then try to lookup/create again with queue_lock. Since
+revive this logic is a bit drastic, so fix it by only offlining pd during
+blkcg_css_offline(), and move the rest destruction (especially
+blkg_put()) into blkcg_css_free(), which should be the right way as
+discussed.
+
+Fixes: ae1188963611 ("blkcg: consolidate blkg creation in blkcg_bio_issue_check()")
+Reported-by: Jiufei Xue <jiufei.xue@linux.alibaba.com>
+Signed-off-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

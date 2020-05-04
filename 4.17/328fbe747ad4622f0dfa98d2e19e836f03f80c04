@@ -1,0 +1,65 @@
+net: Close race between {un, }register_netdevice_notifier() and setup_net()/cleanup_net()
+
+{un,}register_netdevice_notifier() iterate over all net namespaces
+hashed to net_namespace_list. But pernet_operations register and
+unregister netdevices in unhashed net namespace, and they are not
+seen for netdevice notifiers. This results in asymmetry:
+
+1)Race with register_netdevice_notifier()
+  pernet_operations::init(net)	...
+   register_netdevice()		...
+    call_netdevice_notifiers()  ...
+      ... nb is not called ...
+  ...				register_netdevice_notifier(nb) -> net skipped
+  ...				...
+  list_add_tail(&net->list, ..) ...
+
+  Then, userspace stops using net, and it's destructed:
+
+  pernet_operations::exit(net)
+   unregister_netdevice()
+    call_netdevice_notifiers()
+      ... nb is called ...
+
+This always happens with net::loopback_dev, but it may be not the only device.
+
+2)Race with unregister_netdevice_notifier()
+  pernet_operations::init(net)
+   register_netdevice()
+    call_netdevice_notifiers()
+      ... nb is called ...
+
+  Then, userspace stops using net, and it's destructed:
+
+  list_del_rcu(&net->list)	...
+  pernet_operations::exit(net)  unregister_netdevice_notifier(nb) -> net skipped
+   dev_change_net_namespace()	...
+    call_netdevice_notifiers()
+      ... nb is not called ...
+   unregister_netdevice()
+    call_netdevice_notifiers()
+      ... nb is not called ...
+
+This race is more danger, since dev_change_net_namespace() moves real
+network devices, which use not trivial netdevice notifiers, and if this
+will happen, the system will be left in unpredictable state.
+
+The patch closes the race. During the testing I found two places,
+where register_netdevice_notifier() is called from pernet init/exit
+methods (which led to deadlock) and fixed them (see previous patches).
+
+The review moved me to one more unusual registration place:
+raw_init() (can driver). It may be a reason of problems,
+if someone creates in-kernel CAN_RAW sockets, since they
+will be destroyed in exit method and raw_release()
+will call unregister_netdevice_notifier(). But grep over
+kernel tree does not show, someone creates such sockets
+from kernel space.
+
+Theoretically, there can be more places like this, and which are
+hidden from review, but we found them on the first bumping there
+(since there is no a race, it will be 100% reproducible).
+
+Signed-off-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

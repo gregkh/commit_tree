@@ -1,0 +1,74 @@
+mm, mlock, vmscan: no more skipping pagevecs
+
+When a thread mlocks an address space backed either by file pages which
+are currently not present in memory or swapped out anon pages (not in
+swapcache), a new page is allocated and added to the local pagevec
+(lru_add_pvec), I/O is triggered and the thread then sleeps on the page.
+On I/O completion, the thread can wake on a different CPU, the mlock
+syscall will then sets the PageMlocked() bit of the page but will not be
+able to put that page in unevictable LRU as the page is on the pagevec
+of a different CPU.  Even on drain, that page will go to evictable LRU
+because the PageMlocked() bit is not checked on pagevec drain.
+
+The page will eventually go to right LRU on reclaim but the LRU stats
+will remain skewed for a long time.
+
+This patch puts all the pages, even unevictable, to the pagevecs and on
+the drain, the pages will be added on their LRUs correctly by checking
+their evictability.  This resolves the mlocked pages on pagevec of other
+CPUs issue because when those pagevecs will be drained, the mlocked file
+pages will go to unevictable LRU.  Also this makes the race with munlock
+easier to resolve because the pagevec drains happen in LRU lock.
+
+However there is still one place which makes a page evictable and does
+PageLRU check on that page without LRU lock and needs special attention.
+TestClearPageMlocked() and isolate_lru_page() in clear_page_mlock().
+
+	#0: __pagevec_lru_add_fn	#1: clear_page_mlock
+
+	SetPageLRU()			if (!TestClearPageMlocked())
+					  return
+	smp_mb() // <--required
+					// inside does PageLRU
+	if (!PageMlocked())		if (isolate_lru_page())
+	  move to evictable LRU		  putback_lru_page()
+	else
+	  move to unevictable LRU
+
+In '#1', TestClearPageMlocked() provides full memory barrier semantics
+and thus the PageLRU check (inside isolate_lru_page) can not be
+reordered before it.
+
+In '#0', without explicit memory barrier, the PageMlocked() check can be
+reordered before SetPageLRU().  If that happens, '#0' can put a page in
+unevictable LRU and '#1' might have just cleared the Mlocked bit of that
+page but fails to isolate as PageLRU fails as '#0' still hasn't set
+PageLRU bit of that page.  That page will be stranded on the unevictable
+LRU.
+
+There is one (good) side effect though.  Without this patch, the pages
+allocated for System V shared memory segment are added to evictable LRUs
+even after shmctl(SHM_LOCK) on that segment.  This patch will correctly
+put such pages to unevictable LRU.
+
+Link: http://lkml.kernel.org/r/20171121211241.18877-1-shakeelb@google.com
+Signed-off-by: Shakeel Butt <shakeelb@google.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Jérôme Glisse <jglisse@redhat.com>
+Cc: Huang Ying <ying.huang@intel.com>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Greg Thelen <gthelen@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Balbir Singh <bsingharora@gmail.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Shaohua Li <shli@fb.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

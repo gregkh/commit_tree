@@ -1,0 +1,90 @@
+l2tp: fix races with tunnel socket close
+
+The tunnel socket tunnel->sock (struct sock) is accessed when
+preparing a new ppp session on a tunnel at pppol2tp_session_init. If
+the socket is closed by a thread while another is creating a new
+session, the threads race. In pppol2tp_connect, the tunnel object may
+be created if the pppol2tp socket is associated with the special
+session_id 0 and the tunnel socket is looked up using the provided
+fd. When handling this, pppol2tp_connect cannot sock_hold the tunnel
+socket to prevent it being destroyed during pppol2tp_connect since
+this may itself may race with the socket being destroyed. Doing
+sockfd_lookup in pppol2tp_connect isn't sufficient to prevent
+tunnel->sock going away either because a given tunnel socket fd may be
+reused between calls to pppol2tp_connect. Instead, have
+l2tp_tunnel_create sock_hold the tunnel socket before it does
+sockfd_put. This ensures that the tunnel's socket is always extant
+while the tunnel object exists. Hold a ref on the socket until the
+tunnel is destroyed and ensure that all tunnel destroy paths go
+through a common function (l2tp_tunnel_delete) since this will do the
+final sock_put to release the tunnel socket.
+
+Since the tunnel's socket is now guaranteed to exist if the tunnel
+exists, we no longer need to use sockfd_lookup via l2tp_sock_to_tunnel
+to derive the tunnel from the socket since this is always
+sk_user_data.
+
+Also, sessions no longer sock_hold the tunnel socket since sessions
+already hold a tunnel ref and the tunnel sock will not be freed until
+the tunnel is freed. Removing these sock_holds in
+l2tp_session_register avoids a possible sock leak in the
+pppol2tp_connect error path if l2tp_session_register succeeds but
+attaching a ppp channel fails. The pppol2tp_connect error path could
+have been fixed instead and have the sock ref dropped when the session
+is freed, but doing a sock_put of the tunnel socket when the session
+is freed would require a new session_free callback. It is simpler to
+just remove the sock_hold of the tunnel socket in
+l2tp_session_register, now that the tunnel socket lifetime is
+guaranteed.
+
+Finally, some init code in l2tp_tunnel_create is reordered to ensure
+that the new tunnel object's refcount is set and the tunnel socket ref
+is taken before the tunnel socket destructor callbacks are set.
+
+kasan: CONFIG_KASAN_INLINE enabled
+kasan: GPF could be caused by NULL-ptr deref or user memory access
+general protection fault: 0000 [#1] SMP KASAN
+Modules linked in:
+CPU: 0 PID: 4360 Comm: syzbot_19c09769 Not tainted 4.16.0-rc2+ #34
+Hardware name: innotek GmbH VirtualBox/VirtualBox, BIOS VirtualBox 12/01/2006
+RIP: 0010:pppol2tp_session_init+0x1d6/0x500
+RSP: 0018:ffff88001377fb40 EFLAGS: 00010212
+RAX: dffffc0000000000 RBX: ffff88001636a940 RCX: ffffffff84836c1d
+RDX: 0000000000000045 RSI: 0000000055976744 RDI: 0000000000000228
+RBP: ffff88001377fb60 R08: ffffffff84836bc8 R09: 0000000000000002
+R10: ffff88001377fab8 R11: 0000000000000001 R12: 0000000000000000
+R13: ffff88001636aac8 R14: ffff8800160f81c0 R15: 1ffff100026eff76
+FS:  00007ffb3ea66700(0000) GS:ffff88001a400000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 0000000020e77000 CR3: 0000000016261000 CR4: 00000000000006f0
+Call Trace:
+ pppol2tp_connect+0xd18/0x13c0
+ ? pppol2tp_session_create+0x170/0x170
+ ? __might_fault+0x115/0x1d0
+ ? lock_downgrade+0x860/0x860
+ ? __might_fault+0xe5/0x1d0
+ ? security_socket_connect+0x8e/0xc0
+ SYSC_connect+0x1b6/0x310
+ ? SYSC_bind+0x280/0x280
+ ? __do_page_fault+0x5d1/0xca0
+ ? up_read+0x1f/0x40
+ ? __do_page_fault+0x3c8/0xca0
+ SyS_connect+0x29/0x30
+ ? SyS_accept+0x40/0x40
+ do_syscall_64+0x1e0/0x730
+ ? trace_hardirqs_off_thunk+0x1a/0x1c
+ entry_SYSCALL_64_after_hwframe+0x42/0xb7
+RIP: 0033:0x7ffb3e376259
+RSP: 002b:00007ffeda4f6508 EFLAGS: 00000202 ORIG_RAX: 000000000000002a
+RAX: ffffffffffffffda RBX: 0000000020e77012 RCX: 00007ffb3e376259
+RDX: 000000000000002e RSI: 0000000020e77000 RDI: 0000000000000004
+RBP: 00007ffeda4f6540 R08: 0000000000000000 R09: 0000000000000000
+R10: 0000000000000000 R11: 0000000000000202 R12: 0000000000400b60
+R13: 00007ffeda4f6660 R14: 0000000000000000 R15: 0000000000000000
+Code: 80 3d b0 ff 06 02 00 0f 84 07 02 00 00 e8 13 d6 db fc 49 8d bc 24 28 02 00 00 48 b8 00 00 00 00 00 fc ff df 48 89 f
+a 48 c1 ea 03 <80> 3c 02 00 0f 85 ed 02 00 00 4d 8b a4 24 28 02 00 00 e8 13 16
+
+Fixes: 80d84ef3ff1dd ("l2tp: prevent l2tp_tunnel_delete racing with userspace close")
+Signed-off-by: James Chapman <jchapman@katalix.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

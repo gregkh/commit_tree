@@ -1,0 +1,72 @@
+tty: fix port buffer locking
+
+tty_insert_flip_string_fixed_flag() is racy against itself when called
+from the ioctl(TCXONC, TCION/TCIOFF) path [1] and the flush_to_ldisc()
+workqueue path [2].
+
+The problem is that port->buf.tail->used is modified without consistent
+locking; the ioctl path takes tty->atomic_write_lock, whereas the workqueue
+path takes ldata->output_lock.
+
+We cannot simply take ldata->output_lock, since that is specific to the
+N_TTY line discipline.
+
+It might seem natural to try to take port->buf.lock inside
+tty_insert_flip_string_fixed_flag() and friends (where port->buf is
+actually used/modified), but this creates problems for flush_to_ldisc()
+which takes it before grabbing tty->ldisc_sem, o_tty->termios_rwsem,
+and ldata->output_lock.
+
+Therefore, the simplest solution for now seems to be to take
+tty->atomic_write_lock inside tty_port_default_receive_buf(). This lock
+is also used in the write path [3] with a consistent ordering.
+
+[1]: Call Trace:
+ tty_insert_flip_string_fixed_flag
+ pty_write
+ tty_send_xchar                     // down_read(&o_tty->termios_rwsem)
+                                    // mutex_lock(&tty->atomic_write_lock)
+ n_tty_ioctl_helper
+ n_tty_ioctl
+ tty_ioctl                          // down_read(&tty->ldisc_sem)
+ do_vfs_ioctl
+ SyS_ioctl
+
+[2]: Workqueue: events_unbound flush_to_ldisc
+Call Trace:
+ tty_insert_flip_string_fixed_flag
+ pty_write
+ tty_put_char
+ __process_echoes
+ commit_echoes                      // mutex_lock(&ldata->output_lock)
+ n_tty_receive_buf_common
+ n_tty_receive_buf2
+ tty_ldisc_receive_buf              // down_read(&o_tty->termios_rwsem)
+ tty_port_default_receive_buf       // down_read(&tty->ldisc_sem)
+ flush_to_ldisc                     // mutex_lock(&port->buf.lock)
+ process_one_work
+
+[3]: Call Trace:
+ tty_insert_flip_string_fixed_flag
+ pty_write
+ n_tty_write                        // mutex_lock(&ldata->output_lock)
+                                    // down_read(&tty->termios_rwsem)
+ do_tty_write (inline)              // mutex_lock(&tty->atomic_write_lock)
+ tty_write                          // down_read(&tty->ldisc_sem)
+ __vfs_write
+ vfs_write
+ SyS_write
+
+The bug can result in about a dozen different crashes depending on what
+exactly gets corrupted when port->buf.tail->used points outside the
+buffer.
+
+The patch passes my LOCKDEP/PROVE_LOCKING testing but more testing is
+always welcome.
+
+Found using syzkaller.
+
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Vegard Nossum <vegard.nossum@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

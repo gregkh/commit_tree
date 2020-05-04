@@ -1,0 +1,57 @@
+rmdir(),rename(): do shrink_dcache_parent() only on success
+
+Once upon a time ->rmdir() instances used to check if victim inode
+had more than one (in-core) reference and failed with -EBUSY if it
+had.  The reason was race avoidance - emptiness check is worthless
+if somebody could just go and create new objects in the victim
+directory afterwards.
+
+With introduction of dcache the checks had been replaced with
+checking the refcount of dentry.  However, since a cached negative
+lookup leaves a negative child dentry, such check had lead to false
+positives - with empty foo/ doing stat foo/bar before rmdir foo
+ended up with -EBUSY unless the negative dentry of foo/bar happened
+to be evicted by the time of rmdir(2).  That had been fixed by
+doing shrink_dcache_parent() just before the refcount check.
+
+At the same time, ext2_rmdir() has grown a private solution that
+eliminated those -EBUSY - it did something (setting ->i_size to 0)
+which made any subsequent ext2_add_entry() fail.
+
+Unfortunately, even with shrink_dcache_parent() the check had been
+racy - after all, the victim itself could be found by dcache lookup
+just after we'd checked its refcount.  That got fixed by a new
+helper (dentry_unhash()) that did shrink_dcache_parent() and unhashed
+the sucker if its refcount ended up equal to 1.  That got called before
+->rmdir(), turning the checks in ->rmdir() instances into "if not
+unhashed fail with -EBUSY".  Which reduced the boilerplate nicely, but
+had an unpleasant side effect - now shrink_dcache_parent() had been
+done before the emptiness checks, leading to easily triggerable calls
+of shrink_dcache_parent() on arbitrary large subtrees, quite possibly
+nested into each other.
+
+Several years later the ext2-private trick had been generalized -
+(in-core) inodes of dead directories are flagged and calls of
+lookup, readdir and all directory-modifying methods were prevented
+in so marked directories.  Remaining boilerplate in ->rmdir() instances
+became redundant and some instances got rid of it.
+
+In 2011 the call of dentry_unhash() got shifted into ->rmdir() instances
+and then killed off in all of them.  That has lead to another problem,
+though - in case of successful rmdir we *want* any (negative) child
+dentries dropped and the victim itself made negative.  There's no point
+keeping cached negative lookups in foo when we can get the negative
+lookup of foo itself cached.  So shrink_dcache_parent() call had been
+restored; unfortunately, it went into the place where dentry_unhash()
+used to be, i.e. before the ->rmdir() call.  Note that we don't unhash
+anymore, so any "is it busy" checks would be racy; fortunately, all of
+them are gone.
+
+We should've done that call right *after* successful ->rmdir().  That
+reduces contention caused by tree-walking in shrink_dcache_parent()
+and, especially, contention caused by evictions in two nested subtrees
+going on in parallel.  The same goes for directory-overwriting rename() -
+the story there had been parallel to that of rmdir().
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

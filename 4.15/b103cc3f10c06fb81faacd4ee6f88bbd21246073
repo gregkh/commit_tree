@@ -1,0 +1,60 @@
+KVM: arm/arm64: Avoid timer save/restore in vcpu entry/exit
+
+We don't need to save and restore the hardware timer state and examine
+if it generates interrupts on on every entry/exit to the guest.  The
+timer hardware is perfectly capable of telling us when it has expired
+by signaling interrupts.
+
+When taking a vtimer interrupt in the host, we don't want to mess with
+the timer configuration, we just want to forward the physical interrupt
+to the guest as a virtual interrupt.  We can use the split priority drop
+and deactivate feature of the GIC to do this, which leaves an EOI'ed
+interrupt active on the physical distributor, making sure we don't keep
+taking timer interrupts which would prevent the guest from running.  We
+can then forward the physical interrupt to the VM using the HW bit in
+the LR of the GIC, like we do already, which lets the guest directly
+deactivate both the physical and virtual timer simultaneously, allowing
+the timer hardware to exit the VM and generate a new physical interrupt
+when the timer output is again asserted later on.
+
+We do need to capture this state when migrating VCPUs between physical
+CPUs, however, which we use the vcpu put/load functions for, which are
+called through preempt notifiers whenever the thread is scheduled away
+from the CPU or called directly if we return from the ioctl to
+userspace.
+
+One caveat is that we have to save and restore the timer state in both
+kvm_timer_vcpu_[put/load] and kvm_timer_[schedule/unschedule], because
+we can have the following flows:
+
+  1. kvm_vcpu_block
+  2. kvm_timer_schedule
+  3. schedule
+  4. kvm_timer_vcpu_put (preempt notifier)
+  5. schedule (vcpu thread gets scheduled back)
+  6. kvm_timer_vcpu_load (preempt notifier)
+  7. kvm_timer_unschedule
+
+And a version where we don't actually call schedule:
+
+  1. kvm_vcpu_block
+  2. kvm_timer_schedule
+  7. kvm_timer_unschedule
+
+Since kvm_timer_[schedule/unschedule] may not be followed by put/load,
+but put/load also may be called independently, we call the timer
+save/restore functions from both paths.  Since they rely on the loaded
+flag to never save/restore when unnecessary, this doesn't cause any
+harm, and we ensure that all invokations of either set of functions work
+as intended.
+
+An added benefit beyond not having to read and write the timer sysregs
+on every entry and exit is that we no longer have to actively write the
+active state to the physical distributor, because we configured the
+irq for the vtimer to only get a priority drop when handling the
+interrupt in the GIC driver (we called irq_set_vcpu_affinity()), and
+the interrupt stays active after firing on the host.
+
+Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+Signed-off-by: Christoffer Dall <cdall@linaro.org>
+

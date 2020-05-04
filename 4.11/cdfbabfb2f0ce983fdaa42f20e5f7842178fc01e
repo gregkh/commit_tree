@@ -1,0 +1,69 @@
+net: Work around lockdep limitation in sockets that use sockets
+
+Lockdep issues a circular dependency warning when AFS issues an operation
+through AF_RXRPC from a context in which the VFS/VM holds the mmap_sem.
+
+The theory lockdep comes up with is as follows:
+
+ (1) If the pagefault handler decides it needs to read pages from AFS, it
+     calls AFS with mmap_sem held and AFS begins an AF_RXRPC call, but
+     creating a call requires the socket lock:
+
+	mmap_sem must be taken before sk_lock-AF_RXRPC
+
+ (2) afs_open_socket() opens an AF_RXRPC socket and binds it.  rxrpc_bind()
+     binds the underlying UDP socket whilst holding its socket lock.
+     inet_bind() takes its own socket lock:
+
+	sk_lock-AF_RXRPC must be taken before sk_lock-AF_INET
+
+ (3) Reading from a TCP socket into a userspace buffer might cause a fault
+     and thus cause the kernel to take the mmap_sem, but the TCP socket is
+     locked whilst doing this:
+
+	sk_lock-AF_INET must be taken before mmap_sem
+
+However, lockdep's theory is wrong in this instance because it deals only
+with lock classes and not individual locks.  The AF_INET lock in (2) isn't
+really equivalent to the AF_INET lock in (3) as the former deals with a
+socket entirely internal to the kernel that never sees userspace.  This is
+a limitation in the design of lockdep.
+
+Fix the general case by:
+
+ (1) Double up all the locking keys used in sockets so that one set are
+     used if the socket is created by userspace and the other set is used
+     if the socket is created by the kernel.
+
+ (2) Store the kern parameter passed to sk_alloc() in a variable in the
+     sock struct (sk_kern_sock).  This informs sock_lock_init(),
+     sock_init_data() and sk_clone_lock() as to the lock keys to be used.
+
+     Note that the child created by sk_clone_lock() inherits the parent's
+     kern setting.
+
+ (3) Add a 'kern' parameter to ->accept() that is analogous to the one
+     passed in to ->create() that distinguishes whether kernel_accept() or
+     sys_accept4() was the caller and can be passed to sk_alloc().
+
+     Note that a lot of accept functions merely dequeue an already
+     allocated socket.  I haven't touched these as the new socket already
+     exists before we get the parameter.
+
+     Note also that there are a couple of places where I've made the accepted
+     socket unconditionally kernel-based:
+
+	irda_accept()
+	rds_rcp_accept_one()
+	tcp_accept_from_sock()
+
+     because they follow a sock_create_kern() and accept off of that.
+
+Whilst creating this, I noticed that lustre and ocfs don't create sockets
+through sock_create_kern() and thus they aren't marked as for-kernel,
+though they appear to be internal.  I wonder if these should do that so
+that they use the new set of lock keys.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

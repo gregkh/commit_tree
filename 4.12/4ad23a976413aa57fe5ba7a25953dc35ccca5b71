@@ -1,0 +1,47 @@
+MD: use per-cpu counter for writes_pending
+
+The 'writes_pending' counter is used to determine when the
+array is stable so that it can be marked in the superblock
+as "Clean".  Consequently it needs to be updated frequently
+but only checked for zero occasionally.  Recent changes to
+raid5 cause the count to be updated even more often - once
+per 4K rather than once per bio.  This provided
+justification for making the updates more efficient.
+
+So we replace the atomic counter a percpu-refcount.
+This can be incremented and decremented cheaply most of the
+time, and can be switched to "atomic" mode when more
+precise counting is needed.  As it is possible for multiple
+threads to want a precise count, we introduce a
+"sync_checker" counter to count the number of threads
+in "set_in_sync()", and only switch the refcount back
+to percpu mode when that is zero.
+
+We need to be careful about races between set_in_sync()
+setting ->in_sync to 1, and md_write_start() setting it
+to zero.  md_write_start() holds the rcu_read_lock()
+while checking if the refcount is in percpu mode.  If
+it is, then we know a switch to 'atomic' will not happen until
+after we call rcu_read_unlock(), in which case set_in_sync()
+will see the elevated count, and not set in_sync to 1.
+If it is not in percpu mode, we take the mddev->lock to
+ensure proper synchronization.
+
+It is no longer possible to quickly check if the count is zero, which
+we previously did to update a timer or to schedule the md_thread.
+So now we do these every time we decrement that counter, but make
+sure they are fast.
+
+mod_timer() already optimizes the case where the timeout value doesn't
+actually change.  We leverage that further by always rounding off the
+jiffies to the timeout value.  This may delay the marking of 'clean'
+slightly, but ensure we only perform atomic operation here when absolutely
+needed.
+
+md_wakeup_thread() current always calls wake_up(), even if
+THREAD_WAKEUP is already set.  That too can be optimised to avoid
+calls to wake_up().
+
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Shaohua Li <shli@fb.com>
+

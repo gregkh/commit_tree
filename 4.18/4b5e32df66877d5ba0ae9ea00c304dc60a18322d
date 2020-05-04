@@ -1,0 +1,74 @@
+platform/mellanox: mlxreg-hotplug: add extra cycle for hotplug work queue
+
+Add extra cycle for hotplug work queue to handle the case when a signal is
+It adds missed logic for signal acknowledge, by adding an extra run for
+received, but no specific signal assertion is detected. Such case
+theoretically can happen for example in case several units are removed or
+inserted at the same time. In this situation acknowledge for some signal
+can be missed at signal top aggreagation status level. The extra run will
+allow to handler to acknowledge the missed signal.
+
+The interrupt handling flow performs the next steps:
+(1)
+Enter mlxreg_hotplug_work_handler due to signal assertion.
+Aggregation status register is changed for example from 0xff to 0xfd
+(event signal group related to bit 1).
+(2)
+Mask aggregation interrupts, read aggregation status register and save it
+(0xfd) in aggr_cache, then traverse down to handle signal from groups
+related to the changed bit.
+(3)
+Read and mask group related signal.
+Acknowledge and unmask group related signal (acknowledge should clear
+aggregation status register from 0xfd back to 0xff).
+(4)
+Re-schedule work queue for the immediate execution.
+(5)
+Enter mlxreg_hotplug_work_handler due to re-scheduling.
+Aggregation status is changed from previous 0xfd to 0xff.
+Go over steps (2) - (5) and in case no new signal assertion
+is detected - unmask aggregation interrupts.
+
+The possible race could happen in case new signal from the same group is
+asserted after step (3) and prior step (5). In such case aggregation
+status will change back from 0xff to 0xfd and the value read from the
+aggregation status register will be the same as a value saved in
+aggr_cache. As a result the handler will not traverse down and signal
+will stay unhandled.
+
+Example of faulty flow:
+The signal routing flow is as following (f.e. for of FANi removing):
+ - FAN status and event registers related bit is changed;
+ -- intermediate aggregation status register is changed;
+ --- top aggregation status register is changed;
+ ---- interrupt routed to CPU and interrupt handler is invoked.
+
+When interrupt handler is invoked it follows the next simple logic (f.e
+FAN3 is removed):
+ (a1) mask top aggregation interrupt mask register;
+ (a2) read top aggregation interrupt status register and test to which
+      underling group belongs a signal (FANs in this case and is changed
+	  from 0xff to 0xfb and 0xfb is saved as a last status value);
+   (b1) mask FANs interrupt mask register;
+   (b2) read FANs status register and test which FAN has been changed
+        FAN3 in this example);
+     (c1) perform relevant action;
+              <--------------- (FAN2 is removed at this point)
+   (b3) clear FANs interrupt event register to acknowledge FAN3 signal;
+   (b4) unmask FANs interrupt mask register
+ (a3) unmask top aggregation interrupt mask register;
+
+ An interrupt handler is invoked, since FAN2 interrupt is not acknowledge.
+ It should set top aggregation interrupt status register bit 6 (0xfb).
+ In step (a2)
+ (a2) read top aggregation interrupt and comparing it with saved value
+      does not show change (same 0xfb) and after (a2) execution jumps to
+	  (a3) and signal leaved unhandled
+
+The fix will enforce handler to traverse down in case the signal is
+received, but signal assertion is not detected.
+
+Fixes: 304887041d95 ("platform/x86: Introduce support for Mellanox hotplug driver")
+Signed-off-by: Vadim Pasternak <vadimp@mellanox.com>
+Signed-off-by: Darren Hart (VMware) <dvhart@infradead.org>
+

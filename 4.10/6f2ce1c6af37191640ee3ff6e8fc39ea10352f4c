@@ -1,0 +1,136 @@
+scsi: zfcp: fix rport unblock race with LUN recovery
+
+It is unavoidable that zfcp_scsi_queuecommand() has to finish requests
+with DID_IMM_RETRY (like fc_remote_port_chkready()) during the time
+window when zfcp detected an unavailable rport but
+fc_remote_port_delete(), which is asynchronous via
+zfcp_scsi_schedule_rport_block(), has not yet blocked the rport.
+
+However, for the case when the rport becomes available again, we should
+prevent unblocking the rport too early.  In contrast to other FCP LLDDs,
+zfcp has to open each LUN with the FCP channel hardware before it can
+send I/O to a LUN.  So if a port already has LUNs attached and we
+unblock the rport just after port recovery, recoveries of LUNs behind
+this port can still be pending which in turn force
+zfcp_scsi_queuecommand() to unnecessarily finish requests with
+DID_IMM_RETRY.
+
+This also opens a time window with unblocked rport (until the followup
+LUN reopen recovery has finished).  If a scsi_cmnd timeout occurs during
+this time window fc_timed_out() cannot work as desired and such command
+would indeed time out and trigger scsi_eh. This prevents a clean and
+timely path failover.  This should not happen if the path issue can be
+recovered on FC transport layer such as path issues involving RSCNs.
+
+Fix this by only calling zfcp_scsi_schedule_rport_register(), to
+asynchronously trigger fc_remote_port_add(), after all LUN recoveries as
+children of the rport have finished and no new recoveries of equal or
+higher order were triggered meanwhile.  Finished intentionally includes
+any recovery result no matter if successful or failed (still unblock
+rport so other successful LUNs work).  For simplicity, we check after
+each finished LUN recovery if there is another LUN recovery pending on
+the same port and then do nothing.  We handle the special case of a
+successful recovery of a port without LUN children the same way without
+changing this case's semantics.
+
+For debugging we introduce 2 new trace records written if the rport
+unblock attempt was aborted due to still unfinished or freshly triggered
+recovery. The records are only written above the default trace level.
+
+Benjamin noticed the important special case of new recovery that can be
+triggered between having given up the erp_lock and before calling
+zfcp_erp_action_cleanup() within zfcp_erp_strategy().  We must avoid the
+following sequence:
+
+ERP thread                 rport_work      other context
+-------------------------  --------------  --------------------------------
+port is unblocked, rport still blocked,
+ due to pending/running ERP action,
+ so ((port->status & ...UNBLOCK) != 0)
+ and (port->rport == NULL)
+unlock ERP
+zfcp_erp_action_cleanup()
+case ZFCP_ERP_ACTION_REOPEN_LUN:
+zfcp_erp_try_rport_unblock()
+((status & ...UNBLOCK) != 0) [OLD!]
+                                           zfcp_erp_port_reopen()
+                                           lock ERP
+                                           zfcp_erp_port_block()
+                                           port->status clear ...UNBLOCK
+                                           unlock ERP
+                                           zfcp_scsi_schedule_rport_block()
+                                           port->rport_task = RPORT_DEL
+                                           queue_work(rport_work)
+                           zfcp_scsi_rport_work()
+                           (port->rport_task != RPORT_ADD)
+                           port->rport_task = RPORT_NONE
+                           zfcp_scsi_rport_block()
+                           if (!port->rport) return
+zfcp_scsi_schedule_rport_register()
+port->rport_task = RPORT_ADD
+queue_work(rport_work)
+                           zfcp_scsi_rport_work()
+                           (port->rport_task == RPORT_ADD)
+                           port->rport_task = RPORT_NONE
+                           zfcp_scsi_rport_register()
+                           (port->rport == NULL)
+                           rport = fc_remote_port_add()
+                           port->rport = rport;
+
+Now the rport was erroneously unblocked while the zfcp_port is blocked.
+This is another situation we want to avoid due to scsi_eh
+potential. This state would at least remain until the new recovery from
+the other context finished successfully, or potentially forever if it
+failed.  In order to close this race, we take the erp_lock inside
+zfcp_erp_try_rport_unblock() when checking the status of zfcp_port or
+LUN.  With that, the possible corresponding rport state sequences would
+be: (unblock[ERP thread],block[other context]) if the ERP thread gets
+erp_lock first and still sees ((port->status & ...UNBLOCK) != 0),
+(block[other context],NOP[ERP thread]) if the ERP thread gets erp_lock
+after the other context has already cleard ...UNBLOCK from port->status.
+
+Since checking fields of struct erp_action is unsafe because they could
+have been overwritten (re-used for new recovery) meanwhile, we only
+check status of zfcp_port and LUN since these are only changed under
+erp_lock elsewhere. Regarding the check of the proper status flags (port
+or port_forced are similar to the shown adapter recovery):
+
+[zfcp_erp_adapter_shutdown()]
+zfcp_erp_adapter_reopen()
+ zfcp_erp_adapter_block()
+  * clear UNBLOCK ---------------------------------------+
+ zfcp_scsi_schedule_rports_block()                       |
+ write_lock_irqsave(&adapter->erp_lock, flags);-------+  |
+ zfcp_erp_action_enqueue()                            |  |
+  zfcp_erp_setup_act()                                |  |
+   * set ERP_INUSE -----------------------------------|--|--+
+ write_unlock_irqrestore(&adapter->erp_lock, flags);--+  |  |
+.context-switch.                                         |  |
+zfcp_erp_thread()                                        |  |
+ zfcp_erp_strategy()                                     |  |
+  write_lock_irqsave(&adapter->erp_lock, flags);------+  |  |
+  ...                                                 |  |  |
+  zfcp_erp_strategy_check_target()                    |  |  |
+   zfcp_erp_strategy_check_adapter()                  |  |  |
+    zfcp_erp_adapter_unblock()                        |  |  |
+     * set UNBLOCK -----------------------------------|--+  |
+  zfcp_erp_action_dequeue()                           |     |
+   * clear ERP_INUSE ---------------------------------|-----+
+  ...                                                 |
+  write_unlock_irqrestore(&adapter->erp_lock, flags);-+
+
+Hence, we should check for both UNBLOCK and ERP_INUSE because they are
+interleaved.  Also we need to explicitly check ERP_FAILED for the link
+down case which currently does not clear the UNBLOCK flag in
+zfcp_fsf_link_down_info_eval().
+
+Signed-off-by: Steffen Maier <maier@linux.vnet.ibm.com>
+Fixes: 8830271c4819 ("[SCSI] zfcp: Dont fail SCSI commands when transitioning to blocked fc_rport")
+Fixes: a2fa0aede07c ("[SCSI] zfcp: Block FC transport rports early on errors")
+Fixes: 5f852be9e11d ("[SCSI] zfcp: Fix deadlock between zfcp ERP and SCSI")
+Fixes: 338151e06608 ("[SCSI] zfcp: make use of fc_remote_port_delete when target port is unavailable")
+Fixes: 3859f6a248cb ("[PATCH] zfcp: add rports to enable scsi_add_device to work again")
+Cc: <stable@vger.kernel.org> #2.6.32+
+Reviewed-by: Benjamin Block <bblock@linux.vnet.ibm.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+

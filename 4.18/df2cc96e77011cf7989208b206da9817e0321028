@@ -1,0 +1,53 @@
+userfaultfd: prevent non-cooperative events vs mcopy_atomic races
+
+If a process monitored with userfaultfd changes it's memory mappings or
+forks() at the same time as uffd monitor fills the process memory with
+UFFDIO_COPY, the actual creation of page table entries and copying of
+the data in mcopy_atomic may happen either before of after the memory
+mapping modifications and there is no way for the uffd monitor to
+maintain consistent view of the process memory layout.
+
+For instance, let's consider fork() running in parallel with
+userfaultfd_copy():
+
+process        		         |	uffd monitor
+---------------------------------+------------------------------
+fork()        		         | userfaultfd_copy()
+...        		         | ...
+    dup_mmap()        	         |     down_read(mmap_sem)
+    down_write(mmap_sem)         |     /* create PTEs, copy data */
+        dup_uffd()               |     up_read(mmap_sem)
+        copy_page_range()        |
+        up_write(mmap_sem)       |
+        dup_uffd_complete()      |
+            /* notify monitor */ |
+
+If the userfaultfd_copy() takes the mmap_sem first, the new page(s) will
+be present by the time copy_page_range() is called and they will appear
+in the child's memory mappings.  However, if the fork() is the first to
+take the mmap_sem, the new pages won't be mapped in the child's address
+space.
+
+If the pages are not present and child tries to access them, the monitor
+will get page fault notification and everything is fine.  However, if
+the pages *are present*, the child can access them without uffd
+noticing.  And if we copy them into child it'll see the wrong data.
+Since we are talking about background copy, we'd need to decide whether
+the pages should be copied or not regardless #PF notifications.
+
+Since userfaultfd monitor has no way to determine what was the order,
+let's disallow userfaultfd_copy in parallel with the non-cooperative
+events.  In such case we return -EAGAIN and the uffd monitor can
+understand that userfaultfd_copy() clashed with a non-cooperative event
+and take an appropriate action.
+
+Link: http://lkml.kernel.org/r/1527061324-19949-1-git-send-email-rppt@linux.vnet.ibm.com
+Signed-off-by: Mike Rapoport <rppt@linux.vnet.ibm.com>
+Acked-by: Pavel Emelyanov <xemul@virtuozzo.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Andrei Vagin <avagin@virtuozzo.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

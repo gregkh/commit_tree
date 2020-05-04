@@ -1,0 +1,74 @@
+f2fs: fix to let caller retry allocating block address
+
+Configure io_bits with 2 and enable LFS mode, generic/013 reports below dmesg:
+
+BUG: unable to handle kernel NULL pointer dereference at 00000104
+*pdpt = 0000000029b7b001 *pde = 0000000000000000
+Oops: 0002 [#1] PREEMPT SMP
+Modules linked in: crc32_generic zram f2fs(O) rfcomm bnep bluetooth ecdh_generic snd_intel8x0 snd_ac97_codec ac97_bus snd_pcm snd_seq_midi snd_seq_midi_event snd_rawmidi snd_seq pcbc joydev snd_seq_device aesni_intel snd_timer aes_i586 snd crypto_simd cryptd soundcore i2c_piix4 serio_raw mac_hid video parport_pc ppdev lp parport hid_generic psmouse usbhid hid e1000
+CPU: 0 PID: 11161 Comm: fsstress Tainted: G           O      4.17.0-rc2 #38
+Hardware name: innotek GmbH VirtualBox/VirtualBox, BIOS VirtualBox 12/01/2006
+EIP: f2fs_submit_page_write+0x28d/0x550 [f2fs]
+EFLAGS: 00010206 CPU: 0
+EAX: e863dcd8 EBX: 00000000 ECX: 00000100 EDX: 00000200
+ESI: e863dcf4 EDI: f6f82768 EBP: e863dbb0 ESP: e863db74
+ DS: 007b ES: 007b FS: 00d8 GS: 0033 SS: 0068
+CR0: 80050033 CR2: 00000104 CR3: 29a62020 CR4: 000406f0
+Call Trace:
+ do_write_page+0x6f/0xc0 [f2fs]
+ write_data_page+0x4a/0xd0 [f2fs]
+ do_write_data_page+0x327/0x630 [f2fs]
+ __write_data_page+0x34b/0x820 [f2fs]
+ __f2fs_write_data_pages+0x42d/0x8c0 [f2fs]
+ f2fs_write_data_pages+0x27/0x30 [f2fs]
+ do_writepages+0x1a/0x70
+ __filemap_fdatawrite_range+0x94/0xd0
+ filemap_write_and_wait_range+0x3d/0xa0
+ __generic_file_write_iter+0x11a/0x1f0
+ f2fs_file_write_iter+0xdd/0x3b0 [f2fs]
+ __vfs_write+0xd2/0x150
+ vfs_write+0x9b/0x190
+ ksys_write+0x45/0x90
+ sys_write+0x16/0x20
+ do_fast_syscall_32+0xaa/0x22c
+ entry_SYSENTER_32+0x4c/0x7b
+EIP: 0xb7fc8c51
+EFLAGS: 00000246 CPU: 0
+EAX: ffffffda EBX: 00000003 ECX: 09cde000 EDX: 00001000
+ESI: 00000003 EDI: 00001000 EBP: 00000000 ESP: bfbded38
+ DS: 007b ES: 007b FS: 0000 GS: 0033 SS: 007b
+Code: e8 f9 77 34 c9 8b 45 e0 8b 80 b8 00 00 00 39 45 d8 0f 84 bb 02 00 00 8b 45 e0 8b 80 b8 00 00 00 8d 50 d8 8b 08 89 55 f0 8b 50 04 <89> 51 04 89 0a c7 00 00 01 00 00 c7 40 04 00 02 00 00 8b 45 dc
+EIP: f2fs_submit_page_write+0x28d/0x550 [f2fs] SS:ESP: 0068:e863db74
+CR2: 0000000000000104
+---[ end trace 4cac79c0d1305ee6 ]---
+
+allocate_data_block will submit all sequential pending IOs sorted by a
+FIFO list, If we failed to submit other user's IO due to unaligned write,
+we will retry to allocate new block address for current IO, then it will
+initialize fio.list again, if fio was in the list before, it can break
+FIFO list, result in above panic.
+
+Thread A			Thread B
+- do_write_page
+ - allocate_data_block
+  - list_add_tail
+  : fioA cached in FIFO list.
+				- do_write_page
+				 - allocate_data_block
+				  - list_add_tail
+				  : fioB cached in FIFO list.
+				 - f2fs_submit_page_write
+				 : fail to submit IO
+				 - allocate_data_block
+				  - INIT_LIST_HEAD
+ - f2fs_submit_page_write
+  - list_del  <-- NULL pointer dereference
+
+This patch adds fio.retry parameter to indicate failure status for each
+IO, and avoid bailing out if there is still pending IO in FIFO list for
+fixing.
+
+Signed-off-by: Chao Yu <yuchao0@huawei.com>
+
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+
