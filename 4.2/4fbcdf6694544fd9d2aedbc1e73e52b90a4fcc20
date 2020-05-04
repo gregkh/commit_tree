@@ -1,0 +1,51 @@
+Btrfs: fix -ENOSPC when finishing block group creation
+
+While creating a block group, we often end up getting ENOSPC while updating
+the chunk tree, which leads to a transaction abortion that produces a trace
+like the following:
+
+[30670.116368] WARNING: CPU: 4 PID: 20735 at fs/btrfs/super.c:260 __btrfs_abort_transaction+0x52/0x106 [btrfs]()
+[30670.117777] BTRFS: Transaction aborted (error -28)
+(...)
+[30670.163567] Call Trace:
+[30670.163906]  [<ffffffff8142fa46>] dump_stack+0x4f/0x7b
+[30670.164522]  [<ffffffff8108b6a2>] ? console_unlock+0x361/0x3ad
+[30670.165171]  [<ffffffff81045ea5>] warn_slowpath_common+0xa1/0xbb
+[30670.166323]  [<ffffffffa035daa7>] ? __btrfs_abort_transaction+0x52/0x106 [btrfs]
+[30670.167213]  [<ffffffff81045f05>] warn_slowpath_fmt+0x46/0x48
+[30670.167862]  [<ffffffffa035daa7>] __btrfs_abort_transaction+0x52/0x106 [btrfs]
+[30670.169116]  [<ffffffffa03743d7>] btrfs_create_pending_block_groups+0x101/0x130 [btrfs]
+[30670.170593]  [<ffffffffa038426a>] __btrfs_end_transaction+0x84/0x366 [btrfs]
+[30670.171960]  [<ffffffffa038455c>] btrfs_end_transaction+0x10/0x12 [btrfs]
+[30670.174649]  [<ffffffffa036eb6b>] btrfs_check_data_free_space+0x11f/0x27c [btrfs]
+[30670.176092]  [<ffffffffa039450d>] btrfs_fallocate+0x7c8/0xb96 [btrfs]
+[30670.177218]  [<ffffffff812459f2>] ? __this_cpu_preempt_check+0x13/0x15
+[30670.178622]  [<ffffffff81152447>] vfs_fallocate+0x14c/0x1de
+[30670.179642]  [<ffffffff8116b915>] ? __fget_light+0x2d/0x4f
+[30670.180692]  [<ffffffff81152863>] SyS_fallocate+0x47/0x62
+[30670.186737]  [<ffffffff81435b32>] system_call_fastpath+0x12/0x17
+[30670.187792] ---[ end trace 0373e6b491c4a8cc ]---
+
+This is because we don't do proper space reservation for the chunk block
+reserve when we have multiple tasks allocating chunks in parallel.
+
+So block group creation has 2 phases, and the first phase essentially
+checks if there is enough space in the system space_info, allocating a
+new system chunk if there isn't, while the second phase updates the
+device, extent and chunk trees. However, because the updates to the
+chunk tree happen in the second phase, if we have N tasks, each with
+its own transaction handle, allocating new chunks in parallel and if
+there is only enough space in the system space_info to allocate M chunks,
+where M < N, none of the tasks ends up allocating a new system chunk in
+the first phase and N - M tasks will get -ENOSPC when attempting to
+update the chunk tree in phase 2 if they need to COW any nodes/leafs
+from the chunk tree.
+
+Fix this by doing proper reservation in the chunk block reserve.
+
+The issue could be reproduced by running fstests generic/038 in a loop,
+which eventually triggered the problem.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

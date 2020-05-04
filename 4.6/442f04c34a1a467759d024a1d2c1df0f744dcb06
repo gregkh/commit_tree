@@ -1,0 +1,166 @@
+objtool: Add tool to perform compile-time stack metadata validation
+
+This adds a host tool named objtool which has a "check" subcommand which
+analyzes .o files to ensure the validity of stack metadata.  It enforces
+a set of rules on asm code and C inline assembly code so that stack
+traces can be reliable.
+
+For each function, it recursively follows all possible code paths and
+validates the correct frame pointer state at each instruction.
+
+It also follows code paths involving kernel special sections, like
+.altinstructions, __jump_table, and __ex_table, which can add
+alternative execution paths to a given instruction (or set of
+instructions).  Similarly, it knows how to follow switch statements, for
+which gcc sometimes uses jump tables.
+
+Here are some of the benefits of validating stack metadata:
+
+a) More reliable stack traces for frame pointer enabled kernels
+
+   Frame pointers are used for debugging purposes.  They allow runtime
+   code and debug tools to be able to walk the stack to determine the
+   chain of function call sites that led to the currently executing
+   code.
+
+   For some architectures, frame pointers are enabled by
+   CONFIG_FRAME_POINTER.  For some other architectures they may be
+   required by the ABI (sometimes referred to as "backchain pointers").
+
+   For C code, gcc automatically generates instructions for setting up
+   frame pointers when the -fno-omit-frame-pointer option is used.
+
+   But for asm code, the frame setup instructions have to be written by
+   hand, which most people don't do.  So the end result is that
+   CONFIG_FRAME_POINTER is honored for C code but not for most asm code.
+
+   For stack traces based on frame pointers to be reliable, all
+   functions which call other functions must first create a stack frame
+   and update the frame pointer.  If a first function doesn't properly
+   create a stack frame before calling a second function, the *caller*
+   of the first function will be skipped on the stack trace.
+
+   For example, consider the following example backtrace with frame
+   pointers enabled:
+
+     [<ffffffff81812584>] dump_stack+0x4b/0x63
+     [<ffffffff812d6dc2>] cmdline_proc_show+0x12/0x30
+     [<ffffffff8127f568>] seq_read+0x108/0x3e0
+     [<ffffffff812cce62>] proc_reg_read+0x42/0x70
+     [<ffffffff81256197>] __vfs_read+0x37/0x100
+     [<ffffffff81256b16>] vfs_read+0x86/0x130
+     [<ffffffff81257898>] SyS_read+0x58/0xd0
+     [<ffffffff8181c1f2>] entry_SYSCALL_64_fastpath+0x12/0x76
+
+   It correctly shows that the caller of cmdline_proc_show() is
+   seq_read().
+
+   If we remove the frame pointer logic from cmdline_proc_show() by
+   replacing the frame pointer related instructions with nops, here's
+   what it looks like instead:
+
+     [<ffffffff81812584>] dump_stack+0x4b/0x63
+     [<ffffffff812d6dc2>] cmdline_proc_show+0x12/0x30
+     [<ffffffff812cce62>] proc_reg_read+0x42/0x70
+     [<ffffffff81256197>] __vfs_read+0x37/0x100
+     [<ffffffff81256b16>] vfs_read+0x86/0x130
+     [<ffffffff81257898>] SyS_read+0x58/0xd0
+     [<ffffffff8181c1f2>] entry_SYSCALL_64_fastpath+0x12/0x76
+
+   Notice that cmdline_proc_show()'s caller, seq_read(), has been
+   skipped.  Instead the stack trace seems to show that
+   cmdline_proc_show() was called by proc_reg_read().
+
+   The benefit of "objtool check" here is that because it ensures that
+   *all* functions honor CONFIG_FRAME_POINTER, no functions will ever[*]
+   be skipped on a stack trace.
+
+   [*] unless an interrupt or exception has occurred at the very
+       beginning of a function before the stack frame has been created,
+       or at the very end of the function after the stack frame has been
+       destroyed.  This is an inherent limitation of frame pointers.
+
+b) 100% reliable stack traces for DWARF enabled kernels
+
+   This is not yet implemented.  For more details about what is planned,
+   see tools/objtool/Documentation/stack-validation.txt.
+
+c) Higher live patching compatibility rate
+
+   This is not yet implemented.  For more details about what is planned,
+   see tools/objtool/Documentation/stack-validation.txt.
+
+To achieve the validation, "objtool check" enforces the following rules:
+
+1. Each callable function must be annotated as such with the ELF
+   function type.  In asm code, this is typically done using the
+   ENTRY/ENDPROC macros.  If objtool finds a return instruction
+   outside of a function, it flags an error since that usually indicates
+   callable code which should be annotated accordingly.
+
+   This rule is needed so that objtool can properly identify each
+   callable function in order to analyze its stack metadata.
+
+2. Conversely, each section of code which is *not* callable should *not*
+   be annotated as an ELF function.  The ENDPROC macro shouldn't be used
+   in this case.
+
+   This rule is needed so that objtool can ignore non-callable code.
+   Such code doesn't have to follow any of the other rules.
+
+3. Each callable function which calls another function must have the
+   correct frame pointer logic, if required by CONFIG_FRAME_POINTER or
+   the architecture's back chain rules.  This can by done in asm code
+   with the FRAME_BEGIN/FRAME_END macros.
+
+   This rule ensures that frame pointer based stack traces will work as
+   designed.  If function A doesn't create a stack frame before calling
+   function B, the _caller_ of function A will be skipped on the stack
+   trace.
+
+4. Dynamic jumps and jumps to undefined symbols are only allowed if:
+
+   a) the jump is part of a switch statement; or
+
+   b) the jump matches sibling call semantics and the frame pointer has
+      the same value it had on function entry.
+
+   This rule is needed so that objtool can reliably analyze all of a
+   function's code paths.  If a function jumps to code in another file,
+   and it's not a sibling call, objtool has no way to follow the jump
+   because it only analyzes a single file at a time.
+
+5. A callable function may not execute kernel entry/exit instructions.
+   The only code which needs such instructions is kernel entry code,
+   which shouldn't be be in callable functions anyway.
+
+   This rule is just a sanity check to ensure that callable functions
+   return normally.
+
+It currently only supports x86_64.  I tried to make the code generic so
+that support for other architectures can hopefully be plugged in
+relatively easily.
+
+On my Lenovo laptop with a i7-4810MQ 4-core/8-thread CPU, building the
+kernel with objtool checking every .o file adds about three seconds of
+total build time.  It hasn't been optimized for performance yet, so
+there are probably some opportunities for better build performance.
+
+Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Bernd Petrovitsch <bernd@petrovitsch.priv.at>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Chris J Arges <chris.j.arges@canonical.com>
+Cc: Jiri Slaby <jslaby@suse.cz>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Michal Marek <mmarek@suse.cz>
+Cc: Namhyung Kim <namhyung@gmail.com>
+Cc: Pedro Alves <palves@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: live-patching@vger.kernel.org
+Link: http://lkml.kernel.org/r/f3efb173de43bd067b060de73f856567c0fa1174.1456719558.git.jpoimboe@redhat.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

@@ -1,0 +1,200 @@
+perf tools: add JVMTI agent library
+
+This is a standalone JVMTI library to help  profile Java jitted code with perf
+record/perf report. The library is not installed or compiled automatically by
+perf Makefile. It is not used directly by perf. It is arch agnostic and has
+been tested on X86 and ARM. It needs to be used with a Java runtime, such as
+OpenJDK, as follows:
+
+  $ java -agentpath:libjvmti.so .......
+
+See the "Committer Notes" below on how to build it.
+
+When used this way, java will generate a jitdump binary file in
+$HOME/.debug/java/jit/java-jit-*
+
+This binary dump file contains information to help symbolize and
+annotate jitted code.
+
+The jitdump information must be injected into the perf.data file
+using:
+
+  $ perf inject --jit -i perf.data -o perf.data.jitted
+
+This injects the MMAP records to cover the jitted code and also generates
+one ELF image for each jitted function. The ELF images are created in the
+same subdir as the jitdump file. The MMAP records point there too.
+
+Then, to visualize the function or asm profile, simply use the regular
+perf commands:
+
+  $ perf report -i perf.data.jitted
+
+or
+
+  $ perf annotate -i perf.data.jitted
+
+JVMTI agent code adapted from the OProfile's opagent code.
+
+This version of the JVMTI agent is using the CLOCK_MONOTONIC as the time
+source to timestamp jit samples. To correlate with perf_events samples,
+it needs to run on kernel 4.0.0-rc5+ or later with the following commit
+from Peter Zijlstra:
+
+  34f439278cef ("perf: Add per event clockid support")
+
+With this patch recording jitted code is done as follows:
+
+   $ perf record -k mono -- java -agentpath:libjvmti.so .......
+
+ --------------------------------------------------------------------------
+
+Committer Notes:
+
+Extended testing instructions:
+
+  $ cd tools/perf/jvmti/
+  $ dnf install java-devel
+  $ make
+
+Then, create some simple java stuff to record some samples:
+
+  $ cat hello.java
+  public class hello {
+	public static void main(String[] args) {
+                 System.out.println("Hello, World");
+       	}
+  }
+  $ javac hello.java
+  $ java hello
+  Hello, World
+  $
+
+And then record it using this jvmti thing:
+
+  $ perf record -k mono java -agentpath:/home/acme/git/linux/tools/perf/jvmti/libjvmti.so hello
+  java: jvmti: jitdump in /home/acme/.debug/jit/java-jit-20160205.XXWIEDls/jit-1908.dump
+  Hello, World
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.030 MB perf.data (268 samples) ]
+  $
+
+Now lets insert the PERF_RECORD_MMAP2 records to point jitted mmaps to
+files created by the agent:
+
+  $ perf inject --jit -i perf.data -o perf.data.jitted
+
+And finally see that it did its job:
+
+  $ perf report -D -i perf.data.jitted | grep PERF_RECORD_MMAP2 | tail -5
+  79197149129422 0xfe10 [0xa0]: PERF_RECORD_MMAP2 1908/1923: [0x7f172428bd60(0x80) @ 0x40 fd:02 1840554 1]: --xs /home/acme/.debug/jit/java-jit-20160205.XXWIEDls/jitted-1908-283.so
+  79197149235701 0xfeb0 [0xa0]: PERF_RECORD_MMAP2 1908/1923: [0x7f172428ba60(0x180) @ 0x40 fd:02 1840555 1]: --xs /home/acme/.debug/jit/java-jit-20160205.XXWIEDls/jitted-1908-284.so
+  79197149250558 0xff50 [0xa0]: PERF_RECORD_MMAP2 1908/1923: [0x7f172428b860(0x180) @ 0x40 fd:02 1840556 1]: --xs /home/acme/.debug/jit/java-jit-20160205.XXWIEDls/jitted-1908-285.so
+  79197149714746 0xfff0 [0xa0]: PERF_RECORD_MMAP2 1908/1923: [0x7f172428b660(0x180) @ 0x40 fd:02 1840557 1]: --xs /home/acme/.debug/jit/java-jit-20160205.XXWIEDls/jitted-1908-286.so
+  79197149806558 0x10090 [0xa0]: PERF_RECORD_MMAP2 1908/1923: [0x7f172428b460(0x180) @ 0x40 fd:02 1840558 1]: --xs /home/acme/.debug/jit/java-jit-20160205.XXWIEDls/jitted-1908-287.so
+  $
+
+So:
+
+  $ perf report -D -i perf.data | grep PERF_RECORD_MMAP2 | wc -l
+  Failed to open /tmp/perf-1908.map, continuing without symbols
+  21
+  $ perf report -D -i perf.data.jitted | grep PERF_RECORD_MMAP2 | wc -l
+  307
+  $ echo $((307 - 21))
+  286
+  $
+
+286 extra PERF_RECORD_MMAP2 records.
+
+All for thise tiny, with just one function, ELF files:
+
+  $ file /home/acme/.debug/jit/java-jit-20160205.XXWIEDls/jitted-1908-9.so
+  /home/acme/.debug/jit/java-jit-20160205.XXWIEDls/jitted-1908-9.so: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), corrupted program header size, BuildID[sha1]=ae54a2ebc3ecf0ba547bfc8cabdea1519df5203f, not stripped
+  $ readelf -sw /home/acme/.debug/jit/java-jit-20160205.XXWIEDls/jitted-1908-9.so
+
+  Symbol table '.symtab' contains 2 entries:
+   Num:    Value          Size Type    Bind   Vis      Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT  UND
+     1: 0000000000000040     9 FUNC    LOCAL  DEFAULT    1 atomic_cmpxchg_long
+  $
+
+Inserted into the build-id cache:
+
+  $ ls -la ~/.debug/.build-id/ae/54a2ebc3ecf0ba547bfc8cabdea1519df5203f
+  lrwxrwxrwx. 1 acme acme 111 Feb  5 11:30 /home/acme/.debug/.build-id/ae/54a2ebc3ecf0ba547bfc8cabdea1519df5203f -> ../../home/acme/.debug/jit/java-jit-20160205.XXWIEDls/jitted-1908-9.so/ae54a2ebc3ecf0ba547bfc8cabdea1519df5203f
+
+Note: check why 'file' reports that 'corrupted program header size'.
+
+With a stupid java hog to do some profiling:
+
+$ cat hog.java
+  public class hog {
+	private static double do_something_else(int i) {
+		double total = 0;
+		while (i > 0) {
+			total += Math.log(i--);
+		}
+		return total;
+	}
+	private static double do_something(int i) {
+		double total = 0;
+		while (i > 0) {
+			total += Math.sqrt(i--) + do_something_else(i / 100);
+		}
+		return total;
+	}
+	public static void main(String[] args) {
+		System.out.println(String.format("%s=%f & %f", args[0],
+				   do_something(Integer.parseInt(args[0])),
+				   do_something_else(Integer.parseInt(args[1]))));
+	}
+  }
+  $ javac hog.java
+  $ perf record -F 10000 -g -k mono java -agentpath:/home/acme/git/linux/tools/perf/jvmti/libjvmti.so hog 100000 2345000
+  java: jvmti: jitdump in /home/acme/.debug/jit/java-jit-20160205.XX4sqd14/jit-8670.dump
+  100000=291561592.669602 & 32050989.778714
+  [ perf record: Woken up 6 times to write data ]
+  [ perf record: Captured and wrote 1.536 MB perf.data (12538 samples) ]
+  $ perf inject --jit -i perf.data -o perf.data.jitted
+
+Looking at the 'perf report' TUI, at one expanded callchain leading
+to the jitted code:
+
+  $ perf report --no-children -i perf.data.jitted
+
+Samples: 12K of event 'cycles:pp', Event count (approx.): 3829569932
+  Overhead  Comm  Shared Object       Symbol
+-   93.38%  java  jitted-8670-291.so  [.] class hog.do_something_else(int)
+     class hog.do_something_else(int)
+   - Interpreter
+      - 75.86% call_stub
+           JavaCalls::call_helper
+           jni_invoke_static
+           jni_CallStaticVoidMethod
+           JavaMain
+           start_thread
+      - 17.52% JavaCalls::call_helper
+           jni_invoke_static
+           jni_CallStaticVoidMethod
+           JavaMain
+           start_thread
+
+Signed-off-by: Stephane Eranian <eranian@google.com>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Carl Love <cel@us.ibm.com>
+Cc: David Ahern <dsahern@gmail.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: John McCutchan <johnmccutchan@google.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Pawel Moll <pawel.moll@arm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sonny Rao <sonnyrao@chromium.org>
+Cc: Sukadev Bhattiprolu <sukadev@linux.vnet.ibm.com>
+Link: http://lkml.kernel.org/r/1448874143-7269-4-git-send-email-eranian@google.com
+[ Made it build on fedora23, added some build/usage instructions ]
+[ Check if filename != NULL in compiled_method_load_cb, fixing segfault ]
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

@@ -1,0 +1,88 @@
+MIPS: Use per-mm page to execute branch delay slot instructions
+
+In some cases the kernel needs to execute an instruction from the delay
+slot of an emulated branch instruction. These cases include:
+
+  - Emulated floating point branch instructions (bc1[ft]l?) for systems
+    which don't include an FPU, or upon which the kernel is run with the
+    "nofpu" parameter.
+
+  - MIPSr6 systems running binaries targeting older revisions of the
+    architecture, which may include branch instructions whose encodings
+    are no longer valid in MIPSr6.
+
+Executing instructions from such delay slots is done by writing the
+instruction to memory followed by a trap, as part of an "emuframe", and
+executing it. This avoids the requirement of an emulator for the entire
+MIPS instruction set. Prior to this patch such emuframes are written to
+the user stack and executed from there.
+
+This patch moves FP branch delay emuframes off of the user stack and
+into a per-mm page. Allocating a page per-mm leaves userland with access
+to only what it had access to previously, and compared to other
+solutions is relatively simple.
+
+When a thread requires a delay slot emulation, it is allocated a frame.
+A thread may only have one frame allocated at any one time, since it may
+only ever be executing one instruction at any one time. In order to
+ensure that we can free up allocated frame later, its index is recorded
+in struct thread_struct. In the typical case, after executing the delay
+slot instruction we'll execute a break instruction with the BRK_MEMU
+code. This traps back to the kernel & leads to a call to do_dsemulret
+which frees the allocated frame & moves the user PC back to the
+instruction that would have executed following the emulated branch.
+In some cases the delay slot instruction may be invalid, such as a
+branch, or may trigger an exception. In these cases the BRK_MEMU break
+instruction will not be hit. In order to ensure that frames are freed
+this patch introduces dsemul_thread_cleanup() and calls it to free any
+allocated frame upon thread exit. If the instruction generated an
+exception & leads to a signal being delivered to the thread, or indeed
+if a signal simply happens to be delivered to the thread whilst it is
+executing from the struct emuframe, then we need to take care to exit
+the frame appropriately. This is done by either rolling back the user PC
+to the branch or advancing it to the continuation PC prior to signal
+delivery, using dsemul_thread_rollback(). If this were not done then a
+sigreturn would return to the struct emuframe, and if that frame had
+meanwhile been used in response to an emulated branch instruction within
+the signal handler then we would execute the wrong user code.
+
+Whilst a user could theoretically place something like a compact branch
+to self in a delay slot and cause their thread to become stuck in an
+infinite loop with the frame never being deallocated, this would:
+
+  - Only affect the users single process.
+
+  - Be architecturally invalid since there would be a branch in the
+    delay slot, which is forbidden.
+
+  - Be extremely unlikely to happen by mistake, and provide a program
+    with no more ability to harm the system than a simple infinite loop
+    would.
+
+If a thread requires a delay slot emulation & no frame is available to
+it (ie. the process has enough other threads that all frames are
+currently in use) then the thread joins a waitqueue. It will sleep until
+a frame is freed by another thread in the process.
+
+Since we now know whether a thread has an allocated frame due to our
+tracking of its index, the cookie field of struct emuframe is removed as
+we can be more certain whether we have a valid frame. Since a thread may
+only ever have a single frame at any given time, the epc field of struct
+emuframe is also removed & the PC to continue from is instead stored in
+struct thread_struct. Together these changes simplify & shrink struct
+emuframe somewhat, allowing twice as many frames to fit into the page
+allocated for them.
+
+The primary benefit of this patch is that we are now free to mark the
+user stack non-executable where that is possible.
+
+Signed-off-by: Paul Burton <paul.burton@imgtec.com>
+Cc: Leonid Yegoshin <leonid.yegoshin@imgtec.com>
+Cc: Maciej Rozycki <maciej.rozycki@imgtec.com>
+Cc: Faraz Shahbazker <faraz.shahbazker@imgtec.com>
+Cc: Raghu Gandham <raghu.gandham@imgtec.com>
+Cc: Matthew Fortune <matthew.fortune@imgtec.com>
+Cc: linux-mips@linux-mips.org
+Patchwork: https://patchwork.linux-mips.org/patch/13764/
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+

@@ -1,0 +1,79 @@
+Btrfs: fix file loss on log replay after renaming a file and fsync
+
+We have two cases where we end up deleting a file at log replay time
+when we should not. For this to happen the file must have been renamed
+and a directory inode must have been fsynced/logged.
+
+Two examples that exercise these two cases are listed below.
+
+  Case 1)
+
+  $ mkfs.btrfs -f /dev/sdb
+  $ mount /dev/sdb /mnt
+  $ mkdir -p /mnt/a/b
+  $ mkdir /mnt/c
+  $ touch /mnt/a/b/foo
+  $ sync
+  $ mv /mnt/a/b/foo /mnt/c/
+  # Create file bar just to make sure the fsync on directory a/ does
+  # something and it's not a no-op.
+  $ touch /mnt/a/bar
+  $ xfs_io -c "fsync" /mnt/a
+  < power fail / crash >
+
+  The next time the filesystem is mounted, the log replay procedure
+  deletes file foo.
+
+  Case 2)
+
+  $ mkfs.btrfs -f /dev/sdb
+  $ mount /dev/sdb /mnt
+  $ mkdir /mnt/a
+  $ mkdir /mnt/b
+  $ mkdir /mnt/c
+  $ touch /mnt/a/foo
+  $ ln /mnt/a/foo /mnt/b/foo_link
+  $ touch /mnt/b/bar
+  $ sync
+  $ unlink /mnt/b/foo_link
+  $ mv /mnt/b/bar /mnt/c/
+  $ xfs_io -c "fsync" /mnt/a/foo
+  < power fail / crash >
+
+  The next time the filesystem is mounted, the log replay procedure
+  deletes file bar.
+
+The reason why the files are deleted is because when we log inodes
+other then the fsync target inode, we ignore their last_unlink_trans
+value and leave the log without enough information to later replay the
+rename operations. So we need to look at the last_unlink_trans values
+and fallback to a transaction commit if they are greater than the
+id of the last committed transaction.
+
+So fix this by looking at the last_unlink_trans values and fallback to
+transaction commits when needed. Also, when logging other inodes (for
+case 1 we logged descendants of the fsync target inode while for case 2
+we logged ascendants) we need to care about concurrent tasks updating
+the last_unlink_trans of inodes we are logging (which was already an
+existing problem in check_parent_dirs_for_sync()). Since we can not
+acquire their inode mutex (vfs' struct inode ->i_mutex), as that causes
+deadlocks with other concurrent operations that acquire the i_mutex of
+2 inodes (other fsyncs or renames for example), we need to serialize on
+the log_mutex of the inode we are logging. A task setting a new value for
+an inode's last_unlink_trans must acquire the inode's log_mutex and it
+must do this update before doing the actual unlink operation (which is
+already the case except when deleting a snapshot). Conversely the task
+logging the inode must first log the inode and then check the inode's
+last_unlink_trans value while holding its log_mutex, as if its value is
+not greater then the id of the last committed transaction it means it
+logged a safe state of the inode's items, while if its value is not
+smaller then the id of the last committed transaction it means the inode
+state it has logged might not be safe (the concurrent task might have
+just updated last_unlink_trans but hasn't done yet the unlink operation)
+and therefore a transaction commit must be done.
+
+Test cases for xfstests follow in separate patches.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

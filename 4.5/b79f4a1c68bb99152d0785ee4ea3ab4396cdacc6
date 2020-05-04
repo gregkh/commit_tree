@@ -1,0 +1,70 @@
+xfs: inode recovery readahead can race with inode buffer creation
+
+When we do inode readahead in log recovery, we do can do the
+readahead before we've replayed the icreate transaction that stamps
+the buffer with inode cores. The inode readahead verifier catches
+this and marks the buffer as !done to indicate that it doesn't yet
+contain valid inodes.
+
+In adding buffer error notification  (i.e. setting b_error = -EIO at
+the same time as as we clear the done flag) to such a readahead
+verifier failure, we can then get subsequent inode recovery failing
+with this error:
+
+XFS (dm-0): metadata I/O error: block 0xa00060 ("xlog_recover_do..(read#2)") error 5 numblks 32
+
+This occurs when readahead completion races with icreate item replay
+such as:
+
+	inode readahead
+		find buffer
+		lock buffer
+		submit RA io
+	....
+	icreate recovery
+	    xfs_trans_get_buffer
+		find buffer
+		lock buffer
+		<blocks on RA completion>
+	.....
+	<ra completion>
+		fails verifier
+		clear XBF_DONE
+		set bp->b_error = -EIO
+		release and unlock buffer
+	<icreate gains lock>
+	icreate initialises buffer
+	marks buffer as done
+	adds buffer to delayed write queue
+	releases buffer
+
+At this point, we have an initialised inode buffer that is up to
+date but has an -EIO state registered against it. When we finally
+get to recovering an inode in that buffer:
+
+	inode item recovery
+	    xfs_trans_read_buffer
+		find buffer
+		lock buffer
+		sees XBF_DONE is set, returns buffer
+	    sees bp->b_error is set
+		fail log recovery!
+
+Essentially, we need xfs_trans_get_buf_map() to clear the error status of
+the buffer when doing a lookup. This function returns uninitialised
+buffers, so the buffer returned can not be in an error state and
+none of the code that uses this function expects b_error to be set
+on return. Indeed, there is an ASSERT(!bp->b_error); in the
+transaction case in xfs_trans_get_buf_map() that would have caught
+this if log recovery used transactions....
+
+This patch firstly changes the inode readahead failure to set -EIO
+on the buffer, and secondly changes xfs_buf_get_map() to never
+return a buffer with an error state set so this first change doesn't
+cause unexpected log recovery failures.
+
+cc: <stable@vger.kernel.org> # 3.12 - current
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+

@@ -1,0 +1,216 @@
+mm: support madvise(MADV_FREE)
+
+Linux doesn't have an ability to free pages lazy while other OS already
+have been supported that named by madvise(MADV_FREE).
+
+The gain is clear that kernel can discard freed pages rather than
+swapping out or OOM if memory pressure happens.
+
+Without memory pressure, freed pages would be reused by userspace
+without another additional overhead(ex, page fault + allocation +
+zeroing).
+
+Jason Evans said:
+
+: Facebook has been using MAP_UNINITIALIZED
+: (https://lkml.org/lkml/2012/1/18/308) in some of its applications for
+: several years, but there are operational costs to maintaining this
+: out-of-tree in our kernel and in jemalloc, and we are anxious to retire it
+: in favor of MADV_FREE.  When we first enabled MAP_UNINITIALIZED it
+: increased throughput for much of our workload by ~5%, and although the
+: benefit has decreased using newer hardware and kernels, there is still
+: enough benefit that we cannot reasonably retire it without a replacement.
+:
+: Aside from Facebook operations, there are numerous broadly used
+: applications that would benefit from MADV_FREE.  The ones that immediately
+: come to mind are redis, varnish, and MariaDB.  I don't have much insight
+: into Android internals and development process, but I would hope to see
+: MADV_FREE support eventually end up there as well to benefit applications
+: linked with the integrated jemalloc.
+:
+: jemalloc will use MADV_FREE once it becomes available in the Linux kernel.
+: In fact, jemalloc already uses MADV_FREE or equivalent everywhere it's
+: available: *BSD, OS X, Windows, and Solaris -- every platform except Linux
+: (and AIX, but I'm not sure it even compiles on AIX).  The lack of
+: MADV_FREE on Linux forced me down a long series of increasingly
+: sophisticated heuristics for madvise() volume reduction, and even so this
+: remains a common performance issue for people using jemalloc on Linux.
+: Please integrate MADV_FREE; many people will benefit substantially.
+
+How it works:
+
+When madvise syscall is called, VM clears dirty bit of ptes of the
+range.  If memory pressure happens, VM checks dirty bit of page table
+and if it found still "clean", it means it's a "lazyfree pages" so VM
+could discard the page instead of swapping out.  Once there was store
+operation for the page before VM peek a page to reclaim, dirty bit is
+set so VM can swap out the page instead of discarding.
+
+One thing we should notice is that basically, MADV_FREE relies on dirty
+bit in page table entry to decide whether VM allows to discard the page
+or not.  IOW, if page table entry includes marked dirty bit, VM
+shouldn't discard the page.
+
+However, as a example, if swap-in by read fault happens, page table
+entry doesn't have dirty bit so MADV_FREE could discard the page
+wrongly.
+
+For avoiding the problem, MADV_FREE did more checks with PageDirty and
+PageSwapCache.  It worked out because swapped-in page lives on swap
+cache and since it is evicted from the swap cache, the page has PG_dirty
+flag.  So both page flags check effectively prevent wrong discarding by
+MADV_FREE.
+
+However, a problem in above logic is that swapped-in page has PG_dirty
+still after they are removed from swap cache so VM cannot consider the
+page as freeable any more even if madvise_free is called in future.
+
+Look at below example for detail.
+
+    ptr = malloc();
+    memset(ptr);
+    ..
+    ..
+    .. heavy memory pressure so all of pages are swapped out
+    ..
+    ..
+    var = *ptr; -> a page swapped-in and could be removed from
+                   swapcache. Then, page table doesn't mark
+                   dirty bit and page descriptor includes PG_dirty
+    ..
+    ..
+    madvise_free(ptr); -> It doesn't clear PG_dirty of the page.
+    ..
+    ..
+    ..
+    .. heavy memory pressure again.
+    .. In this time, VM cannot discard the page because the page
+    .. has *PG_dirty*
+
+To solve the problem, this patch clears PG_dirty if only the page is
+owned exclusively by current process when madvise is called because
+PG_dirty represents ptes's dirtiness in several processes so we could
+clear it only if we own it exclusively.
+
+Firstly, heavy users would be general allocators(ex, jemalloc, tcmalloc
+and hope glibc supports it) and jemalloc/tcmalloc already have supported
+the feature for other OS(ex, FreeBSD)
+
+  barrios@blaptop:~/benchmark/ebizzy$ lscpu
+  Architecture:          x86_64
+  CPU op-mode(s):        32-bit, 64-bit
+  Byte Order:            Little Endian
+  CPU(s):                12
+  On-line CPU(s) list:   0-11
+  Thread(s) per core:    1
+  Core(s) per socket:    1
+  Socket(s):             12
+  NUMA node(s):          1
+  Vendor ID:             GenuineIntel
+  CPU family:            6
+  Model:                 2
+  Stepping:              3
+  CPU MHz:               3200.185
+  BogoMIPS:              6400.53
+  Virtualization:        VT-x
+  Hypervisor vendor:     KVM
+  Virtualization type:   full
+  L1d cache:             32K
+  L1i cache:             32K
+  L2 cache:              4096K
+  NUMA node0 CPU(s):     0-11
+  ebizzy benchmark(./ebizzy -S 10 -n 512)
+
+  Higher avg is better.
+
+   vanilla-jemalloc             MADV_free-jemalloc
+
+  1 thread
+  records: 10                   records: 10
+  avg:   2961.90                avg:  12069.70
+  std:     71.96(2.43%)         std:    186.68(1.55%)
+  max:   3070.00                max:  12385.00
+  min:   2796.00                min:  11746.00
+
+  2 thread
+  records: 10                   records: 10
+  avg:   5020.00                avg:  17827.00
+  std:    264.87(5.28%)         std:    358.52(2.01%)
+  max:   5244.00                max:  18760.00
+  min:   4251.00                min:  17382.00
+
+  4 thread
+  records: 10                   records: 10
+  avg:   8988.80                avg:  27930.80
+  std:   1175.33(13.08%)        std:   3317.33(11.88%)
+  max:   9508.00                max:  30879.00
+  min:   5477.00                min:  21024.00
+
+  8 thread
+  records: 10                   records: 10
+  avg:  13036.50                avg:  33739.40
+  std:    170.67(1.31%)         std:   5146.22(15.25%)
+  max:  13371.00                max:  40572.00
+  min:  12785.00                min:  24088.00
+
+  16 thread
+  records: 10                   records: 10
+  avg:  11092.40                avg:  31424.20
+  std:    710.60(6.41%)         std:   3763.89(11.98%)
+  max:  12446.00                max:  36635.00
+  min:   9949.00                min:  25669.00
+
+  32 thread
+  records: 10                   records: 10
+  avg:  11067.00                avg:  34495.80
+  std:    971.06(8.77%)         std:   2721.36(7.89%)
+  max:  12010.00                max:  38598.00
+  min:   9002.00                min:  30636.00
+
+In summary, MADV_FREE is about much faster than MADV_DONTNEED.
+
+This patch (of 12):
+
+Add core MADV_FREE implementation.
+
+[akpm@linux-foundation.org: small cleanups]
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Hugh Dickins <hughd@google.com>
+Cc: Mika Penttil <mika.penttila@nextfour.com>
+Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+Cc: Jason Evans <je@fb.com>
+Cc: Daniel Micay <danielmicay@gmail.com>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Cc: Shaohua Li <shli@kernel.org>
+Cc: <yalin.wang2010@gmail.com>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: "James E.J. Bottomley" <jejb@parisc-linux.org>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Cc: "Shaohua Li" <shli@kernel.org>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Chen Gang <gang.chen.5i5j@gmail.com>
+Cc: Chris Zankel <chris@zankel.net>
+Cc: Darrick J. Wong <darrick.wong@oracle.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Helge Deller <deller@gmx.de>
+Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+Cc: Matt Turner <mattst88@gmail.com>
+Cc: Max Filippov <jcmvbkbc@gmail.com>
+Cc: Ralf Baechle <ralf@linux-mips.org>
+Cc: Richard Henderson <rth@twiddle.net>
+Cc: Roland Dreier <roland@kernel.org>
+Cc: Russell King <rmk@arm.linux.org.uk>
+Cc: Shaohua Li <shli@kernel.org>
+Cc: Will Deacon <will.deacon@arm.com>
+Cc: Wu Fengguang <fengguang.wu@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

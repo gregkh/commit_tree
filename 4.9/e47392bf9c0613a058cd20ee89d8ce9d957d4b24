@@ -1,0 +1,145 @@
+perf uprobe: Skip prologue if program compiled without optimization
+
+The function prologue prepares stack and registers before executing
+function logic.
+
+When target program is compiled without optimization, function parameter
+information is only valid after the prologue.
+
+When we probe entrypc of the function, and try to record a function
+parameter, it contains a garbage value.
+
+For example:
+
+  $ vim test.c
+    #include <stdio.h>
+
+    void foo(int i)
+    {
+       printf("i: %d\n", i);
+    }
+
+    int main()
+    {
+      foo(42);
+      return 0;
+    }
+
+  $ gcc -g test.c -o test
+  $ objdump -dl test | less
+    foo():
+    /home/ravi/test.c:4
+      400536:       55                      push   %rbp
+      400537:       48 89 e5                mov    %rsp,%rbp
+      40053a:       48 83 ec 10             sub    -bashx10,%rsp
+      40053e:       89 7d fc                mov    %edi,-0x4(%rbp)
+    /home/ravi/test.c:5
+      400541:       8b 45 fc                mov    -0x4(%rbp),%eax
+    ...
+    ...
+    main():
+    /home/ravi/test.c:9
+      400558:       55                      push   %rbp
+      400559:       48 89 e5                mov    %rsp,%rbp
+    /home/ravi/test.c:10
+      40055c:       bf 2a 00 00 00          mov    -bashx2a,%edi
+      400561:       e8 d0 ff ff ff          callq  400536 <foo>
+
+  $ perf probe -x ./test 'foo i'
+  $ cat /sys/kernel/debug/tracing/uprobe_events
+     p:probe_test/foo /home/ravi/test:0x0000000000000536 i=-12(%sp):s32
+
+  $ perf record -e probe_test:foo ./test
+  $ perf script
+     test  5778 [001]  4918.562027: probe_test:foo: (400536) i=0
+
+Here variable 'i' is passed via stack which is pushed on stack at
+0x40053e. But we are probing at 0x400536.
+
+To resolve this issues, we need to probe on next instruction after
+prologue.  gdb and systemtap also does same thing. I've implemented this
+patch based on approach systemtap has used.
+
+After applying patch:
+
+  $ perf probe -x ./test 'foo i'
+  $ cat /sys/kernel/debug/tracing/uprobe_events
+    p:probe_test/foo /home/ravi/test:0x0000000000000541 i=-4(%bp):s32
+
+  $ perf record -e probe_test:foo ./test
+  $ perf script
+    test  6300 [001]  5877.879327: probe_test:foo: (400541) i=42
+
+No need to skip prologue for optimized case since debug info is correct
+for each instructions for -O2 -g. For more details please visit:
+
+        https://bugzilla.redhat.com/show_bug.cgi?id=612253#c6
+
+Changes in v2:
+
+- Skipping prologue only when any ARG is either C variable, $params or
+  $vars.
+
+- Probe on line(:1) may not be always possible. Recommend only address
+  to force probe on function entry.
+
+Committer notes:
+
+Testing it with 'perf trace':
+
+  # perf probe -x ./test foo i
+  Added new event:
+    probe_test:foo       (on foo in /home/acme/c/test with i)
+
+  You can now use it in all perf tools, such as:
+
+	  perf record -e probe_test:foo -aR sleep 1
+
+  # cat /sys/kernel/debug/tracing/uprobe_events
+  p:probe_test/foo /home/acme/c/test:0x0000000000000526 i=-12(%sp):s32
+  # trace --no-sys --event probe_*:* ./test
+  i: 42
+     0.000 probe_test:foo:(400526) i=0)
+  #
+
+After the patch:
+
+  # perf probe -d *:*
+  Removed event: probe_test:foo
+  # perf probe -x ./test foo i
+  Target program is compiled without optimization. Skipping prologue.
+  Probe on address 0x400526 to force probing at the function entry.
+
+  Added new event:
+    probe_test:foo       (on foo in /home/acme/c/test with i)
+
+  You can now use it in all perf tools, such as:
+
+	perf record -e probe_test:foo -aR sleep 1
+
+  # cat /sys/kernel/debug/tracing/uprobe_events
+  p:probe_test/foo /home/acme/c/test:0x0000000000000531 i=-4(%bp):s32
+  # trace --no-sys --event probe_*:* ./test
+  i: 42
+     0.000 probe_test:foo:(400531) i=42)
+  #
+
+Reported-by: Michael Petlan <mpetlan@redhat.com>
+Report-Link: https://www.mail-archive.com/linux-perf-users@vger.kernel.org/msg02348.html
+Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.vnet.ibm.com>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Tested-by: Jiri Olsa <jolsa@kernel.org>
+Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
+Acked-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Hemant Kumar <hemant@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Wang Nan <wangnan0@huawei.com>
+Cc: Yauheni Kaliuta <yauheni.kaliuta@redhat.com>
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1299021
+Link: http://lkml.kernel.org/r/1470214725-5023-2-git-send-email-ravi.bangoria@linux.vnet.ibm.com
+[ Rename 'die' to 'cu_die' to avoid shadowing a die() definition on at least centos 5, Debian 7 and ubuntu:12.04.5]
+[ Use PRIx64 instead of lx to format a Dwarf_Addr, aka long long unsigned int, fixing the build on 32-bit systems ]
+[ dwarf_getsrclines() expects a size_t * argument ]
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

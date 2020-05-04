@@ -1,0 +1,65 @@
+locking/static_key: Fix concurrent static_key_slow_inc()
+
+The following scenario is possible:
+
+    CPU 1                                   CPU 2
+    static_key_slow_inc()
+     atomic_inc_not_zero()
+      -> key.enabled == 0, no increment
+     jump_label_lock()
+     atomic_inc_return()
+      -> key.enabled == 1 now
+                                            static_key_slow_inc()
+                                             atomic_inc_not_zero()
+                                              -> key.enabled == 1, inc to 2
+                                             return
+                                            ** static key is wrong!
+     jump_label_update()
+     jump_label_unlock()
+
+Testing the static key at the point marked by (**) will follow the
+wrong path for jumps that have not been patched yet.  This can
+actually happen when creating many KVM virtual machines with userspace
+LAPIC emulation; just run several copies of the following program:
+
+    #include <fcntl.h>
+    #include <unistd.h>
+    #include <sys/ioctl.h>
+    #include <linux/kvm.h>
+
+    int main(void)
+    {
+        for (;;) {
+            int kvmfd = open("/dev/kvm", O_RDONLY);
+            int vmfd = ioctl(kvmfd, KVM_CREATE_VM, 0);
+            close(ioctl(vmfd, KVM_CREATE_VCPU, 1));
+            close(vmfd);
+            close(kvmfd);
+        }
+        return 0;
+    }
+
+Every KVM_CREATE_VCPU ioctl will attempt a static_key_slow_inc() call.
+The static key's purpose is to skip NULL pointer checks and indeed one
+of the processes eventually dereferences NULL.
+
+As explained in the commit that introduced the bug:
+
+  706249c222f6 ("locking/static_keys: Rework update logic")
+
+jump_label_update() needs key.enabled to be true.  The solution adopted
+here is to temporarily make key.enabled == -1, and use go down the
+slow path when key.enabled <= 0.
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: <stable@vger.kernel.org> # v4.3+
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Fixes: 706249c222f6 ("locking/static_keys: Rework update logic")
+Link: http://lkml.kernel.org/r/1466527937-69798-1-git-send-email-pbonzini@redhat.com
+[ Small stylistic edits to the changelog and the code. ]
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

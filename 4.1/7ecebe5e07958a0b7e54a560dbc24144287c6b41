@@ -1,0 +1,69 @@
+f2fs: add cond_resched() to sync_dirty_dir_inodes()
+
+In a preempt-off enviroment a alot of FS activity (write/delete) I run
+into a CPU stall:
+
+| NMI watchdog: BUG: soft lockup - CPU#0 stuck for 22s! [kworker/u2:2:59]
+| Modules linked in:
+| CPU: 0 PID: 59 Comm: kworker/u2:2 Tainted: G        W      3.19.0-00010-g10c11c51ffed #153
+| Workqueue: writeback bdi_writeback_workfn (flush-179:0)
+| task: df230000 ti: df23e000 task.ti: df23e000
+| PC is at __submit_merged_bio+0x6c/0x110
+| LR is at f2fs_submit_merged_bio+0x74/0x80
+…
+| [<c00085c4>] (gic_handle_irq) from [<c0012e84>] (__irq_svc+0x44/0x5c)
+| Exception stack(0xdf23fb48 to 0xdf23fb90)
+| fb40:                   deef3484 ffff0001 ffff0001 00000027 deef3484 00000000
+| fb60: deef3440 00000000 de426000 deef34ec deefc440 df23fbb4 df23fbb8 df23fb90
+| fb80: c02191f0 c0218fa0 60000013 ffffffff
+| [<c0012e84>] (__irq_svc) from [<c0218fa0>] (__submit_merged_bio+0x6c/0x110)
+| [<c0218fa0>] (__submit_merged_bio) from [<c02191f0>] (f2fs_submit_merged_bio+0x74/0x80)
+| [<c02191f0>] (f2fs_submit_merged_bio) from [<c021624c>] (sync_dirty_dir_inodes+0x70/0x78)
+| [<c021624c>] (sync_dirty_dir_inodes) from [<c0216358>] (write_checkpoint+0x104/0xc10)
+| [<c0216358>] (write_checkpoint) from [<c021231c>] (f2fs_sync_fs+0x80/0xbc)
+| [<c021231c>] (f2fs_sync_fs) from [<c0221eb8>] (f2fs_balance_fs_bg+0x4c/0x68)
+| [<c0221eb8>] (f2fs_balance_fs_bg) from [<c021e9b8>] (f2fs_write_node_pages+0x40/0x110)
+| [<c021e9b8>] (f2fs_write_node_pages) from [<c00de620>] (do_writepages+0x34/0x48)
+| [<c00de620>] (do_writepages) from [<c0145714>] (__writeback_single_inode+0x50/0x228)
+| [<c0145714>] (__writeback_single_inode) from [<c0146184>] (writeback_sb_inodes+0x1a8/0x378)
+| [<c0146184>] (writeback_sb_inodes) from [<c01463e4>] (__writeback_inodes_wb+0x90/0xc8)
+| [<c01463e4>] (__writeback_inodes_wb) from [<c01465f8>] (wb_writeback+0x1dc/0x28c)
+| [<c01465f8>] (wb_writeback) from [<c0146dd8>] (bdi_writeback_workfn+0x2ac/0x460)
+| [<c0146dd8>] (bdi_writeback_workfn) from [<c003c3fc>] (process_one_work+0x11c/0x3a4)
+| [<c003c3fc>] (process_one_work) from [<c003c844>] (worker_thread+0x17c/0x490)
+| [<c003c844>] (worker_thread) from [<c0041398>] (kthread+0xec/0x100)
+| [<c0041398>] (kthread) from [<c000ed10>] (ret_from_fork+0x14/0x24)
+
+As it turns out, the code loops in sync_dirty_dir_inodes() and waits for
+others to make progress but since it never leaves the CPU there is no
+progress made. At the time of this stall, there is also a rm process
+blocked:
+| rm              R running      0  1989   1774 0x00000000
+| [<c047c55c>] (__schedule) from [<c00486dc>] (__cond_resched+0x30/0x4c)
+| [<c00486dc>] (__cond_resched) from [<c047c8c8>] (_cond_resched+0x4c/0x54)
+| [<c047c8c8>] (_cond_resched) from [<c00e1aec>] (truncate_inode_pages_range+0x1f0/0x5e8)
+| [<c00e1aec>] (truncate_inode_pages_range) from [<c00e1fd8>] (truncate_inode_pages+0x28/0x30)
+| [<c00e1fd8>] (truncate_inode_pages) from [<c00e2148>] (truncate_inode_pages_final+0x60/0x64)
+| [<c00e2148>] (truncate_inode_pages_final) from [<c020c92c>] (f2fs_evict_inode+0x4c/0x268)
+| [<c020c92c>] (f2fs_evict_inode) from [<c0137214>] (evict+0x94/0x140)
+| [<c0137214>] (evict) from [<c01377e8>] (iput+0xc8/0x134)
+| [<c01377e8>] (iput) from [<c01333e4>] (d_delete+0x154/0x180)
+| [<c01333e4>] (d_delete) from [<c0129870>] (vfs_rmdir+0x114/0x12c)
+| [<c0129870>] (vfs_rmdir) from [<c012d644>] (do_rmdir+0x158/0x168)
+| [<c012d644>] (do_rmdir) from [<c012dd90>] (SyS_unlinkat+0x30/0x3c)
+| [<c012dd90>] (SyS_unlinkat) from [<c000ec40>] (ret_fast_syscall+0x0/0x4c)
+
+As explained by Jaegeuk Kim:
+|This inode is the directory (c.f., do_rmdir) causing a infinite loop on
+|sync_dirty_dir_inodes.
+|The sync_dirty_dir_inodes tries to flush dirty dentry pages, but if the
+|inode is under eviction, it submits bios and do it again until eviction
+|is finished.
+
+This patch adds a cond_resched() (as suggested by Jaegeuk) after a BIO
+is submitted so other thread can make progress.
+
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+[Jaegeuk Kim: change fs/f2fs to f2fs in subject as naming convention]
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+

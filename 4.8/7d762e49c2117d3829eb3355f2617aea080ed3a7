@@ -1,0 +1,80 @@
+perf/x86/amd/uncore: Prevent use after free
+
+The resent conversion of the cpu hotplug support in the uncore driver
+introduced a regression due to the way the callbacks are invoked at
+initialization time.
+
+The old code called the prepare/starting/online function on each online cpu
+as a block. The new code registers the hotplug callbacks in the core for
+each state. The core invokes the callbacks at each registration on all
+online cpus.
+
+The code implicitely relied on the prepare/starting/online callbacks being
+called as combo on a particular cpu, which was not obvious and completely
+undocumented.
+
+The resulting subtle wreckage happens due to the way how the uncore code
+manages shared data structures for cpus which share an uncore resource in
+hardware. The sharing is determined in the cpu starting callback, but the
+prepare callback allocates per cpu data for the upcoming cpu because
+potential sharing is unknown at this point. If the starting callback finds
+a online cpu which shares the hardware resource it takes a refcount on the
+percpu data of that cpu and puts the own data structure into a
+'free_at_online' pointer of that shared data structure. The online callback
+frees that.
+
+With the old model this worked because in a starting callback only one non
+unused structure (the one of the starting cpu) was available. The new code
+allocates the data structures for all cpus when the prepare callback is
+registered.
+
+Now the starting function iterates through all online cpus and looks for a
+data structure (skipping its own) which has a matching hardware id. The id
+member of the data structure is initialized to 0, but the hardware id can
+be 0 as well. The resulting wreckage is:
+
+  CPU0 finds a matching id on CPU1, takes a refcount on CPU1 data and puts
+  its own data structure into CPU1s data structure to be freed.
+
+  CPU1 skips CPU0 because the data structure is its allegedly unsued own.
+  It finds a matching id on CPU2, takes a refcount on CPU1 data and puts
+  its own data structure into CPU2s data structure to be freed.
+
+  ....
+
+Now the online callbacks are invoked.
+
+  CPU0 has a pointer to CPU1s data and frees the original CPU0 data. So
+  far so good.
+
+  CPU1 has a pointer to CPU2s data and frees the original CPU1 data, which
+  is still referenced by CPU0 ---> Booom
+
+So there are two issues to be solved here:
+
+1) The id field must be initialized at allocation time to a value which
+   cannot be a valid hardware id, i.e. -1
+
+   This prevents the above scenario, but now CPU1 and CPU2 both stick their
+   own data structure into the free_at_online pointer of CPU0. So we leak
+   CPU1s data structure.
+
+2) Fix the memory leak described in #1
+
+   Instead of having a single pointer, use a hlist to enqueue the
+   superflous data structures which are then freed by the first cpu
+   invoking the online callback.
+
+Ideally we should know the sharing _before_ invoking the prepare callback,
+but that's way beyond the scope of this bug fix.
+
+[ tglx: Rewrote changelog ]
+
+Fixes: 96b2bd3866a0 ("perf/x86/amd/uncore: Convert to hotplug state machine")
+Reported-and-tested-by: Eric Sandeen <sandeen@sandeen.net>
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Borislav Petkov <bp@suse.de>
+Link: http://lkml.kernel.org/r/20160909160822.lowgmkdwms2dheyv@linutronix.de
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+

@@ -1,0 +1,254 @@
+zram: switch to crypto compress API
+
+We don't have an idle zstreams list anymore and our write path now works
+absolutely differently, preventing preemption during compression.  This
+removes possibilities of read paths preempting writes at wrong places
+(which could badly affect the performance of both paths) and at the same
+time opens the door for a move from custom LZO/LZ4 compression backends
+implementation to a more generic one, using crypto compress API.
+
+Joonsoo Kim [1] attempted to do this a while ago, but faced with the
+need of introducing a new crypto API interface.  The root cause was the
+fact that crypto API compression algorithms require a compression stream
+structure (in zram terminology) for both compression and decompression
+ops, while in reality only several of compression algorithms really need
+it.  This resulted in a concept of context-less crypto API compression
+backends [2].  Both write and read paths, though, would have been
+executed with the preemption enabled, which in the worst case could have
+resulted in a decreased worst-case performance, e.g.  consider the
+following case:
+
+	CPU0
+
+	zram_write()
+	  spin_lock()
+	    take the last idle stream
+	  spin_unlock()
+
+	<< preempted >>
+
+		zram_read()
+		  spin_lock()
+		   no idle streams
+			  spin_unlock()
+			  schedule()
+
+	resuming zram_write compression()
+
+but it took me some time to realize that, and it took even longer to
+evolve zram and to make it ready for crypto API.  The key turned out to be
+-- drop the idle streams list entirely.  Without the idle streams list we
+are free to use compression algorithms that require compression stream for
+decompression (read), because streams are now placed in per-cpu data and
+each write path has to disable preemption for compression op, almost
+completely eliminating the aforementioned case (technically, we still have
+a small chance, because write path has a fast and a slow paths and the
+slow path is executed with the preemption enabled; but the frequency of
+failed fast path is too low).
+
+TEST
+====
+
+- 4 CPUs, x86_64 system
+- 3G zram, lzo
+- fio tests: read, randread, write, randwrite, rw, randrw
+
+test script [3] command:
+ ZRAM_SIZE=3G LOG_SUFFIX=XXXX FIO_LOOPS=5 ./zram-fio-test.sh
+
+                   BASE           PATCHED
+jobs1
+READ:           2527.2MB/s	 2482.7MB/s
+READ:           2102.7MB/s	 2045.0MB/s
+WRITE:          1284.3MB/s	 1324.3MB/s
+WRITE:          1080.7MB/s	 1101.9MB/s
+READ:           430125KB/s	 437498KB/s
+WRITE:          430538KB/s	 437919KB/s
+READ:           399593KB/s	 403987KB/s
+WRITE:          399910KB/s	 404308KB/s
+jobs2
+READ:           8133.5MB/s	 7854.8MB/s
+READ:           7086.6MB/s	 6912.8MB/s
+WRITE:          3177.2MB/s	 3298.3MB/s
+WRITE:          2810.2MB/s	 2871.4MB/s
+READ:           1017.6MB/s	 1023.4MB/s
+WRITE:          1018.2MB/s	 1023.1MB/s
+READ:           977836KB/s	 984205KB/s
+WRITE:          979435KB/s	 985814KB/s
+jobs3
+READ:           13557MB/s	 13391MB/s
+READ:           11876MB/s	 11752MB/s
+WRITE:          4641.5MB/s	 4682.1MB/s
+WRITE:          4164.9MB/s	 4179.3MB/s
+READ:           1453.8MB/s	 1455.1MB/s
+WRITE:          1455.1MB/s	 1458.2MB/s
+READ:           1387.7MB/s	 1395.7MB/s
+WRITE:          1386.1MB/s	 1394.9MB/s
+jobs4
+READ:           20271MB/s	 20078MB/s
+READ:           18033MB/s	 17928MB/s
+WRITE:          6176.8MB/s	 6180.5MB/s
+WRITE:          5686.3MB/s	 5705.3MB/s
+READ:           2009.4MB/s	 2006.7MB/s
+WRITE:          2007.5MB/s	 2004.9MB/s
+READ:           1929.7MB/s	 1935.6MB/s
+WRITE:          1926.8MB/s	 1932.6MB/s
+jobs5
+READ:           18823MB/s	 19024MB/s
+READ:           18968MB/s	 19071MB/s
+WRITE:          6191.6MB/s	 6372.1MB/s
+WRITE:          5818.7MB/s	 5787.1MB/s
+READ:           2011.7MB/s	 1981.3MB/s
+WRITE:          2011.4MB/s	 1980.1MB/s
+READ:           1949.3MB/s	 1935.7MB/s
+WRITE:          1940.4MB/s	 1926.1MB/s
+jobs6
+READ:           21870MB/s	 21715MB/s
+READ:           19957MB/s	 19879MB/s
+WRITE:          6528.4MB/s	 6537.6MB/s
+WRITE:          6098.9MB/s	 6073.6MB/s
+READ:           2048.6MB/s	 2049.9MB/s
+WRITE:          2041.7MB/s	 2042.9MB/s
+READ:           2013.4MB/s	 1990.4MB/s
+WRITE:          2009.4MB/s	 1986.5MB/s
+jobs7
+READ:           21359MB/s	 21124MB/s
+READ:           19746MB/s	 19293MB/s
+WRITE:          6660.4MB/s	 6518.8MB/s
+WRITE:          6211.6MB/s	 6193.1MB/s
+READ:           2089.7MB/s	 2080.6MB/s
+WRITE:          2085.8MB/s	 2076.5MB/s
+READ:           2041.2MB/s	 2052.5MB/s
+WRITE:          2037.5MB/s	 2048.8MB/s
+jobs8
+READ:           20477MB/s	 19974MB/s
+READ:           18922MB/s	 18576MB/s
+WRITE:          6851.9MB/s	 6788.3MB/s
+WRITE:          6407.7MB/s	 6347.5MB/s
+READ:           2134.8MB/s	 2136.1MB/s
+WRITE:          2132.8MB/s	 2134.4MB/s
+READ:           2074.2MB/s	 2069.6MB/s
+WRITE:          2087.3MB/s	 2082.4MB/s
+jobs9
+READ:           19797MB/s	 19994MB/s
+READ:           18806MB/s	 18581MB/s
+WRITE:          6878.7MB/s	 6822.7MB/s
+WRITE:          6456.8MB/s	 6447.2MB/s
+READ:           2141.1MB/s	 2154.7MB/s
+WRITE:          2144.4MB/s	 2157.3MB/s
+READ:           2084.1MB/s	 2085.1MB/s
+WRITE:          2091.5MB/s	 2092.5MB/s
+jobs10
+READ:           19794MB/s	 19784MB/s
+READ:           18794MB/s	 18745MB/s
+WRITE:          6984.4MB/s	 6676.3MB/s
+WRITE:          6532.3MB/s	 6342.7MB/s
+READ:           2150.6MB/s	 2155.4MB/s
+WRITE:          2156.8MB/s	 2161.5MB/s
+READ:           2106.4MB/s	 2095.6MB/s
+WRITE:          2109.7MB/s	 2098.4MB/s
+
+                                    BASE                       PATCHED
+jobs1                              perfstat
+stalled-cycles-frontend     102,480,595,419 (  41.53%)	  114,508,864,804 (  46.92%)
+stalled-cycles-backend       51,941,417,832 (  21.05%)	   46,836,112,388 (  19.19%)
+instructions                283,612,054,215 (    1.15)	  283,918,134,959 (    1.16)
+branches                     56,372,560,385 ( 724.923)	   56,449,814,753 ( 733.766)
+branch-misses                   374,826,000 (   0.66%)	      326,935,859 (   0.58%)
+jobs2                              perfstat
+stalled-cycles-frontend     155,142,745,777 (  40.99%)	  164,170,979,198 (  43.82%)
+stalled-cycles-backend       70,813,866,387 (  18.71%)	   66,456,858,165 (  17.74%)
+instructions                463,436,648,173 (    1.22)	  464,221,890,191 (    1.24)
+branches                     91,088,733,902 ( 760.088)	   91,278,144,546 ( 769.133)
+branch-misses                   504,460,363 (   0.55%)	      394,033,842 (   0.43%)
+jobs3                              perfstat
+stalled-cycles-frontend     201,300,397,212 (  39.84%)	  223,969,902,257 (  44.44%)
+stalled-cycles-backend       87,712,593,974 (  17.36%)	   81,618,888,712 (  16.19%)
+instructions                642,869,545,023 (    1.27)	  644,677,354,132 (    1.28)
+branches                    125,724,560,594 ( 690.682)	  126,133,159,521 ( 694.542)
+branch-misses                   527,941,798 (   0.42%)	      444,782,220 (   0.35%)
+jobs4                              perfstat
+stalled-cycles-frontend     246,701,197,429 (  38.12%)	  280,076,030,886 (  43.29%)
+stalled-cycles-backend      119,050,341,112 (  18.40%)	  110,955,641,671 (  17.15%)
+instructions                822,716,962,127 (    1.27)	  825,536,969,320 (    1.28)
+branches                    160,590,028,545 ( 688.614)	  161,152,996,915 ( 691.068)
+branch-misses                   650,295,287 (   0.40%)	      550,229,113 (   0.34%)
+jobs5                              perfstat
+stalled-cycles-frontend     298,958,462,516 (  38.30%)	  344,852,200,358 (  44.16%)
+stalled-cycles-backend      137,558,742,122 (  17.62%)	  129,465,067,102 (  16.58%)
+instructions              1,005,714,688,752 (    1.29)	1,007,657,999,432 (    1.29)
+branches                    195,988,773,962 ( 697.730)	  196,446,873,984 ( 700.319)
+branch-misses                   695,818,940 (   0.36%)	      624,823,263 (   0.32%)
+jobs6                              perfstat
+stalled-cycles-frontend     334,497,602,856 (  36.71%)	  387,590,419,779 (  42.38%)
+stalled-cycles-backend      163,539,365,335 (  17.95%)	  152,640,193,639 (  16.69%)
+instructions              1,184,738,177,851 (    1.30)	1,187,396,281,677 (    1.30)
+branches                    230,592,915,640 ( 702.902)	  231,253,802,882 ( 702.356)
+branch-misses                   747,934,786 (   0.32%)	      643,902,424 (   0.28%)
+jobs7                              perfstat
+stalled-cycles-frontend     396,724,684,187 (  37.71%)	  460,705,858,952 (  43.84%)
+stalled-cycles-backend      188,096,616,496 (  17.88%)	  175,785,787,036 (  16.73%)
+instructions              1,364,041,136,608 (    1.30)	1,366,689,075,112 (    1.30)
+branches                    265,253,096,936 ( 700.078)	  265,890,524,883 ( 702.839)
+branch-misses                   784,991,589 (   0.30%)	      729,196,689 (   0.27%)
+jobs8                              perfstat
+stalled-cycles-frontend     440,248,299,870 (  36.92%)	  509,554,793,816 (  42.46%)
+stalled-cycles-backend      222,575,930,616 (  18.67%)	  213,401,248,432 (  17.78%)
+instructions              1,542,262,045,114 (    1.29)	1,545,233,932,257 (    1.29)
+branches                    299,775,178,439 ( 697.666)	  300,528,458,505 ( 694.769)
+branch-misses                   847,496,084 (   0.28%)	      748,794,308 (   0.25%)
+jobs9                              perfstat
+stalled-cycles-frontend     506,269,882,480 (  37.86%)	  592,798,032,820 (  44.43%)
+stalled-cycles-backend      253,192,498,861 (  18.93%)	  233,727,666,185 (  17.52%)
+instructions              1,721,985,080,913 (    1.29)	1,724,666,236,005 (    1.29)
+branches                    334,517,360,255 ( 694.134)	  335,199,758,164 ( 697.131)
+branch-misses                   873,496,730 (   0.26%)	      815,379,236 (   0.24%)
+jobs10                             perfstat
+stalled-cycles-frontend     549,063,363,749 (  37.18%)	  651,302,376,662 (  43.61%)
+stalled-cycles-backend      281,680,986,810 (  19.07%)	  277,005,235,582 (  18.55%)
+instructions              1,901,859,271,180 (    1.29)	1,906,311,064,230 (    1.28)
+branches                    369,398,536,153 ( 694.004)	  370,527,696,358 ( 688.409)
+branch-misses                   967,929,335 (   0.26%)	      890,125,056 (   0.24%)
+
+                            BASE           PATCHED
+seconds elapsed        79.421641008	78.735285546
+seconds elapsed        61.471246133	60.869085949
+seconds elapsed        62.317058173	62.224188495
+seconds elapsed        60.030739363	60.081102518
+seconds elapsed        74.070398362	74.317582865
+seconds elapsed        84.985953007	85.414364176
+seconds elapsed        97.724553255	98.173311344
+seconds elapsed        109.488066758	110.268399318
+seconds elapsed        122.768189405	122.967164498
+seconds elapsed        135.130035105	136.934770801
+
+On my other system (8 x86_64 CPUs, short version of test results):
+
+                            BASE           PATCHED
+seconds elapsed        19.518065994	19.806320662
+seconds elapsed        15.172772749	15.594718291
+seconds elapsed        13.820925970	13.821708564
+seconds elapsed        13.293097816	14.585206405
+seconds elapsed        16.207284118	16.064431606
+seconds elapsed        17.958376158	17.771825767
+seconds elapsed        19.478009164	19.602961508
+seconds elapsed        21.347152811	21.352318709
+seconds elapsed        24.478121126	24.171088735
+seconds elapsed        26.865057442	26.767327618
+
+So performance-wise the numbers are quite similar.
+
+Also update zcomp interface to be more aligned with the crypto API.
+
+[1] http://marc.info/?l=linux-kernel&m=144480832108927&w=2
+[2] http://marc.info/?l=linux-kernel&m=145379613507518&w=2
+[3] https://github.com/sergey-senozhatsky/zram-perf-test
+
+Link: http://lkml.kernel.org/r/20160531122017.2878-3-sergey.senozhatsky@gmail.com
+Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Suggested-by: Minchan Kim <minchan@kernel.org>
+Suggested-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Acked-by: Minchan Kim <minchan@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,94 @@
+memcg: add per cgroup dirty page accounting
+
+When modifying PG_Dirty on cached file pages, update the new
+MEM_CGROUP_STAT_DIRTY counter.  This is done in the same places where
+global NR_FILE_DIRTY is managed.  The new memcg stat is visible in the
+per memcg memory.stat cgroupfs file.  The most recent past attempt at
+this was http://thread.gmane.org/gmane.linux.kernel.cgroups/8632
+
+The new accounting supports future efforts to add per cgroup dirty
+page throttling and writeback.  It also helps an administrator break
+down a container's memory usage and provides evidence to understand
+memcg oom kills (the new dirty count is included in memcg oom kill
+messages).
+
+The ability to move page accounting between memcg
+(memory.move_charge_at_immigrate) makes this accounting more
+complicated than the global counter.  The existing
+mem_cgroup_{begin,end}_page_stat() lock is used to serialize move
+accounting with stat updates.
+Typical update operation:
+	memcg = mem_cgroup_begin_page_stat(page)
+	if (TestSetPageDirty()) {
+		[...]
+		mem_cgroup_update_page_stat(memcg)
+	}
+	mem_cgroup_end_page_stat(memcg)
+
+Summary of mem_cgroup_end_page_stat() overhead:
+- Without CONFIG_MEMCG it's a no-op
+- With CONFIG_MEMCG and no inter memcg task movement, it's just
+  rcu_read_lock()
+- With CONFIG_MEMCG and inter memcg  task movement, it's
+  rcu_read_lock() + spin_lock_irqsave()
+
+A memcg parameter is added to several routines because their callers
+now grab mem_cgroup_begin_page_stat() which returns the memcg later
+needed by for mem_cgroup_update_page_stat().
+
+Because mem_cgroup_begin_page_stat() may disable interrupts, some
+adjustments are needed:
+- move __mark_inode_dirty() from __set_page_dirty() to its caller.
+  __mark_inode_dirty() locking does not want interrupts disabled.
+- use spin_lock_irqsave(tree_lock) rather than spin_lock_irq() in
+  __delete_from_page_cache(), replace_page_cache_page(),
+  invalidate_complete_page2(), and __remove_mapping().
+
+   text    data     bss      dec    hex filename
+8925147 1774832 1785856 12485835 be84cb vmlinux-!CONFIG_MEMCG-before
+8925339 1774832 1785856 12486027 be858b vmlinux-!CONFIG_MEMCG-after
+                            +192 text bytes
+8965977 1784992 1785856 12536825 bf4bf9 vmlinux-CONFIG_MEMCG-before
+8966750 1784992 1785856 12537598 bf4efe vmlinux-CONFIG_MEMCG-after
+                            +773 text bytes
+
+Performance tests run on v4.0-rc1-36-g4f671fe2f952.  Lower is better for
+all metrics, they're all wall clock or cycle counts.  The read and write
+fault benchmarks just measure fault time, they do not include I/O time.
+
+* CONFIG_MEMCG not set:
+                            baseline                              patched
+  kbuild                 1m25.030000(+-0.088% 3 samples)       1m25.426667(+-0.120% 3 samples)
+  dd write 100 MiB          0.859211561 +-15.10%                  0.874162885 +-15.03%
+  dd write 200 MiB          1.670653105 +-17.87%                  1.669384764 +-11.99%
+  dd write 1000 MiB         8.434691190 +-14.15%                  8.474733215 +-14.77%
+  read fault cycles       254.0(+-0.000% 10 samples)            253.0(+-0.000% 10 samples)
+  write fault cycles     2021.2(+-3.070% 10 samples)           1984.5(+-1.036% 10 samples)
+
+* CONFIG_MEMCG=y root_memcg:
+                            baseline                              patched
+  kbuild                 1m25.716667(+-0.105% 3 samples)       1m25.686667(+-0.153% 3 samples)
+  dd write 100 MiB          0.855650830 +-14.90%                  0.887557919 +-14.90%
+  dd write 200 MiB          1.688322953 +-12.72%                  1.667682724 +-13.33%
+  dd write 1000 MiB         8.418601605 +-14.30%                  8.673532299 +-15.00%
+  read fault cycles       266.0(+-0.000% 10 samples)            266.0(+-0.000% 10 samples)
+  write fault cycles     2051.7(+-1.349% 10 samples)           2049.6(+-1.686% 10 samples)
+
+* CONFIG_MEMCG=y non-root_memcg:
+                            baseline                              patched
+  kbuild                 1m26.120000(+-0.273% 3 samples)       1m25.763333(+-0.127% 3 samples)
+  dd write 100 MiB          0.861723964 +-15.25%                  0.818129350 +-14.82%
+  dd write 200 MiB          1.669887569 +-13.30%                  1.698645885 +-13.27%
+  dd write 1000 MiB         8.383191730 +-14.65%                  8.351742280 +-14.52%
+  read fault cycles       265.7(+-0.172% 10 samples)            267.0(+-0.000% 10 samples)
+  write fault cycles     2070.6(+-1.512% 10 samples)           2084.4(+-2.148% 10 samples)
+
+As expected anon page faults are not affected by this patch.
+
+tj: Updated to apply on top of the recent cancel_dirty_page() changes.
+
+Signed-off-by: Sha Zhengju <handai.szj@gmail.com>
+Signed-off-by: Greg Thelen <gthelen@google.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+

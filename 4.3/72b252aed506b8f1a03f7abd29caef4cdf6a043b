@@ -1,0 +1,88 @@
+mm: send one IPI per CPU to TLB flush all entries after unmapping pages
+
+An IPI is sent to flush remote TLBs when a page is unmapped that was
+potentially accesssed by other CPUs.  There are many circumstances where
+this happens but the obvious one is kswapd reclaiming pages belonging to a
+running process as kswapd and the task are likely running on separate
+CPUs.
+
+On small machines, this is not a significant problem but as machine gets
+larger with more cores and more memory, the cost of these IPIs can be
+high.  This patch uses a simple structure that tracks CPUs that
+potentially have TLB entries for pages being unmapped.  When the unmapping
+is complete, the full TLB is flushed on the assumption that a refill cost
+is lower than flushing individual entries.
+
+Architectures wishing to do this must give the following guarantee.
+
+        If a clean page is unmapped and not immediately flushed, the
+        architecture must guarantee that a write to that linear address
+        from a CPU with a cached TLB entry will trap a page fault.
+
+This is essentially what the kernel already depends on but the window is
+much larger with this patch applied and is worth highlighting.  The
+architecture should consider whether the cost of the full TLB flush is
+higher than sending an IPI to flush each individual entry.  An additional
+architecture helper called flush_tlb_local is required.  It's a trivial
+wrapper with some accounting in the x86 case.
+
+The impact of this patch depends on the workload as measuring any benefit
+requires both mapped pages co-located on the LRU and memory pressure.  The
+case with the biggest impact is multiple processes reading mapped pages
+taken from the vm-scalability test suite.  The test case uses NR_CPU
+readers of mapped files that consume 10*RAM.
+
+Linear mapped reader on a 4-node machine with 64G RAM and 48 CPUs
+
+                                           4.2.0-rc1          4.2.0-rc1
+                                             vanilla       flushfull-v7
+Ops lru-file-mmap-read-elapsed      159.62 (  0.00%)   120.68 ( 24.40%)
+Ops lru-file-mmap-read-time_range    30.59 (  0.00%)     2.80 ( 90.85%)
+Ops lru-file-mmap-read-time_stddv     6.70 (  0.00%)     0.64 ( 90.38%)
+
+           4.2.0-rc1    4.2.0-rc1
+             vanilla flushfull-v7
+User          581.00       611.43
+System       5804.93      4111.76
+Elapsed       161.03       122.12
+
+This is showing that the readers completed 24.40% faster with 29% less
+system CPU time.  From vmstats, it is known that the vanilla kernel was
+interrupted roughly 900K times per second during the steady phase of the
+test and the patched kernel was interrupts 180K times per second.
+
+The impact is lower on a single socket machine.
+
+                                           4.2.0-rc1          4.2.0-rc1
+                                             vanilla       flushfull-v7
+Ops lru-file-mmap-read-elapsed       25.33 (  0.00%)    20.38 ( 19.54%)
+Ops lru-file-mmap-read-time_range     0.91 (  0.00%)     1.44 (-58.24%)
+Ops lru-file-mmap-read-time_stddv     0.28 (  0.00%)     0.47 (-65.34%)
+
+           4.2.0-rc1    4.2.0-rc1
+             vanilla flushfull-v7
+User           58.09        57.64
+System        111.82        76.56
+Elapsed        27.29        22.55
+
+It's still a noticeable improvement with vmstat showing interrupts went
+from roughly 500K per second to 45K per second.
+
+The patch will have no impact on workloads with no memory pressure or have
+relatively few mapped pages.  It will have an unpredictable impact on the
+workload running on the CPU being flushed as it'll depend on how many TLB
+entries need to be refilled and how long that takes.  Worst case, the TLB
+will be completely cleared of active entries when the target PFNs were not
+resident at all.
+
+[sasha.levin@oracle.com: trace tlb flush after disabling preemption in try_to_unmap_flush]
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Reviewed-by: Rik van Riel <riel@redhat.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Acked-by: Ingo Molnar <mingo@kernel.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <sasha.levin@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

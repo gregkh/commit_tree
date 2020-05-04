@@ -1,0 +1,52 @@
+drm/i915: Fix userptr deadlock with aliased GTT mmappings
+
+Michał Winiarski found a really evil way to trigger a struct_mutex
+deadlock with userptr. He found that if he allocated a userptr bo and
+then GTT mmaped another bo, or even itself, at the same address as the
+userptr using MAP_FIXED, he could then cause a deadlock any time we then
+had to invalidate the GTT mmappings (so at will). Tvrtko then found by
+repeatedly allocating GTT mmappings he could alias with an old userptr
+mmap and also trigger the deadlock.
+
+To counter act the deadlock, we make the observation that we only need
+to take the struct_mutex if the object has any pages to revoke, and that
+before userspace can alias with the userptr address space, it must have
+invalidated the userptr->pages. Thus if we can check for those pages
+outside of the struct_mutex, we can avoid the deadlock. To do so we
+introduce a separate flag for userptr objects that we can inspect from
+the mmu-notifier underneath its spinlock.
+
+The patch makes one eye-catching change. That is the removal serial=0
+after detecting a to-be-freed object inside the invalidate walker. I
+felt setting serial=0 was a questionable pessimisation: it denies us the
+chance to reuse the current iterator for the next loop (before it is
+freed) and being explicit makes the reader question the validity of the
+locking (since the object-free race could occur elsewhere). The
+serialisation of the iterator is through the spinlock, if the object is
+freed before the next loop then the notifier.serial will be incremented
+and we start the walk from the beginning as we detect the invalid cache.
+
+To try and tame the error paths and interactions with the userptr->active
+flag, we have to do a fair amount of rearranging of get_pages_userptr().
+
+v2: Grammar fixes
+v3: Reorder set-active so that it is only set when obj->pages is set
+(and so needs cancellation). Only the order of setting obj->pages and
+the active-flag is crucial. Calling gup after invalidate-range begin
+means the userptr sees the new set of backing storage (and so will not
+need to invalidate its new pages), but we have to be careful not to set
+the active-flag prior to successfully establishing obj->pages.
+v4: Take the active->flag early so we know in the mmu-notifier when we
+have to cancel a pending gup-worker.
+v5: Rearrange the error path so that is not so convoluted
+v6: Set pinned to 0 when negative before calling release_pages()
+
+Reported-by: Michał Winiarski <michal.winiarski@intel.com>
+Testcase: igt/gem_userptr_blits/map-fixed*
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Michał Winiarski <michal.winiarski@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: stable@vger.kernel.org
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+

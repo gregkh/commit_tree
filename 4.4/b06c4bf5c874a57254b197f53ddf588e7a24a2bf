@@ -1,0 +1,126 @@
+Btrfs: fix regression running delayed references when using qgroups
+
+In the kernel 4.2 merge window we had a big changes to the implementation
+of delayed references and qgroups which made the no_quota field of delayed
+references not used anymore. More specifically the no_quota field is not
+used anymore as of:
+
+  commit 0ed4792af0e8 ("btrfs: qgroup: Switch to new extent-oriented qgroup mechanism.")
+
+Leaving the no_quota field actually prevents delayed references from
+getting merged, which in turn cause the following BUG_ON(), at
+fs/btrfs/extent-tree.c, to be hit when qgroups are enabled:
+
+  static int run_delayed_tree_ref(...)
+  {
+     (...)
+     BUG_ON(node->ref_mod != 1);
+     (...)
+  }
+
+This happens on a scenario like the following:
+
+  1) Ref1 bytenr X, action = BTRFS_ADD_DELAYED_REF, no_quota = 1, added.
+
+  2) Ref2 bytenr X, action = BTRFS_DROP_DELAYED_REF, no_quota = 0, added.
+     It's not merged with Ref1 because Ref1->no_quota != Ref2->no_quota.
+
+  3) Ref3 bytenr X, action = BTRFS_ADD_DELAYED_REF, no_quota = 1, added.
+     It's not merged with the reference at the tail of the list of refs
+     for bytenr X because the reference at the tail, Ref2 is incompatible
+     due to Ref2->no_quota != Ref3->no_quota.
+
+  4) Ref4 bytenr X, action = BTRFS_DROP_DELAYED_REF, no_quota = 0, added.
+     It's not merged with the reference at the tail of the list of refs
+     for bytenr X because the reference at the tail, Ref3 is incompatible
+     due to Ref3->no_quota != Ref4->no_quota.
+
+  5) We run delayed references, trigger merging of delayed references,
+     through __btrfs_run_delayed_refs() -> btrfs_merge_delayed_refs().
+
+  6) Ref1 and Ref3 are merged as Ref1->no_quota = Ref3->no_quota and
+     all other conditions are satisfied too. So Ref1 gets a ref_mod
+     value of 2.
+
+  7) Ref2 and Ref4 are merged as Ref2->no_quota = Ref4->no_quota and
+     all other conditions are satisfied too. So Ref2 gets a ref_mod
+     value of 2.
+
+  8) Ref1 and Ref2 aren't merged, because they have different values
+     for their no_quota field.
+
+  9) Delayed reference Ref1 is picked for running (select_delayed_ref()
+     always prefers references with an action == BTRFS_ADD_DELAYED_REF).
+     So run_delayed_tree_ref() is called for Ref1 which triggers the
+     BUG_ON because Ref1->red_mod != 1 (equals 2).
+
+So fix this by removing the no_quota field, as it's not used anymore as
+of commit 0ed4792af0e8 ("btrfs: qgroup: Switch to new extent-oriented
+qgroup mechanism.").
+
+The use of no_quota was also buggy in at least two places:
+
+1) At delayed-refs.c:btrfs_add_delayed_tree_ref() - we were setting
+   no_quota to 0 instead of 1 when the following condition was true:
+   is_fstree(ref_root) || !fs_info->quota_enabled
+
+2) At extent-tree.c:__btrfs_inc_extent_ref() - we were attempting to
+   reset a node's no_quota when the condition "!is_fstree(root_objectid)
+   || !root->fs_info->quota_enabled" was true but we did it only in
+   an unused local stack variable, that is, we never reset the no_quota
+   value in the node itself.
+
+This fixes the remainder of problems several people have been having when
+running delayed references, mostly while a balance is running in parallel,
+on a 4.2+ kernel.
+
+Very special thanks to Stéphane Lesimple for helping debugging this issue
+and testing this fix on his multi terabyte filesystem (which took more
+than one day to balance alone, plus fsck, etc).
+
+Also, this fixes deadlock issue when using the clone ioctl with qgroups
+enabled, as reported by Elias Probst in the mailing list. The deadlock
+happens because after calling btrfs_insert_empty_item we have our path
+holding a write lock on a leaf of the fs/subvol tree and then before
+releasing the path we called check_ref() which did backref walking, when
+qgroups are enabled, and tried to read lock the same leaf. The trace for
+this case is the following:
+
+  INFO: task systemd-nspawn:6095 blocked for more than 120 seconds.
+  (...)
+  Call Trace:
+    [<ffffffff86999201>] schedule+0x74/0x83
+    [<ffffffff863ef64c>] btrfs_tree_read_lock+0xc0/0xea
+    [<ffffffff86137ed7>] ? wait_woken+0x74/0x74
+    [<ffffffff8639f0a7>] btrfs_search_old_slot+0x51a/0x810
+    [<ffffffff863a129b>] btrfs_next_old_leaf+0xdf/0x3ce
+    [<ffffffff86413a00>] ? ulist_add_merge+0x1b/0x127
+    [<ffffffff86411688>] __resolve_indirect_refs+0x62a/0x667
+    [<ffffffff863ef546>] ? btrfs_clear_lock_blocking_rw+0x78/0xbe
+    [<ffffffff864122d3>] find_parent_nodes+0xaf3/0xfc6
+    [<ffffffff86412838>] __btrfs_find_all_roots+0x92/0xf0
+    [<ffffffff864128f2>] btrfs_find_all_roots+0x45/0x65
+    [<ffffffff8639a75b>] ? btrfs_get_tree_mod_seq+0x2b/0x88
+    [<ffffffff863e852e>] check_ref+0x64/0xc4
+    [<ffffffff863e9e01>] btrfs_clone+0x66e/0xb5d
+    [<ffffffff863ea77f>] btrfs_ioctl_clone+0x48f/0x5bb
+    [<ffffffff86048a68>] ? native_sched_clock+0x28/0x77
+    [<ffffffff863ed9b0>] btrfs_ioctl+0xabc/0x25cb
+  (...)
+
+The problem goes away by eleminating check_ref(), which no longer is
+needed as its purpose was to get a value for the no_quota field of
+a delayed reference (this patch removes the no_quota field as mentioned
+earlier).
+
+Reported-by: Stéphane Lesimple <stephane_btrfs@lesimple.fr>
+Tested-by: Stéphane Lesimple <stephane_btrfs@lesimple.fr>
+Reported-by: Elias Probst <mail@eliasprobst.eu>
+Reported-by: Peter Becker <floyd.net@gmail.com>
+Reported-by: Malte Schröder <malte@tnxip.de>
+Reported-by: Derek Dongray <derek@valedon.co.uk>
+Reported-by: Erkki Seppala <flux-btrfs@inside.org>
+Cc: stable@vger.kernel.org  # 4.2+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: Qu Wenruo <quwenruo@cn.fujitsu.com>
+

@@ -1,0 +1,152 @@
+perf tools: Enable passing event to BPF object
+
+A new syntax is added to the parser so that the user can access
+predefined perf events in BPF objects.
+
+After this patch, BPF programs for perf are finally able to utilize
+bpf_perf_event_read() introduced in commit 35578d798400 ("bpf: Implement
+function bpf_perf_event_read() that get the selected hardware PMU
+counter").
+
+Test result:
+
+  # cat test_bpf_map_2.c
+  /************************ BEGIN **************************/
+  #include <uapi/linux/bpf.h>
+  #define SEC(NAME) __attribute__((section(NAME), used))
+  struct bpf_map_def {
+      unsigned int type;
+      unsigned int key_size;
+      unsigned int value_size;
+      unsigned int max_entries;
+  };
+  static int (*trace_printk)(const char *fmt, int fmt_size, ...) =
+      (void *)BPF_FUNC_trace_printk;
+  static int (*get_smp_processor_id)(void) =
+      (void *)BPF_FUNC_get_smp_processor_id;
+  static int (*perf_event_read)(struct bpf_map_def *, int) =
+      (void *)BPF_FUNC_perf_event_read;
+
+  struct bpf_map_def SEC("maps") pmu_map = {
+      .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+      .key_size = sizeof(int),
+      .value_size = sizeof(int),
+      .max_entries = __NR_CPUS__,
+  };
+  SEC("func_write=sys_write")
+  int func_write(void *ctx)
+  {
+      unsigned long long val;
+      char fmt[] = "sys_write:        pmu=%llu\n";
+      val = perf_event_read(&pmu_map, get_smp_processor_id());
+      trace_printk(fmt, sizeof(fmt), val);
+      return 0;
+  }
+
+  SEC("func_write_return=sys_write%return")
+  int func_write_return(void *ctx)
+  {
+      unsigned long long val = 0;
+      char fmt[] = "sys_write_return: pmu=%llu\n";
+      val = perf_event_read(&pmu_map, get_smp_processor_id());
+      trace_printk(fmt, sizeof(fmt), val);
+      return 0;
+  }
+  char _license[] SEC("license") = "GPL";
+  int _version SEC("version") = LINUX_VERSION_CODE;
+  /************************* END ***************************/
+
+Normal case:
+
+  # echo "" > /sys/kernel/debug/tracing/trace
+  # perf record -i -e cycles -e './test_bpf_map_2.c/map:pmu_map.event=cycles/' ls /
+  [SNIP]
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.013 MB perf.data (7 samples) ]
+  # cat /sys/kernel/debug/tracing/trace | grep ls
+                ls-17066 [000] d... 938449.863301: : sys_write:        pmu=1157327
+                ls-17066 [000] dN.. 938449.863342: : sys_write_return: pmu=1225218
+                ls-17066 [000] d... 938449.863349: : sys_write:        pmu=1241922
+                ls-17066 [000] dN.. 938449.863369: : sys_write_return: pmu=1267445
+
+Normal case (system wide):
+
+  # echo "" > /sys/kernel/debug/tracing/trace
+  # perf record -i -e cycles -e './test_bpf_map_2.c/map:pmu_map.event=cycles/' -a
+  ^C[ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.811 MB perf.data (120 samples) ]
+
+  # cat /sys/kernel/debug/tracing/trace | grep -v '18446744073709551594' | grep -v perf | head -n 20
+  [SNIP]
+  #           TASK-PID   CPU#  ||||    TIMESTAMP  FUNCTION
+  #              | |       |   ||||       |         |
+             gmain-30828 [002] d... 2740551.068992: : sys_write:        pmu=84373
+             gmain-30828 [002] d... 2740551.068992: : sys_write_return: pmu=87696
+             gmain-30828 [002] d... 2740551.068996: : sys_write:        pmu=100658
+             gmain-30828 [002] d... 2740551.068997: : sys_write_return: pmu=102572
+
+Error case 1:
+
+  # perf record -e './test_bpf_map_2.c' ls /
+  [SNIP]
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.014 MB perf.data ]
+  # cat /sys/kernel/debug/tracing/trace | grep ls
+                ls-17115 [007] d... 2724279.665625: : sys_write:        pmu=18446744073709551614
+                ls-17115 [007] dN.. 2724279.665651: : sys_write_return: pmu=18446744073709551614
+                ls-17115 [007] d... 2724279.665658: : sys_write:        pmu=18446744073709551614
+                ls-17115 [007] dN.. 2724279.665677: : sys_write_return: pmu=18446744073709551614
+
+  (18446744073709551614 is 0xfffffffffffffffe (-2))
+
+Error case 2:
+
+  # perf record -e cycles -e './test_bpf_map_2.c/map:pmu_map.event=evt/' -a
+  event syntax error: '..ps:pmu_map.event=evt/'
+                                    \___ Event not found for map setting
+
+  Hint:	Valid config terms:
+       	map:[<arraymap>].value=[value]
+       	map:[<eventmap>].event=[event]
+  [SNIP]
+
+Error case 3:
+  # ls /proc/2348/task/
+  2348  2505  2506  2507  2508
+  # perf record -i -e cycles -e './test_bpf_map_2.c/map:pmu_map.event=cycles/' -p 2348
+  ERROR: Apply config to BPF failed: Cannot set event to BPF map in multi-thread tracing
+
+Error case 4:
+  # perf record -e cycles -e './test_bpf_map_2.c/map:pmu_map.event=cycles/' ls /
+  ERROR: Apply config to BPF failed: Doesn't support inherit event (Hint: use -i to turn off inherit)
+
+Error case 5:
+  # perf record -i -e raw_syscalls:sys_enter -e './test_bpf_map_2.c/map:pmu_map.event=raw_syscalls:sys_enter/' ls
+  ERROR: Apply config to BPF failed: Can only put raw, hardware and BPF output event into a BPF map
+
+Error case 6:
+  # perf record -i -e './test_bpf_map_2.c/map:pmu_map.event=123/' ls /
+  event syntax error: '.._map.event=123/'
+                                    \___ Incorrect value type for map
+  [SNIP]
+
+Signed-off-by: Wang Nan <wangnan0@huawei.com>
+Acked-by: Jiri Olsa <jolsa@kernel.org>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Brendan Gregg <brendan.d.gregg@gmail.com>
+Cc: Cody P Schafer <dev@codyps.com>
+Cc: He Kuang <hekuang@huawei.com>
+Cc: Jeremie Galarneau <jeremie.galarneau@efficios.com>
+Cc: Kirill Smelkov <kirr@nexedi.com>
+Cc: Li Zefan <lizefan@huawei.com>
+Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Zefan Li <lizefan@huawei.com>
+Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1456132275-98875-7-git-send-email-wangnan0@huawei.com
+Signed-off-by: He Kuang <hekuang@huawei.com>
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

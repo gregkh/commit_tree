@@ -1,0 +1,55 @@
+md-cluster: fix deadlock issue when add disk to an recoverying array
+
+Add a disk to an array which is performing recovery
+is a little complicated, we need to do both reap the
+sync thread and perform add disk for the case, then
+it caused deadlock as follows.
+
+linux44:~ # ps aux|grep md|grep D
+root      1822  0.0  0.0      0     0 ?        D    16:50   0:00 [md127_resync]
+root      1848  0.0  0.0  19860   952 pts/0    D+   16:50   0:00 mdadm --manage /dev/md127 --re-add /dev/vdb
+linux44:~ # cat /proc/1848/stack
+[<ffffffff8107afde>] kthread_stop+0x6e/0x120
+[<ffffffffa051ddb0>] md_unregister_thread+0x40/0x80 [md_mod]
+[<ffffffffa0526e45>] md_reap_sync_thread+0x15/0x150 [md_mod]
+[<ffffffffa05271e0>] action_store+0x260/0x270 [md_mod]
+[<ffffffffa05206b4>] md_attr_store+0xb4/0x100 [md_mod]
+[<ffffffff81214a7e>] sysfs_write_file+0xbe/0x140
+[<ffffffff811a6b98>] vfs_write+0xb8/0x1e0
+[<ffffffff811a75b8>] SyS_write+0x48/0xa0
+[<ffffffff8152a5c9>] system_call_fastpath+0x16/0x1b
+[<00007f068ea1ed30>] 0x7f068ea1ed30
+linux44:~ # cat /proc/1822/stack
+[<ffffffffa05251a6>] md_do_sync+0x846/0xf40 [md_mod]
+[<ffffffffa052402d>] md_thread+0x16d/0x180 [md_mod]
+[<ffffffff8107ad94>] kthread+0xb4/0xc0
+[<ffffffff8152a518>] ret_from_fork+0x58/0x90
+
+                        Task1848                                Task1822
+md_attr_store (held reconfig_mutex by call mddev_lock())
+                        action_store
+			md_reap_sync_thread
+			md_unregister_thread
+			kthread_stop                    md_wakeup_thread(mddev->thread);
+						wait_event(mddev->sb_wait, !test_bit(MD_CHANGE_PENDING))
+
+md_check_recovery is triggered by wakeup mddev->thread,
+but it can't clear MD_CHANGE_PENDING flag since it can't
+get lock which was held by md_attr_store already.
+
+To solve the deadlock problem, we move "->resync_finish()"
+from md_do_sync to md_reap_sync_thread (after md_update_sb),
+also MD_HELD_RESYNC_LOCK is introduced since it is possible
+that node can't get resync lock in md_do_sync.
+
+Then we do not need to wait for MD_CHANGE_PENDING is cleared
+or not since metadata should be updated after md_update_sb,
+so just call resync_finish if MD_HELD_RESYNC_LOCK is set.
+
+We also unified the code after skip label, since set PENDING
+for non-clustered case should be harmless.
+
+Reviewed-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Guoqing Jiang <gqjiang@suse.com>
+Signed-off-by: Shaohua Li <shli@fb.com>
+

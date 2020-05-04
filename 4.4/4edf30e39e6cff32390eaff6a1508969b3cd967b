@@ -1,0 +1,123 @@
+perf bpf: Collect perf_evsel in BPF object files
+
+This patch creates a 'struct perf_evsel' for every probe in a BPF object
+file(s) and fills 'struct evlist' with them. The previously introduced
+dummy event is now removed. After this patch, the following command:
+
+ # perf record --event filter.o ls
+
+Can trace on each of the probes defined in filter.o.
+
+The core of this patch is bpf__foreach_tev(), which calls a callback
+function for each 'struct probe_trace_event' event for a bpf program
+with each associated file descriptors. The add_bpf_event() callback
+creates evsels by calling parse_events_add_tracepoint().
+
+Since bpf-loader.c will not be built if libbpf is turned off, an empty
+bpf__foreach_tev() is defined in bpf-loader.h to avoid build errors.
+
+Committer notes:
+
+Before:
+
+  # /tmp/oldperf record --event /tmp/foo.o -a usleep 1
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.198 MB perf.data ]
+  # perf evlist
+  /tmp/foo.o
+  # perf evlist -v
+  /tmp/foo.o: type: 1, size: 112, config: 0x9, { sample_period,
+  sample_freq }: 4000, sample_type: IP|TID|TIME|CPU|PERIOD, disabled: 1,
+  inherit: 1, mmap: 1, comm: 1, freq: 1, task: 1, sample_id_all: 1,
+  exclude_guest: 1, mmap2: 1, comm_exec: 1
+
+I.e. we create just the PERF_TYPE_SOFTWARE (type: 1),
+PERF_COUNT_SW_DUMMY(config 0x9) event, now, with this patch:
+
+  # perf record --event /tmp/foo.o -a usleep 1
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.210 MB perf.data ]
+  # perf evlist -v
+  perf_bpf_probe:fork: type: 2, size: 112, config: 0x6bd, { sample_period,
+  sample_freq }: 1, sample_type: IP|TID|TIME|CPU|PERIOD|RAW, disabled: 1,
+  inherit: 1, mmap: 1, comm: 1, task: 1, sample_id_all: 1, exclude_guest:
+  1, mmap2: 1, comm_exec: 1
+  #
+
+We now have a PERF_TYPE_SOFTWARE (type: 1), but the config states 0x6bd,
+which is how, after setting up the event via the kprobes interface, the
+'perf_bpf_probe:fork' event is accessible via the perf_event_open
+syscall. This is all transient, as soon as the 'perf record' session
+ends, these probes will go away.
+
+To see how it looks like, lets try doing a neverending session, one that
+expects a control+C to end:
+
+  # perf record --event /tmp/foo.o -a
+
+So, with that in place, we can use 'perf probe' to see what is in place:
+
+  # perf probe -l
+    perf_bpf_probe:fork  (on _do_fork@acme/git/linux/kernel/fork.c)
+
+We also can use debugfs:
+
+  [root@felicio ~]# cat /sys/kernel/debug/tracing/kprobe_events
+  p:perf_bpf_probe/fork _text+638512
+
+Ok, now lets stop and see if we got some forks:
+
+  [root@felicio linux]# perf record --event /tmp/foo.o -a
+  ^C[ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.325 MB perf.data (111 samples) ]
+
+  [root@felicio linux]# perf script
+      sshd  1271 [003] 81797.507678: perf_bpf_probe:fork: (ffffffff8109be30)
+      sshd 18309 [000] 81797.524917: perf_bpf_probe:fork: (ffffffff8109be30)
+      sshd 18309 [001] 81799.381603: perf_bpf_probe:fork: (ffffffff8109be30)
+      sshd 18309 [001] 81799.408635: perf_bpf_probe:fork: (ffffffff8109be30)
+  <SNIP>
+
+Sure enough, we have 111 forks :-)
+
+Callchains seems to work as well:
+
+  # perf report --stdio --no-child
+  # To display the perf.data header info, please use --header/--header-only options.
+  #
+  # Total Lost Samples: 0
+  #
+  # Samples: 562  of event 'perf_bpf_probe:fork'
+  # Event count (approx.): 562
+  #
+  # Overhead  Command   Shared Object     Symbol
+  # ........  ........  ................  ............
+  #
+      44.66%  sh        [kernel.vmlinux]  [k] _do_fork
+                    |
+                    ---_do_fork
+                       entry_SYSCALL_64_fastpath
+                       __libc_fork
+                       make_child
+
+    26.16%  make      [kernel.vmlinux]  [k] _do_fork
+<SNIP>
+  #
+
+Signed-off-by: Wang Nan <wangnan0@huawei.com>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Alexei Starovoitov <ast@plumgrid.com>
+Cc: Brendan Gregg <brendan.d.gregg@gmail.com>
+Cc: Daniel Borkmann <daniel@iogearbox.net>
+Cc: David Ahern <dsahern@gmail.com>
+Cc: He Kuang <hekuang@huawei.com>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Kaixu Xia <xiakaixu@huawei.com>
+Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Zefan Li <lizefan@huawei.com>
+Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1444826502-49291-7-git-send-email-wangnan0@huawei.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

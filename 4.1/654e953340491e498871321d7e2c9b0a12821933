@@ -1,0 +1,64 @@
+rcu: Associate quiescent-state reports with grace period
+
+As noted in earlier commit logs, CPU hotplug operations running
+concurrently with grace-period initialization can result in a given
+leaf rcu_node structure having all CPUs offline and no blocked readers,
+but with this rcu_node structure nevertheless blocking the current
+grace period.  Therefore, the quiescent-state forcing code now checks
+for this situation and repairs it.
+
+Unfortunately, this checking can result in false positives, for example,
+when the last task has just removed itself from this leaf rcu_node
+structure, but has not yet started clearing the ->qsmask bits further
+up the structure.  This means that the grace-period kthread (which
+forces quiescent states) and some other task might be attempting to
+concurrently clear these ->qsmask bits.  This is usually not a problem:
+One of these tasks will be the first to acquire the upper-level rcu_node
+structure's lock and with therefore clear the bit, and the other task,
+seeing the bit already cleared, will stop trying to clear bits.
+
+Sadly, this means that the following unusual sequence of events -can-
+result in a problem:
+
+1.	The grace-period kthread wins, and clears the ->qsmask bits.
+
+2.	This is the last thing blocking the current grace period, so
+	that the grace-period kthread clears ->qsmask bits all the way
+	to the root and finds that the root ->qsmask field is now zero.
+
+3.	Another grace period is required, so that the grace period kthread
+	initializes it, including setting all the needed qsmask bits.
+
+4.	The leaf rcu_node structure (the one that started this whole
+	mess) is blocking this new grace period, either because it
+	has at least one online CPU or because there is at least one
+	task that had blocked within an RCU read-side critical section
+	while running on one of this leaf rcu_node structure's CPUs.
+	(And yes, that CPU might well have gone offline before the
+	grace period in step (3) above started, which can mean that
+	there is a task on the leaf rcu_node structure's ->blkd_tasks
+	list, but ->qsmask equal to zero.)
+
+5.	The other kthread didn't get around to trying to clear the upper
+	level ->qsmask bits until all the above had happened.  This means
+	that it now sees bits set in the upper-level ->qsmask field, so it
+	proceeds to clear them.  Too bad that it is doing so on behalf of
+	a quiescent state that does not apply to the current grace period!
+
+This sequence of events can result in the new grace period being too
+short.  It can also result in the new grace period ending before the
+leaf rcu_node structure's ->qsmask bits have been cleared, which will
+result in splats during initialization of the next grace period.  In
+addition, it can result in tasks blocking the new grace period still
+being queued at the start of the next grace period, which will result
+in other splats.  Sasha's testing turned up another of these splats,
+as did rcutorture testing.  (And yes, rcutorture is being adjusted to
+make these splats show up more quickly.  Which probably is having the
+undesirable side effect of making other problems show up less quickly.
+Can't have everything!)
+
+Reported-by: Sasha Levin <sasha.levin@oracle.com>
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: <stable@vger.kernel.org> # 4.0.x
+Tested-by: Sasha Levin <sasha.levin@oracle.com>
+

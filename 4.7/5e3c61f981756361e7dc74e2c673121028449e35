@@ -1,0 +1,40 @@
+netfilter: conntrack: fix lookup race during hash resize
+
+When resizing the conntrack hash table at runtime via
+echo 42 > /sys/module/nf_conntrack/parameters/hashsize, we are racing with
+the conntrack lookup path -- reads can happen in parallel and nothing
+prevents readers from observing a the newly allocated hash but the old
+size (or vice versa).
+
+So access to hash[bucket] can trigger OOB read access in case the table got
+expanded and we saw the new size but the old hash pointer (or it got shrunk
+and we got new hash ptr but the size of the old and larger table):
+
+kasan: GPF could be caused by NULL-ptr deref or user memory access general protection fault: 0000 [#1] SMP KASAN
+CPU: 0 PID: 3 Comm: ksoftirqd/0 Not tainted 4.6.0-rc2+ #107
+[..]
+Call Trace:
+[<ffffffff822c3d6a>] ? nf_conntrack_tuple_taken+0x12a/0xe90
+[<ffffffff822c3ac1>] ? nf_ct_invert_tuplepr+0x221/0x3a0
+[<ffffffff8230e703>] get_unique_tuple+0xfb3/0x2760
+
+Use generation counter to obtain the address/length of the same table.
+
+Also add a synchronize_net before freeing the old hash.
+AFAICS, without it we might access ct_hash[bucket] after ct_hash has been
+freed, provided that lockless reader got delayed by another event:
+
+CPU1			CPU2
+seq_begin
+seq_retry
+<delay>			resize occurs
+			free oldhash
+for_each(oldhash[size])
+
+Note that resize is only supported in init_netns, it took over 2 minutes
+of constant resizing+flooding to produce the warning, so this isn't a
+big problem in practice.
+
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+

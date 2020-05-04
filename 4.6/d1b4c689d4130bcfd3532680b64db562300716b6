@@ -1,0 +1,64 @@
+netlink: remove mmapped netlink support
+
+mmapped netlink has a number of unresolved issues:
+
+- TX zerocopy support had to be disabled more than a year ago via
+  commit 4682a0358639b29cf ("netlink: Always copy on mmap TX.")
+  because the content of the mmapped area can change after netlink
+  attribute validation but before message processing.
+
+- RX support was implemented mainly to speed up nfqueue dumping packet
+  payload to userspace.  However, since commit ae08ce0021087a5d812d2
+  ("netfilter: nfnetlink_queue: zero copy support") we avoid one copy
+  with the socket-based interface too (via the skb_zerocopy helper).
+
+The other problem is that skbs attached to mmaped netlink socket
+behave different from normal skbs:
+
+- they don't have a shinfo area, so all functions that use skb_shinfo()
+(e.g. skb_clone) cannot be used.
+
+- reserving headroom prevents userspace from seeing the content as
+it expects message to start at skb->head.
+See for instance
+commit aa3a022094fa ("netlink: not trim skb for mmaped socket when dump").
+
+- skbs handed e.g. to netlink_ack must have non-NULL skb->sk, else we
+crash because it needs the sk to check if a tx ring is attached.
+
+Also not obvious, leads to non-intuitive bug fixes such as 7c7bdf359
+("netfilter: nfnetlink: use original skbuff when acking batches").
+
+mmaped netlink also didn't play nicely with the skb_zerocopy helper
+used by nfqueue and openvswitch.  Daniel Borkmann fixed this via
+commit 6bb0fef489f6 ("netlink, mmap: fix edge-case leakages in nf queue
+zero-copy")' but at the cost of also needing to provide remaining
+length to the allocation function.
+
+nfqueue also has problems when used with mmaped rx netlink:
+- mmaped netlink doesn't allow use of nfqueue batch verdict messages.
+  Problem is that in the mmap case, the allocation time also determines
+  the ordering in which the frame will be seen by userspace (A
+  allocating before B means that A is located in earlier ring slot,
+  but this also means that B might get a lower sequence number then A
+  since seqno is decided later.  To fix this we would need to extend the
+  spinlocked region to also cover the allocation and message setup which
+  isn't desirable.
+- nfqueue can now be configured to queue large (GSO) skbs to userspace.
+  Queing GSO packets is faster than having to force a software segmentation
+  in the kernel, so this is a desirable option.  However, with a mmap based
+  ring one has to use 64kb per ring slot element, else mmap has to fall back
+  to the socket path (NL_MMAP_STATUS_COPY) for all large packets.
+
+To use the mmap interface, userspace not only has to probe for mmap netlink
+support, it also has to implement a recv/socket receive path in order to
+handle messages that exceed the size of an rx ring element.
+
+Cc: Daniel Borkmann <daniel@iogearbox.net>
+Cc: Ken-ichirou MATSUZAWA <chamaken@gmail.com>
+Cc: Pablo Neira Ayuso <pablo@netfilter.org>
+Cc: Patrick McHardy <kaber@trash.net>
+Cc: Thomas Graf <tgraf@suug.ch>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

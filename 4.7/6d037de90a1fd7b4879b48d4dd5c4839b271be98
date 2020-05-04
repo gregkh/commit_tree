@@ -1,0 +1,126 @@
+MIPS: Fix possible corruption of cache mode by mprotect.
+
+The following testcase may result in a page table entries with a invalid
+CCA field being generated:
+
+static void *bindstack;
+
+static int sysrqfd;
+
+static void protect_low(int protect)
+{
+	mprotect(bindstack, BINDSTACK_SIZE, protect);
+}
+
+static void sigbus_handler(int signal, siginfo_t * info, void *context)
+{
+	void *addr = info->si_addr;
+
+	write(sysrqfd, "x", 1);
+
+	printf("sigbus, fault address %p (should not happen, but might)\n",
+	       addr);
+	abort();
+}
+
+static void run_bind_test(void)
+{
+	unsigned int *p = bindstack;
+
+	p[0] = 0xf001f001;
+
+	write(sysrqfd, "x", 1);
+
+	/* Set trap on access to p[0] */
+	protect_low(PROT_NONE);
+
+	write(sysrqfd, "x", 1);
+
+	/* Clear trap on access to p[0] */
+	protect_low(PROT_READ | PROT_WRITE | PROT_EXEC);
+
+	write(sysrqfd, "x", 1);
+
+	/* Check the contents of p[0] */
+	if (p[0] != 0xf001f001) {
+		write(sysrqfd, "x", 1);
+
+		/* Reached, but shouldn't be */
+		printf("badness, shouldn't happen but does\n");
+		abort();
+	}
+}
+
+int main(void)
+{
+	struct sigaction sa;
+
+	sysrqfd = open("/proc/sysrq-trigger", O_WRONLY);
+
+	if (sigprocmask(SIG_BLOCK, NULL, &sa.sa_mask)) {
+		perror("sigprocmask");
+		return 0;
+	}
+
+	sa.sa_sigaction = sigbus_handler;
+	sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_RESTART;
+	if (sigaction(SIGBUS, &sa, NULL)) {
+		perror("sigaction");
+		return 0;
+	}
+
+	bindstack = mmap(NULL,
+			 BINDSTACK_SIZE,
+			 PROT_READ | PROT_WRITE | PROT_EXEC,
+			 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (bindstack == MAP_FAILED) {
+		perror("mmap bindstack");
+		return 0;
+	}
+
+	printf("bindstack: %p\n", bindstack);
+
+	run_bind_test();
+
+	printf("done\n");
+
+	return 0;
+}
+
+There are multiple ingredients for this:
+
+ 1) PAGE_NONE is defined to _CACHE_CACHABLE_NONCOHERENT, which is CCA 3
+    on all platforms except SB1 where it's CCA 5.
+ 2) _page_cachable_default must have bits set which are not set
+    _CACHE_CACHABLE_NONCOHERENT.
+ 3) Either the defective version of pte_modify for XPA or the standard
+    version must be in used.  However pte_modify for the 36 bit address
+    space support is no affected.
+
+In that case additional bits in the final CCA mode may generate an invalid
+value for the CCA field.  On the R10000 system where this was tracked
+down for example a CCA 7 has been observed, which is Uncached Accelerated.
+
+Fixed by:
+
+ 1) Using the proper CCA mode for PAGE_NONE just like for all the other
+    PAGE_* pte/pmd bits.
+ 2) Fix the two affected variants of pte_modify.
+
+Further code inspection also shows the same issue to exist in pmd_modify
+which would affect huge page systems.
+
+Issue in pte_modify tracked down by Alastair Bridgewater, PAGE_NONE
+and pmd_modify issue found by me.
+
+The history of this goes back beyond Linus' git history.  Chris Dearman's
+commit 351336929ccf222ae38ff0cb7a8dd5fd5c6236a0 ("[MIPS] Allow setting of
+the cache attribute at run time.") missed the opportunity to fix this
+but it was originally introduced in lmo commit
+d523832cf12007b3242e50bb77d0c9e63e0b6518 ("Missing from last commit.")
+and 32cc38229ac7538f2346918a09e75413e8861f87 ("New configuration option
+CONFIG_MIPS_UNCACHED.")
+
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+Reported-by: Alastair Bridgewater <alastair.bridgewater@gmail.com>
+

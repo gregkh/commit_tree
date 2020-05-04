@@ -1,0 +1,119 @@
+staging: unisys: fix random hangs with network stress in visornic
+
+We learned that it was possible for the core networking code to call
+visornic_xmit() within ISR context, resulting in the need for us to
+use spin_lock_irqsave() / spin_lock_irqrestore() to lock accesses to our
+virtual device channels.
+
+Without the correct locking added in this patch, random hangs would occur
+on typical kernels while stressing the netork.  When using a kernel with
+CONFIG_DEBUG_SPINLOCK=y, a stackdump would occur at the time of the hang
+reporting:
+
+    BUG: spinlock recursion on CPU#0, vnic_incoming/<pid>
+
+(see below for more details)
+
+We considered the possibility of adding a protocol between a visordriver
+and visorbus where the visordriver could specify which type of locking it
+required for its virtual device channels (essentially indicating whether
+or not it was possible for the channel to be accessed in ISR context), but
+decided this extra complexity was NOT needed, and that channel queues
+should always be accessed with the most-stringent locking.  So that is
+what is implemented in this commit.
+
+Below is an example stackdump illustrating the spinlock recursion that is
+fixed by this commit.  Note that we are first in virtnic_rx() writing to
+the device channel when an APIC timer interrupt occurs.  Within the core
+networking code, net_rx_action() calls process_backlog(), which eventually
+lands up back up in virtnic_xmit() in the code attempting to also write to
+the device channel.
+
+    BUG: spinlock recursion on CPU#0, vnic_incoming/262
+     lock: 0xffff88002db810c0, .magic: dead4ead, .owner: vnic_incoming/262,
+                               .owner_cpu: 0
+    CPU: 0 PID: 262 Comm: vnic_incoming
+                    Tainted: G         C      4.2.0-rc1-ARCH+ #56
+    Hardware name: Dell Inc. PowerEdge T110/ , BIOS 1.23 12/15/2009
+     ffff8800216ac200 ffff88002c803388 ffffffff81476364 0000000000000106
+     ffff88002db810c0 ffff88002c8033a8 ffffffff8109e2bc ffff88002db810c0
+     ffffffff817631d4 ffff88002c8033c8 ffffffff8109e330 ffff88002db810c0
+    Call Trace:
+     <IRQ>  [<ffffffff81476364>] dump_stack+0x4f/0x73
+     [<ffffffff8109e2bc>] spin_dump+0x7c/0xc0
+     [<ffffffff8109e330>] spin_bug+0x30/0x40
+     [<ffffffff8109e547>] do_raw_spin_lock+0x127/0x140
+     [<ffffffff8147bad0>] _raw_spin_lock+0x40/0x50
+     [<ffffffffa0151fa6>] ? visorchannel_signalinsert+0x46/0x70 [visorbus]
+     [<ffffffffa0151fa6>] visorchannel_signalinsert+0x46/0x70 [visorbus]
+     [<ffffffffa01683a2>] visornic_xmit+0x302/0x5d0 [visornic]
+     [<ffffffff813b2f30>] dev_hard_start_xmit+0x2e0/0x510
+     [<ffffffff813b2b75>] ? validate_xmit_skb+0x235/0x310
+     [<ffffffff813d79e7>] sch_direct_xmit+0xf7/0x1d0
+     [<ffffffff813b34d3>] __dev_queue_xmit+0x203/0x640
+     [<ffffffff813b3320>] ? __dev_queue_xmit+0x50/0x640
+     [<ffffffff813f3f6f>] ? ip_finish_output+0x1df/0x310
+     [<ffffffff813b3933>] dev_queue_xmit_sk+0x13/0x20
+     [<ffffffff813f3a5c>] ip_finish_output2+0x22c/0x470
+     [<ffffffff813f3f6f>] ? ip_finish_output+0x1df/0x310
+     [<ffffffff810987e0>] ? __lock_is_held+0x50/0x70
+     [<ffffffff813f3f6f>] ip_finish_output+0x1df/0x310
+     [<ffffffff813f4c31>] ip_output+0xb1/0x100
+     [<ffffffff813f41be>] ip_local_out_sk+0x3e/0x80
+     [<ffffffff813f4388>] ip_queue_xmit+0x188/0x4a0
+     [<ffffffff813f4200>] ? ip_local_out_sk+0x80/0x80
+     [<ffffffff8139fcd6>] ? __alloc_skb+0x86/0x1e0
+     [<ffffffff8140bd5b>] tcp_transmit_skb+0x4cb/0x9c0
+     [<ffffffff8139f0dc>] ? __kmalloc_reserve+0x3c/0x90
+     [<ffffffff8139fcea>] ? __alloc_skb+0x9a/0x1e0
+     [<ffffffff8140c47d>] tcp_send_ack+0x10d/0x150
+     [<ffffffff814060ee>] __tcp_ack_snd_check+0x5e/0x90
+     [<ffffffff81408eb4>] tcp_rcv_established+0x354/0x710
+     [<ffffffff81412182>] tcp_v4_do_rcv+0x162/0x3f0
+     [<ffffffff81414412>] tcp_v4_rcv+0xb22/0xb50
+     [<ffffffff813ee2bc>] ? ip_local_deliver_finish+0x4c/0x2d0
+     [<ffffffff813ee350>] ip_local_deliver_finish+0xe0/0x2d0
+     [<ffffffff813ee2bc>] ? ip_local_deliver_finish+0x4c/0x2d0
+     [<ffffffff813ee72e>] ip_local_deliver+0xae/0xc0
+     [<ffffffff813edeaf>] ip_rcv_finish+0x14f/0x510
+     [<ffffffff813aab2d>] ? __netif_receive_skb_core+0x9d/0xb70
+     [<ffffffff813eea13>] ip_rcv+0x2d3/0x3b0
+     [<ffffffff81097110>] ? cpuacct_css_alloc+0xb0/0xb0
+     [<ffffffff813ab0f3>] __netif_receive_skb_core+0x663/0xb70
+     [<ffffffff813aab2d>] ? __netif_receive_skb_core+0x9d/0xb70
+     [<ffffffff810971a9>] ? cpuacct_charge+0x99/0xb0
+     [<ffffffff81097110>] ? cpuacct_css_alloc+0xb0/0xb0
+     [<ffffffff810987e0>] ? __lock_is_held+0x50/0x70
+     [<ffffffff813ab72c>] ? process_backlog+0xbc/0x150
+     [<ffffffff813ab78b>] ? process_backlog+0x11b/0x150
+     [<ffffffff813ab627>] __netif_receive_skb+0x27/0x70
+     [<ffffffff813ab702>] process_backlog+0x92/0x150
+     [<ffffffff813afffd>] net_rx_action+0x13d/0x350
+     [<ffffffff81036b2d>] ? lapic_next_event+0x1d/0x30
+     [<ffffffff81058694>] __do_softirq+0x104/0x320
+     [<ffffffff810c0788>] ? hrtimer_interrupt+0xc8/0x1a0
+     [<ffffffff81074e70>] ? blocking_notifier_chain_cond_register+0x70/0x70
+     [<ffffffff81058ab9>] irq_exit+0x79/0xa0
+     [<ffffffff8147ecca>] smp_apic_timer_interrupt+0x4a/0x60
+     [<ffffffff8147d2c8>] apic_timer_interrupt+0x68/0x70
+     <EOI>  [<ffffffff81271c02>] ? __memcpy+0x12/0x20
+     [<ffffffffa01517da>] ? visorchannel_write+0x4a/0x80 [visorbus]
+     [<ffffffffa0151eb8>] signalinsert_inner+0x88/0x130 [visorbus]
+     [<ffffffffa0151fb5>] visorchannel_signalinsert+0x55/0x70 [visorbus]
+     [<ffffffffa0166e57>] visornic_rx+0x12e7/0x19d0 [visornic]
+     [<ffffffffa01677c9>] process_incoming_rsps+0x289/0x690 [visornic]
+     [<ffffffff814771c5>] ? preempt_schedule+0x25/0x30
+     [<ffffffff81001026>] ? ___preempt_schedule+0x12/0x14
+     [<ffffffff81093080>] ? wait_woken+0x90/0x90
+     [<ffffffffa0167540>] ? visornic_rx+0x19d0/0x19d0 [visornic]
+     [<ffffffffa0167540>] ? visornic_rx+0x19d0/0x19d0 [visornic]
+     [<ffffffff81073a39>] kthread+0xe9/0x110
+     [<ffffffff81073950>] ? __init_kthread_worker+0x70/0x70
+     [<ffffffff8147c89f>] ret_from_fork+0x3f/0x70
+     [<ffffffff81073950>] ? __init_kthread_worker+0x70/0x70
+
+Fixes: b12fdf7da ('staging: unisys: rework signal remove/insert to avoid sparse lock warnings')
+Signed-off-by: Tim Sell <Timothy.Sell@unisys.com>
+Signed-off-by: Benjamin Romer <benjamin.romer@unisys.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

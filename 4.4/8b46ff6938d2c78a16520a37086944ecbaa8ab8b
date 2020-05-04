@@ -1,0 +1,136 @@
+ring_buffer: Do no not complete benchmark reader too early
+
+It seems that complete(&read_done) might be called too early
+in some situations.
+
+1st scenario:
+-------------
+
+CPU0					CPU1
+
+ring_buffer_producer_thread()
+  wake_up_process(consumer);
+  wait_for_completion(&read_start);
+
+					ring_buffer_consumer_thread()
+					  complete(&read_start);
+
+  ring_buffer_producer()
+    # producing data in
+    # the do-while cycle
+
+					  ring_buffer_consumer();
+					    # reading data
+					    # got error
+					    # set kill_test = 1;
+					    set_current_state(
+						TASK_INTERRUPTIBLE);
+					    if (reader_finish)  # false
+					    schedule();
+
+    # producer still in the middle of
+    # do-while cycle
+    if (consumer && !(cnt % wakeup_interval))
+      wake_up_process(consumer);
+
+					    # spurious wakeup
+					    while (!reader_finish &&
+						   !kill_test)
+					    # leaving because
+					    # kill_test == 1
+					    reader_finish = 0;
+					    complete(&read_done);
+
+1st BANG: We might access uninitialized "read_done" if this is the
+	  the first round.
+
+    # producer finally leaving
+    # the do-while cycle because kill_test == 1;
+
+    if (consumer) {
+      reader_finish = 1;
+      wake_up_process(consumer);
+      wait_for_completion(&read_done);
+
+2nd BANG: This will never complete because consumer already did
+	  the completion.
+
+2nd scenario:
+-------------
+
+CPU0					CPU1
+
+ring_buffer_producer_thread()
+  wake_up_process(consumer);
+  wait_for_completion(&read_start);
+
+					ring_buffer_consumer_thread()
+					  complete(&read_start);
+
+  ring_buffer_producer()
+    # CPU3 removes the module	  <--- difference from
+    # and stops producer          <--- the 1st scenario
+    if (kthread_should_stop())
+      kill_test = 1;
+
+					  ring_buffer_consumer();
+					    while (!reader_finish &&
+						   !kill_test)
+					    # kill_test == 1 => we never go
+					    # into the top level while()
+					    reader_finish = 0;
+					    complete(&read_done);
+
+    # producer still in the middle of
+    # do-while cycle
+    if (consumer && !(cnt % wakeup_interval))
+      wake_up_process(consumer);
+
+					    # spurious wakeup
+					    while (!reader_finish &&
+						   !kill_test)
+					    # leaving because kill_test == 1
+					    reader_finish = 0;
+					    complete(&read_done);
+
+BANG: We are in the same "bang" situations as in the 1st scenario.
+
+Root of the problem:
+--------------------
+
+ring_buffer_consumer() must complete "read_done" only when "reader_finish"
+variable is set. It must not be skipped due to other conditions.
+
+Note that we still must keep the check for "reader_finish" in a loop
+because there might be spurious wakeups as described in the
+above scenarios.
+
+Solution:
+----------
+
+The top level cycle in ring_buffer_consumer() will finish only when
+"reader_finish" is set. The data will be read in "while-do" cycle
+so that they are not read after an error (kill_test == 1)
+or a spurious wake up.
+
+In addition, "reader_finish" is manipulated by the producer thread.
+Therefore we add READ_ONCE() to make sure that the fresh value is
+read in each cycle. Also we add the corresponding barrier
+to synchronize the sleep check.
+
+Next we set the state back to TASK_RUNNING for the situation where we
+did not sleep.
+
+Just from paranoid reasons, we initialize both completions statically.
+This is safer, in case there are other races that we are unaware of.
+
+As a side effect we could remove the memory barrier from
+ring_buffer_producer_thread(). IMHO, this was the reason for
+the barrier. ring_buffer_reset() uses spin locks that should
+provide the needed memory barrier for using the buffer.
+
+Link: http://lkml.kernel.org/r/1441629518-32712-2-git-send-email-pmladek@suse.com
+
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+

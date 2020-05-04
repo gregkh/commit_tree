@@ -1,0 +1,75 @@
+libceph: make authorizer destruction independent of ceph_auth_client
+
+Starting the kernel client with cephx disabled and then enabling cephx
+and restarting userspace daemons can result in a crash:
+
+    [262671.478162] BUG: unable to handle kernel paging request at ffffebe000000000
+    [262671.531460] IP: [<ffffffff811cd04a>] kfree+0x5a/0x130
+    [262671.584334] PGD 0
+    [262671.635847] Oops: 0000 [#1] SMP
+    [262672.055841] CPU: 22 PID: 2961272 Comm: kworker/22:2 Not tainted 4.2.0-34-generic #39~14.04.1-Ubuntu
+    [262672.162338] Hardware name: Dell Inc. PowerEdge R720/068CDY, BIOS 2.4.3 07/09/2014
+    [262672.268937] Workqueue: ceph-msgr con_work [libceph]
+    [262672.322290] task: ffff88081c2d0dc0 ti: ffff880149ae8000 task.ti: ffff880149ae8000
+    [262672.428330] RIP: 0010:[<ffffffff811cd04a>]  [<ffffffff811cd04a>] kfree+0x5a/0x130
+    [262672.535880] RSP: 0018:ffff880149aeba58  EFLAGS: 00010286
+    [262672.589486] RAX: 000001e000000000 RBX: 0000000000000012 RCX: ffff8807e7461018
+    [262672.695980] RDX: 000077ff80000000 RSI: ffff88081af2be04 RDI: 0000000000000012
+    [262672.803668] RBP: ffff880149aeba78 R08: 0000000000000000 R09: 0000000000000000
+    [262672.912299] R10: ffffebe000000000 R11: ffff880819a60e78 R12: ffff8800aec8df40
+    [262673.021769] R13: ffffffffc035f70f R14: ffff8807e5b138e0 R15: ffff880da9785840
+    [262673.131722] FS:  0000000000000000(0000) GS:ffff88081fac0000(0000) knlGS:0000000000000000
+    [262673.245377] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    [262673.303281] CR2: ffffebe000000000 CR3: 0000000001c0d000 CR4: 00000000001406e0
+    [262673.417556] Stack:
+    [262673.472943]  ffff880149aeba88 ffff88081af2be04 ffff8800aec8df40 ffff88081af2be04
+    [262673.583767]  ffff880149aeba98 ffffffffc035f70f ffff880149aebac8 ffff8800aec8df00
+    [262673.694546]  ffff880149aebac8 ffffffffc035c89e ffff8807e5b138e0 ffff8805b047f800
+    [262673.805230] Call Trace:
+    [262673.859116]  [<ffffffffc035f70f>] ceph_x_destroy_authorizer+0x1f/0x50 [libceph]
+    [262673.968705]  [<ffffffffc035c89e>] ceph_auth_destroy_authorizer+0x3e/0x60 [libceph]
+    [262674.078852]  [<ffffffffc0352805>] put_osd+0x45/0x80 [libceph]
+    [262674.134249]  [<ffffffffc035290e>] remove_osd+0xae/0x140 [libceph]
+    [262674.189124]  [<ffffffffc0352aa3>] __reset_osd+0x103/0x150 [libceph]
+    [262674.243749]  [<ffffffffc0354703>] kick_requests+0x223/0x460 [libceph]
+    [262674.297485]  [<ffffffffc03559e2>] ceph_osdc_handle_map+0x282/0x5e0 [libceph]
+    [262674.350813]  [<ffffffffc035022e>] dispatch+0x4e/0x720 [libceph]
+    [262674.403312]  [<ffffffffc034bd91>] try_read+0x3d1/0x1090 [libceph]
+    [262674.454712]  [<ffffffff810ab7c2>] ? dequeue_entity+0x152/0x690
+    [262674.505096]  [<ffffffffc034cb1b>] con_work+0xcb/0x1300 [libceph]
+    [262674.555104]  [<ffffffff8108fb3e>] process_one_work+0x14e/0x3d0
+    [262674.604072]  [<ffffffff810901ea>] worker_thread+0x11a/0x470
+    [262674.652187]  [<ffffffff810900d0>] ? rescuer_thread+0x310/0x310
+    [262674.699022]  [<ffffffff810957a2>] kthread+0xd2/0xf0
+    [262674.744494]  [<ffffffff810956d0>] ? kthread_create_on_node+0x1c0/0x1c0
+    [262674.789543]  [<ffffffff817bd81f>] ret_from_fork+0x3f/0x70
+    [262674.834094]  [<ffffffff810956d0>] ? kthread_create_on_node+0x1c0/0x1c0
+
+What happens is the following:
+
+    (1) new MON session is established
+    (2) old "none" ac is destroyed
+    (3) new "cephx" ac is constructed
+    ...
+    (4) old OSD session (w/ "none" authorizer) is put
+          ceph_auth_destroy_authorizer(ac, osd->o_auth.authorizer)
+
+osd->o_auth.authorizer in the "none" case is just a bare pointer into
+ac, which contains a single static copy for all services.  By the time
+we get to (4), "none" ac, freed in (2), is long gone.  On top of that,
+a new vtable installed in (3) points us at ceph_x_destroy_authorizer(),
+so we end up trying to destroy a "none" authorizer with a "cephx"
+destructor operating on invalid memory!
+
+To fix this, decouple authorizer destruction from ac and do away with
+a single static "none" authorizer by making a copy for each OSD or MDS
+session.  Authorizers themselves are independent of ac and so there is
+no reason for destroy_authorizer() to be an ac op.  Make it an op on
+the authorizer itself by turning ceph_authorizer into a real struct.
+
+Fixes: http://tracker.ceph.com/issues/15447
+
+Reported-by: Alan Zhang <alan.zhang@linux.com>
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Reviewed-by: Sage Weil <sage@redhat.com>
+

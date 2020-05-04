@@ -1,0 +1,95 @@
+ACPI / EC: Fix and clean up register access guarding logics.
+
+In the polling mode, EC driver shouldn't access the EC registers too
+frequently. Though this statement is concluded from the non-root caused
+bugs (see links below), we've maintained the register access guarding
+logics in the current EC driver. The guarding logics can be found here and
+there, makes it hard to root cause real timing issues. This patch collects
+the guarding logics into one single function so that all hidden logics
+related to this can be seen clearly.
+
+The current guarding related code also has several issues:
+1. Per-transaction timestamp prevents inter-transaction guarding from being
+   implemented in the same place. We have an inter-transaction udelay() in
+   acpi_ec_transaction_unblocked(), this logic can be merged into ec_poll()
+   if we can use per-device timestamp. This patch completes such merge to
+   form a new ec_guard() function and collects all guarding related hidden
+   logics in it.
+   One hidden logic is: there is no inter-transaction guarding performed
+   for non MSI quirk (wait polling mode), this patch skips
+   inter-transaction guarding before wait_event_timeout() for the wait
+   polling mode to reveal the hidden logic.
+   The other hidden logic is: there is msleep() inter-transaction guarding
+   performed when the GPE storming is observed. As after merging this
+   commit:
+     Commit: e1d4d90fc0313d3d58cbd7912c90f8ef24df45ff
+     Subject: ACPI / EC: Refine command storm prevention support
+   EC_FLAGS_COMMAND_STORM is ensured to be cleared after invoking
+   acpi_ec_transaction_unlocked(), the msleep() guard logic will never
+   happen now. Since no one complains such change, this logic is likely
+   added during the old times where the EC race issues are not fixed and
+   the bugs are false root-caused to the timing issue. This patch simply
+   removes the out-dated logic. We can restore it by stop skipping
+   inter-transaction guarding for wait polling mode.
+   Two different delay values are defined for msleep() and udelay() while
+   they are merged in this patch to 550us.
+2. time_after() causes additional delay in the polling mode (can only be
+   observed in noirq suspend/resume processes where polling mode is always
+   used) before advance_transaction() is invoked ("wait polling" log is
+   added before wait_event_timeout()). We can see 2 wait_event_timeout()
+   invocations. This is because time_after() ensures a ">" validation while
+   we only need a ">=" validation here:
+   [   86.739909] ACPI: Waking up from system sleep state S3
+   [   86.742857] ACPI : EC: 2: Increase command
+   [   86.742859] ACPI : EC: ***** Command(RD_EC) started *****
+   [   86.742861] ACPI : EC: ===== TASK (0) =====
+   [   86.742871] ACPI : EC: EC_SC(R) = 0x20 SCI_EVT=1 BURST=0 CMD=0 IBF=0 OBF=0
+   [   86.742873] ACPI : EC: EC_SC(W) = 0x80
+   [   86.742876] ACPI : EC: ***** Event started *****
+   [   86.742880] ACPI : EC: ~~~~~ wait polling ~~~~~
+   [   86.743972] ACPI : EC: ~~~~~ wait polling ~~~~~
+   [   86.747966] ACPI : EC: ===== TASK (0) =====
+   [   86.747977] ACPI : EC: EC_SC(R) = 0x20 SCI_EVT=1 BURST=0 CMD=0 IBF=0 OBF=0
+   [   86.747978] ACPI : EC: EC_DATA(W) = 0x06
+   [   86.747981] ACPI : EC: ~~~~~ wait polling ~~~~~
+   [   86.751971] ACPI : EC: ~~~~~ wait polling ~~~~~
+   [   86.755969] ACPI : EC: ===== TASK (0) =====
+   [   86.755991] ACPI : EC: EC_SC(R) = 0x21 SCI_EVT=1 BURST=0 CMD=0 IBF=0 OBF=1
+   [   86.755993] ACPI : EC: EC_DATA(R) = 0x03
+   [   86.755994] ACPI : EC: ~~~~~ wait polling ~~~~~
+   [   86.755995] ACPI : EC: ***** Command(RD_EC) stopped *****
+   [   86.755996] ACPI : EC: 1: Decrease command
+   This patch corrects this by using time_before() instead in ec_guard():
+   [   54.283146] ACPI: Waking up from system sleep state S3
+   [   54.285414] ACPI : EC: 2: Increase command
+   [   54.285415] ACPI : EC: ***** Command(RD_EC) started *****
+   [   54.285416] ACPI : EC: ~~~~~ wait polling ~~~~~
+   [   54.285417] ACPI : EC: ===== TASK (0) =====
+   [   54.285424] ACPI : EC: EC_SC(R) = 0x20 SCI_EVT=1 BURST=0 CMD=0 IBF=0 OBF=0
+   [   54.285425] ACPI : EC: EC_SC(W) = 0x80
+   [   54.285427] ACPI : EC: ***** Event started *****
+   [   54.285429] ACPI : EC: ~~~~~ wait polling ~~~~~
+   [   54.287209] ACPI : EC: ===== TASK (0) =====
+   [   54.287218] ACPI : EC: EC_SC(R) = 0x20 SCI_EVT=1 BURST=0 CMD=0 IBF=0 OBF=0
+   [   54.287219] ACPI : EC: EC_DATA(W) = 0x06
+   [   54.287222] ACPI : EC: ~~~~~ wait polling ~~~~~
+   [   54.291190] ACPI : EC: ===== TASK (0) =====
+   [   54.291210] ACPI : EC: EC_SC(R) = 0x21 SCI_EVT=1 BURST=0 CMD=0 IBF=0 OBF=1
+   [   54.291213] ACPI : EC: EC_DATA(R) = 0x03
+   [   54.291214] ACPI : EC: ~~~~~ wait polling ~~~~~
+   [   54.291215] ACPI : EC: ***** Command(RD_EC) stopped *****
+   [   54.291216] ACPI : EC: 1: Decrease command
+
+After cleaning up all guarding logics, we have one single function
+ec_guard() collecting all old, non-root-caused, hidden logics. Then we can
+easily tune the logics in one place to respond to the bug reports.
+
+Except the time_before() change, all other changes do not change the
+behavior of the EC driver.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=12011
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=20242
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=77431
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

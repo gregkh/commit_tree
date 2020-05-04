@@ -1,0 +1,114 @@
+Btrfs: incremental send, check if orphanized dir inode needs delayed rename
+
+If a directory inode is orphanized, because some inode previously
+processed has a new name that collides with the old name of the current
+inode, we need to check if it needs its rename operation delayed too,
+as its ancestor-descendent relationship with some other inode might
+have been reversed between the parent and send snapshots and therefore
+its rename operation needs to happen after that other inode is renamed.
+
+For example, for the following reproducer where this is needed (provided
+by Robbie Ko):
+
+  $ mkfs.btrfs -f /dev/sdb
+  $ mount /dev/sdb /mnt
+  $ mkfs.btrfs -f /dev/sdc
+  $ mount /dev/sdc /mnt2
+
+  $ mkdir -p /mnt/data/n1/n2
+  $ mkdir /mnt/data/n4
+  $ mkdir -p /mnt/data/t6/t7
+  $ mkdir /mnt/data/t5
+  $ mkdir /mnt/data/t7
+  $ mkdir /mnt/data/n4/t2
+  $ mkdir /mnt/data/t4
+  $ mkdir /mnt/data/t3
+  $ mv /mnt/data/t7 /mnt/data/n4/t2
+  $ mv /mnt/data/t4 /mnt/data/n4/t2/t7
+  $ mv /mnt/data/t5 /mnt/data/n4/t2/t7/t4
+  $ mv /mnt/data/t6 /mnt/data/n4/t2/t7/t4/t5
+  $ mv /mnt/data/n1/n2 /mnt/data/n4/t2/t7/t4/t5/t6
+  $ mv /mnt/data/n1 /mnt/data/n4/t2/t7/t4/t5/t6
+  $ mv /mnt/data/n4/t2/t7/t4/t5/t6/t7 /mnt/data/n4/t2/t7/t4/t5/t6/n2
+  $ mv /mnt/data/t3 /mnt/data/n4/t2/t7/t4/t5/t6/n2/t7
+
+  $ btrfs subvolume snapshot -r /mnt /mnt/snap1
+
+  $ mv /mnt/data/n4/t2/t7/t4/t5/t6/n1 /mnt/data/n4
+  $ mv /mnt/data/n4/t2 /mnt/data/n4/n1
+  $ mv /mnt/data/n4/n1/t2/t7/t4/t5/t6/n2 /mnt/data/n4/n1/t2
+  $ mv /mnt/data/n4/n1/t2/n2/t7/t3 /mnt/data/n4/n1/t2
+  $ mv /mnt/data/n4/n1/t2/t7/t4/t5/t6 /mnt/data/n4/n1/t2
+  $ mv /mnt/data/n4/n1/t2/t7/t4 /mnt/data/n4/n1/t2/t6
+  $ mv /mnt/data/n4/n1/t2/t7 /mnt/data/n4/n1/t2/t3
+  $ mv /mnt/data/n4/n1/t2/n2/t7 /mnt/data/n4/n1/t2
+
+  $ btrfs subvolume snapshot -r /mnt /mnt/snap2
+
+  $ btrfs send /mnt/snap1 | btrfs receive /mnt2
+  $ btrfs send -p /mnt/snap1 /mnt/snap2 | btrfs receive /mnt2
+  ERROR: send ioctl failed with -12: Cannot allocate memory
+
+Where the parent snapshot directory hierarchy is the following:
+
+  .                                                        (ino 256)
+  |-- data/                                                (ino 257)
+        |-- n4/                                            (ino 260)
+             |-- t2/                                       (ino 265)
+                  |-- t7/                                  (ino 264)
+                       |-- t4/                             (ino 266)
+                            |-- t5/                        (ino 263)
+                                 |-- t6/                   (ino 261)
+                                      |-- n1/              (ino 258)
+                                      |-- n2/              (ino 259)
+                                           |-- t7/         (ino 262)
+                                                |-- t3/    (ino 267)
+
+And the send snapshot's directory hierarchy is the following:
+
+  .                                                        (ino 256)
+  |-- data/                                                (ino 257)
+        |-- n4/                                            (ino 260)
+             |-- n1/                                       (ino 258)
+                  |-- t2/                                  (ino 265)
+                       |-- n2/                             (ino 259)
+                       |-- t3/                             (ino 267)
+                       |    |-- t7                         (ino 264)
+                       |
+                       |-- t6/                             (ino 261)
+                       |    |-- t4/                        (ino 266)
+                       |         |-- t5/                   (ino 263)
+                       |
+                       |-- t7/                             (ino 262)
+
+While processing inode 262 we orphanize inode 264 and later attempt
+to rename inode 264 to its new name/location, which resulted in building
+an incorrect destination path string for the rename operation with the
+value "data/n4/t2/t7/t4/t5/t6/n2/t7/t3/t7". This rename operation must
+have been done only after inode 267 is processed and renamed, as the
+ancestor-descendent relationship between inodes 264 and 267 was reversed
+between both snapshots, because otherwise it results in an infinite loop
+when building the path string for inode 264 when we are processing an
+inode with a number larger than 264. That loop is the following:
+
+  start inode 264, send progress of 265 for example
+  parent of 264 -> 267
+  parent of 267 -> 262
+  parent of 262 -> 259
+  parent of 259 -> 261
+  parent of 261 -> 263
+  parent of 263 -> 266
+  parent of 266 -> 264
+    |--> back to first iteration while current path string length
+         is <= PATH_MAX, and fail with -ENOMEM otherwise
+
+So fix this by making the check if we need to delay a directory rename
+regardless of the current inode having been orphanized or not.
+
+A test case for fstests follows soon.
+
+Thanks to Robbie Ko for providing a reproducer for this problem.
+
+Reported-by: Robbie Ko <robbieko@synology.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+

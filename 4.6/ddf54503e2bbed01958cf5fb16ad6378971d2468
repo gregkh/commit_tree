@@ -1,0 +1,36 @@
+KVM: i8254: use atomic_t instead of pit.inject_lock
+
+The lock was an overkill, the same can be done with atomics.
+
+A mb() was added in kvm_pit_ack_irq, to pair with implicit barrier
+between pit_timer_fn and pit_do_work.  The mb() prevents a race that
+could happen if pending == 0 and irq_ack == 0:
+
+  kvm_pit_ack_irq:                | pit_timer_fn:
+   p = atomic_read(&ps->pending); |
+                                  |  atomic_inc(&ps->pending);
+                                  |  queue_work(pit_do_work);
+                                  | pit_do_work:
+                                  |  atomic_xchg(&ps->irq_ack, 0);
+                                  |  return;
+   atomic_set(&ps->irq_ack, 1);   |
+   if (p == 0) return;            |
+
+where the interrupt would not be delivered in this tick of pit_timer_fn.
+PIT would have eventually delivered the interrupt, but we sacrifice
+perofmance to make sure that interrupts are not needlessly delayed.
+
+sfence isn't enough: atomic_dec_if_positive does atomic_read first and
+x86 can reorder loads before stores.  lfence isn't enough: store can
+pass lfence, turning it into a nop.  A compiler barrier would be more
+than enough as CPU needs to stall for unbelievably long to use fences.
+
+This patch doesn't do anything in kvm_pit_reset_reinject, because any
+order of resets can race, but the result differs by at most one
+interrupt, which is ok, because it's the same result as if the reset
+happened at a slightly different time.  (Original code didn't protect
+the reset path with a proper lock, so users have to be robust.)
+
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+

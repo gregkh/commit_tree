@@ -1,0 +1,361 @@
+lib/GCD.c: use binary GCD algorithm instead of Euclidean
+
+The binary GCD algorithm is based on the following facts:
+	1. If a and b are all evens, then gcd(a,b) = 2 * gcd(a/2, b/2)
+	2. If a is even and b is odd, then gcd(a,b) = gcd(a/2, b)
+	3. If a and b are all odds, then gcd(a,b) = gcd((a-b)/2, b) = gcd((a+b)/2, b)
+
+Even on x86 machines with reasonable division hardware, the binary
+algorithm runs about 25% faster (80% the execution time) than the
+division-based Euclidian algorithm.
+
+On platforms like Alpha and ARMv6 where division is a function call to
+emulation code, it's even more significant.
+
+There are two variants of the code here, depending on whether a fast
+__ffs (find least significant set bit) instruction is available.  This
+allows the unpredictable branches in the bit-at-a-time shifting loop to
+be eliminated.
+
+If fast __ffs is not available, the "even/odd" GCD variant is used.
+
+I use the following code to benchmark:
+
+	#include <stdio.h>
+	#include <stdlib.h>
+	#include <stdint.h>
+	#include <string.h>
+	#include <time.h>
+	#include <unistd.h>
+
+	#define swap(a, b) \
+		do { \
+			a ^= b; \
+			b ^= a; \
+			a ^= b; \
+		} while (0)
+
+	unsigned long gcd0(unsigned long a, unsigned long b)
+	{
+		unsigned long r;
+
+		if (a < b) {
+			swap(a, b);
+		}
+
+		if (b == 0)
+			return a;
+
+		while ((r = a % b) != 0) {
+			a = b;
+			b = r;
+		}
+
+		return b;
+	}
+
+	unsigned long gcd1(unsigned long a, unsigned long b)
+	{
+		unsigned long r = a | b;
+
+		if (!a || !b)
+			return r;
+
+		b >>= __builtin_ctzl(b);
+
+		for (;;) {
+			a >>= __builtin_ctzl(a);
+			if (a == b)
+				return a << __builtin_ctzl(r);
+
+			if (a < b)
+				swap(a, b);
+			a -= b;
+		}
+	}
+
+	unsigned long gcd2(unsigned long a, unsigned long b)
+	{
+		unsigned long r = a | b;
+
+		if (!a || !b)
+			return r;
+
+		r &= -r;
+
+		while (!(b & r))
+			b >>= 1;
+
+		for (;;) {
+			while (!(a & r))
+				a >>= 1;
+			if (a == b)
+				return a;
+
+			if (a < b)
+				swap(a, b);
+			a -= b;
+			a >>= 1;
+			if (a & r)
+				a += b;
+			a >>= 1;
+		}
+	}
+
+	unsigned long gcd3(unsigned long a, unsigned long b)
+	{
+		unsigned long r = a | b;
+
+		if (!a || !b)
+			return r;
+
+		b >>= __builtin_ctzl(b);
+		if (b == 1)
+			return r & -r;
+
+		for (;;) {
+			a >>= __builtin_ctzl(a);
+			if (a == 1)
+				return r & -r;
+			if (a == b)
+				return a << __builtin_ctzl(r);
+
+			if (a < b)
+				swap(a, b);
+			a -= b;
+		}
+	}
+
+	unsigned long gcd4(unsigned long a, unsigned long b)
+	{
+		unsigned long r = a | b;
+
+		if (!a || !b)
+			return r;
+
+		r &= -r;
+
+		while (!(b & r))
+			b >>= 1;
+		if (b == r)
+			return r;
+
+		for (;;) {
+			while (!(a & r))
+				a >>= 1;
+			if (a == r)
+				return r;
+			if (a == b)
+				return a;
+
+			if (a < b)
+				swap(a, b);
+			a -= b;
+			a >>= 1;
+			if (a & r)
+				a += b;
+			a >>= 1;
+		}
+	}
+
+	static unsigned long (*gcd_func[])(unsigned long a, unsigned long b) = {
+		gcd0, gcd1, gcd2, gcd3, gcd4,
+	};
+
+	#define TEST_ENTRIES (sizeof(gcd_func) / sizeof(gcd_func[0]))
+
+	#if defined(__x86_64__)
+
+	#define rdtscll(val) do { \
+		unsigned long __a,__d; \
+		__asm__ __volatile__("rdtsc" : "=a" (__a), "=d" (__d)); \
+		(val) = ((unsigned long long)__a) | (((unsigned long long)__d)<<32); \
+	} while(0)
+
+	static unsigned long long benchmark_gcd_func(unsigned long (*gcd)(unsigned long, unsigned long),
+								unsigned long a, unsigned long b, unsigned long *res)
+	{
+		unsigned long long start, end;
+		unsigned long long ret;
+		unsigned long gcd_res;
+
+		rdtscll(start);
+		gcd_res = gcd(a, b);
+		rdtscll(end);
+
+		if (end >= start)
+			ret = end - start;
+		else
+			ret = ~0ULL - start + 1 + end;
+
+		*res = gcd_res;
+		return ret;
+	}
+
+	#else
+
+	static inline struct timespec read_time(void)
+	{
+		struct timespec time;
+		clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time);
+		return time;
+	}
+
+	static inline unsigned long long diff_time(struct timespec start, struct timespec end)
+	{
+		struct timespec temp;
+
+		if ((end.tv_nsec - start.tv_nsec) < 0) {
+			temp.tv_sec = end.tv_sec - start.tv_sec - 1;
+			temp.tv_nsec = 1000000000ULL + end.tv_nsec - start.tv_nsec;
+		} else {
+			temp.tv_sec = end.tv_sec - start.tv_sec;
+			temp.tv_nsec = end.tv_nsec - start.tv_nsec;
+		}
+
+		return temp.tv_sec * 1000000000ULL + temp.tv_nsec;
+	}
+
+	static unsigned long long benchmark_gcd_func(unsigned long (*gcd)(unsigned long, unsigned long),
+								unsigned long a, unsigned long b, unsigned long *res)
+	{
+		struct timespec start, end;
+		unsigned long gcd_res;
+
+		start = read_time();
+		gcd_res = gcd(a, b);
+		end = read_time();
+
+		*res = gcd_res;
+		return diff_time(start, end);
+	}
+
+	#endif
+
+	static inline unsigned long get_rand()
+	{
+		if (sizeof(long) == 8)
+			return (unsigned long)rand() << 32 | rand();
+		else
+			return rand();
+	}
+
+	int main(int argc, char **argv)
+	{
+		unsigned int seed = time(0);
+		int loops = 100;
+		int repeats = 1000;
+		unsigned long (*res)[TEST_ENTRIES];
+		unsigned long long elapsed[TEST_ENTRIES];
+		int i, j, k;
+
+		for (;;) {
+			int opt = getopt(argc, argv, "n:r:s:");
+			/* End condition always first */
+			if (opt == -1)
+				break;
+
+			switch (opt) {
+			case 'n':
+				loops = atoi(optarg);
+				break;
+			case 'r':
+				repeats = atoi(optarg);
+				break;
+			case 's':
+				seed = strtoul(optarg, NULL, 10);
+				break;
+			default:
+				/* You won't actually get here. */
+				break;
+			}
+		}
+
+		res = malloc(sizeof(unsigned long) * TEST_ENTRIES * loops);
+		memset(elapsed, 0, sizeof(elapsed));
+
+		srand(seed);
+		for (j = 0; j < loops; j++) {
+			unsigned long a = get_rand();
+			/* Do we have args? */
+			unsigned long b = argc > optind ? strtoul(argv[optind], NULL, 10) : get_rand();
+			unsigned long long min_elapsed[TEST_ENTRIES];
+			for (k = 0; k < repeats; k++) {
+				for (i = 0; i < TEST_ENTRIES; i++) {
+					unsigned long long tmp = benchmark_gcd_func(gcd_func[i], a, b, &res[j][i]);
+					if (k == 0 || min_elapsed[i] > tmp)
+						min_elapsed[i] = tmp;
+				}
+			}
+			for (i = 0; i < TEST_ENTRIES; i++)
+				elapsed[i] += min_elapsed[i];
+		}
+
+		for (i = 0; i < TEST_ENTRIES; i++)
+			printf("gcd%d: elapsed %llu\n", i, elapsed[i]);
+
+		k = 0;
+		srand(seed);
+		for (j = 0; j < loops; j++) {
+			unsigned long a = get_rand();
+			unsigned long b = argc > optind ? strtoul(argv[optind], NULL, 10) : get_rand();
+			for (i = 1; i < TEST_ENTRIES; i++) {
+				if (res[j][i] != res[j][0])
+					break;
+			}
+			if (i < TEST_ENTRIES) {
+				if (k == 0) {
+					k = 1;
+					fprintf(stderr, "Error:\n");
+				}
+				fprintf(stderr, "gcd(%lu, %lu): ", a, b);
+				for (i = 0; i < TEST_ENTRIES; i++)
+					fprintf(stderr, "%ld%s", res[j][i], i < TEST_ENTRIES - 1 ? ", " : "\n");
+			}
+		}
+
+		if (k == 0)
+			fprintf(stderr, "PASS\n");
+
+		free(res);
+
+		return 0;
+	}
+
+Compiled with "-O2", on "VirtualBox 4.4.0-22-generic #38-Ubuntu x86_64" got:
+
+  zhaoxiuzeng@zhaoxiuzeng-VirtualBox:~/develop$ ./gcd -r 500000 -n 10
+  gcd0: elapsed 10174
+  gcd1: elapsed 2120
+  gcd2: elapsed 2902
+  gcd3: elapsed 2039
+  gcd4: elapsed 2812
+  PASS
+  zhaoxiuzeng@zhaoxiuzeng-VirtualBox:~/develop$ ./gcd -r 500000 -n 10
+  gcd0: elapsed 9309
+  gcd1: elapsed 2280
+  gcd2: elapsed 2822
+  gcd3: elapsed 2217
+  gcd4: elapsed 2710
+  PASS
+  zhaoxiuzeng@zhaoxiuzeng-VirtualBox:~/develop$ ./gcd -r 500000 -n 10
+  gcd0: elapsed 9589
+  gcd1: elapsed 2098
+  gcd2: elapsed 2815
+  gcd3: elapsed 2030
+  gcd4: elapsed 2718
+  PASS
+  zhaoxiuzeng@zhaoxiuzeng-VirtualBox:~/develop$ ./gcd -r 500000 -n 10
+  gcd0: elapsed 9914
+  gcd1: elapsed 2309
+  gcd2: elapsed 2779
+  gcd3: elapsed 2228
+  gcd4: elapsed 2709
+  PASS
+
+[akpm@linux-foundation.org: avoid #defining a CONFIG_ variable]
+Signed-off-by: Zhaoxiu Zeng <zhaoxiu.zeng@gmail.com>
+Signed-off-by: George Spelvin <linux@horizon.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

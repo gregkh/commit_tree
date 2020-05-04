@@ -1,0 +1,67 @@
+packet: race condition in packet_bind
+
+There is a race conditions between packet_notifier and packet_bind{_spkt}.
+
+It happens if packet_notifier(NETDEV_UNREGISTER) executes between the
+time packet_bind{_spkt} takes a reference on the new netdevice and the
+time packet_do_bind sets po->ifindex.
+In this case the notification can be missed.
+If this happens during a dev_change_net_namespace this can result in the
+netdevice to be moved to the new namespace while the packet_sock in the
+old namespace still holds a reference on it. When the netdevice is later
+deleted in the new namespace the deletion hangs since the packet_sock
+is not found in the new namespace' &net->packet.sklist.
+It can be reproduced with the script below.
+
+This patch makes packet_do_bind check again for the presence of the
+netdevice in the packet_sock's namespace after the synchronize_net
+in unregister_prot_hook.
+More in general it also uses the rcu lock for the duration of the bind
+to stop dev_change_net_namespace/rollback_registered_many from
+going past the synchronize_net following unlist_netdevice, so that
+no NETDEV_UNREGISTER notifications can happen on the new netdevice
+while the bind is executing. In order to do this some code from
+packet_bind{_spkt} is consolidated into packet_do_dev.
+
+import socket, os, time, sys
+proto=7
+realDev='em1'
+vlanId=400
+if len(sys.argv) > 1:
+   vlanId=int(sys.argv[1])
+dev='vlan%d' % vlanId
+
+os.system('taskset -p 0x10 %d' % os.getpid())
+
+s = socket.socket(socket.PF_PACKET, socket.SOCK_RAW, proto)
+os.system('ip link add link %s name %s type vlan id %d' %
+          (realDev, dev, vlanId))
+os.system('ip netns add dummy')
+
+pid=os.fork()
+
+if pid == 0:
+   # dev should be moved while packet_do_bind is in synchronize net
+   os.system('taskset -p 0x20000 %d' % os.getpid())
+   os.system('ip link set %s netns dummy' % dev)
+   os.system('ip netns exec dummy ip link del %s' % dev)
+   s.close()
+   sys.exit(0)
+
+time.sleep(.004)
+try:
+   s.bind(('%s' % dev, proto+1))
+except:
+   print 'Could not bind socket'
+   s.close()
+   os.system('ip netns del dummy')
+   sys.exit(0)
+
+os.waitpid(pid, 0)
+s.close()
+os.system('ip netns del dummy')
+sys.exit(0)
+
+Signed-off-by: Francesco Ruggeri <fruggeri@arista.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

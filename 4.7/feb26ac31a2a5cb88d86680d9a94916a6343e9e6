@@ -1,0 +1,89 @@
+usb: core: hub: hub_port_init lock controller instead of bus
+
+The XHCI controller presents two USB buses to the system - one for USB2
+and one for USB3. The hub init code (hub_port_init) is reentrant but
+only locks one bus per thread, leading to a race condition failure when
+two threads attempt to simultaneously initialise a USB2 and USB3 device:
+
+[    8.034843] xhci_hcd 0000:00:14.0: Timeout while waiting for setup device command
+[   13.183701] usb 3-3: device descriptor read/all, error -110
+
+On a test system this failure occurred on 6% of all boots.
+
+The call traces at the point of failure are:
+
+Call Trace:
+ [<ffffffff81b9bab7>] schedule+0x37/0x90
+ [<ffffffff817da7cd>] usb_kill_urb+0x8d/0xd0
+ [<ffffffff8111e5e0>] ? wake_up_atomic_t+0x30/0x30
+ [<ffffffff817dafbe>] usb_start_wait_urb+0xbe/0x150
+ [<ffffffff817db10c>] usb_control_msg+0xbc/0xf0
+ [<ffffffff817d07de>] hub_port_init+0x51e/0xb70
+ [<ffffffff817d4697>] hub_event+0x817/0x1570
+ [<ffffffff810f3e6f>] process_one_work+0x1ff/0x620
+ [<ffffffff810f3dcf>] ? process_one_work+0x15f/0x620
+ [<ffffffff810f4684>] worker_thread+0x64/0x4b0
+ [<ffffffff810f4620>] ? rescuer_thread+0x390/0x390
+ [<ffffffff810fa7f5>] kthread+0x105/0x120
+ [<ffffffff810fa6f0>] ? kthread_create_on_node+0x200/0x200
+ [<ffffffff81ba183f>] ret_from_fork+0x3f/0x70
+ [<ffffffff810fa6f0>] ? kthread_create_on_node+0x200/0x200
+
+Call Trace:
+ [<ffffffff817fd36d>] xhci_setup_device+0x53d/0xa40
+ [<ffffffff817fd87e>] xhci_address_device+0xe/0x10
+ [<ffffffff817d047f>] hub_port_init+0x1bf/0xb70
+ [<ffffffff811247ed>] ? trace_hardirqs_on+0xd/0x10
+ [<ffffffff817d4697>] hub_event+0x817/0x1570
+ [<ffffffff810f3e6f>] process_one_work+0x1ff/0x620
+ [<ffffffff810f3dcf>] ? process_one_work+0x15f/0x620
+ [<ffffffff810f4684>] worker_thread+0x64/0x4b0
+ [<ffffffff810f4620>] ? rescuer_thread+0x390/0x390
+ [<ffffffff810fa7f5>] kthread+0x105/0x120
+ [<ffffffff810fa6f0>] ? kthread_create_on_node+0x200/0x200
+ [<ffffffff81ba183f>] ret_from_fork+0x3f/0x70
+ [<ffffffff810fa6f0>] ? kthread_create_on_node+0x200/0x200
+
+Which results from the two call chains:
+
+hub_port_init
+ usb_get_device_descriptor
+  usb_get_descriptor
+   usb_control_msg
+    usb_internal_control_msg
+     usb_start_wait_urb
+      usb_submit_urb / wait_for_completion_timeout / usb_kill_urb
+
+hub_port_init
+ hub_set_address
+  xhci_address_device
+   xhci_setup_device
+
+Mathias Nyman explains the current behaviour violates the XHCI spec:
+
+ hub_port_reset() will end up moving the corresponding xhci device slot
+ to default state.
+
+ As hub_port_reset() is called several times in hub_port_init() it
+ sounds reasonable that we could end up with two threads having their
+ xhci device slots in default state at the same time, which according to
+ xhci 4.5.3 specs still is a big no no:
+
+ "Note: Software shall not transition more than one Device Slot to the
+  Default State at a time"
+
+ So both threads fail at their next task after this.
+ One fails to read the descriptor, and the other fails addressing the
+ device.
+
+Fix this in hub_port_init by locking the USB controller (instead of an
+individual bus) to prevent simultaneous initialisation of both buses.
+
+Fixes: 638139eb95d2 ("usb: hub: allow to process more usb hub events in parallel")
+Link: https://lkml.org/lkml/2016/2/8/312
+Link: https://lkml.org/lkml/2016/2/4/748
+Signed-off-by: Chris Bainbridge <chris.bainbridge@gmail.com>
+Cc: stable <stable@vger.kernel.org>
+Acked-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

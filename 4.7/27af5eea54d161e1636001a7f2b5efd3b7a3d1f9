@@ -1,0 +1,136 @@
+drm/i915: Move execlists irq handler to a bottom half
+
+Doing a lot of work in the interrupt handler introduces huge
+latencies to the system as a whole.
+
+Most dramatic effect can be seen by running an all engine
+stress test like igt/gem_exec_nop/all where, when the kernel
+config is lean enough, the whole system can be brought into
+multi-second periods of complete non-interactivty. That can
+look for example like this:
+
+ NMI watchdog: BUG: soft lockup - CPU#0 stuck for 23s! [kworker/u8:3:143]
+ Modules linked in: [redacted for brevity]
+ CPU: 0 PID: 143 Comm: kworker/u8:3 Tainted: G     U       L  4.5.0-160321+ #183
+ Hardware name: Intel Corporation Broadwell Client platform/WhiteTip Mountain 1
+ Workqueue: i915 gen6_pm_rps_work [i915]
+ task: ffff8800aae88000 ti: ffff8800aae90000 task.ti: ffff8800aae90000
+ RIP: 0010:[<ffffffff8104a3c2>]  [<ffffffff8104a3c2>] __do_softirq+0x72/0x1d0
+ RSP: 0000:ffff88014f403f38  EFLAGS: 00000206
+ RAX: ffff8800aae94000 RBX: 0000000000000000 RCX: 00000000000006e0
+ RDX: 0000000000000020 RSI: 0000000004208060 RDI: 0000000000215d80
+ RBP: ffff88014f403f80 R08: 0000000b1b42c180 R09: 0000000000000022
+ R10: 0000000000000004 R11: 00000000ffffffff R12: 000000000000a030
+ R13: 0000000000000082 R14: ffff8800aa4d0080 R15: 0000000000000082
+ FS:  0000000000000000(0000) GS:ffff88014f400000(0000) knlGS:0000000000000000
+ CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ CR2: 00007fa53b90c000 CR3: 0000000001a0a000 CR4: 00000000001406f0
+ DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+ DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+ Stack:
+  042080601b33869f ffff8800aae94000 00000000fffc2678 ffff88010000000a
+  0000000000000000 000000000000a030 0000000000005302 ffff8800aa4d0080
+  0000000000000206 ffff88014f403f90 ffffffff8104a716 ffff88014f403fa8
+ Call Trace:
+  <IRQ>
+  [<ffffffff8104a716>] irq_exit+0x86/0x90
+  [<ffffffff81031e7d>] smp_apic_timer_interrupt+0x3d/0x50
+  [<ffffffff814f3eac>] apic_timer_interrupt+0x7c/0x90
+  <EOI>
+  [<ffffffffa01c5b40>] ? gen8_write64+0x1a0/0x1a0 [i915]
+  [<ffffffff814f2b39>] ? _raw_spin_unlock_irqrestore+0x9/0x20
+  [<ffffffffa01c5c44>] gen8_write32+0x104/0x1a0 [i915]
+  [<ffffffff8132c6a2>] ? n_tty_receive_buf_common+0x372/0xae0
+  [<ffffffffa017cc9e>] gen6_set_rps_thresholds+0x1be/0x330 [i915]
+  [<ffffffffa017eaf0>] gen6_set_rps+0x70/0x200 [i915]
+  [<ffffffffa0185375>] intel_set_rps+0x25/0x30 [i915]
+  [<ffffffffa01768fd>] gen6_pm_rps_work+0x10d/0x2e0 [i915]
+  [<ffffffff81063852>] ? finish_task_switch+0x72/0x1c0
+  [<ffffffff8105ab29>] process_one_work+0x139/0x350
+  [<ffffffff8105b186>] worker_thread+0x126/0x490
+  [<ffffffff8105b060>] ? rescuer_thread+0x320/0x320
+  [<ffffffff8105fa64>] kthread+0xc4/0xe0
+  [<ffffffff8105f9a0>] ? kthread_create_on_node+0x170/0x170
+  [<ffffffff814f351f>] ret_from_fork+0x3f/0x70
+  [<ffffffff8105f9a0>] ? kthread_create_on_node+0x170/0x170
+
+I could not explain, or find a code path, which would explain
+a +20 second lockup, but from some instrumentation it was
+apparent the interrupts off proportion of time was between
+10-25% under heavy load which is quite bad.
+
+When a interrupt "cliff" is reached, which was >~320k irq/s on
+my machine, the whole system goes into a terrible state of the
+above described multi-second lockups.
+
+By moving the GT interrupt handling to a tasklet in a most
+simple way, the problem above disappears completely.
+
+Testing the effect on sytem-wide latencies using
+igt/gem_syslatency shows the following before this patch:
+
+gem_syslatency: cycles=1532739, latency mean=416531.829us max=2499237us
+gem_syslatency: cycles=1839434, latency mean=1458099.157us max=4998944us
+gem_syslatency: cycles=1432570, latency mean=2688.451us max=1201185us
+gem_syslatency: cycles=1533543, latency mean=416520.499us max=2498886us
+
+This shows that the unrelated process is experiencing huge
+delays in its wake-up latency. After the patch the results
+look like this:
+
+gem_syslatency: cycles=808907, latency mean=53.133us max=1640us
+gem_syslatency: cycles=862154, latency mean=62.778us max=2117us
+gem_syslatency: cycles=856039, latency mean=58.079us max=2123us
+gem_syslatency: cycles=841683, latency mean=56.914us max=1667us
+
+Showing a huge improvement in the unrelated process wake-up
+latency. It also shows an approximate halving in the number
+of total empty batches submitted during the test. This may
+not be worrying since the test puts the driver under
+a very unrealistic load with ncpu threads doing empty batch
+submission to all GPU engines each.
+
+Another benefit compared to the hard-irq handling is that now
+work on all engines can be dispatched in parallel since we can
+have up to number of CPUs active tasklets. (While previously
+a single hard-irq would serially dispatch on one engine after
+another.)
+
+More interesting scenario with regards to throughput is
+"gem_latency -n 100" which  shows 25% better throughput and
+CPU usage, and 14% better dispatch latencies.
+
+I did not find any gains or regressions with Synmark2 or
+GLbench under light testing. More benchmarking is certainly
+required.
+
+v2:
+   * execlists_lock should be taken as spin_lock_bh when
+     queuing work from userspace now. (Chris Wilson)
+   * uncore.lock must be taken with spin_lock_irq when
+     submitting requests since that now runs from either
+     softirq or process context.
+
+v3:
+   * Expanded commit message with more testing data;
+   * converted missed locking sites to _bh;
+   * added execlist_lock comment. (Chris Wilson)
+
+v4:
+   * Mention dispatch parallelism in commit. (Chris Wilson)
+   * Do not hold uncore.lock over MMIO reads since the block
+     is already serialised per-engine via the tasklet itself.
+     (Chris Wilson)
+   * intel_lrc_irq_handler should be static. (Chris Wilson)
+   * Cancel/sync the tasklet on GPU reset. (Chris Wilson)
+   * Document and WARN that tasklet cannot be active/pending
+     on engine cleanup. (Chris Wilson/Imre Deak)
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Imre Deak <imre.deak@intel.com>
+Testcase: igt/gem_exec_nop/all
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=94350
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/1459768316-6670-1-git-send-email-tvrtko.ursulin@linux.intel.com
+

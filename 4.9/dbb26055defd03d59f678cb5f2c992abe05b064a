@@ -1,0 +1,93 @@
+locking/rtmutex: Prevent dequeue vs. unlock race
+
+David reported a futex/rtmutex state corruption. It's caused by the
+following problem:
+
+CPU0		CPU1		CPU2
+
+l->owner=T1
+		rt_mutex_lock(l)
+		lock(l->wait_lock)
+		l->owner = T1 | HAS_WAITERS;
+		enqueue(T2)
+		boost()
+		  unlock(l->wait_lock)
+		schedule()
+
+				rt_mutex_lock(l)
+				lock(l->wait_lock)
+				l->owner = T1 | HAS_WAITERS;
+				enqueue(T3)
+				boost()
+				  unlock(l->wait_lock)
+				schedule()
+		signal(->T2)	signal(->T3)
+		lock(l->wait_lock)
+		dequeue(T2)
+		deboost()
+		  unlock(l->wait_lock)
+				lock(l->wait_lock)
+				dequeue(T3)
+				  ===> wait list is now empty
+				deboost()
+				 unlock(l->wait_lock)
+		lock(l->wait_lock)
+		fixup_rt_mutex_waiters()
+		  if (wait_list_empty(l)) {
+		    owner = l->owner & ~HAS_WAITERS;
+		    l->owner = owner
+		     ==> l->owner = T1
+		  }
+
+				lock(l->wait_lock)
+rt_mutex_unlock(l)		fixup_rt_mutex_waiters()
+				  if (wait_list_empty(l)) {
+				    owner = l->owner & ~HAS_WAITERS;
+cmpxchg(l->owner, T1, NULL)
+ ===> Success (l->owner = NULL)
+				    l->owner = owner
+				     ==> l->owner = T1
+				  }
+
+That means the problem is caused by fixup_rt_mutex_waiters() which does the
+RMW to clear the waiters bit unconditionally when there are no waiters in
+the rtmutexes rbtree.
+
+This can be fatal: A concurrent unlock can release the rtmutex in the
+fastpath because the waiters bit is not set. If the cmpxchg() gets in the
+middle of the RMW operation then the previous owner, which just unlocked
+the rtmutex is set as the owner again when the write takes place after the
+successfull cmpxchg().
+
+The solution is rather trivial: verify that the owner member of the rtmutex
+has the waiters bit set before clearing it. This does not require a
+cmpxchg() or other atomic operations because the waiters bit can only be
+set and cleared with the rtmutex wait_lock held. It's also safe against the
+fast path unlock attempt. The unlock attempt via cmpxchg() will either see
+the bit set and take the slowpath or see the bit cleared and release it
+atomically in the fastpath.
+
+It's remarkable that the test program provided by David triggers on ARM64
+and MIPS64 really quick, but it refuses to reproduce on x86-64, while the
+problem exists there as well. That refusal might explain that this got not
+discovered earlier despite the bug existing from day one of the rtmutex
+implementation more than 10 years ago.
+
+Thanks to David for meticulously instrumenting the code and providing the
+information which allowed to decode this subtle problem.
+
+Reported-by: David Daney <ddaney@caviumnetworks.com>
+Tested-by: David Daney <david.daney@cavium.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Steven Rostedt <rostedt@goodmis.org>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sebastian Siewior <bigeasy@linutronix.de>
+Cc: Will Deacon <will.deacon@arm.com>
+Cc: stable@vger.kernel.org
+Fixes: 23f78d4a03c5 ("[PATCH] pi-futex: rt mutex core")
+Link: http://lkml.kernel.org/r/20161130210030.351136722@linutronix.de
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

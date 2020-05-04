@@ -1,0 +1,75 @@
+NFC: pn533: Fix socket deadlock
+
+A deadlock can occur when the NFC raw socket is closed while
+the driver is processing a command.
+
+Following is the call graph of the affected situation:
+
+send data via raw_sock:
+-------------
+rawsock_tx_work
+  sock_hold => socket refcnt++
+  nfc_data_exchange => cb = rawsock_data_exchange_complete
+
+    ops->im_transceive = pn533_transceive => arg->cb = db
+                               = rawsock_data_exchange_complete
+
+      pn533_send_data_async => cb = pn533_data_exchange_complete
+
+        __pn533_send_async => cmd->complete_cb = cb
+                              = pn533_data_exchange_complete
+
+          if_ops->send_frame_async
+
+response:
+--------
+pn533_recv_response
+  queue_work(priv->wq, &priv->cmd_complete_work)
+
+pn533_wq_cmd_complete
+
+  pn533_send_async_complete
+
+    cmd->complete_cb() = pn533_data_exchange_complete()
+
+      arg->cb() = rawsock_data_exchange_complete()
+
+        sock_put => socket refcnt-- => If the corresponding
+                    socket gets closed in the meantime socket
+                    will be destructed
+
+          sk_free
+
+            __sk_free
+
+              sk->sk_destruct = rawsock_destruct
+
+                nfc_deactivate_target
+
+                  ops->deactivate_target = pn533_deactivate_target
+
+                    pn533_send_cmd_sync
+
+                      pn533_send_cmd_async
+
+                        __pn533_send_async
+
+                          list_add_tail(&cmd->queue,&dev->cmd_queue)
+                                  => add to command list because
+                                     a command is currently
+                                     processed
+
+                        wait_for_completion
+                                   => the workqueue thread waits
+                                      here because it is the one
+                                      processing the commands
+                                         => deadlock
+
+To fix the deadlock pn533_deactivate_target is changed to
+issue the PN533_CMD_IN_RELEASE command in async mode. This
+way nothing blocks and the release command is executed after
+the current command.
+
+Signed-off-by: Michael Thalmeier <michael.thalmeier@hale.at>
+Signed-off-by: Samuel Ortiz <sameo@linux.intel.com>
+

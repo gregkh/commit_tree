@@ -1,0 +1,45 @@
+iommu/vt-d: Fix mm refcounting to hold mm_count not mm_users
+
+Holding mm_users works OK for graphics, which was the first user of SVM
+with VT-d. However, it works less well for other devices, where we actually
+do a mmap() from the file descriptor to which the SVM PASID state is tied.
+
+In this case on process exit we end up with a recursive reference count:
+ - The MM remains alive until the file is closed and the driver's release()
+   call ends up unbinding the PASID.
+ - The VMA corresponding to the mmap() remains intact until the MM is
+   destroyed.
+ - Thus the file isn't closed, even when exit_files() runs, because the
+   VMA is still holding a reference to it. And the MM remains alive…
+
+To address this issue, we *stop* holding mm_users while the PASID is bound.
+We already hold mm_count by virtue of the MMU notifier, and that can be
+made to be sufficient.
+
+It means that for a period during process exit, the fun part of mmput()
+has happened and exit_mmap() has been called so the MM is basically
+defunct. But the PGD still exists and the PASID is still bound to it.
+
+During this period, we have to be very careful — exit_mmap() doesn't use
+mm->mmap_sem because it doesn't expect anyone else to be touching the MM
+(quite reasonably, since mm_users is zero). So we also need to fix the
+fault handler to just report failure if mm_users is already zero, and to
+temporarily bump mm_users while handling any faults.
+
+Additionally, exit_mmap() calls mmu_notifier_release() *before* it tears
+down the page tables, which is too early for us to flush the IOTLB for
+this PASID. And __mmu_notifier_release() removes every notifier from the
+list, so when exit_mmap() finally *does* tear down the mappings and
+clear the page tables, we don't get notified. So we work around this by
+clearing the PASID table entry in our MMU notifier release() callback.
+That way, the hardware *can't* get any pages back from the page tables
+before they get cleared.
+
+Hardware designers have confirmed that the resulting 'PASID not present'
+faults should be handled just as gracefully as 'page not present' faults,
+the important criterion being that they don't perturb the operation for
+any *other* PASID in the system.
+
+Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+Cc: stable@vger.kernel.org
+

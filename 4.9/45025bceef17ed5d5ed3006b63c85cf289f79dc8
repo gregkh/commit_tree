@@ -1,0 +1,121 @@
+rxrpc: Improve management and caching of client connection objects
+
+Improve the management and caching of client rxrpc connection objects.
+From this point, client connections will be managed separately from service
+connections because AF_RXRPC controls the creation and re-use of client
+connections but doesn't have that luxury with service connections.
+
+Further, there will be limits on the numbers of client connections that may
+be live on a machine.  No direct restriction will be placed on the number
+of client calls, excepting that each client connection can support a
+maximum of four concurrent calls.
+
+Note that, for a number of reasons, we don't want to simply discard a
+client connection as soon as the last call is apparently finished:
+
+ (1) Security is negotiated per-connection and the context is then shared
+     between all calls on that connection.  The context can be negotiated
+     again if the connection lapses, but that involves holding up calls
+     whilst at least two packets are exchanged and various crypto bits are
+     performed - so we'd ideally like to cache it for a little while at
+     least.
+
+ (2) If a packet goes astray, we will need to retransmit a final ACK or
+     ABORT packet.  To make this work, we need to keep around the
+     connection details for a little while.
+
+ (3) The locally held structures represent some amount of setup time, to be
+     weighed against their occupation of memory when idle.
+
+
+To this end, the client connection cache is managed by a state machine on
+each connection.  There are five states:
+
+ (1) INACTIVE - The connection is not held in any list and may not have
+     been exposed to the world.  If it has been previously exposed, it was
+     discarded from the idle list after expiring.
+
+ (2) WAITING - The connection is waiting for the number of client conns to
+     drop below the maximum capacity.  Calls may be in progress upon it
+     from when it was active and got culled.
+
+     The connection is on the rxrpc_waiting_client_conns list which is kept
+     in to-be-granted order.  Culled conns with waiters go to the back of
+     the queue just like new conns.
+
+ (3) ACTIVE - The connection has at least one call in progress upon it, it
+     may freely grant available channels to new calls and calls may be
+     waiting on it for channels to become available.
+
+     The connection is on the rxrpc_active_client_conns list which is kept
+     in activation order for culling purposes.
+
+ (4) CULLED - The connection got summarily culled to try and free up
+     capacity.  Calls currently in progress on the connection are allowed
+     to continue, but new calls will have to wait.  There can be no waiters
+     in this state - the conn would have to go to the WAITING state
+     instead.
+
+ (5) IDLE - The connection has no calls in progress upon it and must have
+     been exposed to the world (ie. the EXPOSED flag must be set).  When it
+     expires, the EXPOSED flag is cleared and the connection transitions to
+     the INACTIVE state.
+
+     The connection is on the rxrpc_idle_client_conns list which is kept in
+     order of how soon they'll expire.
+
+A connection in the ACTIVE or CULLED state must have at least one active
+call upon it; if in the WAITING state it may have active calls upon it;
+other states may not have active calls.
+
+As long as a connection remains active and doesn't get culled, it may
+continue to process calls - even if there are connections on the wait
+queue.  This simplifies things a bit and reduces the amount of checking we
+need do.
+
+
+There are a couple flags of relevance to the cache:
+
+ (1) EXPOSED - The connection ID got exposed to the world.  If this flag is
+     set, an extra ref is added to the connection preventing it from being
+     reaped when it has no calls outstanding.  This flag is cleared and the
+     ref dropped when a conn is discarded from the idle list.
+
+ (2) DONT_REUSE - The connection should be discarded as soon as possible and
+     should not be reused.
+
+
+This commit also provides a number of new settings:
+
+ (*) /proc/net/rxrpc/max_client_conns
+
+     The maximum number of live client connections.  Above this number, new
+     connections get added to the wait list and must wait for an active
+     conn to be culled.  Culled connections can be reused, but they will go
+     to the back of the wait list and have to wait.
+
+ (*) /proc/net/rxrpc/reap_client_conns
+
+     If the number of desired connections exceeds the maximum above, the
+     active connection list will be culled until there are only this many
+     left in it.
+
+ (*) /proc/net/rxrpc/idle_conn_expiry
+
+     The normal expiry time for a client connection, provided there are
+     fewer than reap_client_conns of them around.
+
+ (*) /proc/net/rxrpc/idle_conn_fast_expiry
+
+     The expedited expiry time, used when there are more than
+     reap_client_conns of them around.
+
+
+Note that I combined the Tx wait queue with the channel grant wait queue to
+save space as only one of these should be in use at once.
+
+Note also that, for the moment, the service connection cache still uses the
+old connection management code.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+

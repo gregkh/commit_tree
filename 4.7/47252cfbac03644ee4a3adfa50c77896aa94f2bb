@@ -1,0 +1,99 @@
+sched/core: Add preempt checks in preempt_schedule() code
+
+While testing the tracer preemptoff, I hit this strange trace:
+
+   <...>-259     0...1    0us : schedule <-worker_thread
+   <...>-259     0d..1    0us : rcu_note_context_switch <-__schedule
+   <...>-259     0d..1    0us : rcu_sched_qs <-rcu_note_context_switch
+   <...>-259     0d..1    0us : rcu_preempt_qs <-rcu_note_context_switch
+   <...>-259     0d..1    0us : _raw_spin_lock <-__schedule
+   <...>-259     0d..1    0us : preempt_count_add <-_raw_spin_lock
+   <...>-259     0d..2    0us : do_raw_spin_lock <-_raw_spin_lock
+   <...>-259     0d..2    1us : deactivate_task <-__schedule
+   <...>-259     0d..2    1us : update_rq_clock.part.84 <-deactivate_task
+   <...>-259     0d..2    1us : dequeue_task_fair <-deactivate_task
+   <...>-259     0d..2    1us : dequeue_entity <-dequeue_task_fair
+   <...>-259     0d..2    1us : update_curr <-dequeue_entity
+   <...>-259     0d..2    1us : update_min_vruntime <-update_curr
+   <...>-259     0d..2    1us : cpuacct_charge <-update_curr
+   <...>-259     0d..2    1us : __rcu_read_lock <-cpuacct_charge
+   <...>-259     0d..2    1us : __rcu_read_unlock <-cpuacct_charge
+   <...>-259     0d..2    1us : clear_buddies <-dequeue_entity
+   <...>-259     0d..2    1us : account_entity_dequeue <-dequeue_entity
+   <...>-259     0d..2    2us : update_min_vruntime <-dequeue_entity
+   <...>-259     0d..2    2us : update_cfs_shares <-dequeue_entity
+   <...>-259     0d..2    2us : hrtick_update <-dequeue_task_fair
+   <...>-259     0d..2    2us : wq_worker_sleeping <-__schedule
+   <...>-259     0d..2    2us : kthread_data <-wq_worker_sleeping
+   <...>-259     0d..2    2us : pick_next_task_fair <-__schedule
+   <...>-259     0d..2    2us : check_cfs_rq_runtime <-pick_next_task_fair
+   <...>-259     0d..2    2us : pick_next_entity <-pick_next_task_fair
+   <...>-259     0d..2    2us : clear_buddies <-pick_next_entity
+   <...>-259     0d..2    2us : pick_next_entity <-pick_next_task_fair
+   <...>-259     0d..2    2us : clear_buddies <-pick_next_entity
+   <...>-259     0d..2    2us : set_next_entity <-pick_next_task_fair
+   <...>-259     0d..2    3us : put_prev_entity <-pick_next_task_fair
+   <...>-259     0d..2    3us : check_cfs_rq_runtime <-put_prev_entity
+   <...>-259     0d..2    3us : set_next_entity <-pick_next_task_fair
+gnome-sh-1031    0d..2    3us : finish_task_switch <-__schedule
+gnome-sh-1031    0d..2    3us : _raw_spin_unlock_irq <-finish_task_switch
+gnome-sh-1031    0d..2    3us : do_raw_spin_unlock <-_raw_spin_unlock_irq
+gnome-sh-1031    0...2    3us!: preempt_count_sub <-_raw_spin_unlock_irq
+gnome-sh-1031    0...1  582us : do_raw_spin_lock <-_raw_spin_lock
+gnome-sh-1031    0...1  583us : _raw_spin_unlock <-drm_gem_object_lookup
+gnome-sh-1031    0...1  583us : do_raw_spin_unlock <-_raw_spin_unlock
+gnome-sh-1031    0...1  583us : preempt_count_sub <-_raw_spin_unlock
+gnome-sh-1031    0...1  584us : _raw_spin_unlock <-drm_gem_object_lookup
+gnome-sh-1031    0...1  584us+: trace_preempt_on <-drm_gem_object_lookup
+gnome-sh-1031    0...1  603us : <stack trace>
+ => preempt_count_sub
+ => _raw_spin_unlock
+ => drm_gem_object_lookup
+ => i915_gem_madvise_ioctl
+ => drm_ioctl
+ => do_vfs_ioctl
+ => SyS_ioctl
+ => entry_SYSCALL_64_fastpath
+
+As I'm tracing preemption disabled, it seemed incorrect that the trace
+would go across a schedule and report not being in the scheduler.
+Looking into this I discovered the problem.
+
+schedule() calls preempt_disable() but the preempt_schedule() calls
+preempt_enable_notrace(). What happened above was that the gnome-shell
+task was preempted on another CPU, migrated over to the idle cpu. The
+tracer stared with idle calling schedule(), which called
+preempt_disable(), but then gnome-shell finished, and it enabled
+preemption with preempt_enable_notrace() that does stop the trace, even
+though preemption was enabled.
+
+The purpose of the preempt_disable_notrace() in the preempt_schedule()
+is to prevent function tracing from going into an infinite loop.
+Because function tracing can trace the preempt_enable/disable() calls
+that are traced. The problem with function tracing is:
+
+  NEED_RESCHED set
+  preempt_schedule()
+    preempt_disable()
+      preempt_count_inc()
+        function trace (before incrementing preempt count)
+          preempt_disable_notrace()
+          preempt_enable_notrace()
+            sees NEED_RESCHED set
+               preempt_schedule() (repeat)
+
+Now by breaking out the preempt off/on tracing into their own code:
+preempt_disable_check() and preempt_enable_check(), we can add these to
+the preempt_schedule() code. As preemption would then be disabled, even
+if they were to be traced by the function tracer, the disabled
+preemption would prevent the recursion.
+
+Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20160321112339.6dc78ad6@gandalf.local.home
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

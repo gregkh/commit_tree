@@ -1,0 +1,165 @@
+ACPICA: Namespace: Fix dynamic table loading issues
+
+ACPICA commit 767ee53354e0c4b7e8e7c57c6dd7bf569f0d52bb
+
+There are issues related to the namespace/interpreter locks, which causes
+several ACPI functionalities not specification compliant. The lock issues
+were detectec when we were trying to fix the functionalities (please see
+Link # [1] for the details).
+
+What's the lock issues? Let's first look into the namespace/interpreter
+lock usages inside of the object evaluation and the table loading which are
+the key AML interpretion code paths:
+Table loading:
+acpi_ns_load_table
+	L(Namespace)
+	acpi_ns_parse_table
+		acpi_ns_one_complete_parse(LOAD_PASS1/LOAD_PASS2)
+			acpi_ds_load1_begion_op
+			acpi_ds_load1_end_op
+			acpi_ds_load2_begion_op
+			acpi_ds_load2_end_op
+	U(Namespace)
+Object evaluation:
+acpi_ns_evaluate
+	L(Interpreter)
+	acpi_ps_execute_method
+		acpi_ds_exec_begin_op
+		acpi_ds_exec_end_op
+			U(Interpreter)
+			acpi_ns_load_table
+				L(Namespace)
+				U(Namespace)
+			acpi_ev_initialize_region
+				L(Namespace)
+				U(Namespace)
+			address_space.Setup
+			address_space.Handler
+			acpi_os_wait_semaphore
+			acpi_os_acquire_mutex
+			acpi_os_sleep
+			L(Interpreter)
+	U(Interpreter)
+	L(Interpreter)
+	acpi_ex_resolve_node_to_value
+	U(Interpreter)
+	acpi_ns_check_return_value
+Where:
+  1. L(Interpreter) means acquire(MTX_INTERPRETER);
+  2. U(Interpreter) means release(MTX_INTERPRETER);
+  3. L(Namespace) means acquire(MTX_NAMESPACE);
+  4. U(Namespace) means release(MTX_NAMESPACE);
+
+We can see that acpi_ns_exec_module_code() (which invokes acpi_ns_evaluate) is
+implemented in a deferred way just in order to avoid to reacquire the
+namespace lock. This is in fact the root cause of many other ACPICA issues:
+1. We now know for sure that the module code should be executed right in
+   place by the Windows AML interpreter. So in the current design, if
+   the region initializations/accesses or the table loadings (where the
+   namespace surely should be locked again) happening during the table
+   loading period, dead lock could happen because ACPICA never unlocks the
+   namespace during the AML interpretion.
+2. ACPICA interpreter just ensures that all static namespace nodes (named
+   objects created during the acpi_load_tables()) are created
+   (acpi_ns_lookup()) with the correct lock held, but doesn't ensure that
+   the named objects created by the control method are created with the
+   same correct lock held. It requires the control methods to be executed
+   in a serial way after "loading a table", that's why ACPICA requires
+   method auto serialization.
+
+This patch fixes these software design issues by extending interpreter
+enter/exit APIs to hold both interpreter/namespace locks to ensure the lock
+order correctness, so that we can get these code paths:
+Table loading:
+acpi_ns_load_table
+	E(Interpreter)
+		acpi_ns_parse_table
+			acpi_ns_one_complete_parse
+			acpi_ns_execute_table
+				X(Interpreter)
+				acpi_ns_load_table
+				acpi_ev_initialize_region
+				address_space.Setup
+				address_space.Handler
+				acpi_os_wait_semaphore
+				acpi_os_acquire_mutex
+				acpi_os_sleep
+				E(Interpreter)
+	X(Interpreter)
+Object evaluation:
+acpi_ns_evaluate
+	E(Interpreter)
+	acpi_ps_execute_method
+		X(Interpreter)
+		acpi_ns_load_table
+		acpi_ev_initialize_region
+		address_space.Setup
+		address_space.Handler
+		acpi_os_wait_semaphore
+		acpi_os_acquire_mutex
+		acpi_os_sleep
+		E(Interpreter)
+	X(Interpreter)
+Where:
+  1. E(Interpreter) means acquire(MTX_INTERPRETER, MTX_NAMESPACE);
+  2. X(Interpreter) means release(MTX_NAMESPACE, MTX_INTERPRETER);
+
+After this change, we can see:
+1. All namespace nodes creations are locked by the namespace lock.
+2. All namespace nodes referencing are locked with the same lock.
+3. But we also can notice a defact that, all namespace nodes deletions
+   could be affected by this change. As a consequence,
+   acpi_ns_delete_namespace_subtree() may delete a static namespace node that
+   is still referenced by the interpreter (for example, the parser scopes).
+Currently, we needn't worry about the last defact because in ACPICA, table
+unloading is not fully functioning, its design strictly relies on the fact
+that when the namespace deletion happens, either the AML table or the OSPMs
+should have been notified and thus either the AML table or the OSPMs
+shouldn't reference deletion-related namespace nodes during the namespace
+deletion. And this change still works with the above restrictions applied.
+While making this a-step-forward helps us to correct the wrong grammar to
+pull many things back to the correct rail. And pulling things back to the
+correct rail in return makes it possible for us to support fully
+functioning table unloading after doing many cleanups.
+
+While this patch is generated, all namespace locks are examined to ensure
+that they can meet either of the following pattens:
+1. L(Namespace)
+   U(Namespace)
+2. E(Interpreter)
+   X(Interpreter)
+3. E(Interpreter)
+   X(Interpreter)
+   L(Namespace)
+   U(Namespace)
+   E(Interpreter)
+   X(Interpreter)
+We ensure this by adding X(Interpreter)/E(Interpreter) or removing
+U(Namespace)/L(Namespace) for those currently are executed in the following
+order:
+   E(Interpreter)
+   L(Namespace)
+   U(Namespace)
+   X(Interpreter)
+And adding E(Interpreter)/X(Interpreter) for those currently are executed
+in the following order:
+   X(Interpreter)
+   E(Interpreter)
+
+Originally, the interpreter lock is held for the execution AML opcodes, the
+namespace lock is held for the named object creation AML opcodes. Since
+they are actually same in MS interpreter (can all be executed during the
+table loading), we can combine the 2 locks and tune the locking code better
+in this way. Lv Zheng.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=153541 # [1]
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=121701 # [1]
+Link: https://bugs.acpica.org/show_bug.cgi?id=1323
+Link: https://github.com/acpica/acpica/commit/767ee533
+Reported-and-tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Reported-and-tested-by: Greg White <gwhite@kupulau.com>
+Reported-and-tested-by: Dutch Guy <lucht_piloot@gmx.net>
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Signed-off-by: Bob Moore <robert.moore@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

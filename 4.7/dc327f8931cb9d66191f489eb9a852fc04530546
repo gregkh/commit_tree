@@ -1,0 +1,47 @@
+net_sched: close another race condition in tcf_mirred_release()
+
+We saw the following extra refcount release on veth device:
+
+  kernel: [7957821.463992] unregister_netdevice: waiting for mesos50284 to become free. Usage count = -1
+
+Since we heavily use mirred action to redirect packets to veth, I think
+this is caused by the following race condition:
+
+CPU0:
+tcf_mirred_release(): (in RCU callback)
+	struct net_device *dev = rcu_dereference_protected(m->tcfm_dev, 1);
+
+CPU1:
+mirred_device_event():
+        spin_lock_bh(&mirred_list_lock);
+        list_for_each_entry(m, &mirred_list, tcfm_list) {
+                if (rcu_access_pointer(m->tcfm_dev) == dev) {
+                        dev_put(dev);
+                        /* Note : no rcu grace period necessary, as
+                         * net_device are already rcu protected.
+                         */
+                        RCU_INIT_POINTER(m->tcfm_dev, NULL);
+                }
+        }
+        spin_unlock_bh(&mirred_list_lock);
+
+CPU0:
+tcf_mirred_release():
+        spin_lock_bh(&mirred_list_lock);
+        list_del(&m->tcfm_list);
+        spin_unlock_bh(&mirred_list_lock);
+        if (dev)               // <======== Stil refers to the old m->tcfm_dev
+                dev_put(dev);  // <======== dev_put() is called on it again
+
+The action init code path is good because it is impossible to modify
+an action that is being removed.
+
+So, fix this by moving everything under the spinlock.
+
+Fixes: 2ee22a90c7af ("net_sched: act_mirred: remove spinlock in fast path")
+Fixes: 6bd00b850635 ("act_mirred: fix a race condition on mirred_list")
+Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

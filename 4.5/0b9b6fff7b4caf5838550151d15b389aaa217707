@@ -1,0 +1,117 @@
+thp: fix interrupt unsafe locking in split_huge_page()
+
+split_queue_lock can be taken from interrupt context in some cases, but
+I forgot to convert locking in split_huge_page() to interrupt-safe
+primitives.
+
+Let's fix this.
+
+lockdep output:
+
+  ======================================================
+  [ INFO: SOFTIRQ-safe -> SOFTIRQ-unsafe lock order detected ]
+  4.4.0+ #259 Tainted: G        W
+  ------------------------------------------------------
+  syz-executor/18183 [HC0[0]:SC0[2]:HE0:SE0] is trying to acquire:
+   (split_queue_lock){+.+...}, at: free_transhuge_page+0x24/0x90 mm/huge_memory.c:3436
+
+  and this task is already holding:
+   (slock-AF_INET){+.-...}, at: spin_lock_bh include/linux/spinlock.h:307
+   (slock-AF_INET){+.-...}, at: lock_sock_fast+0x45/0x120 net/core/sock.c:2462
+  which would create a new lock dependency:
+   (slock-AF_INET){+.-...} -> (split_queue_lock){+.+...}
+
+  but this new dependency connects a SOFTIRQ-irq-safe lock:
+   (slock-AF_INET){+.-...}
+  ... which became SOFTIRQ-irq-safe at:
+     mark_irqflags kernel/locking/lockdep.c:2799
+     __lock_acquire+0xfd8/0x4700 kernel/locking/lockdep.c:3162
+     lock_acquire+0x1dc/0x430 kernel/locking/lockdep.c:3585
+     __raw_spin_lock include/linux/spinlock_api_smp.h:144
+     _raw_spin_lock+0x33/0x50 kernel/locking/spinlock.c:151
+     spin_lock include/linux/spinlock.h:302
+     udp_queue_rcv_skb+0x781/0x1550 net/ipv4/udp.c:1680
+     flush_stack+0x50/0x330 net/ipv6/udp.c:799
+     __udp4_lib_mcast_deliver+0x694/0x7f0 net/ipv4/udp.c:1798
+     __udp4_lib_rcv+0x17dc/0x23e0 net/ipv4/udp.c:1888
+     udp_rcv+0x21/0x30 net/ipv4/udp.c:2108
+     ip_local_deliver_finish+0x2b3/0xa50 net/ipv4/ip_input.c:216
+     NF_HOOK_THRESH include/linux/netfilter.h:226
+     NF_HOOK include/linux/netfilter.h:249
+     ip_local_deliver+0x1c4/0x2f0 net/ipv4/ip_input.c:257
+     dst_input include/net/dst.h:498
+     ip_rcv_finish+0x5ec/0x1730 net/ipv4/ip_input.c:365
+     NF_HOOK_THRESH include/linux/netfilter.h:226
+     NF_HOOK include/linux/netfilter.h:249
+     ip_rcv+0x963/0x1080 net/ipv4/ip_input.c:455
+     __netif_receive_skb_core+0x1620/0x2f80 net/core/dev.c:4154
+     __netif_receive_skb+0x2a/0x160 net/core/dev.c:4189
+     netif_receive_skb_internal+0x1b5/0x390 net/core/dev.c:4217
+     napi_skb_finish net/core/dev.c:4542
+     napi_gro_receive+0x2bd/0x3c0 net/core/dev.c:4572
+     e1000_clean_rx_irq+0x4e2/0x1100 drivers/net/ethernet/intel/e1000e/netdev.c:1038
+     e1000_clean+0xa08/0x24a0 drivers/net/ethernet/intel/e1000/e1000_main.c:3819
+     napi_poll net/core/dev.c:5074
+     net_rx_action+0x7eb/0xdf0 net/core/dev.c:5139
+     __do_softirq+0x26a/0x920 kernel/softirq.c:273
+     invoke_softirq kernel/softirq.c:350
+     irq_exit+0x18f/0x1d0 kernel/softirq.c:391
+     exiting_irq ./arch/x86/include/asm/apic.h:659
+     do_IRQ+0x86/0x1a0 arch/x86/kernel/irq.c:252
+     ret_from_intr+0x0/0x20 arch/x86/entry/entry_64.S:520
+     arch_safe_halt ./arch/x86/include/asm/paravirt.h:117
+     default_idle+0x52/0x2e0 arch/x86/kernel/process.c:304
+     arch_cpu_idle+0xa/0x10 arch/x86/kernel/process.c:295
+     default_idle_call+0x48/0xa0 kernel/sched/idle.c:92
+     cpuidle_idle_call kernel/sched/idle.c:156
+     cpu_idle_loop kernel/sched/idle.c:252
+     cpu_startup_entry+0x554/0x710 kernel/sched/idle.c:300
+     rest_init+0x192/0x1a0 init/main.c:412
+     start_kernel+0x678/0x69e init/main.c:683
+     x86_64_start_reservations+0x2a/0x2c arch/x86/kernel/head64.c:195
+     x86_64_start_kernel+0x158/0x167 arch/x86/kernel/head64.c:184
+
+  to a SOFTIRQ-irq-unsafe lock:
+   (split_queue_lock){+.+...}
+   which became SOFTIRQ-irq-unsafe at:
+     mark_irqflags kernel/locking/lockdep.c:2817
+     __lock_acquire+0x146e/0x4700 kernel/locking/lockdep.c:3162
+     lock_acquire+0x1dc/0x430 kernel/locking/lockdep.c:3585
+     __raw_spin_lock include/linux/spinlock_api_smp.h:144
+     _raw_spin_lock+0x33/0x50 kernel/locking/spinlock.c:151
+     spin_lock include/linux/spinlock.h:302
+     split_huge_page_to_list+0xcc0/0x1c50 mm/huge_memory.c:3399
+     split_huge_page include/linux/huge_mm.h:99
+     queue_pages_pte_range+0xa38/0xef0 mm/mempolicy.c:507
+     walk_pmd_range mm/pagewalk.c:50
+     walk_pud_range mm/pagewalk.c:90
+     walk_pgd_range mm/pagewalk.c:116
+     __walk_page_range+0x653/0xcd0 mm/pagewalk.c:204
+     walk_page_range+0xfe/0x2b0 mm/pagewalk.c:281
+     queue_pages_range+0xfb/0x130 mm/mempolicy.c:687
+     migrate_to_node mm/mempolicy.c:1004
+     do_migrate_pages+0x370/0x4e0 mm/mempolicy.c:1109
+     SYSC_migrate_pages mm/mempolicy.c:1453
+     SyS_migrate_pages+0x640/0x730 mm/mempolicy.c:1374
+     entry_SYSCALL_64_fastpath+0x16/0x7a arch/x86/entry/entry_64.S:185
+
+  other info that might help us debug this:
+
+   Possible interrupt unsafe locking scenario:
+
+         CPU0                    CPU1
+         ----                    ----
+    lock(split_queue_lock);
+                                 local_irq_disable();
+                                 lock(slock-AF_INET);
+                                 lock(split_queue_lock);
+    <Interrupt>
+      lock(slock-AF_INET);
+
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Acked-by: David Rientjes <rientjes@google.com>
+Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

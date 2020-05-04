@@ -1,0 +1,96 @@
+Btrfs: fix race between balance and unused block group deletion
+
+We have a race between deleting an unused block group and balancing the
+same block group that leads to an assertion failure/BUG(), producing the
+following trace:
+
+[181631.208236] BTRFS: assertion failed: 0, file: fs/btrfs/volumes.c, line: 2622
+[181631.220591] ------------[ cut here ]------------
+[181631.222959] kernel BUG at fs/btrfs/ctree.h:4062!
+[181631.223932] invalid opcode: 0000 [#1] PREEMPT SMP DEBUG_PAGEALLOC
+[181631.224566] Modules linked in: btrfs dm_flakey dm_mod crc32c_generic xor raid6_pq nfsd auth_rpcgss oid_registry nfs_acl nfs lockd grace fscache sunrpc loop fuse acpi_cpufreq parpor$
+[181631.224566] CPU: 8 PID: 17451 Comm: btrfs Tainted: G        W       4.1.0-rc5-btrfs-next-10+ #1
+[181631.224566] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.8.1-0-g4adadbd-20150316_085822-nilsson.home.kraxel.org 04/01/2014
+[181631.224566] task: ffff880127e09590 ti: ffff8800b5824000 task.ti: ffff8800b5824000
+[181631.224566] RIP: 0010:[<ffffffffa03f19f6>]  [<ffffffffa03f19f6>] assfail.constprop.50+0x1e/0x20 [btrfs]
+[181631.224566] RSP: 0018:ffff8800b5827ae8  EFLAGS: 00010246
+[181631.224566] RAX: 0000000000000040 RBX: ffff8800109fc218 RCX: ffffffff81095dce
+[181631.224566] RDX: 0000000000005124 RSI: ffffffff81464819 RDI: 00000000ffffffff
+[181631.224566] RBP: ffff8800b5827ae8 R08: 0000000000000001 R09: 0000000000000000
+[181631.224566] R10: 0000000000000000 R11: 0000000000000000 R12: ffff8800109fc200
+[181631.224566] R13: ffff880020095000 R14: ffff8800b1a13f38 R15: ffff880020095000
+[181631.224566] FS:  00007f70ca0b0c80(0000) GS:ffff88013ec00000(0000) knlGS:0000000000000000
+[181631.224566] CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
+[181631.224566] CR2: 00007f2872ab6e68 CR3: 00000000a717c000 CR4: 00000000000006e0
+[181631.224566] Stack:
+[181631.224566]  ffff8800b5827ba8 ffffffffa03f3916 ffff8800b5827b38 ffffffffa03d080e
+[181631.224566]  ffffffffa03d1423 ffff880020095000 ffff88001233c000 0000000000000001
+[181631.224566]  ffff880020095000 ffff8800b1a13f38 0000000a69c00000 0000000000000000
+[181631.224566] Call Trace:
+[181631.224566]  [<ffffffffa03f3916>] btrfs_remove_chunk+0xa4/0x6bb [btrfs]
+[181631.224566]  [<ffffffffa03d080e>] ? join_transaction.isra.8+0xb9/0x3ba [btrfs]
+[181631.224566]  [<ffffffffa03d1423>] ? wait_current_trans.isra.13+0x22/0xfc [btrfs]
+[181631.224566]  [<ffffffffa03f3fbc>] btrfs_relocate_chunk.isra.29+0x8f/0xa7 [btrfs]
+[181631.224566]  [<ffffffffa03f54df>] btrfs_balance+0xaa4/0xc52 [btrfs]
+[181631.224566]  [<ffffffffa03fd388>] btrfs_ioctl_balance+0x23f/0x2b0 [btrfs]
+[181631.224566]  [<ffffffff810872f9>] ? trace_hardirqs_on+0xd/0xf
+[181631.224566]  [<ffffffffa04019a3>] btrfs_ioctl+0xfe2/0x2220 [btrfs]
+[181631.224566]  [<ffffffff812603ed>] ? __this_cpu_preempt_check+0x13/0x15
+[181631.224566]  [<ffffffff81084669>] ? arch_local_irq_save+0x9/0xc
+[181631.224566]  [<ffffffff81138def>] ? handle_mm_fault+0x834/0xcd2
+[181631.224566]  [<ffffffff81138def>] ? handle_mm_fault+0x834/0xcd2
+[181631.224566]  [<ffffffff8103e48c>] ? __do_page_fault+0x211/0x424
+[181631.224566]  [<ffffffff811755e6>] do_vfs_ioctl+0x3c6/0x479
+(...)
+
+The sequence of steps leading to this are:
+
+           CPU 0                                         CPU 1
+
+  btrfs_balance()
+    btrfs_relocate_chunk()
+
+      btrfs_relocate_block_group(bg X)
+        btrfs_lookup_block_group(bg X)
+
+                                               cleaner_kthread
+                                                  locks fs_info->cleaner_mutex
+
+                                                  btrfs_delete_unused_bgs()
+                                                    finds bg X, which became
+                                                    unused in the previous
+                                                    transaction
+
+                                                    checks bg X ->ro == 0,
+                                                    so it proceeds
+        sets bg X ->ro to 1
+        (btrfs_set_block_group_ro(bg X))
+
+        blocks on fs_info->cleaner_mutex
+                                                    btrfs_remove_chunk(bg X)
+                                                  unlocks fs_info->cleaner_mutex
+
+        acquires fs_info->cleaner_mutex
+        relocate_block_group()
+          --> does nothing, no extents found in
+              the extent tree from bg X
+        unlocks fs_info->cleaner_mutex
+
+      btrfs_relocate_block_group(bg X) returns
+
+    btrfs_remove_chunk(bg X)
+       extent map not found
+          --> ASSERT(0)
+
+Fix this by using a new mutex to make sure these 2 operations, block
+group relocation and removal, are serialized.
+
+This issue is reproducible by running fstests generic/038 (which stresses
+chunk allocation and automatic removal of unused block groups) together
+with the following balance loop:
+
+    while true; do btrfs balance start -dusage=0 <mountpoint> ; done
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

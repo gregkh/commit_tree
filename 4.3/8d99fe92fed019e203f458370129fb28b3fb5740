@@ -1,0 +1,54 @@
+xfs: fix efi/efd error handling to avoid fs shutdown hangs
+
+Freeing an extent in XFS involves logging an EFI (extent free
+intention), freeing the actual extent, and logging an EFD (extent
+free done). The EFI object is created with a reference count of 2:
+one for the current transaction and one for the subsequently created
+EFD. Under normal circumstances, the first reference is dropped when
+the EFI is unpinned and the second reference is dropped when the EFD
+is committed to the on-disk log.
+
+In event of errors or filesystem shutdown, there are various
+potential cleanup scenarios depending on the state of the EFI/EFD.
+The cleanup scenarios are confusing and racy, as demonstrated by the
+following test sequence:
+
+	# mount $dev $mnt
+	# fsstress -d $mnt -n 99999 -p 16 -z -f fallocate=1 \
+		-f punch=1 -f creat=1 -f unlink=1 &
+	# sleep 5
+	# killall -9 fsstress; wait
+	# godown -f $mnt
+	# umount
+
+... in which the final umount can hang due to the AIL being pinned
+indefinitely by one or more EFI items. This can occur due to several
+conditions. For example, if the shutdown occurs after the EFI is
+committed to the on-disk log and the EFD committed to the CIL, but
+before the EFD committed to the log, the EFD iop_committed() abort
+handler does not drop its reference to the EFI. Alternatively,
+manual error injection in the xfs_bmap_finish() codepath shows that
+if an error occurs after the EFI transaction is committed but before
+the EFD is constructed and logged, the EFI is never released from
+the AIL.
+
+Update the EFI/EFD item handling code to use a more straightforward
+and reliable approach to error handling. If an error occurs after
+the EFI transaction is committed and before the EFD is constructed,
+release the EFI explicitly from xfs_bmap_finish(). If the EFI
+transaction is cancelled, release the EFI in the unlock handler.
+
+Once the EFD is constructed, it is responsible for releasing the EFI
+under any circumstances (including whether the EFI item aborts due
+to log I/O error). Update the EFD item handlers to release the EFI
+if the transaction is cancelled or aborts due to log I/O error.
+Finally, update xfs_bmap_finish() to log at least one EFD extent to
+the transaction before xfs_free_extent() errors are handled to
+ensure the transaction is dirty and EFD item error handling is
+triggered.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+

@@ -1,0 +1,79 @@
+locking/seqcount: Re-fix raw_read_seqcount_latch()
+
+Commit 50755bc1c305 ("seqlock: fix raw_read_seqcount_latch()") broke
+raw_read_seqcount_latch().
+
+If you look at the comment that was modified; the thing that changes is
+the seq count, not the latch pointer.
+
+ * void latch_modify(struct latch_struct *latch, ...)
+ * {
+ *	smp_wmb();	<- Ensure that the last data[1] update is visible
+ *	latch->seq++;
+ *	smp_wmb();	<- Ensure that the seqcount update is visible
+ *
+ *	modify(latch->data[0], ...);
+ *
+ *	smp_wmb();	<- Ensure that the data[0] update is visible
+ *	latch->seq++;
+ *	smp_wmb();	<- Ensure that the seqcount update is visible
+ *
+ *	modify(latch->data[1], ...);
+ * }
+ *
+ * The query will have a form like:
+ *
+ * struct entry *latch_query(struct latch_struct *latch, ...)
+ * {
+ *	struct entry *entry;
+ *	unsigned seq, idx;
+ *
+ *	do {
+ *		seq = lockless_dereference(latch->seq);
+
+So here we have:
+
+		seq = READ_ONCE(latch->seq);
+		smp_read_barrier_depends();
+
+Which is exactly what we want; the new code:
+
+		seq = ({ p = READ_ONCE(latch);
+			 smp_read_barrier_depends(); p })->seq;
+
+is just wrong; because it looses the volatile read on seq, which can now
+be torn or worse 'optimized'. And the read_depend barrier is also placed
+wrong, we want it after the load of seq, to match the above data[]
+up-to-date wmb()s.
+
+Such that when we dereference latch->data[] below, we're guaranteed to
+observe the right data.
+
+ *
+ *		idx = seq & 0x01;
+ *		entry = data_query(latch->data[idx], ...);
+ *
+ *		smp_rmb();
+ *	} while (seq != latch->seq);
+ *
+ *	return entry;
+ * }
+
+So yes, not passing a pointer is not pretty, but the code was correct,
+and isn't anymore now.
+
+Change to explicit READ_ONCE()+smp_read_barrier_depends() to avoid
+confusion and allow strict lockless_dereference() checking.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Paul McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Fixes: 50755bc1c305 ("seqlock: fix raw_read_seqcount_latch()")
+Link: http://lkml.kernel.org/r/20160527111117.GL3192@twins.programming.kicks-ass.net
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

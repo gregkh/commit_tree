@@ -1,0 +1,59 @@
+x86/irq: Plug irq vector hotplug race
+
+Jin debugged a nasty cpu hotplug race which results in leaking a irq
+vector on the newly hotplugged cpu.
+
+cpu N				cpu M
+native_cpu_up                   device_shutdown
+  do_boot_cpu			  free_msi_irqs
+  start_secondary                   arch_teardown_msi_irqs
+    smp_callin                        default_teardown_msi_irqs
+       setup_vector_irq                  arch_teardown_msi_irq
+        __setup_vector_irq		   native_teardown_msi_irq
+          lock(vector_lock)		     destroy_irq 
+          install vectors
+          unlock(vector_lock)
+					       lock(vector_lock)
+--->                                  	       __clear_irq_vector
+                                    	       unlock(vector_lock)
+    lock(vector_lock)
+    set_cpu_online
+    unlock(vector_lock)
+
+This leaves the irq vector(s) which are torn down on CPU M stale in
+the vector array of CPU N, because CPU M does not see CPU N online
+yet. There is a similar issue with concurrent newly setup interrupts.
+
+The alloc/free protection of irq descriptors does not prevent the
+above race, because it merily prevents interrupt descriptors from
+going away or changing concurrently.
+
+Prevent this by moving the call to setup_vector_irq() into the
+vector_lock held region which protects set_cpu_online():
+
+cpu N				cpu M
+native_cpu_up                   device_shutdown
+  do_boot_cpu			  free_msi_irqs
+  start_secondary                   arch_teardown_msi_irqs
+    smp_callin                        default_teardown_msi_irqs
+       lock(vector_lock)                arch_teardown_msi_irq
+       setup_vector_irq()
+        __setup_vector_irq		   native_teardown_msi_irq
+          install vectors		     destroy_irq 
+       set_cpu_online
+       unlock(vector_lock)
+					       lock(vector_lock)
+                                  	       __clear_irq_vector
+                                    	       unlock(vector_lock)
+
+So cpu M either sees the cpu N online before clearing the vector or
+cpu N installs the vectors after cpu M has cleared it.
+
+Reported-by: xiao jin <jin.xiao@intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Joerg Roedel <jroedel@suse.de>
+Cc: Borislav Petkov <bp@suse.de>
+Cc: Yanmin Zhang <yanmin_zhang@linux.intel.com>
+Link: http://lkml.kernel.org/r/20150705171102.141898931@linutronix.de
+

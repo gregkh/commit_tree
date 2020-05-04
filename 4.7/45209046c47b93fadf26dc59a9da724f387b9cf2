@@ -1,0 +1,95 @@
+ACPICA: Namespace: Fix namespace/interpreter lock ordering
+
+There is a lock order issue in acpi_load_tables(). The namespace lock
+is held before holding the interpreter lock.
+
+With ACPI_MUTEX_DEBUG enabled in the kernel, this is printed to the
+log during boot:
+
+  [    0.885699] ACPI Error: Invalid acquire order: Thread 405884224 owns [ACPI_MTX_Namespace], wants [ACPI_MTX_Interpreter] (20160422/utmutex-263)
+  [    0.885881] ACPI Error: Could not acquire AML Interpreter mutex (20160422/exutils-95)
+  [    0.893846] ACPI Error: Mutex [0x0] is not acquired, cannot release (20160422/utmutex-326)
+  [    0.894019] ACPI Error: Could not release AML Interpreter mutex (20160422/exutils-133)
+
+The issue has been introduced by the following commit:
+
+  Commit: 2f38b1b16d9280689e5cfa47a4c50956bf437f0d
+  ACPICA Commit: bfe03ffcde8ed56a7eae38ea0b188aeb12f9c52e
+  Subject: ACPICA: Namespace: Fix a regression that MLC support triggers
+           dead lock in dynamic table loading
+
+Which fixed a deadlock issue for acpi_ns_load_table() in
+acpi_ex_add_table() but didn't take care of the lock order in
+acpi_ns_load_table() correctly.
+
+Originally (before the above commit), ACPICA used the
+namespace/interpreter locks in the following 2 key code
+paths:
+
+ 1. Table loading:
+ acpi_ns_load_table
+	L(Namespace)
+		acpi_ns_parse_table
+			acpi_ns_one_complete_parse
+	U(Namespace)
+ 2. Object evaluation:
+ acpi_ns_evaluate
+	L(Interpreter)
+	acpi_ps_execute_method
+		U(Interpreter)
+		acpi_ns_load_table
+			L(Namespace)
+			U(Namespace)
+		acpi_ev_initialize_region
+			L(Namespace)
+			U(Namespace)
+		address_space.setup
+			L(Namespace)
+			U(Namespace)
+		address_space.handler
+			L(Namespace)
+			U(Namespace)
+		acpi_os_wait_semaphore
+		acpi_os_acquire_mutex
+		acpi_os_sleep
+		L(Interpreter)
+	U(Interpreter)
+
+During runtime, while acpi_ns_evaluate is called, the lock order is
+always Interpreter -> Namespace.
+
+In turn, the problematic commit acquires the locks in the following
+order:
+
+ 3. Table loading:
+ acpi_ns_load_table
+	L(Namespace)
+		acpi_ns_parse_table
+		L(Interpreter)
+			acpi_ns_one_complete_parse
+		U(Interpreter)
+	U(Namespace)
+
+To fix the lock order issue, move the interpreter lock to
+acpi_ns_load_table() to ensure the lock order correctness:
+
+ 4. Table loading:
+ acpi_ns_load_table
+	L(Interpreter)
+	L(Namespace)
+		acpi_ns_parse_table
+			acpi_ns_one_complete_parse
+	U(Namespace)
+	U(Interpreter)
+
+However, this doesn't fix the current design issues related to the
+namespace lock. For example, we can notice that in acpi_ns_evaluate(),
+outside of acpi_ns_load_table(), the namespace objects may be created
+by the named object creation control methods. And the creation of
+the method-owned namespace objects are not locked by the namespace
+lock. This patch doesn't try to fix such kind of existing issues.
+
+Fixes: 2f38b1b16d92 (ACPICA: Namespace: Fix a regression that MLC support triggers dead lock in dynamic table loading)
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

@@ -1,0 +1,91 @@
+xfs: fix quota block reservation leak when tp allocates and frees blocks
+
+Al Viro reports that generic/231 fails frequently on XFS and bisected
+the problem to the following commit:
+
+	5d11fb4b xfs: rework zero range to prevent invalid i_size updates
+
+... which is just the first commit that happens to cause fsx to
+reproduce the problem. fsx reproduces via zero range calls. The
+aforementioned commit overhauls zero range to use hole punch and
+fallocate. As it turns out, the problem is reproducible on demand using
+basic hole punch as follows:
+
+$ mkfs.xfs -f -m crc=1,finobt=1 <dev>
+$ mount <dev> /mnt -o uquota
+$ xfs_io -f -c "falloc 0 50m" /mnt/file
+$ for i in $(seq 1 20); do xfs_io -c "fpunch ${i}m 32k" /mnt/file; done
+$ rm -f /mnt/file
+$ repquota -us /mnt
+...
+User            used    soft    hard  grace    used  soft  hard  grace
+----------------------------------------------------------------------
+root      --     32K      0K      0K              3     0     0
+
+A file is allocated with a single 50m extent. The extent count increases
+via hole punches until the bmap converts to btree format. The file is
+removed but quota reports 32k of space usage for the user. This
+reservation is effectively leaked for the lifetime of the mount.
+
+The reason this occurs is because the quota block reservation tracking
+is confused when a transaction happens to free and allocate blocks at
+the same time. Consider the following sequence of events:
+
+- tp is allocated from xfs_free_file_space() and reserves several blocks
+  for btree management. Blocks are reserved against the dquot and marked
+  as such in the transaction (qtrx->qt_blk_res).
+- 8 blocks are accounted free when the 32k range is punched out.
+  xfs_trans_mod_dquot() is called with XFS_TRANS_DQ_BCOUNT and sets
+  ->qt_bcount_delta to -8.
+- Subsequently, a block is allocated against the same transaction by
+  xfs_bmap_extents_to_btree() for btree conversion. A call to
+  xfs_trans_mod_dquot() increases qt_blk_res_used to 1 and qt_bcount_delta
+  to -7.
+- The transaction is dup'd and committed by xfs_bmap_finish().
+  xfs_trans_dup_dqinfo() sets the first transaction up such that it has a
+  matching qt_blk_res and qt_blk_res_used of 1. The remaining unused
+  reservation is transferred to the duplicate tp.
+
+When the transactions are committed, the dquots are fixed up in
+xfs_trans_apply_dquot_deltas() according to one of two methods:
+
+1.) If the transaction holds a block reservation (->qt_blk_res != 0),
+_only_ the unused portion reservation is unaccounted from the dquot.
+Note that the tp duplication behavior of xfs_bmap_finish() makes it such
+that qt_blk_res is typically 0 for tp's with unused reservation.
+2.) Otherwise, the dquot is fixed up based on the block delta
+(->qt_bcount_delta) created by the transaction.
+
+Therefore, if a transaction has a negative qt_bcount_delta and positive
+qt_blk_res_used, the former set of blocks that have been removed from
+the file are never factored out of the in-core dquot reservation.
+Instead, *_apply_dquot_deltas() sees 1 block used out of a 1 block
+reservation and believes there is nothing to fix up. The on-disk
+d_bcount is updated independently from qt_bcount_delta, and thus is
+correct (and allows the quota usage to correct on remount).
+
+To deal with this situation, we effectively want the "used reservation"
+part of the transaction to be consistent with any freed blocks with
+respect to quota tracking. For example, if 8 blocks are freed, the
+subsequent single block allocation does not need to consume the initial
+reservation made by the tp. Instead, it simply borrows one from the
+previously freed. One possible implementation of such borrowing is to
+avoid the blks_res_used increment when bcount_delta is negative. This
+alone is flawed logic in that it only handles the case where blocks are
+freed before allocated, however.
+
+Rather than add more complexity to manage synchronization between
+bcount_delta and blks_res_used, kill the latter entirely. blk_res_used
+is only updated in one place and always in sync with delta_bcount.
+Therefore, the net block reservation consumption of the transaction is
+always available from bcount_delta. Calculate the reservation
+consumption on the fly where necessary based on whether the tp has a
+reservation and results in a positive net block delta on the inode.
+
+Reported-by: Al Viro <viro@ZenIV.linux.org.uk>
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+

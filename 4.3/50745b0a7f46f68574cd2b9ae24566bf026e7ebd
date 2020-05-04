@@ -1,0 +1,77 @@
+Btrfs: Direct I/O: Fix space accounting
+
+The following call trace is seen when generic/095 test is executed,
+
+WARNING: CPU: 3 PID: 2769 at /home/chandan/code/repos/linux/fs/btrfs/inode.c:8967 btrfs_destroy_inode+0x284/0x2a0()
+Modules linked in:
+CPU: 3 PID: 2769 Comm: umount Not tainted 4.2.0-rc5+ #31
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.7.5-20150306_163512-brownie 04/01/2014
+ ffffffff81c08150 ffff8802ec9cbce8 ffffffff81984058 ffff8802ffd8feb0
+ 0000000000000000 ffff8802ec9cbd28 ffffffff81050385 ffff8802ec9cbd38
+ ffff8802d12f8588 ffff8802d12f8588 ffff8802f15ab000 ffff8800bb96c0b0
+Call Trace:
+ [<ffffffff81984058>] dump_stack+0x45/0x57
+ [<ffffffff81050385>] warn_slowpath_common+0x85/0xc0
+ [<ffffffff81050465>] warn_slowpath_null+0x15/0x20
+ [<ffffffff81340294>] btrfs_destroy_inode+0x284/0x2a0
+ [<ffffffff8117ce07>] destroy_inode+0x37/0x60
+ [<ffffffff8117cf39>] evict+0x109/0x170
+ [<ffffffff8117cfd5>] dispose_list+0x35/0x50
+ [<ffffffff8117dd3a>] evict_inodes+0xaa/0x100
+ [<ffffffff81165667>] generic_shutdown_super+0x47/0xf0
+ [<ffffffff81165951>] kill_anon_super+0x11/0x20
+ [<ffffffff81302093>] btrfs_kill_super+0x13/0x110
+ [<ffffffff81165c99>] deactivate_locked_super+0x39/0x70
+ [<ffffffff811660cf>] deactivate_super+0x5f/0x70
+ [<ffffffff81180e1e>] cleanup_mnt+0x3e/0x90
+ [<ffffffff81180ebd>] __cleanup_mnt+0xd/0x10
+ [<ffffffff81069c06>] task_work_run+0x96/0xb0
+ [<ffffffff81003a3d>] do_notify_resume+0x3d/0x50
+ [<ffffffff8198cbc2>] int_signal+0x12/0x17
+
+This means that the inode had non-zero "outstanding extents" during
+eviction. This occurs because, during direct I/O a task which successfully
+used up its reserved data space would set BTRFS_INODE_DIO_READY bit and does
+not clear the bit after finishing the DIO write. A future DIO write could
+actually fail and the unused reserve space won't be freed because of the
+previously set BTRFS_INODE_DIO_READY bit.
+
+Clearing the BTRFS_INODE_DIO_READY bit in btrfs_direct_IO() caused the
+following issue,
+|-----------------------------------+-------------------------------------|
+| Task A                            | Task B                              |
+|-----------------------------------+-------------------------------------|
+| Start direct i/o write on inode X.|                                     |
+| reserve space                     |                                     |
+| Allocate ordered extent           |                                     |
+| release reserved space            |                                     |
+| Set BTRFS_INODE_DIO_READY bit.    |                                     |
+|                                   | splice()                            |
+|                                   | Transfer data from pipe buffer to   |
+|                                   | destination file.                   |
+|                                   | - kmap(pipe buffer page)            |
+|                                   | - Start direct i/o write on         |
+|                                   |   inode X.                          |
+|                                   |   - reserve space                   |
+|                                   |   - dio_refill_pages()              |
+|                                   |     - sdio->blocks_available == 0   |
+|                                   |     - Since a kernel address is     |
+|                                   |       being passed instead of a     |
+|                                   |       user space address,           |
+|                                   |       iov_iter_get_pages() returns  |
+|                                   |       -EFAULT.                      |
+|                                   |   - Since BTRFS_INODE_DIO_READY is  |
+|                                   |     set, we don't release reserved  |
+|                                   |     space.                          |
+|                                   |   - Clear BTRFS_INODE_DIO_READY bit.|
+| -EIOCBQUEUED is returned.         |                                     |
+|-----------------------------------+-------------------------------------|
+
+Hence this commit introduces "struct btrfs_dio_data" to track the usage of
+reserved data space. The remaining unused "reserve space" can now be freed
+reliably.
+
+Signed-off-by: Chandan Rajendra <chandan@linux.vnet.ibm.com>
+Reviewed-by: Liu Bo <bo.li.liu@oracle.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

@@ -1,0 +1,74 @@
+Btrfs: fix lockdep deadlock warning due to dev_replace
+
+Xfstests btrfs/011 complains about a deadlock warning,
+
+[ 1226.649039] =========================================================
+[ 1226.649039] [ INFO: possible irq lock inversion dependency detected ]
+[ 1226.649039] 4.1.0+ #270 Not tainted
+[ 1226.649039] ---------------------------------------------------------
+[ 1226.652955] kswapd0/46 just changed the state of lock:
+[ 1226.652955]  (&delayed_node->mutex){+.+.-.}, at: [<ffffffff81458735>] __btrfs_release_delayed_node+0x45/0x1d0
+[ 1226.652955] but this lock took another, RECLAIM_FS-unsafe lock in the past:
+[ 1226.652955]  (&fs_info->dev_replace.lock){+.+.+.}
+
+and interrupts could create inverse lock ordering between them.
+
+[ 1226.652955]
+other info that might help us debug this:
+[ 1226.652955] Chain exists of:
+  &delayed_node->mutex --> &found->groups_sem --> &fs_info->dev_replace.lock
+
+[ 1226.652955]  Possible interrupt unsafe locking scenario:
+
+[ 1226.652955]        CPU0                    CPU1
+[ 1226.652955]        ----                    ----
+[ 1226.652955]   lock(&fs_info->dev_replace.lock);
+[ 1226.652955]                                local_irq_disable();
+[ 1226.652955]                                lock(&delayed_node->mutex);
+[ 1226.652955]                                lock(&found->groups_sem);
+[ 1226.652955]   <Interrupt>
+[ 1226.652955]     lock(&delayed_node->mutex);
+[ 1226.652955]
+ *** DEADLOCK ***
+
+Commit 084b6e7c7607 ("btrfs: Fix a lockdep warning when running xfstest.") tried
+to fix a similar one that has the exactly same warning, but with that, we still
+run to this.
+
+The above lock chain comes from
+btrfs_commit_transaction
+  ->btrfs_run_delayed_items
+    ...
+    ->__btrfs_update_delayed_inode
+      ...
+      ->__btrfs_cow_block
+         ...
+         ->find_free_extent
+            ->cache_block_group
+              ->load_free_space_cache
+                ->btrfs_readpages
+                  ->submit_one_bio
+                    ...
+                    ->__btrfs_map_block
+                      ->btrfs_dev_replace_lock
+
+However, with high memory pressure, tasks which hold dev_replace.lock can
+be interrupted by kswapd and then kswapd is intended to release memory occupied
+by superblock, inodes and dentries, where we may call evict_inode, and it comes
+to
+
+[ 1226.652955]  [<ffffffff81458735>] __btrfs_release_delayed_node+0x45/0x1d0
+[ 1226.652955]  [<ffffffff81459e74>] btrfs_remove_delayed_node+0x24/0x30
+[ 1226.652955]  [<ffffffff8140c5fe>] btrfs_evict_inode+0x34e/0x700
+
+delayed_node->mutex may be acquired in __btrfs_release_delayed_node(), and it leads
+to a ABBA deadlock.
+
+To fix this, we can use "blocking rwlock" used in the case of extent_buffer, but
+things are simpler here since we only needs read's spinlock to blocking lock.
+
+With this, btrfs/011 no more produces warnings in dmesg.
+
+Signed-off-by: Liu Bo <bo.li.liu@oracle.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

@@ -1,0 +1,142 @@
+ebpf, x86: fix general protection fault when tail call is invoked
+
+With eBPF JIT compiler enabled on x86_64, I was able to reliably trigger
+the following general protection fault out of an eBPF program with a simple
+tail call, f.e. tracex5 (or a stripped down version of it):
+
+  [  927.097918] general protection fault: 0000 [#1] SMP DEBUG_PAGEALLOC
+  [...]
+  [  927.100870] task: ffff8801f228b780 ti: ffff880016a64000 task.ti: ffff880016a64000
+  [  927.102096] RIP: 0010:[<ffffffffa002440d>]  [<ffffffffa002440d>] 0xffffffffa002440d
+  [  927.103390] RSP: 0018:ffff880016a67a68  EFLAGS: 00010006
+  [  927.104683] RAX: 5a5a5a5a5a5a5a5a RBX: 0000000000000000 RCX: 0000000000000001
+  [  927.105921] RDX: 0000000000000000 RSI: ffff88014e438000 RDI: ffff880016a67e00
+  [  927.107137] RBP: ffff880016a67c90 R08: 0000000000000000 R09: 0000000000000001
+  [  927.108351] R10: 0000000000000000 R11: 0000000000000000 R12: ffff880016a67e00
+  [  927.109567] R13: 0000000000000000 R14: ffff88026500e460 R15: ffff880220a81520
+  [  927.110787] FS:  00007fe7d5c1f740(0000) GS:ffff880265000000(0000) knlGS:0000000000000000
+  [  927.112021] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+  [  927.113255] CR2: 0000003e7bbb91a0 CR3: 000000006e04b000 CR4: 00000000001407e0
+  [  927.114500] Stack:
+  [  927.115737]  ffffc90008cdb000 ffff880016a67e00 ffff88026500e460 ffff880220a81520
+  [  927.117005]  0000000100000000 000000000000001b ffff880016a67aa8 ffffffff8106c548
+  [  927.118276]  00007ffcdaf22e58 0000000000000000 0000000000000000 ffff880016a67ff0
+  [  927.119543] Call Trace:
+  [  927.120797]  [<ffffffff8106c548>] ? lookup_address+0x28/0x30
+  [  927.122058]  [<ffffffff8113d176>] ? __module_text_address+0x16/0x70
+  [  927.123314]  [<ffffffff8117bf0e>] ? is_ftrace_trampoline+0x3e/0x70
+  [  927.124562]  [<ffffffff810c1a0f>] ? __kernel_text_address+0x5f/0x80
+  [  927.125806]  [<ffffffff8102086f>] ? print_context_stack+0x7f/0xf0
+  [  927.127033]  [<ffffffff810f7852>] ? __lock_acquire+0x572/0x2050
+  [  927.128254]  [<ffffffff810f7852>] ? __lock_acquire+0x572/0x2050
+  [  927.129461]  [<ffffffff8119edfa>] ? trace_call_bpf+0x3a/0x140
+  [  927.130654]  [<ffffffff8119ee4a>] trace_call_bpf+0x8a/0x140
+  [  927.131837]  [<ffffffff8119edfa>] ? trace_call_bpf+0x3a/0x140
+  [  927.133015]  [<ffffffff8119f008>] kprobe_perf_func+0x28/0x220
+  [  927.134195]  [<ffffffff811a1668>] kprobe_dispatcher+0x38/0x60
+  [  927.135367]  [<ffffffff81174b91>] ? seccomp_phase1+0x1/0x230
+  [  927.136523]  [<ffffffff81061400>] kprobe_ftrace_handler+0xf0/0x150
+  [  927.137666]  [<ffffffff81174b95>] ? seccomp_phase1+0x5/0x230
+  [  927.138802]  [<ffffffff8117950c>] ftrace_ops_recurs_func+0x5c/0xb0
+  [  927.139934]  [<ffffffffa022b0d5>] 0xffffffffa022b0d5
+  [  927.141066]  [<ffffffff81174b91>] ? seccomp_phase1+0x1/0x230
+  [  927.142199]  [<ffffffff81174b95>] seccomp_phase1+0x5/0x230
+  [  927.143323]  [<ffffffff8102c0a4>] syscall_trace_enter_phase1+0xc4/0x150
+  [  927.144450]  [<ffffffff81174b95>] ? seccomp_phase1+0x5/0x230
+  [  927.145572]  [<ffffffff8102c0a4>] ? syscall_trace_enter_phase1+0xc4/0x150
+  [  927.146666]  [<ffffffff817f9a9f>] tracesys+0xd/0x44
+  [  927.147723] Code: 48 8b 46 10 48 39 d0 76 2c 8b 85 fc fd ff ff 83 f8 20 77 21 83
+                       c0 01 89 85 fc fd ff ff 48 8d 44 d6 80 48 8b 00 48 83 f8 00 74
+                       0a <48> 8b 40 20 48 83 c0 33 ff e0 48 89 d8 48 8b 9d d8 fd ff
+                       ff 4c
+  [  927.150046] RIP  [<ffffffffa002440d>] 0xffffffffa002440d
+
+The code section with the instructions that traps points into the eBPF JIT
+image of the root program (the one invoking the tail call instruction).
+
+Using bpf_jit_disasm -o on the eBPF root program image:
+
+  [...]
+  4e:   mov    -0x204(%rbp),%eax
+        8b 85 fc fd ff ff
+  54:   cmp    $0x20,%eax               <--- if (tail_call_cnt > MAX_TAIL_CALL_CNT)
+        83 f8 20
+  57:   ja     0x000000000000007a
+        77 21
+  59:   add    $0x1,%eax                <--- tail_call_cnt++
+        83 c0 01
+  5c:   mov    %eax,-0x204(%rbp)
+        89 85 fc fd ff ff
+  62:   lea    -0x80(%rsi,%rdx,8),%rax  <--- prog = array->prog[index]
+        48 8d 44 d6 80
+  67:   mov    (%rax),%rax
+        48 8b 00
+  6a:   cmp    $0x0,%rax                <--- check for NULL
+        48 83 f8 00
+  6e:   je     0x000000000000007a
+        74 0a
+  70:   mov    0x20(%rax),%rax          <--- GPF triggered here! fetch of bpf_func
+        48 8b 40 20                              [ matches <48> 8b 40 20 ... from above ]
+  74:   add    $0x33,%rax               <--- prologue skip of new prog
+        48 83 c0 33
+  78:   jmpq   *%rax                    <--- jump to new prog insns
+        ff e0
+  [...]
+
+The problem is that rax has 5a5a5a5a5a5a5a5a, which suggests a tail call
+jump to map slot 0 is pointing to a poisoned page. The issue is the following:
+
+lea instruction has a wrong offset, i.e. it should be ...
+
+  lea    0x80(%rsi,%rdx,8),%rax
+
+... but it actually seems to be ...
+
+  lea   -0x80(%rsi,%rdx,8),%rax
+
+... where 0x80 is offsetof(struct bpf_array, prog), thus the offset needs
+to be positive instead of negative. Disassembling the interpreter, we btw
+similarly do:
+
+  [...]
+  c88:  lea     0x80(%rax,%rdx,8),%rax  <--- prog = array->prog[index]
+        48 8d 84 d0 80 00 00 00
+  c90:  add     $0x1,%r13d
+        41 83 c5 01
+  c94:  mov     (%rax),%rax
+        48 8b 00
+  [...]
+
+Now the other interesting fact is that this panic triggers only when things
+like CONFIG_LOCKDEP are being used. In that case offsetof(struct bpf_array,
+prog) starts at offset 0x80 and in non-CONFIG_LOCKDEP case at offset 0x50.
+Reason is that the work_struct inside struct bpf_map grows by 48 bytes in my
+case due to the lockdep_map member (which also has CONFIG_LOCK_STAT enabled
+members).
+
+Changing the emitter to always use the 4 byte displacement in the lea
+instruction fixes the panic on my side. It increases the tail call instruction
+emission by 3 more byte, but it should cover us from various combinations
+(and perhaps other future increases on related structures).
+
+After patch, disassembly:
+
+  [...]
+  9e:   lea    0x80(%rsi,%rdx,8),%rax   <--- CONFIG_LOCKDEP/CONFIG_LOCK_STAT
+        48 8d 84 d6 80 00 00 00
+  a6:   mov    (%rax),%rax
+        48 8b 00
+  [...]
+
+  [...]
+  9e:   lea    0x50(%rsi,%rdx,8),%rax   <--- No CONFIG_LOCKDEP
+        48 8d 84 d6 50 00 00 00
+  a6:   mov    (%rax),%rax
+        48 8b 00
+  [...]
+
+Fixes: b52f00e6a715 ("x86: bpf_jit: implement bpf_tail_call() helper")
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

@@ -1,0 +1,92 @@
+netlink: Replace rhash_portid with bound
+
+On Mon, Sep 21, 2015 at 02:20:22PM -0400, Tejun Heo wrote:
+>
+> store_release and load_acquire are different from the usual memory
+> barriers and can't be paired this way.  You have to pair store_release
+> and load_acquire.  Besides, it isn't a particularly good idea to
+
+OK I've decided to drop the acquire/release helpers as they don't
+help us at all and simply pessimises the code by using full memory
+barriers (on some architectures) where only a write or read barrier
+is needed.
+
+> depend on memory barriers embedded in other data structures like the
+> above.  Here, especially, rhashtable_insert() would have write barrier
+> *before* the entry is hashed not necessarily *after*, which means that
+> in the above case, a socket which appears to have set bound to a
+> reader might not visible when the reader tries to look up the socket
+> on the hashtable.
+
+But you are right we do need an explicit write barrier here to
+ensure that the hashing is visible.
+
+> There's no reason to be overly smart here.  This isn't a crazy hot
+> path, write barriers tend to be very cheap, store_release more so.
+> Please just do smp_store_release() and note what it's paired with.
+
+It's not about being overly smart.  It's about actually understanding
+what's going on with the code.  I've seen too many instances of
+people simply sprinkling synchronisation primitives around without
+any knowledge of what is happening underneath, which is just a recipe
+for creating hard-to-debug races.
+
+> > @@ -1539,7 +1546,7 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
+> >  		}
+> >  	}
+> >
+> > -	if (!nlk->portid) {
+> > +	if (!nlk->bound) {
+>
+> I don't think you can skip load_acquire here just because this is the
+> second deref of the variable.  That doesn't change anything.  Race
+> condition could still happen between the first and second tests and
+> skipping the second would lead to the same kind of bug.
+
+The reason this one is OK is because we do not use nlk->portid or
+try to get nlk from the hash table before we return to user-space.
+
+However, there is a real bug here that none of these acquire/release
+helpers discovered.  The two bound tests here used to be a single
+one.  Now that they are separate it is entirely possible for another
+thread to come in the middle and bind the socket.  So we need to
+repeat the portid check in order to maintain consistency.
+
+> > @@ -1587,7 +1594,7 @@ static int netlink_connect(struct socket *sock, struct sockaddr *addr,
+> >  	    !netlink_allowed(sock, NL_CFG_F_NONROOT_SEND))
+> >  		return -EPERM;
+> >
+> > -	if (!nlk->portid)
+> > +	if (!nlk->bound)
+>
+> Don't we need load_acquire here too?  Is this path holding a lock
+> which makes that unnecessary?
+
+Ditto.
+
+---8<---
+The commit 1f770c0a09da855a2b51af6d19de97fb955eca85 ("netlink:
+Fix autobind race condition that leads to zero port ID") created
+some new races that can occur due to inconcsistencies between the
+two port IDs.
+
+Tejun is right that a barrier is unavoidable.  Therefore I am
+reverting to the original patch that used a boolean to indicate
+that a user netlink socket has been bound.
+
+Barriers have been added where necessary to ensure that a valid
+portid and the hashed socket is visible.
+
+I have also changed netlink_insert to only return EBUSY if the
+socket is bound to a portid different to the requested one.  This
+combined with only reading nlk->bound once in netlink_bind fixes
+a race where two threads that bind the socket at the same time
+with different port IDs may both succeed.
+
+Fixes: 1f770c0a09da ("netlink: Fix autobind race condition that leads to zero port ID")
+Reported-by: Tejun Heo <tj@kernel.org>
+Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Nacked-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

@@ -1,0 +1,65 @@
+mm: soft-offline: don't free target page in successful page migration
+
+Stress testing showed that soft offline events for a process iterating
+"mmap-pagefault-munmap" loop can trigger
+VM_BUG_ON(PAGE_FLAGS_CHECK_AT_PREP) in __free_one_page():
+
+  Soft offlining page 0x70fe1 at 0x70100008d000
+  Soft offlining page 0x705fb at 0x70300008d000
+  page:ffffea0001c3f840 count:0 mapcount:0 mapping:          (null) index:0x2
+  flags: 0x1fffff80800000(hwpoison)
+  page dumped because: VM_BUG_ON_PAGE(page->flags & ((1 << 25) - 1))
+  ------------[ cut here ]------------
+  kernel BUG at /src/linux-dev/mm/page_alloc.c:585!
+  invalid opcode: 0000 [#1] SMP DEBUG_PAGEALLOC
+  Modules linked in: cfg80211 rfkill crc32c_intel microcode ppdev parport_pc pcspkr serio_raw virtio_balloon parport i2c_piix4 virtio_blk virtio_net ata_generic pata_acpi floppy
+  CPU: 3 PID: 1779 Comm: test_base_madv_ Not tainted 4.0.0-v4.0-150511-1451-00009-g82360a3730e6 #139
+  RIP: free_pcppages_bulk+0x52a/0x6f0
+  Call Trace:
+    drain_pages_zone+0x3d/0x50
+    drain_local_pages+0x1d/0x30
+    on_each_cpu_mask+0x46/0x80
+    drain_all_pages+0x14b/0x1e0
+    soft_offline_page+0x432/0x6e0
+    SyS_madvise+0x73c/0x780
+    system_call_fastpath+0x12/0x17
+  Code: ff 89 45 b4 48 8b 45 c0 48 83 b8 a8 00 00 00 00 0f 85 e3 fb ff ff 0f 1f 00 0f 0b 48 8b 7d 90 48 c7 c6 e8 95 a6 81 e8 e6 32 02 00 <0f> 0b 8b 45 cc 49 89 47 30 41 8b 47 18 83 f8 ff 0f 85 10 ff ff
+  RIP  [<ffffffff811a806a>] free_pcppages_bulk+0x52a/0x6f0
+   RSP <ffff88007a117d28>
+  ---[ end trace 53926436e76d1f35 ]---
+
+When soft offline successfully migrates page, the source page is supposed
+to be freed.  But there is a race condition where a source page looks
+isolated (i.e.  the refcount is 0 and the PageHWPoison is set) but
+somewhat linked to pcplist.  Then another soft offline event calls
+drain_all_pages() and tries to free such hwpoisoned page, which is
+forbidden.
+
+This odd page state seems to happen due to the race between put_page() in
+putback_lru_page() and __pagevec_lru_add_fn().  But I don't want to play
+with tweaking drain code as done in commit 9ab3b598d2df "mm: hwpoison:
+drop lru_add_drain_all() in __soft_offline_page()", or to change page
+freeing code for this soft offline's purpose.
+
+Instead, let's think about the difference between hard offline and soft
+offline.  There is an interesting difference in how to isolate the in-use
+page between these, that is, hard offline marks PageHWPoison of the target
+page at first, and doesn't free it by keeping its refcount 1.  OTOH, soft
+offline tries to free the target page then marks PageHWPoison.  This
+difference might be the source of complexity and result in bugs like the
+above.  So making soft offline isolate with keeping refcount can be a
+solution for this problem.
+
+We can pass to page migration code the "reason" which shows the caller, so
+let's use this more to avoid calling putback_lru_page() when called from
+soft offline, which effectively does the isolation for soft offline.  With
+this change, target pages of soft offline never be reused without changing
+migratetype, so this patch also removes the related code.
+
+Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Cc: Andi Kleen <andi@firstfloor.org>
+Cc: Tony Luck <tony.luck@intel.com>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

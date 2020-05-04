@@ -1,0 +1,53 @@
+sunrpc: move NO_CRKEY_TIMEOUT to the auth->au_flags
+
+A generic_cred can be used to look up a unx_cred or a gss_cred, so it's
+not really safe to use the the generic_cred->acred->ac_flags to store
+the NO_CRKEY_TIMEOUT flag.  A lookup for a unx_cred triggered while the
+KEY_EXPIRE_SOON flag is already set will cause both NO_CRKEY_TIMEOUT and
+KEY_EXPIRE_SOON to be set in the ac_flags, leaving the user associated
+with the auth_cred to be in a state where they're perpetually doing 4K
+NFS_FILE_SYNC writes.
+
+This can be reproduced as follows:
+
+1. Mount two NFS filesystems, one with sec=krb5 and one with sec=sys.
+They do not need to be the same export, nor do they even need to be from
+the same NFS server.  Also, v3 is fine.
+$ sudo mount -o v3,sec=krb5 server1:/export /mnt/krb5
+$ sudo mount -o v3,sec=sys server2:/export /mnt/sys
+
+2. As the normal user, before accessing the kerberized mount, kinit with
+a short lifetime (but not so short that renewing the ticket would leave
+you within the 4-minute window again by the time the original ticket
+expires), e.g.
+$ kinit -l 10m -r 60m
+
+3. Do some I/O to the kerberized mount and verify that the writes are
+wsize, UNSTABLE:
+$ dd if=/dev/zero of=/mnt/krb5/file bs=1M count=1
+
+4. Wait until you're within 4 minutes of key expiry, then do some more
+I/O to the kerberized mount to ensure that RPC_CRED_KEY_EXPIRE_SOON gets
+set.  Verify that the writes are 4K, FILE_SYNC:
+$ dd if=/dev/zero of=/mnt/krb5/file bs=1M count=1
+
+5. Now do some I/O to the sec=sys mount.  This will cause
+RPC_CRED_NO_CRKEY_TIMEOUT to be set:
+$ dd if=/dev/zero of=/mnt/sys/file bs=1M count=1
+
+6. Writes for that user will now be permanently 4K, FILE_SYNC for that
+user, regardless of which mount is being written to, until you reboot
+the client.  Renewing the kerberos ticket (assuming it hasn't already
+expired) will have no effect.  Grabbing a new kerberos ticket at this
+point will have no effect either.
+
+Move the flag to the auth->au_flags field (which is currently unused)
+and rename it slightly to reflect that it's no longer associated with
+the auth_cred->ac_flags.  Add the rpc_auth to the arg list of
+rpcauth_cred_key_to_expire and check the au_flags there too.  Finally,
+add the inode to the arg list of nfs_ctx_key_to_expire so we can
+determine the rpc_auth to pass to rpcauth_cred_key_to_expire.
+
+Signed-off-by: Scott Mayhew <smayhew@redhat.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+

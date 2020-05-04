@@ -1,0 +1,157 @@
+perf annotate: Add branch stack / basic block
+
+I wanted to know the hottest path through a function and figured the
+branch-stack (LBR) information should be able to help out with that.
+
+The below uses the branch-stack to create basic blocks and generate
+statistics from them.
+
+        from    to              branch_i
+        * ----> *
+                |
+                | block
+                v
+                * ----> *
+                from    to      branch_i+1
+
+The blocks are broken down into non-overlapping ranges, while tracking
+if the start of each range is an entry point and/or the end of a range
+is a branch.
+
+Each block iterates all ranges it covers (while splitting where required
+to exactly match the block) and increments the 'coverage' count.
+
+For the range including the branch we increment the taken counter, as
+well as the pred counter if flags.predicted.
+
+Using these number we can find if an instruction:
+
+ - had coverage; given by:
+
+        br->coverage / br->sym->max_coverage
+
+   This metric ensures each symbol has a 100% spot, which reflects the
+   observation that each symbol must have a most covered/hottest
+   block.
+
+ - is a branch target: br->is_target && br->start == add
+
+ - for targets, how much of a branch's coverages comes from it:
+
+	target->entry / branch->coverage
+
+ - is a branch: br->is_branch && br->end == addr
+
+ - for branches, how often it was taken:
+
+        br->taken / br->coverage
+
+   after all, all execution that didn't take the branch would have
+   incremented the coverage and continued onward to a later branch.
+
+ - for branches, how often it was predicted:
+
+        br->pred / br->taken
+
+The coverage percentage is used to color the address and asm sections;
+for low (<1%) coverage we use NORMAL (uncolored), indicating that these
+instructions are not 'important'. For high coverage (>75%) we color the
+address RED.
+
+For each branch, we add an asm comment after the instruction with
+information on how often it was taken and predicted.
+
+Output looks like (sans color, which does loose a lot of the
+information :/)
+
+$ perf record --branch-filter u,any -e cycles:p ./branches 27
+$ perf annotate branches
+
+ Percent |	Source code & Disassembly of branches for cycles:pu (217 samples)
+---------------------------------------------------------------------------------
+         :	branches():
+    0.00 :	  40057a:       push   %rbp
+    0.00 :	  40057b:       mov    %rsp,%rbp
+    0.00 :	  40057e:       sub    $0x20,%rsp
+    0.00 :	  400582:       mov    %rdi,-0x18(%rbp)
+    0.00 :	  400586:       mov    %rsi,-0x20(%rbp)
+    0.00 :	  40058a:       mov    -0x18(%rbp),%rax
+    0.00 :	  40058e:       mov    %rax,-0x10(%rbp)
+    0.00 :	  400592:       movq   $0x0,-0x8(%rbp)
+    0.00 :	  40059a:       jmpq   400656 <branches+0xdc>
+    1.84 :	  40059f:       mov    -0x10(%rbp),%rax	# +100.00%
+    3.23 :	  4005a3:       and    $0x1,%eax
+    1.84 :	  4005a6:       test   %rax,%rax
+    0.00 :	  4005a9:       je     4005bf <branches+0x45>	# -54.50% (p:42.00%)
+    0.46 :	  4005ab:       mov    0x200bbe(%rip),%rax        # 601170 <acc>
+   12.90 :	  4005b2:       add    $0x1,%rax
+    2.30 :	  4005b6:       mov    %rax,0x200bb3(%rip)        # 601170 <acc>
+    0.46 :	  4005bd:       jmp    4005d1 <branches+0x57>	# -100.00% (p:100.00%)
+    0.92 :	  4005bf:       mov    0x200baa(%rip),%rax        # 601170 <acc>	# +49.54%
+   13.82 :	  4005c6:       sub    $0x1,%rax
+    0.46 :	  4005ca:       mov    %rax,0x200b9f(%rip)        # 601170 <acc>
+    2.30 :	  4005d1:       mov    -0x10(%rbp),%rax	# +50.46%
+    0.46 :	  4005d5:       mov    %rax,%rdi
+    0.46 :	  4005d8:       callq  400526 <lfsr>	# -100.00% (p:100.00%)
+    0.00 :	  4005dd:       mov    %rax,-0x10(%rbp)	# +100.00%
+    0.92 :	  4005e1:       mov    -0x18(%rbp),%rax
+    0.00 :	  4005e5:       and    $0x1,%eax
+    0.00 :	  4005e8:       test   %rax,%rax
+    0.00 :	  4005eb:       je     4005ff <branches+0x85>	# -100.00% (p:100.00%)
+    0.00 :	  4005ed:       mov    0x200b7c(%rip),%rax        # 601170 <acc>
+    0.00 :	  4005f4:       shr    $0x2,%rax
+    0.00 :	  4005f8:       mov    %rax,0x200b71(%rip)        # 601170 <acc>
+    0.00 :	  4005ff:       mov    -0x10(%rbp),%rax	# +100.00%
+    7.37 :	  400603:       and    $0x1,%eax
+    3.69 :	  400606:       test   %rax,%rax
+    0.00 :	  400609:       jne    400612 <branches+0x98>	# -59.25% (p:42.99%)
+    1.84 :	  40060b:       mov    $0x1,%eax
+   14.29 :	  400610:       jmp    400617 <branches+0x9d>	# -100.00% (p:100.00%)
+    1.38 :	  400612:       mov    $0x0,%eax	# +57.65%
+   10.14 :	  400617:       test   %al,%al	# +42.35%
+    0.00 :	  400619:       je     40062f <branches+0xb5>	# -57.65% (p:100.00%)
+    0.46 :	  40061b:       mov    0x200b4e(%rip),%rax        # 601170 <acc>
+    2.76 :	  400622:       sub    $0x1,%rax
+    0.00 :	  400626:       mov    %rax,0x200b43(%rip)        # 601170 <acc>
+    0.46 :	  40062d:       jmp    400641 <branches+0xc7>	# -100.00% (p:100.00%)
+    0.92 :	  40062f:       mov    0x200b3a(%rip),%rax        # 601170 <acc>	# +56.13%
+    2.30 :	  400636:       add    $0x1,%rax
+    0.92 :	  40063a:       mov    %rax,0x200b2f(%rip)        # 601170 <acc>
+    0.92 :	  400641:       mov    -0x10(%rbp),%rax	# +43.87%
+    2.30 :	  400645:       mov    %rax,%rdi
+    0.00 :	  400648:       callq  400526 <lfsr>	# -100.00% (p:100.00%)
+    0.00 :	  40064d:       mov    %rax,-0x10(%rbp)	# +100.00%
+    1.84 :	  400651:       addq   $0x1,-0x8(%rbp)
+    0.92 :	  400656:       mov    -0x8(%rbp),%rax
+    5.07 :	  40065a:       cmp    -0x20(%rbp),%rax
+    0.00 :	  40065e:       jb     40059f <branches+0x25>	# -100.00% (p:100.00%)
+    0.00 :	  400664:       nop
+    0.00 :	  400665:       leaveq
+    0.00 :	  400666:       retq
+
+(Note: the --branch-filter u,any was used to avoid spurious target and
+branch points due to interrupts/faults, they show up as very small -/+
+annotations on 'weird' locations)
+
+Committer note:
+
+Please take a look at:
+
+  http://vger.kernel.org/~acme/perf/annotate_basic_blocks.png
+
+To see the colors.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <andi@firstfloor.org>
+Cc: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Cc: David Carrillo-Cisneros <davidcc@google.com>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Kan Liang <kan.liang@intel.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Stephane Eranian <eranian@google.com>
+[ Moved sym->max_coverage to 'struct annotate', aka symbol__annotate(sym) ]
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

@@ -1,0 +1,41 @@
+ALSA: seq_oss: fix waitqueue_active without memory barrier in snd-seq-oss
+
+snd_seq_oss_readq_put_event() seems to be missing a memory barrier which
+might cause the waker to not notice the waiter and miss sending a
+wake_up as in the following figure.
+
+    snd_seq_oss_readq_put_event		    snd_seq_oss_readq_wait
+------------------------------------------------------------------------
+					/* wait_event_interruptible_timeout */
+					 /* __wait_event_interruptible_timeout */
+					  /* ___wait_event */
+					  for (;;) {									 prepare_to_wait_event(&wq, &__wait,
+					    state);
+spin_lock_irqsave(&q->lock, flags);
+if (waitqueue_active(&q->midi_sleep))
+/* The CPU might reorder the test for
+   the waitqueue up here, before
+   prior writes complete */
+					  if ((q->qlen>0 || q->head==q->tail)
+					  ...
+					  __ret = schedule_timeout(__ret)
+if (q->qlen >= q->maxlen - 1) {
+memcpy(&q->q[q->tail], ev, sizeof(*ev));
+q->tail = (q->tail + 1) % q->maxlen;
+q->qlen++;
+------------------------------------------------------------------------
+
+There are two other place in sound/core/seq/oss/ which have similar
+code.  The attached patch removes the call to waitqueue_active() leaving
+just wake_up() behind.  This fixes the problem because the call to
+spin_lock_irqsave() in wake_up() will be an ACQUIRE operation.
+
+I found this issue when I was looking through the linux source code
+for places calling waitqueue_active() before wake_up*(), but without
+preceding memory barriers, after sending a patch to fix a similar
+issue in drivers/tty/n_tty.c  (Details about the original issue can be
+found here: https://lkml.org/lkml/2015/9/28/849).
+
+Signed-off-by: Kosuke Tatsukawa <tatsu@ab.jp.nec.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+

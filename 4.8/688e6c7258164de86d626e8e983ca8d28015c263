@@ -1,0 +1,96 @@
+drm/i915: Slaughter the thundering i915_wait_request herd
+
+One particularly stressful scenario consists of many independent tasks
+all competing for GPU time and waiting upon the results (e.g. realtime
+transcoding of many, many streams). One bottleneck in particular is that
+each client waits on its own results, but every client is woken up after
+every batchbuffer - hence the thunder of hooves as then every client must
+do its heavyweight dance to read a coherent seqno to see if it is the
+lucky one.
+
+Ideally, we only want one client to wake up after the interrupt and
+check its request for completion. Since the requests must retire in
+order, we can select the first client on the oldest request to be woken.
+Once that client has completed his wait, we can then wake up the
+next client and so on. However, all clients then incur latency as every
+process in the chain may be delayed for scheduling - this may also then
+cause some priority inversion. To reduce the latency, when a client
+is added or removed from the list, we scan the tree for completed
+seqno and wake up all the completed waiters in parallel.
+
+Using igt/benchmarks/gem_latency, we can demonstrate this effect. The
+benchmark measures the number of GPU cycles between completion of a
+batch and the client waking up from a call to wait-ioctl. With many
+concurrent waiters, with each on a different request, we observe that
+the wakeup latency before the patch scales nearly linearly with the
+number of waiters (before external factors kick in making the scaling much
+worse). After applying the patch, we can see that only the single waiter
+for the request is being woken up, providing a constant wakeup latency
+for every operation. However, the situation is not quite as rosy for
+many waiters on the same request, though to the best of my knowledge this
+is much less likely in practice. Here, we can observe that the
+concurrent waiters incur extra latency from being woken up by the
+solitary bottom-half, rather than directly by the interrupt. This
+appears to be scheduler induced (having discounted adverse effects from
+having a rbtree walk/erase in the wakeup path), each additional
+wake_up_process() costs approximately 1us on big core. Another effect of
+performing the secondary wakeups from the first bottom-half is the
+incurred delay this imposes on high priority threads - rather than
+immediately returning to userspace and leaving the interrupt handler to
+wake the others.
+
+To offset the delay incurred with additional waiters on a request, we
+could use a hybrid scheme that did a quick read in the interrupt handler
+and dequeued all the completed waiters (incurring the overhead in the
+interrupt handler, not the best plan either as we then incur GPU
+submission latency) but we would still have to wake up the bottom-half
+every time to do the heavyweight slow read. Or we could only kick the
+waiters on the seqno with the same priority as the current task (i.e. in
+the realtime waiter scenario, only it is woken up immediately by the
+interrupt and simply queues the next waiter before returning to userspace,
+minimising its delay at the expense of the chain, and also reducing
+contention on its scheduler runqueue). This is effective at avoid long
+pauses in the interrupt handler and at avoiding the extra latency in
+realtime/high-priority waiters.
+
+v2: Convert from a kworker per engine into a dedicated kthread for the
+bottom-half.
+v3: Rename request members and tweak comments.
+v4: Use a per-engine spinlock in the breadcrumbs bottom-half.
+v5: Fix race in locklessly checking waiter status and kicking the task on
+adding a new waiter.
+v6: Fix deciding when to force the timer to hide missing interrupts.
+v7: Move the bottom-half from the kthread to the first client process.
+v8: Reword a few comments
+v9: Break the busy loop when the interrupt is unmasked or has fired.
+v10: Comments, unnecessary churn, better debugging from Tvrtko
+v11: Wake all completed waiters on removing the current bottom-half to
+reduce the latency of waking up a herd of clients all waiting on the
+same request.
+v12: Rearrange missed-interrupt fault injection so that it works with
+igt/drv_missed_irq_hang
+v13: Rename intel_breadcrumb and friends to intel_wait in preparation
+for signal handling.
+v14: RCU commentary, assert_spin_locked
+v15: Hide BUG_ON behind the compiler; report on gem_latency findings.
+v16: Sort seqno-groups by priority so that first-waiter has the highest
+task priority (and so avoid priority inversion).
+v17: Add waiters to post-mortem GPU hang state.
+v18: Return early for a completed wait after acquiring the spinlock.
+Avoids adding ourselves to the tree if the is already complete, and
+skips the awkward question of why we don't do completion wakeups for
+waits earlier than or equal to ourselves.
+v19: Prepare for init_breadcrumbs to fail. Later patches may want to
+allocate during init, so be prepared to propagate back the error code.
+
+Testcase: igt/gem_concurrent_blit
+Testcase: igt/benchmarks/gem_latency
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: "Rogozhkin, Dmitry V" <dmitry.v.rogozhkin@intel.com>
+Cc: "Gong, Zhipeng" <zhipeng.gong@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Cc: Dave Gordon <david.s.gordon@intel.com>
+Cc: "Goel, Akash" <akash.goel@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com> #v18
+Link: http://patchwork.freedesktop.org/patch/msgid/1467390209-3576-6-git-send-email-chris@chris-wilson.co.uk
+

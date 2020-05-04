@@ -1,0 +1,94 @@
+cls_bpf: add initial eBPF support for programmable classifiers
+
+This work extends the "classic" BPF programmable tc classifier by
+extending its scope also to native eBPF code!
+
+This allows for user space to implement own custom, 'safe' C like
+classifiers (or whatever other frontend language LLVM et al may
+provide in future), that can then be compiled with the LLVM eBPF
+backend to an eBPF elf file. The result of this can be loaded into
+the kernel via iproute2's tc. In the kernel, they can be JITed on
+major archs and thus run in native performance.
+
+Simple, minimal toy example to demonstrate the workflow:
+
+  #include <linux/ip.h>
+  #include <linux/if_ether.h>
+  #include <linux/bpf.h>
+
+  #include "tc_bpf_api.h"
+
+  __section("classify")
+  int cls_main(struct sk_buff *skb)
+  {
+    return (0x800 << 16) | load_byte(skb, ETH_HLEN + __builtin_offsetof(struct iphdr, tos));
+  }
+
+  char __license[] __section("license") = "GPL";
+
+The classifier can then be compiled into eBPF opcodes and loaded
+via tc, for example:
+
+  clang -O2 -emit-llvm -c cls.c -o - | llc -march=bpf -filetype=obj -o cls.o
+  tc filter add dev em1 parent 1: bpf cls.o [...]
+
+As it has been demonstrated, the scope can even reach up to a fully
+fledged flow dissector (similarly as in samples/bpf/sockex2_kern.c).
+
+For tc, maps are allowed to be used, but from kernel context only,
+in other words, eBPF code can keep state across filter invocations.
+In future, we perhaps may reattach from a different application to
+those maps e.g., to read out collected statistics/state.
+
+Similarly as in socket filters, we may extend functionality for eBPF
+classifiers over time depending on the use cases. For that purpose,
+cls_bpf programs are using BPF_PROG_TYPE_SCHED_CLS program type, so
+we can allow additional functions/accessors (e.g. an ABI compatible
+offset translation to skb fields/metadata). For an initial cls_bpf
+support, we allow the same set of helper functions as eBPF socket
+filters, but we could diverge at some point in time w/o problem.
+
+I was wondering whether cls_bpf and act_bpf could share C programs,
+I can imagine that at some point, we introduce i) further common
+handlers for both (or even beyond their scope), and/or if truly needed
+ii) some restricted function space for each of them. Both can be
+abstracted easily through struct bpf_verifier_ops in future.
+
+The context of cls_bpf versus act_bpf is slightly different though:
+a cls_bpf program will return a specific classid whereas act_bpf a
+drop/non-drop return code, latter may also in future mangle skbs.
+That said, we can surely have a "classify" and "action" section in
+a single object file, or considered mentioned constraint add a
+possibility of a shared section.
+
+The workflow for getting native eBPF running from tc [1] is as
+follows: for f_bpf, I've added a slightly modified ELF parser code
+from Alexei's kernel sample, which reads out the LLVM compiled
+object, sets up maps (and dynamically fixes up map fds) if any, and
+loads the eBPF instructions all centrally through the bpf syscall.
+
+The resulting fd from the loaded program itself is being passed down
+to cls_bpf, which looks up struct bpf_prog from the fd store, and
+holds reference, so that it stays available also after tc program
+lifetime. On tc filter destruction, it will then drop its reference.
+
+Moreover, I've also added the optional possibility to annotate an
+eBPF filter with a name (e.g. path to object file, or something
+else if preferred) so that when tc dumps currently installed filters,
+some more context can be given to an admin for a given instance (as
+opposed to just the file descriptor number).
+
+Last but not least, bpf_prog_get() and bpf_prog_put() needed to be
+exported, so that eBPF can be used from cls_bpf built as a module.
+Thanks to 60a3b2253c41 ("net: bpf: make eBPF interpreter images
+read-only") I think this is of no concern since anything wanting to
+alter eBPF opcode after verification stage would crash the kernel.
+
+  [1] http://git.breakpoint.cc/cgit/dborkman/iproute2.git/log/?h=ebpf
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+Cc: Jiri Pirko <jiri@resnulli.us>
+Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

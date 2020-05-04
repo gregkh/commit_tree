@@ -1,0 +1,89 @@
+zsmalloc: page migration support
+
+This patch introduces run-time migration feature for zspage.
+
+For migration, VM uses page.lru field so it would be better to not use
+page.next field which is unified with page.lru for own purpose.  For
+that, firstly, we can get first object offset of the page via runtime
+calculation instead of using page.index so we can use page.index as link
+for page chaining instead of page.next.
+
+In case of huge object, it stores handle to page.index instead of next
+link of page chaining because huge object doesn't need to next link for
+page chaining.  So get_next_page need to identify huge object to return
+NULL.  For it, this patch uses PG_owner_priv_1 flag of the page flag.
+
+For migration, it supports three functions
+
+* zs_page_isolate
+
+It isolates a zspage which includes a subpage VM want to migrate from
+class so anyone cannot allocate new object from the zspage.
+
+We could try to isolate a zspage by the number of subpage so subsequent
+isolation trial of other subpage of the zpsage shouldn't fail.  For
+that, we introduce zspage.isolated count.  With that, zs_page_isolate
+can know whether zspage is already isolated or not for migration so if
+it is isolated for migration, subsequent isolation trial can be
+successful without trying further isolation.
+
+* zs_page_migrate
+
+First of all, it holds write-side zspage->lock to prevent migrate other
+subpage in zspage.  Then, lock all objects in the page VM want to
+migrate.  The reason we should lock all objects in the page is due to
+race between zs_map_object and zs_page_migrate.
+
+  zs_map_object				zs_page_migrate
+
+  pin_tag(handle)
+  obj = handle_to_obj(handle)
+  obj_to_location(obj, &page, &obj_idx);
+
+					write_lock(&zspage->lock)
+					if (!trypin_tag(handle))
+						goto unpin_object
+
+  zspage = get_zspage(page);
+  read_lock(&zspage->lock);
+
+If zs_page_migrate doesn't do trypin_tag, zs_map_object's page can be
+stale by migration so it goes crash.
+
+If it locks all of objects successfully, it copies content from old page
+to new one, finally, create new zspage chain with new page.  And if it's
+last isolated subpage in the zspage, put the zspage back to class.
+
+* zs_page_putback
+
+It returns isolated zspage to right fullness_group list if it fails to
+migrate a page.  If it find a zspage is ZS_EMPTY, it queues zspage
+freeing to workqueue.  See below about async zspage freeing.
+
+This patch introduces asynchronous zspage free.  The reason to need it
+is we need page_lock to clear PG_movable but unfortunately, zs_free path
+should be atomic so the apporach is try to grab page_lock.  If it got
+page_lock of all of pages successfully, it can free zspage immediately.
+Otherwise, it queues free request and free zspage via workqueue in
+process context.
+
+If zs_free finds the zspage is isolated when it try to free zspage, it
+delays the freeing until zs_page_putback finds it so it will free free
+the zspage finally.
+
+In this patch, we expand fullness_list from ZS_EMPTY to ZS_FULL.  First
+of all, it will use ZS_EMPTY list for delay freeing.  And with adding
+ZS_FULL list, it makes to identify whether zspage is isolated or not via
+list_empty(&zspage->list) test.
+
+[minchan@kernel.org: zsmalloc: keep first object offset in struct page]
+  Link: http://lkml.kernel.org/r/1465788015-23195-1-git-send-email-minchan@kernel.org
+[minchan@kernel.org: zsmalloc: zspage sanity check]
+  Link: http://lkml.kernel.org/r/20160603010129.GC3304@bbox
+Link: http://lkml.kernel.org/r/1464736881-24886-12-git-send-email-minchan@kernel.org
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Cc: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,90 @@
+mm, fs: obey gfp_mapping for add_to_page_cache()
+
+Commit 6afdb859b710 ("mm: do not ignore mapping_gfp_mask in page cache
+allocation paths") has caught some users of hardcoded GFP_KERNEL used in
+the page cache allocation paths.  This, however, wasn't complete and
+there were others which went unnoticed.
+
+Dave Chinner has reported the following deadlock for xfs on loop device:
+: With the recent merge of the loop device changes, I'm now seeing
+: XFS deadlock on my single CPU, 1GB RAM VM running xfs/073.
+:
+: The deadlocked is as follows:
+:
+: kloopd1: loop_queue_read_work
+:       xfs_file_iter_read
+:       lock XFS inode XFS_IOLOCK_SHARED (on image file)
+:       page cache read (GFP_KERNEL)
+:       radix tree alloc
+:       memory reclaim
+:       reclaim XFS inodes
+:       log force to unpin inodes
+:       <wait for log IO completion>
+:
+: xfs-cil/loop1: <does log force IO work>
+:       xlog_cil_push
+:       xlog_write
+:       <loop issuing log writes>
+:               xlog_state_get_iclog_space()
+:               <blocks due to all log buffers under write io>
+:               <waits for IO completion>
+:
+: kloopd1: loop_queue_write_work
+:       xfs_file_write_iter
+:       lock XFS inode XFS_IOLOCK_EXCL (on image file)
+:       <wait for inode to be unlocked>
+:
+: i.e. the kloopd, with it's split read and write work queues, has
+: introduced a dependency through memory reclaim. i.e. that writes
+: need to be able to progress for reads make progress.
+:
+: The problem, fundamentally, is that mpage_readpages() does a
+: GFP_KERNEL allocation, rather than paying attention to the inode's
+: mapping gfp mask, which is set to GFP_NOFS.
+:
+: The didn't used to happen, because the loop device used to issue
+: reads through the splice path and that does:
+:
+:       error = add_to_page_cache_lru(page, mapping, index,
+:                       GFP_KERNEL & mapping_gfp_mask(mapping));
+
+This has changed by commit aa4d86163e4 ("block: loop: switch to VFS
+ITER_BVEC").
+
+This patch changes mpage_readpage{s} to follow gfp mask set for the
+mapping.  There are, however, other places which are doing basically the
+same.
+
+lustre:ll_dir_filler is doing GFP_KERNEL from the function which
+apparently uses GFP_NOFS for other allocations so let's make this
+consistent.
+
+cifs:readpages_get_pages is called from cifs_readpages and
+__cifs_readpages_from_fscache called from the same path obeys mapping
+gfp.
+
+ramfs_nommu_expand_for_mapping is hardcoding GFP_KERNEL as well
+regardless it uses mapping_gfp_mask for the page allocation.
+
+ext4_mpage_readpages is the called from the page cache allocation path
+same as read_pages and read_cache_pages
+
+As I've noticed in my previous post I cannot say I would be happy about
+sprinkling mapping_gfp_mask all over the place and it sounds like we
+should drop gfp_mask argument altogether and use it internally in
+__add_to_page_cache_locked that would require all the filesystems to use
+mapping gfp consistently which I am not sure is the case here.  From a
+quick glance it seems that some file system use it all the time while
+others are selective.
+
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Reported-by: Dave Chinner <david@fromorbit.com>
+Cc: "Theodore Ts'o" <tytso@mit.edu>
+Cc: Ming Lei <ming.lei@canonical.com>
+Cc: Andreas Dilger <andreas.dilger@intel.com>
+Cc: Oleg Drokin <oleg.drokin@intel.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

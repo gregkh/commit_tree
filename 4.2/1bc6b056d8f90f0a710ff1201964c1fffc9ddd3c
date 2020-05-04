@@ -1,0 +1,64 @@
+x86/fpu: Optimize copy_fpregs_to_fpstate() by removing the FNCLEX synchronization with FP exceptions
+
+So we have the following ancient code in copy_fpregs_to_fpstate():
+
+	if (unlikely(fpu->state->fxsave.swd & X87_FSW_ES)) {
+		asm volatile("fnclex");
+		goto drop_fpregs;
+	}
+
+which clears pending FPU exceptions and then drops registers, which
+causes the next FP instruction of the saved context to re-load the
+saved FPU state, with all pending exceptions marked properly, and
+will re-start the exception handling mechanism in the hardware.
+
+Since FPU exceptions are always issued on instruction boundaries,
+in particular on the next FP instruction following the exception
+generating instruction, there's no fear of getting an FP exception
+asynchronously.
+
+They were truly asynchronous back in the IRQ13 days, when the FPU was
+a weird and expensive co-processor that did its own processing, and we
+had to synchronize with them, but that code is not working anymore:
+we don't have IRQ13 mapped in the IDT anymore.
+
+With the introduction of optimized XSAVE support there's a new
+complication: if the xstate features bit indicates that a particular
+state component is unused (in 'init state'), then the hardware does
+not guarantee that the XSAVE (et al) instruction keeps the underlying
+FPU state image in memory valid and current. In practice this means
+that the hardware won't write it, and the exceptions flag in the
+state might be an older version, with it still being set. This
+meant that we had to check the xfeatures flag as well, adding
+another memory load and branch to a critical hot path of the scheduler.
+
+So optimize all this by removing both the old quirk and the new check,
+and straight-line optimizing the most common cases with likely()
+hints. Quite a bit of code gets removed this way:
+
+  arch/x86/kernel/process_64.o:
+
+    text    data     bss     dec     filename
+    5484       8       0    5492     process_64.o.before
+    5416       8       0    5424     process_64.o.after
+
+Now there's also a chance that some weird behavior or erratum was
+masked by our IRQ13 handling quirk (or that I misunderstood the
+nature of the quirk), and that this change triggers some badness.
+
+There's no real good way to protect against that possibility other
+than keeping this change well isolated, well commented and well
+bisectable. If you bisect a weird (or not so weird) breakage to
+this commit then please let us know!
+
+Reviewed-by: Borislav Petkov <bp@alien8.de>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Fenghua Yu <fenghua.yu@intel.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

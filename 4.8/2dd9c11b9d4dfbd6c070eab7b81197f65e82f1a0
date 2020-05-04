@@ -1,0 +1,81 @@
+powerpc/pseries: use pci_host_bridge.release_fn() to kfree(phb)
+
+This patch leverages 'struct pci_host_bridge' from the PCI subsystem
+in order to free the pci_controller only after the last reference to
+its devices is dropped (avoiding an oops in pcibios_release_device()
+if the last reference is dropped after pcibios_free_controller()).
+
+The patch relies on pci_host_bridge.release_fn() (and .release_data),
+which is called automatically by the PCI subsystem when the root bus
+is released (i.e., the last reference is dropped).  Those fields are
+set via pci_set_host_bridge_release() (e.g. in the platform-specific
+implementation of pcibios_root_bridge_prepare()).
+
+It introduces the 'pcibios_free_controller_deferred()' .release_fn()
+and it expects .release_data to hold a pointer to the pci_controller.
+
+The function implictly calls 'pcibios_free_controller()', so an user
+must *NOT* explicitly call it if using the new _deferred() callback.
+
+The functionality is enabled for pseries (although it isn't platform
+specific, and may be used by cxl).
+
+Details on not-so-elegant design choices:
+
+ - Use 'pci_host_bridge.release_data' field as pointer to associated
+   'struct pci_controller' so *not* to 'pci_bus_to_host(bridge->bus)'
+   in pcibios_free_controller_deferred().
+
+   That's because pci_remove_root_bus() sets 'host_bridge->bus = NULL'
+   (so, if the last reference is released after pci_remove_root_bus()
+   runs, which eventually reaches pcibios_free_controller_deferred(),
+   that would hit a null pointer dereference).
+
+   The cxl/vphb.c code calls pci_remove_root_bus(), and the cxl folks
+   are interested in this fix.
+
+Test-case #1 (hold references)
+
+  # ls -ld /sys/block/sd* | grep -m1 0021:01:00.0
+  <...> /sys/block/sdaa -> ../devices/pci0021:01/0021:01:00.0/<...>
+
+  # ls -ld /sys/block/sd* | grep -m1 0021:01:00.1
+  <...> /sys/block/sdab -> ../devices/pci0021:01/0021:01:00.1/<...>
+
+  # cat >/dev/sdaa & pid1=$!
+  # cat >/dev/sdab & pid2=$!
+
+  # drmgr -w 5 -d 1 -c phb -s 'PHB 33' -r
+  Validating PHB DLPAR capability...yes.
+  [  594.306719] pci_hp_remove_devices: PCI: Removing devices on bus 0021:01
+  [  594.306738] pci_hp_remove_devices:    Removing 0021:01:00.0...
+  ...
+  [  598.236381] pci_hp_remove_devices:    Removing 0021:01:00.1...
+  ...
+  [  611.972077] pci_bus 0021:01: busn_res: [bus 01-ff] is released
+  [  611.972140] rpadlpar_io: slot PHB 33 removed
+
+  # kill -9 $pid1
+  # kill -9 $pid2
+  [  632.918088] pcibios_free_controller_deferred: domain 33, dynamic 1
+
+Test-case #2 (don't hold references)
+
+  # drmgr -w 5 -d 1 -c phb -s 'PHB 33' -r
+  Validating PHB DLPAR capability...yes.
+  [  916.357363] pci_hp_remove_devices: PCI: Removing devices on bus 0021:01
+  [  916.357386] pci_hp_remove_devices:    Removing 0021:01:00.0...
+  ...
+  [  920.566527] pci_hp_remove_devices:    Removing 0021:01:00.1...
+  ...
+  [  933.955873] pci_bus 0021:01: busn_res: [bus 01-ff] is released
+  [  933.955977] pcibios_free_controller_deferred: domain 33, dynamic 1
+  [  933.955999] rpadlpar_io: slot PHB 33 removed
+
+Suggested-By: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Signed-off-by: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
+Reviewed-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Reviewed-by: Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+Tested-by: Andrew Donnellan <andrew.donnellan@au1.ibm.com> # cxl
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+

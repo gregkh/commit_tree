@@ -1,0 +1,113 @@
+bpf: allow bpf programs to tail-call other bpf programs
+
+introduce bpf_tail_call(ctx, &jmp_table, index) helper function
+which can be used from BPF programs like:
+int bpf_prog(struct pt_regs *ctx)
+{
+  ...
+  bpf_tail_call(ctx, &jmp_table, index);
+  ...
+}
+that is roughly equivalent to:
+int bpf_prog(struct pt_regs *ctx)
+{
+  ...
+  if (jmp_table[index])
+    return (*jmp_table[index])(ctx);
+  ...
+}
+The important detail that it's not a normal call, but a tail call.
+The kernel stack is precious, so this helper reuses the current
+stack frame and jumps into another BPF program without adding
+extra call frame.
+It's trivially done in interpreter and a bit trickier in JITs.
+In case of x64 JIT the bigger part of generated assembler prologue
+is common for all programs, so it is simply skipped while jumping.
+Other JITs can do similar prologue-skipping optimization or
+do stack unwind before jumping into the next program.
+
+bpf_tail_call() arguments:
+ctx - context pointer
+jmp_table - one of BPF_MAP_TYPE_PROG_ARRAY maps used as the jump table
+index - index in the jump table
+
+Since all BPF programs are idenitified by file descriptor, user space
+need to populate the jmp_table with FDs of other BPF programs.
+If jmp_table[index] is empty the bpf_tail_call() doesn't jump anywhere
+and program execution continues as normal.
+
+New BPF_MAP_TYPE_PROG_ARRAY map type is introduced so that user space can
+populate this jmp_table array with FDs of other bpf programs.
+Programs can share the same jmp_table array or use multiple jmp_tables.
+
+The chain of tail calls can form unpredictable dynamic loops therefore
+tail_call_cnt is used to limit the number of calls and currently is set to 32.
+
+Use cases:
+Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+
+==========
+- simplify complex programs by splitting them into a sequence of small programs
+
+- dispatch routine
+  For tracing and future seccomp the program may be triggered on all system
+  calls, but processing of syscall arguments will be different. It's more
+  efficient to implement them as:
+  int syscall_entry(struct seccomp_data *ctx)
+  {
+     bpf_tail_call(ctx, &syscall_jmp_table, ctx->nr /* syscall number */);
+     ... default: process unknown syscall ...
+  }
+  int sys_write_event(struct seccomp_data *ctx) {...}
+  int sys_read_event(struct seccomp_data *ctx) {...}
+  syscall_jmp_table[__NR_write] = sys_write_event;
+  syscall_jmp_table[__NR_read] = sys_read_event;
+
+  For networking the program may call into different parsers depending on
+  packet format, like:
+  int packet_parser(struct __sk_buff *skb)
+  {
+     ... parse L2, L3 here ...
+     __u8 ipproto = load_byte(skb, ... offsetof(struct iphdr, protocol));
+     bpf_tail_call(skb, &ipproto_jmp_table, ipproto);
+     ... default: process unknown protocol ...
+  }
+  int parse_tcp(struct __sk_buff *skb) {...}
+  int parse_udp(struct __sk_buff *skb) {...}
+  ipproto_jmp_table[IPPROTO_TCP] = parse_tcp;
+  ipproto_jmp_table[IPPROTO_UDP] = parse_udp;
+
+- for TC use case, bpf_tail_call() allows to implement reclassify-like logic
+
+- bpf_map_update_elem/delete calls into BPF_MAP_TYPE_PROG_ARRAY jump table
+  are atomic, so user space can build chains of BPF programs on the fly
+
+Implementation details:
+=======================
+- high performance of bpf_tail_call() is the goal.
+  It could have been implemented without JIT changes as a wrapper on top of
+  BPF_PROG_RUN() macro, but with two downsides:
+  . all programs would have to pay performance penalty for this feature and
+    tail call itself would be slower, since mandatory stack unwind, return,
+    stack allocate would be done for every tailcall.
+  . tailcall would be limited to programs running preempt_disabled, since
+    generic 'void *ctx' doesn't have room for 'tail_call_cnt' and it would
+    need to be either global per_cpu variable accessed by helper and by wrapper
+    or global variable protected by locks.
+
+  In this implementation x64 JIT bypasses stack unwind and jumps into the
+  callee program after prologue.
+
+- bpf_prog_array_compatible() ensures that prog_type of callee and caller
+  are the same and JITed/non-JITed flag is the same, since calling JITed
+  program from non-JITed is invalid, since stack frames are different.
+  Similarly calling kprobe type program from socket type program is invalid.
+
+- jump table is implemented as BPF_MAP_TYPE_PROG_ARRAY to reuse 'map'
+  abstraction, its user space API and all of verifier logic.
+  It's in the existing arraymap.c file, since several functions are
+  shared with regular array map.
+
+Signed-off-by: Alexei Starovoitov <ast@plumgrid.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

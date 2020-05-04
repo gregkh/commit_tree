@@ -1,0 +1,380 @@
+mm, vmstat: add infrastructure for per-node vmstats
+
+Patchset: "Move LRU page reclaim from zones to nodes v9"
+
+This series moves LRUs from the zones to the node.  While this is a
+current rebase, the test results were based on mmotm as of June 23rd.
+Conceptually, this series is simple but there are a lot of details.
+Some of the broad motivations for this are;
+
+1. The residency of a page partially depends on what zone the page was
+   allocated from.  This is partially combatted by the fair zone allocation
+   policy but that is a partial solution that introduces overhead in the
+   page allocator paths.
+
+2. Currently, reclaim on node 0 behaves slightly different to node 1. For
+   example, direct reclaim scans in zonelist order and reclaims even if
+   the zone is over the high watermark regardless of the age of pages
+   in that LRU. Kswapd on the other hand starts reclaim on the highest
+   unbalanced zone. A difference in distribution of file/anon pages due
+   to when they were allocated results can result in a difference in
+   again. While the fair zone allocation policy mitigates some of the
+   problems here, the page reclaim results on a multi-zone node will
+   always be different to a single-zone node.
+   it was scheduled on as a result.
+
+3. kswapd and the page allocator scan zones in the opposite order to
+   avoid interfering with each other but it's sensitive to timing.  This
+   mitigates the page allocator using pages that were allocated very recently
+   in the ideal case but it's sensitive to timing. When kswapd is allocating
+   from lower zones then it's great but during the rebalancing of the highest
+   zone, the page allocator and kswapd interfere with each other. It's worse
+   if the highest zone is small and difficult to balance.
+
+4. slab shrinkers are node-based which makes it harder to identify the exact
+   relationship between slab reclaim and LRU reclaim.
+
+The reason we have zone-based reclaim is that we used to have
+large highmem zones in common configurations and it was necessary
+to quickly find ZONE_NORMAL pages for reclaim. Today, this is much
+less of a concern as machines with lots of memory will (or should) use
+64-bit kernels. Combinations of 32-bit hardware and 64-bit hardware are
+rare. Machines that do use highmem should have relatively low highmem:lowmem
+ratios than we worried about in the past.
+
+Conceptually, moving to node LRUs should be easier to understand. The
+page allocator plays fewer tricks to game reclaim and reclaim behaves
+similarly on all nodes.
+
+The series has been tested on a 16 core UMA machine and a 2-socket 48
+core NUMA machine. The UMA results are presented in most cases as the NUMA
+machine behaved similarly.
+
+pagealloc
+---------
+
+This is a microbenchmark that shows the benefit of removing the fair zone
+allocation policy. It was tested uip to order-4 but only orders 0 and 1 are
+shown as the other orders were comparable.
+
+                                           4.7.0-rc4                  4.7.0-rc4
+                                      mmotm-20160623                 nodelru-v9
+Min      total-odr0-1               490.00 (  0.00%)           457.00 (  6.73%)
+Min      total-odr0-2               347.00 (  0.00%)           329.00 (  5.19%)
+Min      total-odr0-4               288.00 (  0.00%)           273.00 (  5.21%)
+Min      total-odr0-8               251.00 (  0.00%)           239.00 (  4.78%)
+Min      total-odr0-16              234.00 (  0.00%)           222.00 (  5.13%)
+Min      total-odr0-32              223.00 (  0.00%)           211.00 (  5.38%)
+Min      total-odr0-64              217.00 (  0.00%)           208.00 (  4.15%)
+Min      total-odr0-128             214.00 (  0.00%)           204.00 (  4.67%)
+Min      total-odr0-256             250.00 (  0.00%)           230.00 (  8.00%)
+Min      total-odr0-512             271.00 (  0.00%)           269.00 (  0.74%)
+Min      total-odr0-1024            291.00 (  0.00%)           282.00 (  3.09%)
+Min      total-odr0-2048            303.00 (  0.00%)           296.00 (  2.31%)
+Min      total-odr0-4096            311.00 (  0.00%)           309.00 (  0.64%)
+Min      total-odr0-8192            316.00 (  0.00%)           314.00 (  0.63%)
+Min      total-odr0-16384           317.00 (  0.00%)           315.00 (  0.63%)
+Min      total-odr1-1               742.00 (  0.00%)           712.00 (  4.04%)
+Min      total-odr1-2               562.00 (  0.00%)           530.00 (  5.69%)
+Min      total-odr1-4               457.00 (  0.00%)           433.00 (  5.25%)
+Min      total-odr1-8               411.00 (  0.00%)           381.00 (  7.30%)
+Min      total-odr1-16              381.00 (  0.00%)           356.00 (  6.56%)
+Min      total-odr1-32              372.00 (  0.00%)           346.00 (  6.99%)
+Min      total-odr1-64              372.00 (  0.00%)           343.00 (  7.80%)
+Min      total-odr1-128             375.00 (  0.00%)           351.00 (  6.40%)
+Min      total-odr1-256             379.00 (  0.00%)           351.00 (  7.39%)
+Min      total-odr1-512             385.00 (  0.00%)           355.00 (  7.79%)
+Min      total-odr1-1024            386.00 (  0.00%)           358.00 (  7.25%)
+Min      total-odr1-2048            390.00 (  0.00%)           362.00 (  7.18%)
+Min      total-odr1-4096            390.00 (  0.00%)           362.00 (  7.18%)
+Min      total-odr1-8192            388.00 (  0.00%)           363.00 (  6.44%)
+
+This shows a steady improvement throughout. The primary benefit is from
+reduced system CPU usage which is obvious from the overall times;
+
+           4.7.0-rc4   4.7.0-rc4
+        mmotm-20160623nodelru-v8
+User          189.19      191.80
+System       2604.45     2533.56
+Elapsed      2855.30     2786.39
+
+The vmstats also showed that the fair zone allocation policy was definitely
+removed as can be seen here;
+
+                             4.7.0-rc3   4.7.0-rc3
+                         mmotm-20160623 nodelru-v8
+DMA32 allocs               28794729769           0
+Normal allocs              48432501431 77227309877
+Movable allocs                       0           0
+
+tiobench on ext4
+----------------
+
+tiobench is a benchmark that artifically benefits if old pages remain resident
+while new pages get reclaimed. The fair zone allocation policy mitigates this
+problem so pages age fairly. While the benchmark has problems, it is important
+that tiobench performance remains constant as it implies that page aging
+problems that the fair zone allocation policy fixes are not re-introduced.
+
+                                         4.7.0-rc4             4.7.0-rc4
+                                    mmotm-20160623            nodelru-v9
+Min      PotentialReadSpeed        89.65 (  0.00%)       90.21 (  0.62%)
+Min      SeqRead-MB/sec-1          82.68 (  0.00%)       82.01 ( -0.81%)
+Min      SeqRead-MB/sec-2          72.76 (  0.00%)       72.07 ( -0.95%)
+Min      SeqRead-MB/sec-4          75.13 (  0.00%)       74.92 ( -0.28%)
+Min      SeqRead-MB/sec-8          64.91 (  0.00%)       65.19 (  0.43%)
+Min      SeqRead-MB/sec-16         62.24 (  0.00%)       62.22 ( -0.03%)
+Min      RandRead-MB/sec-1          0.88 (  0.00%)        0.88 (  0.00%)
+Min      RandRead-MB/sec-2          0.95 (  0.00%)        0.92 ( -3.16%)
+Min      RandRead-MB/sec-4          1.43 (  0.00%)        1.34 ( -6.29%)
+Min      RandRead-MB/sec-8          1.61 (  0.00%)        1.60 ( -0.62%)
+Min      RandRead-MB/sec-16         1.80 (  0.00%)        1.90 (  5.56%)
+Min      SeqWrite-MB/sec-1         76.41 (  0.00%)       76.85 (  0.58%)
+Min      SeqWrite-MB/sec-2         74.11 (  0.00%)       73.54 ( -0.77%)
+Min      SeqWrite-MB/sec-4         80.05 (  0.00%)       80.13 (  0.10%)
+Min      SeqWrite-MB/sec-8         72.88 (  0.00%)       73.20 (  0.44%)
+Min      SeqWrite-MB/sec-16        75.91 (  0.00%)       76.44 (  0.70%)
+Min      RandWrite-MB/sec-1         1.18 (  0.00%)        1.14 ( -3.39%)
+Min      RandWrite-MB/sec-2         1.02 (  0.00%)        1.03 (  0.98%)
+Min      RandWrite-MB/sec-4         1.05 (  0.00%)        0.98 ( -6.67%)
+Min      RandWrite-MB/sec-8         0.89 (  0.00%)        0.92 (  3.37%)
+Min      RandWrite-MB/sec-16        0.92 (  0.00%)        0.93 (  1.09%)
+
+           4.7.0-rc4   4.7.0-rc4
+        mmotm-20160623 approx-v9
+User          645.72      525.90
+System        403.85      331.75
+Elapsed      6795.36     6783.67
+
+This shows that the series has little or not impact on tiobench which is
+desirable and a reduction in system CPU usage. It indicates that the fair
+zone allocation policy was removed in a manner that didn't reintroduce
+one class of page aging bug. There were only minor differences in overall
+reclaim activity
+
+                             4.7.0-rc4   4.7.0-rc4
+                          mmotm-20160623nodelru-v8
+Minor Faults                    645838      647465
+Major Faults                       573         640
+Swap Ins                             0           0
+Swap Outs                            0           0
+DMA allocs                           0           0
+DMA32 allocs                  46041453    44190646
+Normal allocs                 78053072    79887245
+Movable allocs                       0           0
+Allocation stalls                   24          67
+Stall zone DMA                       0           0
+Stall zone DMA32                     0           0
+Stall zone Normal                    0           2
+Stall zone HighMem                   0           0
+Stall zone Movable                   0          65
+Direct pages scanned             10969       30609
+Kswapd pages scanned          93375144    93492094
+Kswapd pages reclaimed        93372243    93489370
+Direct pages reclaimed           10969       30609
+Kswapd efficiency                  99%         99%
+Kswapd velocity              13741.015   13781.934
+Direct efficiency                 100%        100%
+Direct velocity                  1.614       4.512
+Percentage direct scans             0%          0%
+
+kswapd activity was roughly comparable. There were differences in direct
+reclaim activity but negligible in the context of the overall workload
+(velocity of 4 pages per second with the patches applied, 1.6 pages per
+second in the baseline kernel).
+
+pgbench read-only large configuration on ext4
+---------------------------------------------
+
+pgbench is a database benchmark that can be sensitive to page reclaim
+decisions. This also checks if removing the fair zone allocation policy
+is safe
+
+pgbench Transactions
+                        4.7.0-rc4             4.7.0-rc4
+                   mmotm-20160623            nodelru-v8
+Hmean    1       188.26 (  0.00%)      189.78 (  0.81%)
+Hmean    5       330.66 (  0.00%)      328.69 ( -0.59%)
+Hmean    12      370.32 (  0.00%)      380.72 (  2.81%)
+Hmean    21      368.89 (  0.00%)      369.00 (  0.03%)
+Hmean    30      382.14 (  0.00%)      360.89 ( -5.56%)
+Hmean    32      428.87 (  0.00%)      432.96 (  0.95%)
+
+Negligible differences again. As with tiobench, overall reclaim activity
+was comparable.
+
+bonnie++ on ext4
+----------------
+
+No interesting performance difference, negligible differences on reclaim
+stats.
+
+paralleldd on ext4
+------------------
+
+This workload uses varying numbers of dd instances to read large amounts of
+data from disk.
+
+                               4.7.0-rc3             4.7.0-rc3
+                          mmotm-20160623            nodelru-v9
+Amean    Elapsd-1       186.04 (  0.00%)      189.41 ( -1.82%)
+Amean    Elapsd-3       192.27 (  0.00%)      191.38 (  0.46%)
+Amean    Elapsd-5       185.21 (  0.00%)      182.75 (  1.33%)
+Amean    Elapsd-7       183.71 (  0.00%)      182.11 (  0.87%)
+Amean    Elapsd-12      180.96 (  0.00%)      181.58 ( -0.35%)
+Amean    Elapsd-16      181.36 (  0.00%)      183.72 ( -1.30%)
+
+           4.7.0-rc4   4.7.0-rc4
+        mmotm-20160623 nodelru-v9
+User         1548.01     1552.44
+System       8609.71     8515.08
+Elapsed      3587.10     3594.54
+
+There is little or no change in performance but some drop in system CPU usage.
+
+                             4.7.0-rc3   4.7.0-rc3
+                        mmotm-20160623  nodelru-v9
+Minor Faults                    362662      367360
+Major Faults                      1204        1143
+Swap Ins                            22           0
+Swap Outs                         2855        1029
+DMA allocs                           0           0
+DMA32 allocs                  31409797    28837521
+Normal allocs                 46611853    49231282
+Movable allocs                       0           0
+Direct pages scanned                 0           0
+Kswapd pages scanned          40845270    40869088
+Kswapd pages reclaimed        40830976    40855294
+Direct pages reclaimed               0           0
+Kswapd efficiency                  99%         99%
+Kswapd velocity              11386.711   11369.769
+Direct efficiency                 100%        100%
+Direct velocity                  0.000       0.000
+Percentage direct scans             0%          0%
+Page writes by reclaim            2855        1029
+Page writes file                     0           0
+Page writes anon                  2855        1029
+Page reclaim immediate             771        1628
+Sector Reads                 293312636   293536360
+Sector Writes                 18213568    18186480
+Page rescued immediate               0           0
+Slabs scanned                   128257      132747
+Direct inode steals                181          56
+Kswapd inode steals                 59        1131
+
+It basically shows that kswapd was active at roughly the same rate in
+both kernels. There was also comparable slab scanning activity and direct
+reclaim was avoided in both cases. There appears to be a large difference
+in numbers of inodes reclaimed but the workload has few active inodes and
+is likely a timing artifact.
+
+stutter
+-------
+
+stutter simulates a simple workload. One part uses a lot of anonymous
+memory, a second measures mmap latency and a third copies a large file.
+The primary metric is checking for mmap latency.
+
+stutter
+                             4.7.0-rc4             4.7.0-rc4
+                        mmotm-20160623            nodelru-v8
+Min         mmap     16.6283 (  0.00%)     13.4258 ( 19.26%)
+1st-qrtle   mmap     54.7570 (  0.00%)     34.9121 ( 36.24%)
+2nd-qrtle   mmap     57.3163 (  0.00%)     46.1147 ( 19.54%)
+3rd-qrtle   mmap     58.9976 (  0.00%)     47.1882 ( 20.02%)
+Max-90%     mmap     59.7433 (  0.00%)     47.4453 ( 20.58%)
+Max-93%     mmap     60.1298 (  0.00%)     47.6037 ( 20.83%)
+Max-95%     mmap     73.4112 (  0.00%)     82.8719 (-12.89%)
+Max-99%     mmap     92.8542 (  0.00%)     88.8870 (  4.27%)
+Max         mmap   1440.6569 (  0.00%)    121.4201 ( 91.57%)
+Mean        mmap     59.3493 (  0.00%)     42.2991 ( 28.73%)
+Best99%Mean mmap     57.2121 (  0.00%)     41.8207 ( 26.90%)
+Best95%Mean mmap     55.9113 (  0.00%)     39.9620 ( 28.53%)
+Best90%Mean mmap     55.6199 (  0.00%)     39.3124 ( 29.32%)
+Best50%Mean mmap     53.2183 (  0.00%)     33.1307 ( 37.75%)
+Best10%Mean mmap     45.9842 (  0.00%)     20.4040 ( 55.63%)
+Best5%Mean  mmap     43.2256 (  0.00%)     17.9654 ( 58.44%)
+Best1%Mean  mmap     32.9388 (  0.00%)     16.6875 ( 49.34%)
+
+This shows a number of improvements with the worst-case outlier greatly
+improved.
+
+Some of the vmstats are interesting
+
+                             4.7.0-rc4   4.7.0-rc4
+                          mmotm-20160623nodelru-v8
+Swap Ins                           163         502
+Swap Outs                            0           0
+DMA allocs                           0           0
+DMA32 allocs                 618719206  1381662383
+Normal allocs                891235743   564138421
+Movable allocs                       0           0
+Allocation stalls                 2603           1
+Direct pages scanned            216787           2
+Kswapd pages scanned          50719775    41778378
+Kswapd pages reclaimed        41541765    41777639
+Direct pages reclaimed          209159           0
+Kswapd efficiency                  81%         99%
+Kswapd velocity              16859.554   14329.059
+Direct efficiency                  96%          0%
+Direct velocity                 72.061       0.001
+Percentage direct scans             0%          0%
+Page writes by reclaim         6215049           0
+Page writes file               6215049           0
+Page writes anon                     0           0
+Page reclaim immediate           70673          90
+Sector Reads                  81940800    81680456
+Sector Writes                100158984    98816036
+Page rescued immediate               0           0
+Slabs scanned                  1366954       22683
+
+While this is not guaranteed in all cases, this particular test showed
+a large reduction in direct reclaim activity. It's also worth noting
+that no page writes were issued from reclaim context.
+
+This series is not without its hazards. There are at least three areas
+that I'm concerned with even though I could not reproduce any problems in
+that area.
+
+1. Reclaim/compaction is going to be affected because the amount of reclaim is
+   no longer targetted at a specific zone. Compaction works on a per-zone basis
+   so there is no guarantee that reclaiming a few THP's worth page pages will
+   have a positive impact on compaction success rates.
+
+2. The Slab/LRU reclaim ratio is affected because the frequency the shrinkers
+   are called is now different. This may or may not be a problem but if it
+   is, it'll be because shrinkers are not called enough and some balancing
+   is required.
+
+3. The anon/file reclaim ratio may be affected. Pages about to be dirtied are
+   distributed between zones and the fair zone allocation policy used to do
+   something very similar for anon. The distribution is now different but not
+   necessarily in any way that matters but it's still worth bearing in mind.
+
+VM statistic counters for reclaim decisions are zone-based.  If the kernel
+is to reclaim on a per-node basis then we need to track per-node
+statistics but there is no infrastructure for that.  The most notable
+change is that the old node_page_state is renamed to
+sum_zone_node_page_state.  The new node_page_state takes a pglist_data and
+uses per-node stats but none exist yet.  There is some renaming such as
+vm_stat to vm_zone_stat and the addition of vm_node_stat and the renaming
+of mod_state to mod_zone_state.  Otherwise, this is mostly a mechanical
+patch with no functional change.  There is a lot of similarity between the
+node and zone helpers which is unfortunate but there was no obvious way of
+reusing the code and maintaining type safety.
+
+Link: http://lkml.kernel.org/r/1467970510-21195-2-git-send-email-mgorman@techsingularity.net
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

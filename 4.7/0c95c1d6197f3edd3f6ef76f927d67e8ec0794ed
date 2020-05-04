@@ -1,0 +1,171 @@
+ALSA: firewire-lib: add tracepoints to dump a part of isochronous packet data
+
+When audio and music units have some quirks in their sequence of packet,
+it's really hard for non-owners to identify the quirks. Although developers
+need dumps for sequence of packets, it's difficult for users who have no
+knowledges and no equipments for this purpose.
+
+This commit adds tracepoints for this situation. When users encounter
+the issue, they can dump a part of packet data via Linux tracing framework
+as long as using drivers in ALSA firewire stack.
+
+Additionally, tracepoints for outgoing packets will be our help to check
+and debug packet processing of ALSA firewire stack.
+
+This commit newly adds 'snd_firewire_lib' subsystem with 'in_packet' and
+'out_packet' events. In the events, some attributes of packets and the
+index of packet managed by this module are recorded per packet.
+
+This is an usage:
+
+$ trace-cmd record -e snd_firewire_lib:out_packet \
+                   -e snd_firewire_lib:in_packet
+/sys/kernel/tracing/events/snd_firewire_lib/out_packet/filter
+/sys/kernel/tracing/events/snd_firewire_lib/in_packet/filter
+Hit Ctrl^C to stop recording
+^C
+$ trace-cmd report trace.dat
+...
+23647.033934: in_packet:  01 4073 ffc0 ffc1 00 000f0040 9001b2d1 122 44
+23647.033936: in_packet:  01 4074 ffc0 ffc1 00 000f0048 9001c83b 122 45
+23647.033937: in_packet:  01 4075 ffc0 ffc1 00 000f0050 9001ffff 002 46
+23647.033938: in_packet:  01 4076 ffc0 ffc1 00 000f0050 9001e1a6 122 47
+23647.035426: out_packet: 01 4123 ffc1 ffc0 01 010f00d0 9001fb40 122 17
+23647.035428: out_packet: 01 4124 ffc1 ffc0 01 010f00d8 9001ffff 002 18
+23647.035429: out_packet: 01 4125 ffc1 ffc0 01 010f00d8 900114aa 122 19
+23647.035430: out_packet: 01 4126 ffc1 ffc0 01 010f00e0 90012a15 122 20
+(Here, some common fields are omitted so that a line to be within 80
+characters.)
+...
+
+One line represent one packet. The legend for the last nine fields is:
+ - The second of cycle scheduled for the packet
+ - The count of cycle scheduled for the packet
+ - The ID of node as source (hex)
+  - Some devices transfer packets with invalid source node ID in their CIP
+    header.
+ - The ID of node as destination (hex)
+  - The value is not in CIP header of packets.
+ - The value of isochronous channel
+ - The first quadlet of CIP header (hex)
+ - The second quadlet of CIP header (hex)
+ - The number of included quadlets
+ - The index of packet in a buffer maintained by this module
+
+This is an example to parse these lines from text file by Python3 script:
+
+\#!/usr/bin/env python3
+import sys
+
+def parse_ts(second, cycle, syt):
+    offset = syt & 0xfff
+    syt >>= 12
+    if cycle & 0x0f > syt:
+        cycle += 0x10
+    cycle &= 0x1ff0
+    cycle |= syt
+    second += cycle // 8000
+    cycle %= 8000
+    # In CYCLE_TIMER of 1394 OHCI, second is represented in 8 bit.
+    second %= 128
+    return (second, cycle, offset)
+
+def calc_ts(second, cycle, offset):
+    ts = offset
+    ts += cycle * 3072
+    # In DMA descriptor of 1394 OHCI, second is represented in 3 bit.
+    ts += (second % 8) * 8000 * 3072
+    return ts
+
+def subtract_ts(minuend, subtrahend):
+    # In DMA descriptor of 1394 OHCI, second is represented in 3 bit.
+    if minuend < subtrahend:
+        minuend += 8 * 8000 * 3072
+    return minuend - subtrahend
+
+if len(sys.argv) != 2:
+    print('At least, one argument is required for packet dump.')
+    sys.exit()
+
+filename = sys.argv[1]
+
+data = []
+
+prev = 0
+with open(filename, 'r') as f:
+    for line in f:
+        pos = line.find('packet:')
+        if pos < 0:
+            continue
+
+        pos += len('packet:')
+        line = line[pos:].strip()
+        fields = line.split(' ')
+
+        datum = []
+
+        datum.append(fields[8])
+
+        syt = int(fields[6][4:], 16)
+
+        # Empty packet in IEC 61883-1, or NODATA in IEC 61883-6
+        if syt == 0xffff:
+            data_blocks = 0
+        else:
+            payload_size = int(fields[7], 10)
+            data_block_size = int(fields[5][2:4], 16)
+            data_blocks = (payload_size - 2) / data_block_size
+        datum.append(data_blocks)
+
+        second = int(fields[0], 10)
+        cycle = int(fields[1], 10)
+        start = (second << 25) | (cycle << 12)
+        datum.append('0x{0:08x}'.format(start))
+        start = calc_ts(second, cycle, 0)
+
+        datum.append("0x" + fields[5])
+        datum.append("0x" + fields[6])
+
+        if syt == 0xffff:
+            second = 0
+            cycle = 0
+            tick = 0
+        else:
+            second, cycle, tick = parse_ts(second, cycle, syt)
+        ts = calc_ts(second, cycle, tick)
+        datum.append(start)
+        datum.append(ts)
+        if ts == 0:
+            datum.append(0)
+            datum.append(0)
+        else:
+            # Usual case, or a case over 8 seconds.
+            if ts > start or start > 7 * 8000 * 3072:
+                datum.append(subtract_ts(ts, start))
+                if ts > prev or start > 7 * 8000 * 3072:
+                    gap = subtract_ts(ts, prev)
+                    datum.append(gap)
+                else:
+                    datum.append('backward')
+            else:
+                datum.append('invalid')
+            prev = ts
+
+        data.append(datum)
+
+sys.exit()
+
+The data variable includes array with these elements:
+- The index of the packet
+- The number of data blocks in the packet
+- The value of cycle count (hex)
+- The value of CIP header 1 (hex)
+- The value of CIP header 2 (hex)
+- The value of cycle count (tick)
+- The value of calculated presentation timestamp (tick)
+- The offset between the cycle count and presentation timestamp
+- The elapsed ticks from the previous presentation timestamp
+
+Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+

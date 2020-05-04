@@ -1,0 +1,49 @@
+bpf: fix clearing on persistent program array maps
+
+Currently, when having map file descriptors pointing to program arrays,
+there's still the issue that we unconditionally flush program array
+contents via bpf_fd_array_map_clear() in bpf_map_release(). This happens
+when such a file descriptor is released and is independent of the map's
+refcount.
+
+Having this flush independent of the refcount is for a reason: there
+can be arbitrary complex dependency chains among tail calls, also circular
+ones (direct or indirect, nesting limit determined during runtime), and
+we need to make sure that the map drops all references to eBPF programs
+it holds, so that the map's refcount can eventually drop to zero and
+initiate its freeing. Btw, a walk of the whole dependency graph would
+not be possible for various reasons, one being complexity and another
+one inconsistency, i.e. new programs can be added to parts of the graph
+at any time, so there's no guaranteed consistent state for the time of
+such a walk.
+
+Now, the program array pinning itself works, but the issue is that each
+derived file descriptor on close would nevertheless call unconditionally
+into bpf_fd_array_map_clear(). Instead, keep track of users and postpone
+this flush until the last reference to a user is dropped. As this only
+concerns a subset of references (f.e. a prog array could hold a program
+that itself has reference on the prog array holding it, etc), we need to
+track them separately.
+
+Short analysis on the refcounting: on map creation time usercnt will be
+one, so there's no change in behaviour for bpf_map_release(), if unpinned.
+If we already fail in map_create(), we are immediately freed, and no
+file descriptor has been made public yet. In bpf_obj_pin_user(), we need
+to probe for a possible map in bpf_fd_probe_obj() already with a usercnt
+reference, so before we drop the reference on the fd with fdput().
+Therefore, if actual pinning fails, we need to drop that reference again
+in bpf_any_put(), otherwise we keep holding it. When last reference
+drops on the inode, the bpf_any_put() in bpf_evict_inode() will take
+care of dropping the usercnt again. In the bpf_obj_get_user() case, the
+bpf_any_get() will grab a reference on the usercnt, still at a time when
+we have the reference on the path. Should we later on fail to grab a new
+file descriptor, bpf_any_put() will drop it, otherwise we hold it until
+bpf_map_release() time.
+
+Joint work with Alexei.
+
+Fixes: b2197755b263 ("bpf: add support for persistent maps/progs")
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

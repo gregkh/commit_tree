@@ -1,0 +1,104 @@
+Btrfs: remove deleted xattrs on fsync log replay
+
+If we deleted xattrs from a file and fsynced the file, after a log replay
+the xattrs would remain associated to the file. This was an unexpected
+behaviour and differs from what other filesystems do, such as for example
+xfs and ext3/4.
+
+Fix this by, on fsync log replay, check if every xattr in the fs/subvol
+tree (that belongs to a logged inode) has a matching xattr in the log,
+and if it does not, delete it from the fs/subvol tree. This is a similar
+approach to what we do for dentries when we replay a directory from the
+fsync log.
+
+This issue is trivial to reproduce, and the following excerpt from my
+test for xfstests triggers the issue:
+
+  _crash_and_mount()
+  {
+       # Simulate a crash/power loss.
+       _load_flakey_table $FLAKEY_DROP_WRITES
+       _unmount_flakey
+       _load_flakey_table $FLAKEY_ALLOW_WRITES
+       _mount_flakey
+  }
+
+  rm -f $seqres.full
+
+  _scratch_mkfs >> $seqres.full 2>&1
+  _init_flakey
+  _mount_flakey
+
+  # Create out test file and add 3 xattrs to it.
+  touch $SCRATCH_MNT/foobar
+  $SETFATTR_PROG -n user.attr1 -v val1 $SCRATCH_MNT/foobar
+  $SETFATTR_PROG -n user.attr2 -v val2 $SCRATCH_MNT/foobar
+  $SETFATTR_PROG -n user.attr3 -v val3 $SCRATCH_MNT/foobar
+
+  # Make sure everything is durably persisted.
+  sync
+
+  # Now delete the second xattr and fsync the inode.
+  $SETFATTR_PROG -x user.attr2 $SCRATCH_MNT/foobar
+  $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foobar
+
+  _crash_and_mount
+
+  # After the fsync log is replayed, the file should have only 2 xattrs, the ones
+  # named user.attr1 and user.attr3. The btrfs fsync log replay bug left the file
+  # with the 3 xattrs that we had before deleting the second one and fsyncing the
+  # file.
+  echo "xattr names and values after first fsync log replay:"
+  $GETFATTR_PROG --absolute-names --dump $SCRATCH_MNT/foobar | _filter_scratch
+
+  # Now write some data to our file, fsync it, remove the first xattr, add a new
+  # hard link to our file and commit the fsync log by fsyncing some other new
+  # file. This is to verify that after log replay our first xattr does not exist
+  # anymore.
+  echo "hello world!" >> $SCRATCH_MNT/foobar
+  $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foobar
+  $SETFATTR_PROG -x user.attr1 $SCRATCH_MNT/foobar
+  ln $SCRATCH_MNT/foobar $SCRATCH_MNT/foobar_link
+  touch $SCRATCH_MNT/qwerty
+  $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/qwerty
+
+  _crash_and_mount
+
+  # Now only the xattr with name user.attr3 should be set in our file.
+  echo "xattr names and values after second fsync log replay:"
+  $GETFATTR_PROG --absolute-names --dump $SCRATCH_MNT/foobar | _filter_scratch
+
+  status=0
+  exit
+
+The expected golden output, which is produced with this patch applied or
+when testing against xfs or ext3/4, is:
+
+  xattr names and values after first fsync log replay:
+  # file: SCRATCH_MNT/foobar
+  user.attr1="val1"
+  user.attr3="val3"
+
+  xattr names and values after second fsync log replay:
+  # file: SCRATCH_MNT/foobar
+  user.attr3="val3"
+
+Without this patch applied, the output is:
+
+  xattr names and values after first fsync log replay:
+  # file: SCRATCH_MNT/foobar
+  user.attr1="val1"
+  user.attr2="val2"
+  user.attr3="val3"
+
+  xattr names and values after second fsync log replay:
+  # file: SCRATCH_MNT/foobar
+  user.attr1="val1"
+  user.attr2="val2"
+  user.attr3="val3"
+
+A patch with a test case for xfstests follows soon.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

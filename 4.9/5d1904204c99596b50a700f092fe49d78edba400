@@ -1,0 +1,95 @@
+mremap: fix race between mremap() and page cleanning
+
+Prior to 3.15, there was a race between zap_pte_range() and
+page_mkclean() where writes to a page could be lost.  Dave Hansen
+discovered by inspection that there is a similar race between
+move_ptes() and page_mkclean().
+
+We've been able to reproduce the issue by enlarging the race window with
+a msleep(), but have not been able to hit it without modifying the code.
+So, we think it's a real issue, but is difficult or impossible to hit in
+practice.
+
+The zap_pte_range() issue is fixed by commit 1cf35d47712d("mm: split
+'tlb_flush_mmu()' into tlb flushing and memory freeing parts").  And
+this patch is to fix the race between page_mkclean() and mremap().
+
+Here is one possible way to hit the race: suppose a process mmapped a
+file with READ | WRITE and SHARED, it has two threads and they are bound
+to 2 different CPUs, e.g.  CPU1 and CPU2.  mmap returned X, then thread
+1 did a write to addr X so that CPU1 now has a writable TLB for addr X
+on it.  Thread 2 starts mremaping from addr X to Y while thread 1
+cleaned the page and then did another write to the old addr X again.
+The 2nd write from thread 1 could succeed but the value will get lost.
+
+        thread 1                           thread 2
+     (bound to CPU1)                    (bound to CPU2)
+
+  1: write 1 to addr X to get a
+     writeable TLB on this CPU
+
+                                        2: mremap starts
+
+                                        3: move_ptes emptied PTE for addr X
+                                           and setup new PTE for addr Y and
+                                           then dropped PTL for X and Y
+
+  4: page laundering for N by doing
+     fadvise FADV_DONTNEED. When done,
+     pageframe N is deemed clean.
+
+  5: *write 2 to addr X
+
+                                        6: tlb flush for addr X
+
+  7: munmap (Y, pagesize) to make the
+     page unmapped
+
+  8: fadvise with FADV_DONTNEED again
+     to kick the page off the pagecache
+
+  9: pread the page from file to verify
+     the value. If 1 is there, it means
+     we have lost the written 2.
+
+  *the write may or may not cause segmentation fault, it depends on
+  if the TLB is still on the CPU.
+
+Please note that this is only one specific way of how the race could
+occur, it didn't mean that the race could only occur in exact the above
+config, e.g. more than 2 threads could be involved and fadvise() could
+be done in another thread, etc.
+
+For anonymous pages, they could race between mremap() and page reclaim:
+THP: a huge PMD is moved by mremap to a new huge PMD, then the new huge
+PMD gets unmapped/splitted/pagedout before the flush tlb happened for
+the old huge PMD in move_page_tables() and we could still write data to
+it.  The normal anonymous page has similar situation.
+
+To fix this, check for any dirty PTE in move_ptes()/move_huge_pmd() and
+if any, did the flush before dropping the PTL.  If we did the flush for
+every move_ptes()/move_huge_pmd() call then we do not need to do the
+flush in move_pages_tables() for the whole range.  But if we didn't, we
+still need to do the whole range flush.
+
+Alternatively, we can track which part of the range is flushed in
+move_ptes()/move_huge_pmd() and which didn't to avoid flushing the whole
+range in move_page_tables().  But that would require multiple tlb
+flushes for the different sub-ranges and should be less efficient than
+the single whole range flush.
+
+KBuild test on my Sandybridge desktop doesn't show any noticeable change.
+v4.9-rc4:
+  real    5m14.048s
+  user    32m19.800s
+  sys     4m50.320s
+
+With this commit:
+  real    5m13.888s
+  user    32m19.330s
+  sys     4m51.200s
+
+Reported-by: Dave Hansen <dave.hansen@intel.com>
+Signed-off-by: Aaron Lu <aaron.lu@intel.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

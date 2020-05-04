@@ -1,0 +1,77 @@
+memcg: fix dirty page migration
+
+The problem starts with a file backed dirty page which is charged to a
+memcg.  Then page migration is used to move oldpage to newpage.
+
+Migration:
+ - copies the oldpage's data to newpage
+ - clears oldpage.PG_dirty
+ - sets newpage.PG_dirty
+ - uncharges oldpage from memcg
+ - charges newpage to memcg
+
+Clearing oldpage.PG_dirty decrements the charged memcg's dirty page
+count.
+
+However, because newpage is not yet charged, setting newpage.PG_dirty
+does not increment the memcg's dirty page count.  After migration
+completes newpage.PG_dirty is eventually cleared, often in
+account_page_cleaned().  At this time newpage is charged to a memcg so
+the memcg's dirty page count is decremented which causes underflow
+because the count was not previously incremented by migration.  This
+underflow causes balance_dirty_pages() to see a very large unsigned
+number of dirty memcg pages which leads to aggressive throttling of
+buffered writes by processes in non root memcg.
+
+This issue:
+ - can harm performance of non root memcg buffered writes.
+ - can report too small (even negative) values in
+   memory.stat[(total_)dirty] counters of all memcg, including the root.
+
+To avoid polluting migrate.c with #ifdef CONFIG_MEMCG checks, introduce
+page_memcg() and set_page_memcg() helpers.
+
+Test:
+    0) setup and enter limited memcg
+    mkdir /sys/fs/cgroup/test
+    echo 1G > /sys/fs/cgroup/test/memory.limit_in_bytes
+    echo $$ > /sys/fs/cgroup/test/cgroup.procs
+
+    1) buffered writes baseline
+    dd if=/dev/zero of=/data/tmp/foo bs=1M count=1k
+    sync
+    grep ^dirty /sys/fs/cgroup/test/memory.stat
+
+    2) buffered writes with compaction antagonist to induce migration
+    yes 1 > /proc/sys/vm/compact_memory &
+    rm -rf /data/tmp/foo
+    dd if=/dev/zero of=/data/tmp/foo bs=1M count=1k
+    kill %
+    sync
+    grep ^dirty /sys/fs/cgroup/test/memory.stat
+
+    3) buffered writes without antagonist, should match baseline
+    rm -rf /data/tmp/foo
+    dd if=/dev/zero of=/data/tmp/foo bs=1M count=1k
+    sync
+    grep ^dirty /sys/fs/cgroup/test/memory.stat
+
+                       (speed, dirty residue)
+             unpatched                       patched
+    1) 841 MB/s 0 dirty pages          886 MB/s 0 dirty pages
+    2) 611 MB/s -33427456 dirty pages  793 MB/s 0 dirty pages
+    3) 114 MB/s -33427456 dirty pages  891 MB/s 0 dirty pages
+
+    Notice that unpatched baseline performance (1) fell after
+    migration (3): 841 -> 114 MB/s.  In the patched kernel, post
+    migration performance matches baseline.
+
+Fixes: c4843a7593a9 ("memcg: add per cgroup dirty page accounting")
+Signed-off-by: Greg Thelen <gthelen@google.com>
+Reported-by: Dave Hansen <dave.hansen@intel.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: <stable@vger.kernel.org>	[4.2+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

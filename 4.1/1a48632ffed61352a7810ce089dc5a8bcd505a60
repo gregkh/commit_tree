@@ -1,0 +1,61 @@
+pty: Fix input race when closing
+
+A read() from a pty master may mistakenly indicate EOF (errno == -EIO)
+after the pty slave has closed, even though input data remains to be read.
+For example,
+
+       pty slave       |        input worker        |    pty master
+                       |                            |
+                       |                            |   n_tty_read()
+pty_write()            |                            |     input avail? no
+  add data             |                            |     sleep
+  schedule worker  --->|                            |     .
+                       |---> flush_to_ldisc()       |     .
+pty_close()            |       fill read buffer     |     .
+  wait for worker      |       wakeup reader    --->|     .
+                       |       read buffer full?    |---> input avail ? yes
+                       |<---   yes - exit worker    |     copy 4096 bytes to user
+  TTY_OTHER_CLOSED <---|                            |<--- kick worker
+                       |                            |
+
+		                **** New read() before worker starts ****
+
+                       |                            |   n_tty_read()
+                       |                            |     input avail? no
+                       |                            |     TTY_OTHER_CLOSED? yes
+                       |                            |     return -EIO
+
+Several conditions are required to trigger this race:
+1. the ldisc read buffer must become full so the input worker exits
+2. the read() count parameter must be >= 4096 so the ldisc read buffer
+   is empty
+3. the subsequent read() occurs before the kicked worker has processed
+   more input
+
+However, the underlying cause of the race is that data is pipelined, while
+tty state is not; ie., data already written by the pty slave end is not
+yet visible to the pty master end, but state changes by the pty slave end
+are visible to the pty master end immediately.
+
+Pipeline the TTY_OTHER_CLOSED state through input worker to the reader.
+1. Introduce TTY_OTHER_DONE which is set by the input worker when
+   TTY_OTHER_CLOSED is set and either the input buffers are flushed or
+   input processing has completed. Readers/polls are woken when
+   TTY_OTHER_DONE is set.
+2. Reader/poll checks TTY_OTHER_DONE instead of TTY_OTHER_CLOSED.
+3. A new input worker is started from pty_close() after setting
+   TTY_OTHER_CLOSED, which ensures the TTY_OTHER_DONE state will be
+   set if the last input worker is already finished (or just about to
+   exit).
+
+Remove tty_flush_to_ldisc(); no in-tree callers.
+
+Fixes: 52bce7f8d4fc ("pty, n_tty: Simplify input processing on final close")
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=96311
+BugLink: http://bugs.launchpad.net/bugs/1429756
+Cc: <stable@vger.kernel.org> # 3.19+
+Reported-by: Andy Whitcroft <apw@canonical.com>
+Reported-by: H.J. Lu <hjl.tools@gmail.com>
+Signed-off-by: Peter Hurley <peter@hurleysoftware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

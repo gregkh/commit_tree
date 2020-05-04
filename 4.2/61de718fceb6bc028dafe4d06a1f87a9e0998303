@@ -1,0 +1,70 @@
+Btrfs: fix memory corruption on failure to submit bio for direct IO
+
+If we fail to submit a bio for a direct IO request, we were grabbing the
+corresponding ordered extent and decrementing its reference count twice,
+once for our lookup reference and once for the ordered tree reference.
+This was a problem because it caused the ordered extent to be freed
+without removing it from the ordered tree and any lists it might be
+attached to, leaving dangling pointers to the ordered extent around.
+Example trace with CONFIG_DEBUG_PAGEALLOC=y:
+
+[161779.858707] BUG: unable to handle kernel paging request at 0000000087654330
+[161779.859983] IP: [<ffffffff8124ca68>] rb_prev+0x22/0x3b
+[161779.860636] PGD 34d818067 PUD 0
+[161779.860636] Oops: 0000 [#1] PREEMPT SMP DEBUG_PAGEALLOC
+(...)
+[161779.860636] Call Trace:
+[161779.860636]  [<ffffffffa06b36a6>] __tree_search+0xd9/0xf9 [btrfs]
+[161779.860636]  [<ffffffffa06b3708>] tree_search+0x42/0x63 [btrfs]
+[161779.860636]  [<ffffffffa06b4868>] ? btrfs_lookup_ordered_range+0x2d/0xa5 [btrfs]
+[161779.860636]  [<ffffffffa06b4873>] btrfs_lookup_ordered_range+0x38/0xa5 [btrfs]
+[161779.860636]  [<ffffffffa06aab8e>] btrfs_get_blocks_direct+0x11b/0x615 [btrfs]
+[161779.860636]  [<ffffffff8119727f>] do_blockdev_direct_IO+0x5ff/0xb43
+[161779.860636]  [<ffffffffa06aaa73>] ? btrfs_page_exists_in_range+0x1ad/0x1ad [btrfs]
+[161779.860636]  [<ffffffffa06a2c9a>] ? btrfs_get_extent_fiemap+0x1bc/0x1bc [btrfs]
+[161779.860636]  [<ffffffff811977f5>] __blockdev_direct_IO+0x32/0x34
+[161779.860636]  [<ffffffffa06a2c9a>] ? btrfs_get_extent_fiemap+0x1bc/0x1bc [btrfs]
+[161779.860636]  [<ffffffffa06a10ae>] btrfs_direct_IO+0x198/0x21f [btrfs]
+[161779.860636]  [<ffffffffa06a2c9a>] ? btrfs_get_extent_fiemap+0x1bc/0x1bc [btrfs]
+[161779.860636]  [<ffffffff81112ca1>] generic_file_direct_write+0xb3/0x128
+[161779.860636]  [<ffffffffa06affaa>] ? btrfs_file_write_iter+0x15f/0x3e0 [btrfs]
+[161779.860636]  [<ffffffffa06b004c>] btrfs_file_write_iter+0x201/0x3e0 [btrfs]
+(...)
+
+We were also not freeing the btrfs_dio_private we allocated previously,
+which kmemleak reported with the following trace in its sysfs file:
+
+unreferenced object 0xffff8803f553bf80 (size 96):
+  comm "xfs_io", pid 4501, jiffies 4295039588 (age 173.936s)
+  hex dump (first 32 bytes):
+    88 6c 9b f5 02 88 ff ff 00 00 00 00 00 00 00 00  .l..............
+    00 00 00 00 00 00 00 00 00 00 c4 00 00 00 00 00  ................
+  backtrace:
+    [<ffffffff81161ffe>] create_object+0x172/0x29a
+    [<ffffffff8145870f>] kmemleak_alloc+0x25/0x41
+    [<ffffffff81154e64>] kmemleak_alloc_recursive.constprop.40+0x16/0x18
+    [<ffffffff811579ed>] kmem_cache_alloc_trace+0xfb/0x148
+    [<ffffffffa03d8cff>] btrfs_submit_direct+0x65/0x16a [btrfs]
+    [<ffffffff811968dc>] dio_bio_submit+0x62/0x8f
+    [<ffffffff811975fe>] do_blockdev_direct_IO+0x97e/0xb43
+    [<ffffffff811977f5>] __blockdev_direct_IO+0x32/0x34
+    [<ffffffffa03d70ae>] btrfs_direct_IO+0x198/0x21f [btrfs]
+    [<ffffffff81112ca1>] generic_file_direct_write+0xb3/0x128
+    [<ffffffffa03e604d>] btrfs_file_write_iter+0x201/0x3e0 [btrfs]
+    [<ffffffff8116586a>] __vfs_write+0x7c/0xa5
+    [<ffffffff81165da9>] vfs_write+0xa0/0xe4
+    [<ffffffff81166675>] SyS_pwrite64+0x64/0x82
+    [<ffffffff81464fd7>] system_call_fastpath+0x12/0x6f
+    [<ffffffffffffffff>] 0xffffffffffffffff
+
+For read requests we weren't doing any cleanup either (none of the work
+done by btrfs_endio_direct_read()), so a failure submitting a bio for a
+read request would leave a range in the inode's io_tree locked forever,
+blocking any future operations (both reads and writes) against that range.
+
+So fix this by making sure we do the same cleanup that we do for the case
+where the bio submission succeeds.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

@@ -1,0 +1,123 @@
+printk: move can_use_console() out of console_trylock_for_printk()
+
+console_unlock() allows to cond_resched() if its caller has set
+`console_may_schedule' to 1 (this functionality is present since
+8d91f8b15361 ("printk: do cond_resched() between lines while outputting
+to consoles").
+
+The rules are:
+-- console_lock() always sets `console_may_schedule' to 1
+-- console_trylock() always sets `console_may_schedule' to 0
+
+printk() calls console_unlock() with preemption desabled, which
+basically can lead to RCU stalls, watchdog soft lockups, etc.  if
+something is simultaneously calling printk() frequent enough (IOW,
+console_sem owner always has new data to send to console divers and
+can't leave console_unlock() for a long time).
+
+printk()->console_trylock() callers do not necessarily execute in atomic
+contexts, and some of them can cond_resched() in console_unlock().
+console_trylock() can set `console_may_schedule' to 1 (allow
+cond_resched() later in consoe_unlock()) when it's safe.
+
+This patch (of 3):
+
+vprintk_emit() disables preemption around console_trylock_for_printk()
+and console_unlock() calls for a strong reason -- can_use_console()
+check.  The thing is that vprintl_emit() can be called on a CPU that is
+not fully brought up yet (!cpu_online()), which potentially can cause
+problems if console driver wants to access per-cpu data.  A console
+driver can explicitly state that it's safe to call it from !online cpu
+by setting CON_ANYTIME bit in console ->flags.  That's why for
+!cpu_online() can_use_console() iterates all the console to find out if
+there is a CON_ANYTIME console, otherwise console_unlock() must be
+avoided.
+
+can_use_console() ensures that console_unlock() call is safe in
+vprintk_emit() only; console_lock() and console_trylock() are not
+covered by this check.  Even though call_console_drivers(), invoked from
+console_cont_flush() and console_unlock(), tests `!cpu_online() &&
+CON_ANYTIME' for_each_console(), it may be too late, which can result in
+messages loss.
+
+Assume that we have 2 cpus -- CPU0 is online, CPU1 is !online, and no
+CON_ANYTIME consoles available.
+
+CPU0 online                        CPU1 !online
+                                 console_trylock()
+                                 ...
+                                 console_unlock()
+                                   console_cont_flush
+                                     spin_lock logbuf_lock
+                                     if (!cont.len) {
+                                        spin_unlock logbuf_lock
+                                        return
+                                     }
+                                   for (;;) {
+vprintk_emit
+  spin_lock logbuf_lock
+  log_store
+  spin_unlock logbuf_lock
+                                     spin_lock logbuf_lock
+  !console_trylock_for_printk        msg_print_text
+ return                              console_idx = log_next()
+                                     console_seq++
+                                     console_prev = msg->flags
+                                     spin_unlock logbuf_lock
+
+                                     call_console_drivers()
+                                       for_each_console(con) {
+                                         if (!cpu_online() &&
+                                             !(con->flags & CON_ANYTIME))
+                                                 continue;
+                                         }
+                                   /*
+                                    * no message printed, we lost it
+                                    */
+vprintk_emit
+  spin_lock logbuf_lock
+  log_store
+  spin_unlock logbuf_lock
+  !console_trylock_for_printk
+ return
+                                   /*
+                                    * go to the beginning of the loop,
+                                    * find out there are new messages,
+                                    * lose it
+                                    */
+                                   }
+
+console_trylock()/console_lock() call on CPU1 may come from cpu
+notifiers registered on that CPU.  Since notifiers are not getting
+unregistered when CPU is going DOWN, all of the notifiers receive
+notifications during CPU UP.  For example, on my x86_64, I see around 50
+notification sent from offline CPU to itself
+
+ [swapper/2] from cpu:2 to:2 action:CPU_STARTING hotplug_hrtick
+ [swapper/2] from cpu:2 to:2 action:CPU_STARTING blk_mq_main_cpu_notify
+ [swapper/2] from cpu:2 to:2 action:CPU_STARTING blk_mq_queue_reinit_notify
+ [swapper/2] from cpu:2 to:2 action:CPU_STARTING console_cpu_notify
+
+while doing
+  echo 0 > /sys/devices/system/cpu/cpu2/online
+  echo 1 > /sys/devices/system/cpu/cpu2/online
+
+So grabbing the console_sem lock while CPU is !online is possible,
+in theory.
+
+This patch moves can_use_console() check out of
+console_trylock_for_printk().  Instead it calls it in console_unlock(),
+so now console_lock()/console_unlock() are also 'protected' by
+can_use_console().  This also means that console_trylock_for_printk() is
+not really needed anymore and can be removed.
+
+Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Reviewed-by: Petr Mladek <pmladek@suse.com>
+Cc: Jan Kara <jack@suse.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Kyle McMartin <kyle@kernel.org>
+Cc: Dave Jones <davej@codemonkey.org.uk>
+Cc: Calvin Owens <calvinowens@fb.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

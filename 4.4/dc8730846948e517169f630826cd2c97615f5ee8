@@ -1,0 +1,89 @@
+usb: dwc2: host: Fix use after free w/ simultaneous irqs
+
+While plugging / unplugging on a DWC2 host port with "slub_debug=FZPUA"
+enabled, I found a crash that was quite obviously a use after free.
+
+It appears that in some cases when we handle the various sub-cases of
+HCINT we may end up freeing the QTD.  If there is more than one bit set
+in HCINT we may then end up continuing to use the QTD, which is bad.
+Let's be paranoid and check for this after each sub-case.  This should
+be safe since we officially have the "hsotg->lock" (it was grabbed in
+dwc2_handle_hcd_intr).
+
+The specific crash I found was:
+ Unable to handle kernel paging request at virtual address 6b6b6b9f
+
+At the time of the crash, the kernel reported:
+ (dwc2_hc_nak_intr+0x5c/0x198)
+ (dwc2_handle_hcd_intr+0xa84/0xbf8)
+ (_dwc2_hcd_irq+0x1c/0x20)
+ (usb_hcd_irq+0x34/0x48)
+
+Popping into kgdb found that "*qtd" was filled with "0x6b", AKA qtd had
+been freed and filled with slub_debug poison.
+
+kgdb gave a little better stack crawl:
+ 0 dwc2_hc_nak_intr (hsotg=hsotg@entry=0xec42e058,
+     chan=chan@entry=0xec546dc0, chnum=chnum@entry=4,
+     qtd=qtd@entry=0xec679600) at drivers/usb/dwc2/hcd_intr.c:1237
+ 1 dwc2_hc_n_intr (chnum=4, hsotg=0xec42e058) at
+     drivers/usb/dwc2/hcd_intr.c:2041
+ 2 dwc2_hc_intr (hsotg=0xec42e058) at drivers/usb/dwc2/hcd_intr.c:2078
+ 3 dwc2_handle_hcd_intr (hsotg=0xec42e058) at
+     drivers/usb/dwc2/hcd_intr.c:2128
+ 4 _dwc2_hcd_irq (hcd=<optimized out>) at drivers/usb/dwc2/hcd.c:2837
+ 5 usb_hcd_irq (irq=<optimized out>, __hcd=<optimized out>) at
+     drivers/usb/core/hcd.c:2353
+
+Popping up to frame #1 (dwc2_hc_n_intr) found:
+ (gdb) print /x hcint
+ $12 = 0x12
+
+AKA:
+ #define HCINTMSK_CHHLTD  (1 << 1)
+ #define HCINTMSK_NAK     (1 << 4)
+
+Further debugging found that by simulating receiving those two
+interrupts at the same time it was trivial to replicate the
+use-after-free.  See <http://crosreview.com/305712> for a patch and
+instructions.  This lead to getting the following stack crawl of the
+actual free:
+ 0  arch_kgdb_breakpoint () at arch/arm/include/asm/outercache.h:103
+ 1  kgdb_breakpoint () at kernel/debug/debug_core.c:1054
+ 2  dwc2_hcd_qtd_unlink_and_free (hsotg=<optimized out>, qh=<optimized
+      out>, qtd=0xe4479a00) at drivers/usb/dwc2/hcd.h:488
+ 3  dwc2_deactivate_qh (free_qtd=<optimized out>, qh=0xe5efa280,
+      hsotg=0xed424618) at drivers/usb/dwc2/hcd_intr.c:671
+ 4  dwc2_release_channel (hsotg=hsotg@entry=0xed424618,
+      chan=chan@entry=0xed5be000, qtd=<optimized out>,
+      halt_status=<optimized out>) at drivers/usb/dwc2/hcd_intr.c:742
+ 5  dwc2_halt_channel (hsotg=0xed424618, chan=0xed5be000, qtd=<optimized
+      out>, halt_status=<optimized out>) at
+      drivers/usb/dwc2/hcd_intr.c:804
+ 6  dwc2_complete_non_periodic_xfer (chnum=<optimized out>,
+      halt_status=<optimized out>, qtd=<optimized out>, chan=<optimized
+      out>, hsotg=<optimized out>) at drivers/usb/dwc2/hcd_intr.c:889
+ 7  dwc2_hc_xfercomp_intr (hsotg=hsotg@entry=0xed424618,
+      chan=chan@entry=0xed5be000, chnum=chnum@entry=6,
+      qtd=qtd@entry=0xe4479a00) at drivers/usb/dwc2/hcd_intr.c:1065
+ 8  dwc2_hc_chhltd_intr_dma (qtd=0xe4479a00, chnum=6, chan=0xed5be000,
+      hsotg=0xed424618) at drivers/usb/dwc2/hcd_intr.c:1823
+ 9  dwc2_hc_chhltd_intr (qtd=0xe4479a00, chnum=6, chan=0xed5be000,
+      hsotg=0xed424618) at drivers/usb/dwc2/hcd_intr.c:1944
+ 10 dwc2_hc_n_intr (chnum=6, hsotg=0xed424618) at
+      drivers/usb/dwc2/hcd_intr.c:2052
+ 11 dwc2_hc_intr (hsotg=0xed424618) at drivers/usb/dwc2/hcd_intr.c:2097
+ 12 dwc2_handle_hcd_intr (hsotg=0xed424618) at
+      drivers/usb/dwc2/hcd_intr.c:2147
+ 13 _dwc2_hcd_irq (hcd=<optimized out>) at drivers/usb/dwc2/hcd.c:2837
+ 14 usb_hcd_irq (irq=<optimized out>, __hcd=<optimized out>) at
+      drivers/usb/core/hcd.c:2353
+
+Though we could add specific code to handle this case, adding the
+general purpose code to check for all cases where qtd might be freed
+seemed safer.
+
+Acked-by: John Youn <johnyoun@synopsys.com>
+Signed-off-by: Douglas Anderson <dianders@chromium.org>
+Signed-off-by: Felipe Balbi <balbi@ti.com>
+

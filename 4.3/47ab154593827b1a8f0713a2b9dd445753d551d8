@@ -1,0 +1,44 @@
+ALSA: usb-audio: Avoid nested autoresume calls
+
+After the recent fix of runtime PM for USB-audio driver, we got a
+lockdep warning like:
+
+  =============================================
+  [ INFO: possible recursive locking detected ]
+  4.2.0-rc8+ #61 Not tainted
+  ---------------------------------------------
+  pulseaudio/980 is trying to acquire lock:
+   (&chip->shutdown_rwsem){.+.+.+}, at: [<ffffffffa0355dac>] snd_usb_autoresume+0x1d/0x52 [snd_usb_audio]
+  but task is already holding lock:
+   (&chip->shutdown_rwsem){.+.+.+}, at: [<ffffffffa0355dac>] snd_usb_autoresume+0x1d/0x52 [snd_usb_audio]
+
+This comes from snd_usb_autoresume() invoking down_read() and it's
+used in a nested way.  Although it's basically safe, per se (as these
+are read locks), it's better to reduce such spurious warnings.
+
+The read lock is needed to guarantee the execution of "shutdown"
+(cleanup at disconnection) task after all concurrent tasks are
+finished.  This can be implemented in another better way.
+
+Also, the current check of chip->in_pm isn't good enough for
+protecting the racy execution of multiple auto-resumes.
+
+This patch rewrites the logic of snd_usb_autoresume() & co; namely,
+- The recursive call of autopm is avoided by the new refcount,
+  chip->active.  The chip->in_pm flag is removed accordingly.
+- Instead of rwsem, another refcount, chip->usage_count, is introduced
+  for tracking the period to delay the shutdown procedure.  At
+  the last clear of this refcount, wake_up() to the shutdown waiter is
+  called.
+- The shutdown flag is replaced with shutdown atomic count; this is
+  for reducing the lock.
+- Two new helpers are introduced to simplify the management of these
+  refcounts; snd_usb_lock_shutdown() increases the usage_count, checks
+  the shutdown state, and does autoresume.  snd_usb_unlock_shutdown()
+  does the opposite.  Most of mixer and other codes just need this,
+  and simply returns an error if it receives an error from lock.
+
+Fixes: 9003ebb13f61 ('ALSA: usb-audio: Fix runtime PM unbalance')
+Reported-and-tested-by: Alexnader Kuleshov <kuleshovmail@gmail.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+

@@ -1,0 +1,97 @@
+netfilter: nf_conntrack: add direction support for zones
+
+This work adds a direction parameter to netfilter zones, so identity
+separation can be performed only in original/reply or both directions
+(default). This basically opens up the possibility of doing NAT with
+conflicting IP address/port tuples from multiple, isolated tenants
+on a host (e.g. from a netns) without requiring each tenant to NAT
+twice resp. to use its own dedicated IP address to SNAT to, meaning
+overlapping tuples can be made unique with the zone identifier in
+original direction, where the NAT engine will then allocate a unique
+tuple in the commonly shared default zone for the reply direction.
+In some restricted, local DNAT cases, also port redirection could be
+used for making the reply traffic unique w/o requiring SNAT.
+
+The consensus we've reached and discussed at NFWS and since the initial
+implementation [1] was to directly integrate the direction meta data
+into the existing zones infrastructure, as opposed to the ct->mark
+approach we proposed initially.
+
+As we pass the nf_conntrack_zone object directly around, we don't have
+to touch all call-sites, but only those, that contain equality checks
+of zones. Thus, based on the current direction (original or reply),
+we either return the actual id, or the default NF_CT_DEFAULT_ZONE_ID.
+CT expectations are direction-agnostic entities when expectations are
+being compared among themselves, so we can only use the identifier
+in this case.
+
+Note that zone identifiers can not be included into the hash mix
+anymore as they don't contain a "stable" value that would be equal
+for both directions at all times, f.e. if only zone->id would
+unconditionally be xor'ed into the table slot hash, then replies won't
+find the corresponding conntracking entry anymore.
+
+If no particular direction is specified when configuring zones, the
+behaviour is exactly as we expect currently (both directions).
+
+Support has been added for the CT netlink interface as well as the
+x_tables raw CT target, which both already offer existing interfaces
+to user space for the configuration of zones.
+
+Below a minimal, simplified collision example (script in [2]) with
+netperf sessions:
+
+  +--- tenant-1 ---+   mark := 1
+  |    netperf     |--+
+  +----------------+  |                CT zone := mark [ORIGINAL]
+   [ip,sport] := X   +--------------+  +--- gateway ---+
+                     | mark routing |--|     SNAT      |-- ... +
+                     +--------------+  +---------------+       |
+  +--- tenant-2 ---+  |                                     ~~~|~~~
+  |    netperf     |--+                +-----------+           |
+  +----------------+   mark := 2       | netserver |------ ... +
+   [ip,sport] := X                     +-----------+
+                                        [ip,port] := Y
+On the gateway netns, example:
+
+  iptables -t raw -A PREROUTING -j CT --zone mark --zone-dir ORIGINAL
+  iptables -t nat -A POSTROUTING -o <dev> -j SNAT --to-source <ip> --random-fully
+
+  iptables -t mangle -A PREROUTING -m conntrack --ctdir ORIGINAL -j CONNMARK --save-mark
+  iptables -t mangle -A POSTROUTING -m conntrack --ctdir REPLY -j CONNMARK --restore-mark
+
+conntrack dump from gateway netns:
+
+  netperf -H 10.1.1.2 -t TCP_STREAM -l60 -p12865,5555 from each tenant netns
+
+  tcp 6 431995 ESTABLISHED src=40.1.1.1 dst=10.1.1.2 sport=5555 dport=12865 zone-orig=1
+                           src=10.1.1.2 dst=10.1.1.1 sport=12865 dport=1024
+               [ASSURED] mark=1 secctx=system_u:object_r:unlabeled_t:s0 use=1
+
+  tcp 6 431994 ESTABLISHED src=40.1.1.1 dst=10.1.1.2 sport=5555 dport=12865 zone-orig=2
+                           src=10.1.1.2 dst=10.1.1.1 sport=12865 dport=5555
+               [ASSURED] mark=2 secctx=system_u:object_r:unlabeled_t:s0 use=1
+
+  tcp 6 299 ESTABLISHED src=40.1.1.1 dst=10.1.1.2 sport=39438 dport=33768 zone-orig=1
+                        src=10.1.1.2 dst=10.1.1.1 sport=33768 dport=39438
+               [ASSURED] mark=1 secctx=system_u:object_r:unlabeled_t:s0 use=1
+
+  tcp 6 300 ESTABLISHED src=40.1.1.1 dst=10.1.1.2 sport=32889 dport=40206 zone-orig=2
+                        src=10.1.1.2 dst=10.1.1.1 sport=40206 dport=32889
+               [ASSURED] mark=2 secctx=system_u:object_r:unlabeled_t:s0 use=2
+
+Taking this further, test script in [2] creates 200 tenants and runs
+original-tuple colliding netperf sessions each. A conntrack -L dump in
+the gateway netns also confirms 200 overlapping entries, all in ESTABLISHED
+state as expected.
+
+I also did run various other tests with some permutations of the script,
+to mention some: SNAT in random/random-fully/persistent mode, no zones (no
+overlaps), static zones (original, reply, both directions), etc.
+
+  [1] http://thread.gmane.org/gmane.comp.security.firewalls.netfilter.devel/57412/
+  [2] https://paste.fedoraproject.org/242835/65657871/
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+

@@ -1,0 +1,57 @@
+bpf: generally move prog destruction to RCU deferral
+
+Jann Horn reported following analysis that could potentially result
+in a very hard to trigger (if not impossible) UAF race, to quote his
+event timeline:
+
+ - Set up a process with threads T1, T2 and T3
+ - Let T1 set up a socket filter F1 that invokes another filter F2
+   through a BPF map [tail call]
+ - Let T1 trigger the socket filter via a unix domain socket write,
+   don't wait for completion
+ - Let T2 call PERF_EVENT_IOC_SET_BPF with F2, don't wait for completion
+ - Now T2 should be behind bpf_prog_get(), but before bpf_prog_put()
+ - Let T3 close the file descriptor for F2, dropping the reference
+   count of F2 to 2
+ - At this point, T1 should have looked up F2 from the map, but not
+   finished executing it
+ - Let T3 remove F2 from the BPF map, dropping the reference count of
+   F2 to 1
+ - Now T2 should call bpf_prog_put() (wrong BPF program type), dropping
+   the reference count of F2 to 0 and scheduling bpf_prog_free_deferred()
+   via schedule_work()
+ - At this point, the BPF program could be freed
+ - BPF execution is still running in a freed BPF program
+
+While at PERF_EVENT_IOC_SET_BPF time it's only guaranteed that the perf
+event fd we're doing the syscall on doesn't disappear from underneath us
+for whole syscall time, it may not be the case for the bpf fd used as
+an argument only after we did the put. It needs to be a valid fd pointing
+to a BPF program at the time of the call to make the bpf_prog_get() and
+while T2 gets preempted, F2 must have dropped reference to 1 on the other
+CPU. The fput() from the close() in T3 should also add additionally delay
+to the reference drop via exit_task_work() when bpf_prog_release() gets
+called as well as scheduling bpf_prog_free_deferred().
+
+That said, it makes nevertheless sense to move the BPF prog destruction
+generally after RCU grace period to guarantee that such scenario above,
+but also others as recently fixed in ceb56070359b ("bpf, perf: delay release
+of BPF prog after grace period") with regards to tail calls won't happen.
+Integrating bpf_prog_free_deferred() directly into the RCU callback is
+not allowed since the invocation might happen from either softirq or
+process context, so we're not permitted to block. Reviewing all bpf_prog_put()
+invocations from eBPF side (note, cBPF -> eBPF progs don't use this for
+their destruction) with call_rcu() look good to me.
+
+Since we don't know whether at the time of attaching the program, we're
+already part of a tail call map, we need to use RCU variant. However, due
+to this, there won't be severely more stress on the RCU callback queue:
+situations with above bpf_prog_get() and bpf_prog_put() combo in practice
+normally won't lead to releases, but even if they would, enough effort/
+cycles have to be put into loading a BPF program into the kernel already.
+
+Reported-by: Jann Horn <jannh@google.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

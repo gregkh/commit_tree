@@ -1,0 +1,93 @@
+rxrpc: Calls shouldn't hold socket refs
+
+rxrpc calls shouldn't hold refs on the sock struct.  This was done so that
+the socket wouldn't go away whilst the call was in progress, such that the
+call could reach the socket's queues.
+
+However, we can mark the socket as requiring an RCU release and rely on the
+RCU read lock.
+
+To make this work, we do:
+
+ (1) rxrpc_release_call() removes the call's call user ID.  This is now
+     only called from socket operations and not from the call processor:
+
+	rxrpc_accept_call() / rxrpc_kernel_accept_call()
+	rxrpc_reject_call() / rxrpc_kernel_reject_call()
+	rxrpc_kernel_end_call()
+	rxrpc_release_calls_on_socket()
+	rxrpc_recvmsg()
+
+     Though it is also called in the cleanup path of
+     rxrpc_accept_incoming_call() before we assign a user ID.
+
+ (2) Pass the socket pointer into rxrpc_release_call() rather than getting
+     it from the call so that we can get rid of uninitialised calls.
+
+ (3) Fix call processor queueing to pass a ref to the work queue and to
+     release that ref at the end of the processor function (or to pass it
+     back to the work queue if we have to requeue).
+
+ (4) Skip out of the call processor function asap if the call is complete
+     and don't requeue it if the call is complete.
+
+ (5) Clean up the call immediately that the refcount reaches 0 rather than
+     trying to defer it.  Actual deallocation is deferred to RCU, however.
+
+ (6) Don't hold socket refs for allocated calls.
+
+ (7) Use the RCU read lock when queueing a message on a socket and treat
+     the call's socket pointer according to RCU rules and check it for
+     NULL.
+
+     We also need to use the RCU read lock when viewing a call through
+     procfs.
+
+ (8) Transmit the final ACK/ABORT to a client call in rxrpc_release_call()
+     if this hasn't been done yet so that we can then disconnect the call.
+     Once the call is disconnected, it won't have any access to the
+     connection struct and the UDP socket for the call work processor to be
+     able to send the ACK.  Terminal retransmission will be handled by the
+     connection processor.
+
+ (9) Release all calls immediately on the closing of a socket rather than
+     trying to defer this.  Incomplete calls will be aborted.
+
+The call refcount model is much simplified.  Refs are held on the call by:
+
+ (1) A socket's user ID tree.
+
+ (2) A socket's incoming call secureq and acceptq.
+
+ (3) A kernel service that has a call in progress.
+
+ (4) A queued call work processor.  We have to take care to put any call
+     that we failed to queue.
+
+ (5) sk_buffs on a socket's receive queue.  A future patch will get rid of
+     this.
+
+Whilst we're at it, we can do:
+
+ (1) Get rid of the RXRPC_CALL_EV_RELEASE event.  Release is now done
+     entirely from the socket routines and never from the call's processor.
+
+ (2) Get rid of the RXRPC_CALL_DEAD state.  Calls now end in the
+     RXRPC_CALL_COMPLETE state.
+
+ (3) Get rid of the rxrpc_call::destroyer work item.  Calls are now torn
+     down when their refcount reaches 0 and then handed over to RCU for
+     final cleanup.
+
+ (4) Get rid of the rxrpc_call::deadspan timer.  Calls are cleaned up
+     immediately they're finished with and don't hang around.
+     Post-completion retransmission is handled by the connection processor
+     once the call is disconnected.
+
+ (5) Get rid of the dead call expiry setting as there's no longer a timer
+     to set.
+
+ (6) rxrpc_destroy_all_calls() can just check that the call list is empty.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+

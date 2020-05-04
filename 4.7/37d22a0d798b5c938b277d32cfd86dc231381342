@@ -1,0 +1,85 @@
+MIPS: Sync icache & dcache in set_pte_at
+
+It's possible for pages to become visible prior to update_mmu_cache
+running if a thread within the same address space preempts the current
+thread or runs simultaneously on another CPU. That is, the following
+scenario is possible:
+
+    CPU0                            CPU1
+
+    write to page
+    flush_dcache_page
+    flush_icache_page
+    set_pte_at
+                                    map page
+    update_mmu_cache
+
+If CPU1 maps the page in between CPU0's set_pte_at, which marks it valid
+& visible, and update_mmu_cache where the dcache flush occurs then CPU1s
+icache will fill from stale data (unless it fills from the dcache, in
+which case all is good, but most MIPS CPUs don't have this property).
+Commit 4d46a67a3eb8 ("MIPS: Fix race condition in lazy cache flushing.")
+attempted to fix that by performing the dcache flush in
+flush_icache_page such that it occurs before the set_pte_at call makes
+the page visible. However it has the problem that not all code that
+writes to pages exposed to userland call flush_icache_page. There are
+many callers of set_pte_at under mm/ and only 2 of them do call
+flush_icache_page. Thus the race window between a page becoming visible
+& being coherent between the icache & dcache remains open in some cases.
+
+To illustrate some of the cases, a WARN was added to __update_cache with
+this patch applied that triggered in cases where a page about to be
+flushed from the dcache was not the last page provided to
+flush_icache_page. That is, backtraces were obtained for cases in which
+the race window is left open without this patch. The 2 standout examples
+follow.
+
+When forking a process:
+
+[   15.271842] [<80417630>] __update_cache+0xcc/0x188
+[   15.277274] [<80530394>] copy_page_range+0x56c/0x6ac
+[   15.282861] [<8042936c>] copy_process.part.54+0xd40/0x17ac
+[   15.289028] [<80429f80>] do_fork+0xe4/0x420
+[   15.293747] [<80413808>] handle_sys+0x128/0x14c
+
+When exec'ing an ELF binary:
+
+[   14.445964] [<80417630>] __update_cache+0xcc/0x188
+[   14.451369] [<80538d88>] move_page_tables+0x414/0x498
+[   14.457075] [<8055d848>] setup_arg_pages+0x220/0x318
+[   14.462685] [<805b0f38>] load_elf_binary+0x530/0x12a0
+[   14.468374] [<8055ec3c>] search_binary_handler+0xbc/0x214
+[   14.474444] [<8055f6c0>] do_execveat_common+0x43c/0x67c
+[   14.480324] [<8055f938>] do_execve+0x38/0x44
+[   14.485137] [<80413808>] handle_sys+0x128/0x14c
+
+These code paths write into a page, call flush_dcache_page then call
+set_pte_at without flush_icache_page inbetween. The end result is that
+the icache can become corrupted & userland processes may execute
+unexpected or invalid code, typically resulting in a reserved
+instruction exception, a trap or a segfault.
+
+Fix this race condition fully by performing any cache maintenance
+required to keep the icache & dcache in sync in set_pte_at, before the
+page is made valid. This has the added bonus of ensuring the cache
+maintenance always happens in one location, rather than being duplicated
+in flush_icache_page & update_mmu_cache. It also matches the way other
+architectures solve the same problem (see arm, ia64 & powerpc).
+
+Signed-off-by: Paul Burton <paul.burton@imgtec.com>
+Reported-by: Ionela Voinescu <ionela.voinescu@imgtec.com>
+Cc: Lars Persson <lars.persson@axis.com>
+Fixes: 4d46a67a3eb8 ("MIPS: Fix race condition in lazy cache flushing.")
+Cc: Steven J. Hill <sjhill@realitydiluted.com>
+Cc: David Daney <david.daney@cavium.com>
+Cc: Huacai Chen <chenhc@lemote.com>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Jerome Marchand <jmarchan@redhat.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: linux-mips@linux-mips.org
+Cc: linux-kernel@vger.kernel.org
+Cc: stable <stable@vger.kernel.org> # v4.1+
+Patchwork: https://patchwork.linux-mips.org/patch/12722/
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+

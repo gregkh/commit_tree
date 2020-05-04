@@ -1,0 +1,106 @@
+drm/amdgpu: Fixup hw vblank counter/ts for new drm_update_vblank_count() (v3)
+
+commit 4dfd6486 "drm: Use vblank timestamps to guesstimate how many
+vblanks were missed" introduced in Linux 4.4-rc1 makes the drm core
+more fragile to drivers which don't update hw vblank counters and
+vblank timestamps in sync with firing of the vblank irq and
+essentially at leading edge of vblank.
+
+This exposed a problem with radeon-kms/amdgpu-kms which do not
+satisfy above requirements:
+
+The vblank irq fires a few scanlines before start of vblank, but
+programmed pageflips complete at start of vblank and
+vblank timestamps update at start of vblank, whereas the
+hw vblank counter increments only later, at start of vsync.
+
+This leads to problems like off by one errors for vblank counter
+updates, vblank counters apparently going backwards or vblank
+timestamps apparently having time going backwards. The net result
+is stuttering of graphics in games, or little hangs, as well as
+total failure of timing sensitive applications.
+
+See bug #93147 for an example of the regression on Linux 4.4-rc:
+
+https://bugs.freedesktop.org/show_bug.cgi?id=93147
+
+This patch tries to align all above events better from the
+viewpoint of the drm core / of external callers to fix the problem:
+
+1. The apparent start of vblank is shifted a few scanlines earlier,
+so the vblank irq now always happens after start of this extended
+vblank interval and thereby drm_update_vblank_count() always samples
+the updated vblank count and timestamp of the new vblank interval.
+
+To achieve this, the reporting of scanout positions by
+radeon_get_crtc_scanoutpos() now operates as if the vblank starts
+radeon_crtc->lb_vblank_lead_lines before the real start of the hw
+vblank interval. This means that the vblank timestamps which are based
+on these scanout positions will now update at this earlier start of
+vblank.
+
+2. The driver->get_vblank_counter() function will bump the returned
+vblank count as read from the hw by +1 if the query happens after
+the shifted earlier start of the vblank, but before the real hw increment
+at start of vsync, so the counter appears to increment at start of vblank
+in sync with the timestamp update.
+
+3. Calls from vblank irq-context and regular non-irq calls are now
+treated identical, always simulating the shifted vblank start, to
+avoid inconsistent results for queries happening from vblank irq vs.
+happening from drm_vblank_enable() or vblank_disable_fn().
+
+4. The radeon_flip_work_func will delay mmio programming a pageflip until
+the start of the real vblank iff it happens to execute inside the shifted
+earlier start of the vblank, so pageflips now also appear to execute at
+start of the shifted vblank, in sync with vblank counter and timestamp
+updates. This to avoid some races between updates of vblank count and
+timestamps that are used for swap scheduling and pageflip execution which
+could cause pageflips to execute before the scheduled target vblank.
+
+The lb_vblank_lead_lines "fudge" value is calculated as the size of
+the display controllers line buffer in scanlines for the given video
+mode: Vblank irq's are triggered by the line buffer logic when the line
+buffer refill for a video frame ends, ie. when the line buffer source read
+position enters the hw vblank. This means that a vblank irq could fire at
+most as many scanlines before the current reported scanout position of the
+crtc timing generator as the number of scanlines the line buffer can
+maximally hold for a given video mode.
+
+This patch has been successfully tested on a RV730 card with DCE-3 display
+engine and on a evergreen card with DCE-4 display engine, in single-display
+and dual-display configuration, with different video modes.
+
+A similar patch is needed for amdgpu-kms to fix the same problem.
+
+Limitations:
+
+- Maybe replace the udelay() in the flip_work_func() by a suitable
+  usleep_range() for a bit better efficiency? Will try that.
+
+- Line buffer sizes in pixels are hard-coded on < DCE-4 to a value
+  i just guessed to be high enough to work ok, lacking info on the true
+  sizes atm.
+
+Probably fixes: fdo#93147
+
+Port of Mario's radeon fix to amdgpu.
+
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(v1) Reviewed-by: Mario Kleiner <mario.kleiner.de@gmail.com>
+
+(v2) Refine amdgpu_flip_work_func() for better efficiency.
+
+     In amdgpu_flip_work_func, replace the busy waiting udelay(5)
+     with event lock held by a more performance and energy efficient
+     usleep_range() until at least predicted true start of hw vblank,
+     with some slack for scheduler happiness. Release the event lock
+     during waits to not delay other outputs in doing their stuff, as
+     the waiting can last up to 200 usecs in some cases.
+
+     Also small fix to code comment and formatting in that function.
+
+(v2) Signed-off-by: Mario Kleiner <mario.kleiner.de@gmail.com>
+
+(v3) Fix crash in crtc disabled case
+

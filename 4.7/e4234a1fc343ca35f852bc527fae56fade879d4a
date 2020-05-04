@@ -1,0 +1,165 @@
+kernfs: Move faulting copy_user operations outside of the mutex
+
+A fault in a user provided buffer may lead anywhere, and lockdep warns
+that we have a potential deadlock between the mm->mmap_sem and the
+kernfs file mutex:
+
+[   82.811702] ======================================================
+[   82.811705] [ INFO: possible circular locking dependency detected ]
+[   82.811709] 4.5.0-rc4-gfxbench+ #1 Not tainted
+[   82.811711] -------------------------------------------------------
+[   82.811714] kms_setmode/5859 is trying to acquire lock:
+[   82.811717]  (&dev->struct_mutex){+.+.+.}, at: [<ffffffff8150d9c1>] drm_gem_mmap+0x1a1/0x270
+[   82.811731]
+but task is already holding lock:
+[   82.811734]  (&mm->mmap_sem){++++++}, at: [<ffffffff8117b364>] vm_mmap_pgoff+0x44/0xa0
+[   82.811745]
+which lock already depends on the new lock.
+
+[   82.811749]
+the existing dependency chain (in reverse order) is:
+[   82.811752]
+-> #3 (&mm->mmap_sem){++++++}:
+[   82.811761]        [<ffffffff810cc883>] lock_acquire+0xc3/0x1d0
+[   82.811766]        [<ffffffff8118bc65>] __might_fault+0x75/0xa0
+[   82.811771]        [<ffffffff8124da4a>] kernfs_fop_write+0x8a/0x180
+[   82.811787]        [<ffffffff811d1023>] __vfs_write+0x23/0xe0
+[   82.811792]        [<ffffffff811d1d74>] vfs_write+0xa4/0x190
+[   82.811797]        [<ffffffff811d2c14>] SyS_write+0x44/0xb0
+[   82.811801]        [<ffffffff817bb81b>] entry_SYSCALL_64_fastpath+0x16/0x73
+[   82.811807]
+-> #2 (s_active#6){++++.+}:
+[   82.811814]        [<ffffffff810cc883>] lock_acquire+0xc3/0x1d0
+[   82.811819]        [<ffffffff8124c070>] __kernfs_remove+0x210/0x2f0
+[   82.811823]        [<ffffffff8124d040>] kernfs_remove_by_name_ns+0x40/0xa0
+[   82.811828]        [<ffffffff8124e9e0>] sysfs_remove_file_ns+0x10/0x20
+[   82.811832]        [<ffffffff815318d4>] device_del+0x124/0x250
+[   82.811837]        [<ffffffff81531a19>] device_unregister+0x19/0x60
+[   82.811841]        [<ffffffff8153c051>] cpu_cache_sysfs_exit+0x51/0xb0
+[   82.811846]        [<ffffffff8153c628>] cacheinfo_cpu_callback+0x38/0x70
+[   82.811851]        [<ffffffff8109ae89>] notifier_call_chain+0x39/0xa0
+[   82.811856]        [<ffffffff8109aef9>] __raw_notifier_call_chain+0x9/0x10
+[   82.811860]        [<ffffffff810786de>] cpu_notify+0x1e/0x40
+[   82.811865]        [<ffffffff81078779>] cpu_notify_nofail+0x9/0x20
+[   82.811869]        [<ffffffff81078ac3>] _cpu_down+0x233/0x340
+[   82.811874]        [<ffffffff81079019>] disable_nonboot_cpus+0xc9/0x350
+[   82.811878]        [<ffffffff810d2e11>] suspend_devices_and_enter+0x5a1/0xb50
+[   82.811883]        [<ffffffff810d3903>] pm_suspend+0x543/0x8d0
+[   82.811888]        [<ffffffff810d1b77>] state_store+0x77/0xe0
+[   82.811892]        [<ffffffff813fa68f>] kobj_attr_store+0xf/0x20
+[   82.811897]        [<ffffffff8124e740>] sysfs_kf_write+0x40/0x50
+[   82.811902]        [<ffffffff8124dafc>] kernfs_fop_write+0x13c/0x180
+[   82.811906]        [<ffffffff811d1023>] __vfs_write+0x23/0xe0
+[   82.811910]        [<ffffffff811d1d74>] vfs_write+0xa4/0x190
+[   82.811914]        [<ffffffff811d2c14>] SyS_write+0x44/0xb0
+[   82.811918]        [<ffffffff817bb81b>] entry_SYSCALL_64_fastpath+0x16/0x73
+[   82.811923]
+-> #1 (cpu_hotplug.lock){+.+.+.}:
+[   82.811929]        [<ffffffff810cc883>] lock_acquire+0xc3/0x1d0
+[   82.811933]        [<ffffffff817b6f72>] mutex_lock_nested+0x62/0x3b0
+[   82.811940]        [<ffffffff810784c1>] get_online_cpus+0x61/0x80
+[   82.811944]        [<ffffffff811170eb>] stop_machine+0x1b/0xe0
+[   82.811949]        [<ffffffffa0178edd>] gen8_ggtt_insert_entries__BKL+0x2d/0x30 [i915]
+[   82.812009]        [<ffffffffa017d3a6>] ggtt_bind_vma+0x46/0x70 [i915]
+[   82.812045]        [<ffffffffa017eb70>] i915_vma_bind+0x140/0x290 [i915]
+[   82.812081]        [<ffffffffa01862b9>] i915_gem_object_do_pin+0x899/0xb00 [i915]
+[   82.812117]        [<ffffffffa0186555>] i915_gem_object_pin+0x35/0x40 [i915]
+[   82.812154]        [<ffffffffa019a23e>] intel_init_pipe_control+0xbe/0x210 [i915]
+[   82.812192]        [<ffffffffa0197312>] intel_logical_rings_init+0xe2/0xde0 [i915]
+[   82.812232]        [<ffffffffa0186fe3>] i915_gem_init+0xf3/0x130 [i915]
+[   82.812278]        [<ffffffffa02097ed>] i915_driver_load+0xf2d/0x1770 [i915]
+[   82.812318]        [<ffffffff81512474>] drm_dev_register+0xa4/0xb0
+[   82.812323]        [<ffffffff8151467e>] drm_get_pci_dev+0xce/0x1e0
+[   82.812328]        [<ffffffffa01472cf>] i915_pci_probe+0x2f/0x50 [i915]
+[   82.812360]        [<ffffffff8143f907>] pci_device_probe+0x87/0xf0
+[   82.812366]        [<ffffffff81535f89>] driver_probe_device+0x229/0x450
+[   82.812371]        [<ffffffff81536233>] __driver_attach+0x83/0x90
+[   82.812375]        [<ffffffff81533c61>] bus_for_each_dev+0x61/0xa0
+[   82.812380]        [<ffffffff81535879>] driver_attach+0x19/0x20
+[   82.812384]        [<ffffffff8153535f>] bus_add_driver+0x1ef/0x290
+[   82.812388]        [<ffffffff81536e9b>] driver_register+0x5b/0xe0
+[   82.812393]        [<ffffffff8143e83b>] __pci_register_driver+0x5b/0x60
+[   82.812398]        [<ffffffff81514866>] drm_pci_init+0xd6/0x100
+[   82.812402]        [<ffffffffa027c094>] 0xffffffffa027c094
+[   82.812406]        [<ffffffff810003de>] do_one_initcall+0xae/0x1d0
+[   82.812412]        [<ffffffff811595a0>] do_init_module+0x5b/0x1cb
+[   82.812417]        [<ffffffff81106160>] load_module+0x1c20/0x2480
+[   82.812422]        [<ffffffff81106bae>] SyS_finit_module+0x7e/0xa0
+[   82.812428]        [<ffffffff817bb81b>] entry_SYSCALL_64_fastpath+0x16/0x73
+[   82.812433]
+-> #0 (&dev->struct_mutex){+.+.+.}:
+[   82.812439]        [<ffffffff810cbe59>] __lock_acquire+0x1fc9/0x20f0
+[   82.812443]        [<ffffffff810cc883>] lock_acquire+0xc3/0x1d0
+[   82.812456]        [<ffffffff8150d9e7>] drm_gem_mmap+0x1c7/0x270
+[   82.812460]        [<ffffffff81196a14>] mmap_region+0x334/0x580
+[   82.812466]        [<ffffffff81196fc4>] do_mmap+0x364/0x410
+[   82.812470]        [<ffffffff8117b38d>] vm_mmap_pgoff+0x6d/0xa0
+[   82.812474]        [<ffffffff811950f4>] SyS_mmap_pgoff+0x184/0x220
+[   82.812479]        [<ffffffff8100a0fd>] SyS_mmap+0x1d/0x20
+[   82.812484]        [<ffffffff817bb81b>] entry_SYSCALL_64_fastpath+0x16/0x73
+[   82.812489]
+other info that might help us debug this:
+
+[   82.812493] Chain exists of:
+  &dev->struct_mutex --> s_active#6 --> &mm->mmap_sem
+
+[   82.812502]  Possible unsafe locking scenario:
+
+[   82.812506]        CPU0                    CPU1
+[   82.812508]        ----                    ----
+[   82.812510]   lock(&mm->mmap_sem);
+[   82.812514]                                lock(s_active#6);
+[   82.812519]                                lock(&mm->mmap_sem);
+[   82.812522]   lock(&dev->struct_mutex);
+[   82.812526]
+ *** DEADLOCK ***
+
+[   82.812531] 1 lock held by kms_setmode/5859:
+[   82.812533]  #0:  (&mm->mmap_sem){++++++}, at: [<ffffffff8117b364>] vm_mmap_pgoff+0x44/0xa0
+[   82.812541]
+stack backtrace:
+[   82.812547] CPU: 0 PID: 5859 Comm: kms_setmode Not tainted 4.5.0-rc4-gfxbench+ #1
+[   82.812550] Hardware name:                  /NUC5CPYB, BIOS PYBSWCEL.86A.0040.2015.0814.1353 08/14/2015
+[   82.812553]  0000000000000000 ffff880079407bf0 ffffffff813f8505 ffffffff825fb270
+[   82.812560]  ffffffff825c4190 ffff880079407c30 ffffffff810c84ac ffff880079407c90
+[   82.812566]  ffff8800797ed328 ffff8800797ecb00 0000000000000001 ffff8800797ed350
+[   82.812573] Call Trace:
+[   82.812578]  [<ffffffff813f8505>] dump_stack+0x67/0x92
+[   82.812582]  [<ffffffff810c84ac>] print_circular_bug+0x1fc/0x310
+[   82.812586]  [<ffffffff810cbe59>] __lock_acquire+0x1fc9/0x20f0
+[   82.812590]  [<ffffffff810cc883>] lock_acquire+0xc3/0x1d0
+[   82.812594]  [<ffffffff8150d9c1>] ? drm_gem_mmap+0x1a1/0x270
+[   82.812599]  [<ffffffff8150d9e7>] drm_gem_mmap+0x1c7/0x270
+[   82.812603]  [<ffffffff8150d9c1>] ? drm_gem_mmap+0x1a1/0x270
+[   82.812608]  [<ffffffff81196a14>] mmap_region+0x334/0x580
+[   82.812612]  [<ffffffff81196fc4>] do_mmap+0x364/0x410
+[   82.812616]  [<ffffffff8117b38d>] vm_mmap_pgoff+0x6d/0xa0
+[   82.812629]  [<ffffffff811950f4>] SyS_mmap_pgoff+0x184/0x220
+[   82.812633]  [<ffffffff8100a0fd>] SyS_mmap+0x1d/0x20
+[   82.812637]  [<ffffffff817bb81b>] entry_SYSCALL_64_fastpath+0x16/0x73
+
+Highly unlikely though this scenario is, we can avoid the issue entirely
+by moving the copy operation from out under the kernfs_get_active()
+tracking by assigning the preallocated buffer its own mutex. The
+temporary buffer allocation doesn't require mutex locking as it is
+entirely local.
+
+The locked section was extended by the addition of the preallocated buf
+to speed up md user operations in
+
+commit 2b75869bba676c248d8d25ae6d2bd9221dfffdb6
+Author: NeilBrown <neilb@suse.de>
+Date:   Mon Oct 13 16:41:28 2014 +1100
+
+    sysfs/kernfs: allow attributes to request write buffer be pre-allocated.
+
+Reported-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=94350
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: NeilBrown <neilb@suse.de>
+Acked-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

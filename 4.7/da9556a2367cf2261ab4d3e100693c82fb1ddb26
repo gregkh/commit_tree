@@ -1,0 +1,242 @@
+zram: user per-cpu compression streams
+
+Remove idle streams list and keep compression streams in per-cpu data.
+This removes two contented spin_lock()/spin_unlock() calls from write
+path and also prevent write OP from being preempted while holding the
+compression stream, which can cause slow downs.
+
+For instance, let's assume that we have N cpus and N-2
+max_comp_streams.TASK1 owns the last idle stream, TASK2-TASK3 come in
+with the write requests:
+
+  TASK1            TASK2              TASK3
+ zram_bvec_write()
+  spin_lock
+  find stream
+  spin_unlock
+
+  compress
+
+  <<preempted>>   zram_bvec_write()
+                   spin_lock
+                   find stream
+                   spin_unlock
+                     no_stream
+                       schedule
+                                     zram_bvec_write()
+                                      spin_lock
+                                      find_stream
+                                      spin_unlock
+                                        no_stream
+                                          schedule
+   spin_lock
+   release stream
+   spin_unlock
+     wake up TASK2
+
+not only TASK2 and TASK3 will not get the stream, TASK1 will be
+preempted in the middle of its operation; while we would prefer it to
+finish compression and release the stream.
+
+Test environment: x86_64, 4 CPU box, 3G zram, lzo
+
+The following fio tests were executed:
+      read, randread, write, randwrite, rw, randrw
+with the increasing number of jobs from 1 to 10.
+
+                  4 streams        8 streams       per-cpu
+  ===========================================================
+  jobs1
+  READ:           2520.1MB/s       2566.5MB/s      2491.5MB/s
+  READ:           2102.7MB/s       2104.2MB/s      2091.3MB/s
+  WRITE:          1355.1MB/s       1320.2MB/s      1378.9MB/s
+  WRITE:          1103.5MB/s       1097.2MB/s      1122.5MB/s
+  READ:           434013KB/s       435153KB/s      439961KB/s
+  WRITE:          433969KB/s       435109KB/s      439917KB/s
+  READ:           403166KB/s       405139KB/s      403373KB/s
+  WRITE:          403223KB/s       405197KB/s      403430KB/s
+  jobs2
+  READ:           7958.6MB/s       8105.6MB/s      8073.7MB/s
+  READ:           6864.9MB/s       6989.8MB/s      7021.8MB/s
+  WRITE:          2438.1MB/s       2346.9MB/s      3400.2MB/s
+  WRITE:          1994.2MB/s       1990.3MB/s      2941.2MB/s
+  READ:           981504KB/s       973906KB/s      1018.8MB/s
+  WRITE:          981659KB/s       974060KB/s      1018.1MB/s
+  READ:           937021KB/s       938976KB/s      987250KB/s
+  WRITE:          934878KB/s       936830KB/s      984993KB/s
+  jobs3
+  READ:           13280MB/s        13553MB/s       13553MB/s
+  READ:           11534MB/s        11785MB/s       11755MB/s
+  WRITE:          3456.9MB/s       3469.9MB/s      4810.3MB/s
+  WRITE:          3029.6MB/s       3031.6MB/s      4264.8MB/s
+  READ:           1363.8MB/s       1362.6MB/s      1448.9MB/s
+  WRITE:          1361.9MB/s       1360.7MB/s      1446.9MB/s
+  READ:           1309.4MB/s       1310.6MB/s      1397.5MB/s
+  WRITE:          1307.4MB/s       1308.5MB/s      1395.3MB/s
+  jobs4
+  READ:           20244MB/s        20177MB/s       20344MB/s
+  READ:           17886MB/s        17913MB/s       17835MB/s
+  WRITE:          4071.6MB/s       4046.1MB/s      6370.2MB/s
+  WRITE:          3608.9MB/s       3576.3MB/s      5785.4MB/s
+  READ:           1824.3MB/s       1821.6MB/s      1997.5MB/s
+  WRITE:          1819.8MB/s       1817.4MB/s      1992.5MB/s
+  READ:           1765.7MB/s       1768.3MB/s      1937.3MB/s
+  WRITE:          1767.5MB/s       1769.1MB/s      1939.2MB/s
+  jobs5
+  READ:           18663MB/s        18986MB/s       18823MB/s
+  READ:           16659MB/s        16605MB/s       16954MB/s
+  WRITE:          3912.4MB/s       3888.7MB/s      6126.9MB/s
+  WRITE:          3506.4MB/s       3442.5MB/s      5519.3MB/s
+  READ:           1798.2MB/s       1746.5MB/s      1935.8MB/s
+  WRITE:          1792.7MB/s       1740.7MB/s      1929.1MB/s
+  READ:           1727.6MB/s       1658.2MB/s      1917.3MB/s
+  WRITE:          1726.5MB/s       1657.2MB/s      1916.6MB/s
+  jobs6
+  READ:           21017MB/s        20922MB/s       21162MB/s
+  READ:           19022MB/s        19140MB/s       18770MB/s
+  WRITE:          3968.2MB/s       4037.7MB/s      6620.8MB/s
+  WRITE:          3643.5MB/s       3590.2MB/s      6027.5MB/s
+  READ:           1871.8MB/s       1880.5MB/s      2049.9MB/s
+  WRITE:          1867.8MB/s       1877.2MB/s      2046.2MB/s
+  READ:           1755.8MB/s       1710.3MB/s      1964.7MB/s
+  WRITE:          1750.5MB/s       1705.9MB/s      1958.8MB/s
+  jobs7
+  READ:           21103MB/s        20677MB/s       21482MB/s
+  READ:           18522MB/s        18379MB/s       19443MB/s
+  WRITE:          4022.5MB/s       4067.4MB/s      6755.9MB/s
+  WRITE:          3691.7MB/s       3695.5MB/s      5925.6MB/s
+  READ:           1841.5MB/s       1933.9MB/s      2090.5MB/s
+  WRITE:          1842.7MB/s       1935.3MB/s      2091.9MB/s
+  READ:           1832.4MB/s       1856.4MB/s      1971.5MB/s
+  WRITE:          1822.3MB/s       1846.2MB/s      1960.6MB/s
+  jobs8
+  READ:           20463MB/s        20194MB/s       20862MB/s
+  READ:           18178MB/s        17978MB/s       18299MB/s
+  WRITE:          4085.9MB/s       4060.2MB/s      7023.8MB/s
+  WRITE:          3776.3MB/s       3737.9MB/s      6278.2MB/s
+  READ:           1957.6MB/s       1944.4MB/s      2109.5MB/s
+  WRITE:          1959.2MB/s       1946.2MB/s      2111.4MB/s
+  READ:           1900.6MB/s       1885.7MB/s      2082.1MB/s
+  WRITE:          1896.2MB/s       1881.4MB/s      2078.3MB/s
+  jobs9
+  READ:           19692MB/s        19734MB/s       19334MB/s
+  READ:           17678MB/s        18249MB/s       17666MB/s
+  WRITE:          4004.7MB/s       4064.8MB/s      6990.7MB/s
+  WRITE:          3724.7MB/s       3772.1MB/s      6193.6MB/s
+  READ:           1953.7MB/s       1967.3MB/s      2105.6MB/s
+  WRITE:          1953.4MB/s       1966.7MB/s      2104.1MB/s
+  READ:           1860.4MB/s       1897.4MB/s      2068.5MB/s
+  WRITE:          1858.9MB/s       1895.9MB/s      2066.8MB/s
+  jobs10
+  READ:           19730MB/s        19579MB/s       19492MB/s
+  READ:           18028MB/s        18018MB/s       18221MB/s
+  WRITE:          4027.3MB/s       4090.6MB/s      7020.1MB/s
+  WRITE:          3810.5MB/s       3846.8MB/s      6426.8MB/s
+  READ:           1956.1MB/s       1994.6MB/s      2145.2MB/s
+  WRITE:          1955.9MB/s       1993.5MB/s      2144.8MB/s
+  READ:           1852.8MB/s       1911.6MB/s      2075.8MB/s
+  WRITE:          1855.7MB/s       1914.6MB/s      2078.1MB/s
+
+perf stat
+
+                                  4 streams                       8 streams                       per-cpu
+  ====================================================================================================================
+  jobs1
+  stalled-cycles-frontend      23,174,811,209 (  38.21%)     23,220,254,188 (  38.25%)       23,061,406,918 (  38.34%)
+  stalled-cycles-backend       11,514,174,638 (  18.98%)     11,696,722,657 (  19.27%)       11,370,852,810 (  18.90%)
+  instructions                 73,925,005,782 (    1.22)     73,903,177,632 (    1.22)       73,507,201,037 (    1.22)
+  branches                     14,455,124,835 ( 756.063)     14,455,184,779 ( 755.281)       14,378,599,509 ( 758.546)
+  branch-misses                    69,801,336 (   0.48%)         80,225,529 (   0.55%)           72,044,726 (   0.50%)
+  jobs2
+  stalled-cycles-frontend      49,912,741,782 (  46.11%)     50,101,189,290 (  45.95%)       32,874,195,633 (  35.11%)
+  stalled-cycles-backend       27,080,366,230 (  25.02%)     27,949,970,232 (  25.63%)       16,461,222,706 (  17.58%)
+  instructions                122,831,629,690 (    1.13)    122,919,846,419 (    1.13)      121,924,786,775 (    1.30)
+  branches                     23,725,889,239 ( 692.663)     23,733,547,140 ( 688.062)       23,553,950,311 ( 794.794)
+  branch-misses                    90,733,041 (   0.38%)         96,320,895 (   0.41%)           84,561,092 (   0.36%)
+  jobs3
+  stalled-cycles-frontend      66,437,834,608 (  45.58%)     63,534,923,344 (  43.69%)       42,101,478,505 (  33.19%)
+  stalled-cycles-backend       34,940,799,661 (  23.97%)     34,774,043,148 (  23.91%)       21,163,324,388 (  16.68%)
+  instructions                171,692,121,862 (    1.18)    171,775,373,044 (    1.18)      170,353,542,261 (    1.34)
+  branches                     32,968,962,622 ( 628.723)     32,987,739,894 ( 630.512)       32,729,463,918 ( 717.027)
+  branch-misses                   111,522,732 (   0.34%)        110,472,894 (   0.33%)           99,791,291 (   0.30%)
+  jobs4
+  stalled-cycles-frontend      98,741,701,675 (  49.72%)     94,797,349,965 (  47.59%)       54,535,655,381 (  33.53%)
+  stalled-cycles-backend       54,642,609,615 (  27.51%)     55,233,554,408 (  27.73%)       27,882,323,541 (  17.14%)
+  instructions                220,884,807,851 (    1.11)    220,930,887,273 (    1.11)      218,926,845,851 (    1.35)
+  branches                     42,354,518,180 ( 592.105)     42,362,770,587 ( 590.452)       41,955,552,870 ( 716.154)
+  branch-misses                   138,093,449 (   0.33%)        131,295,286 (   0.31%)          121,794,771 (   0.29%)
+  jobs5
+  stalled-cycles-frontend     116,219,747,212 (  48.14%)    110,310,397,012 (  46.29%)       66,373,082,723 (  33.70%)
+  stalled-cycles-backend       66,325,434,776 (  27.48%)     64,157,087,914 (  26.92%)       32,999,097,299 (  16.76%)
+  instructions                270,615,008,466 (    1.12)    270,546,409,525 (    1.14)      268,439,910,948 (    1.36)
+  branches                     51,834,046,557 ( 599.108)     51,811,867,722 ( 608.883)       51,412,576,077 ( 729.213)
+  branch-misses                   158,197,086 (   0.31%)        142,639,805 (   0.28%)          133,425,455 (   0.26%)
+  jobs6
+  stalled-cycles-frontend     138,009,414,492 (  48.23%)    139,063,571,254 (  48.80%)       75,278,568,278 (  32.80%)
+  stalled-cycles-backend       79,211,949,650 (  27.68%)     79,077,241,028 (  27.75%)       37,735,797,899 (  16.44%)
+  instructions                319,763,993,731 (    1.12)    319,937,782,834 (    1.12)      316,663,600,784 (    1.38)
+  branches                     61,219,433,294 ( 595.056)     61,250,355,540 ( 598.215)       60,523,446,617 ( 733.706)
+  branch-misses                   169,257,123 (   0.28%)        154,898,028 (   0.25%)          141,180,587 (   0.23%)
+  jobs7
+  stalled-cycles-frontend     162,974,812,119 (  49.20%)    159,290,061,987 (  48.43%)       88,046,641,169 (  33.21%)
+  stalled-cycles-backend       92,223,151,661 (  27.84%)     91,667,904,406 (  27.87%)       44,068,454,971 (  16.62%)
+  instructions                369,516,432,430 (    1.12)    369,361,799,063 (    1.12)      365,290,380,661 (    1.38)
+  branches                     70,795,673,950 ( 594.220)     70,743,136,124 ( 597.876)       69,803,996,038 ( 732.822)
+  branch-misses                   181,708,327 (   0.26%)        165,767,821 (   0.23%)          150,109,797 (   0.22%)
+  jobs8
+  stalled-cycles-frontend     185,000,017,027 (  49.30%)    182,334,345,473 (  48.37%)       99,980,147,041 (  33.26%)
+  stalled-cycles-backend      105,753,516,186 (  28.18%)    107,937,830,322 (  28.63%)       51,404,177,181 (  17.10%)
+  instructions                418,153,161,055 (    1.11)    418,308,565,828 (    1.11)      413,653,475,581 (    1.38)
+  branches                     80,035,882,398 ( 592.296)     80,063,204,510 ( 589.843)       79,024,105,589 ( 730.530)
+  branch-misses                   199,764,528 (   0.25%)        177,936,926 (   0.22%)          160,525,449 (   0.20%)
+  jobs9
+  stalled-cycles-frontend     210,941,799,094 (  49.63%)    204,714,679,254 (  48.55%)      114,251,113,756 (  33.96%)
+  stalled-cycles-backend      122,640,849,067 (  28.85%)    122,188,553,256 (  28.98%)       58,360,041,127 (  17.35%)
+  instructions                468,151,025,415 (    1.10)    467,354,869,323 (    1.11)      462,665,165,216 (    1.38)
+  branches                     89,657,067,510 ( 585.628)     89,411,550,407 ( 588.990)       88,360,523,943 ( 730.151)
+  branch-misses                   218,292,301 (   0.24%)        191,701,247 (   0.21%)          178,535,678 (   0.20%)
+  jobs10
+  stalled-cycles-frontend     233,595,958,008 (  49.81%)    227,540,615,689 (  49.11%)      160,341,979,938 (  43.07%)
+  stalled-cycles-backend      136,153,676,021 (  29.03%)    133,635,240,742 (  28.84%)       65,909,135,465 (  17.70%)
+  instructions                517,001,168,497 (    1.10)    516,210,976,158 (    1.11)      511,374,038,613 (    1.37)
+  branches                     98,911,641,329 ( 585.796)     98,700,069,712 ( 591.583)       97,646,761,028 ( 728.712)
+  branch-misses                   232,341,823 (   0.23%)        199,256,308 (   0.20%)          183,135,268 (   0.19%)
+
+per-cpu streams tend to cause significantly less stalled cycles; execute
+less branches and hit less branch-misses.
+
+perf stat reported execution time
+
+                          4 streams        8 streams       per-cpu
+  ====================================================================
+  jobs1
+  seconds elapsed        20.909073870     20.875670495    20.817838540
+  jobs2
+  seconds elapsed        18.529488399     18.720566469    16.356103108
+  jobs3
+  seconds elapsed        18.991159531     18.991340812    16.766216066
+  jobs4
+  seconds elapsed        19.560643828     19.551323547    16.246621715
+  jobs5
+  seconds elapsed        24.746498464     25.221646740    20.696112444
+  jobs6
+  seconds elapsed        28.258181828     28.289765505    22.885688857
+  jobs7
+  seconds elapsed        32.632490241     31.909125381    26.272753738
+  jobs8
+  seconds elapsed        35.651403851     36.027596308    29.108024711
+  jobs9
+  seconds elapsed        40.569362365     40.024227989    32.898204012
+  jobs10
+  seconds elapsed        44.673112304     43.874898137    35.632952191
+
+Please see
+  Link: http://marc.info/?l=linux-kernel&m=146166970727530
+  Link: http://marc.info/?l=linux-kernel&m=146174716719650
+for more test results (under low memory conditions).
+
+Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Suggested-by: Minchan Kim <minchan@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

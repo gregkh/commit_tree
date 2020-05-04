@@ -1,0 +1,115 @@
+sparc64: Fix return from trap window fill crashes.
+
+We must handle data access exception as well as memory address unaligned
+exceptions from return from trap window fill faults, not just normal
+TLB misses.
+
+Otherwise we can get an OOPS that looks like this:
+
+ld-linux.so.2(36808): Kernel bad sw trap 5 [#1]
+CPU: 1 PID: 36808 Comm: ld-linux.so.2 Not tainted 4.6.0 #34
+task: fff8000303be5c60 ti: fff8000301344000 task.ti: fff8000301344000
+TSTATE: 0000004410001601 TPC: 0000000000a1a784 TNPC: 0000000000a1a788 Y: 00000002    Not tainted
+TPC: <do_sparc64_fault+0x5c4/0x700>
+g0: fff8000024fc8248 g1: 0000000000db04dc g2: 0000000000000000 g3: 0000000000000001
+g4: fff8000303be5c60 g5: fff800030e672000 g6: fff8000301344000 g7: 0000000000000001
+o0: 0000000000b95ee8 o1: 000000000000012b o2: 0000000000000000 o3: 0000000200b9b358
+o4: 0000000000000000 o5: fff8000301344040 sp: fff80003013475c1 ret_pc: 0000000000a1a77c
+RPC: <do_sparc64_fault+0x5bc/0x700>
+l0: 00000000000007ff l1: 0000000000000000 l2: 000000000000005f l3: 0000000000000000
+l4: fff8000301347e98 l5: fff8000024ff3060 l6: 0000000000000000 l7: 0000000000000000
+i0: fff8000301347f60 i1: 0000000000102400 i2: 0000000000000000 i3: 0000000000000000
+i4: 0000000000000000 i5: 0000000000000000 i6: fff80003013476a1 i7: 0000000000404d4c
+I7: <user_rtt_fill_fixup+0x6c/0x7c>
+Call Trace:
+ [0000000000404d4c] user_rtt_fill_fixup+0x6c/0x7c
+
+The window trap handlers are slightly clever, the trap table entries for them are
+composed of two pieces of code.  First comes the code that actually performs
+the window fill or spill trap handling, and then there are three instructions at
+the end which are for exception processing.
+
+The userland register window fill handler is:
+
+	add	%sp, STACK_BIAS + 0x00, %g1;		\
+	ldxa	[%g1 + %g0] ASI, %l0;			\
+	mov	0x08, %g2;				\
+	mov	0x10, %g3;				\
+	ldxa	[%g1 + %g2] ASI, %l1;			\
+	mov	0x18, %g5;				\
+	ldxa	[%g1 + %g3] ASI, %l2;			\
+	ldxa	[%g1 + %g5] ASI, %l3;			\
+	add	%g1, 0x20, %g1;				\
+	ldxa	[%g1 + %g0] ASI, %l4;			\
+	ldxa	[%g1 + %g2] ASI, %l5;			\
+	ldxa	[%g1 + %g3] ASI, %l6;			\
+	ldxa	[%g1 + %g5] ASI, %l7;			\
+	add	%g1, 0x20, %g1;				\
+	ldxa	[%g1 + %g0] ASI, %i0;			\
+	ldxa	[%g1 + %g2] ASI, %i1;			\
+	ldxa	[%g1 + %g3] ASI, %i2;			\
+	ldxa	[%g1 + %g5] ASI, %i3;			\
+	add	%g1, 0x20, %g1;				\
+	ldxa	[%g1 + %g0] ASI, %i4;			\
+	ldxa	[%g1 + %g2] ASI, %i5;			\
+	ldxa	[%g1 + %g3] ASI, %i6;			\
+	ldxa	[%g1 + %g5] ASI, %i7;			\
+	restored;					\
+	retry; nop; nop; nop; nop;			\
+	b,a,pt	%xcc, fill_fixup_dax;			\
+	b,a,pt	%xcc, fill_fixup_mna;			\
+	b,a,pt	%xcc, fill_fixup;
+
+And the way this works is that if any of those memory accesses
+generate an exception, the exception handler can revector to one of
+those final three branch instructions depending upon which kind of
+exception the memory access took.  In this way, the fault handler
+doesn't have to know if it was a spill or a fill that it's handling
+the fault for.  It just always branches to the last instruction in
+the parent trap's handler.
+
+For example, for a regular fault, the code goes:
+
+winfix_trampoline:
+	rdpr	%tpc, %g3
+	or	%g3, 0x7c, %g3
+	wrpr	%g3, %tnpc
+	done
+
+All window trap handlers are 0x80 aligned, so if we "or" 0x7c into the
+trap time program counter, we'll get that final instruction in the
+trap handler.
+
+On return from trap, we have to pull the register window in but we do
+this by hand instead of just executing a "restore" instruction for
+several reasons.  The largest being that from Niagara and onward we
+simply don't have enough levels in the trap stack to fully resolve all
+possible exception cases of a window fault when we are already at
+trap level 1 (which we enter to get ready to return from the original
+trap).
+
+This is executed inline via the FILL_*_RTRAP handlers.  rtrap_64.S's
+code branches directly to these to do the window fill by hand if
+necessary.  Now if you look at them, we'll see at the end:
+
+	    ba,a,pt    %xcc, user_rtt_fill_fixup;
+	    ba,a,pt    %xcc, user_rtt_fill_fixup;
+	    ba,a,pt    %xcc, user_rtt_fill_fixup;
+
+And oops, all three cases are handled like a fault.
+
+This doesn't work because each of these trap types (data access
+exception, memory address unaligned, and faults) store their auxiliary
+info in different registers to pass on to the C handler which does the
+real work.
+
+So in the case where the stack was unaligned, the unaligned trap
+handler sets up the arg registers one way, and then we branched to
+the fault handler which expects them setup another way.
+
+So the FAULT_TYPE_* value ends up basically being garbage, and
+randomly would generate the backtrace seen above.
+
+Reported-by: Nick Alcock <nix@esperi.org.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

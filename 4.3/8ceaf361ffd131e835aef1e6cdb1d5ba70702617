@@ -1,0 +1,243 @@
+net: netcp: fix deadlock reported by lockup detector
+
+A deadlock trace is seen in netcp driver with lockup detector enabled.
+The trace log is provided below for reference. This patch fixes the
+bug by removing the usage of netcp_modules_lock within ndo_ops functions.
+ndo_{open/close/ioctl)() is already called with rtnl_lock held. So there
+is no need to hold another mutex for serialization across processes on
+multiple cores.  So remove use of netcp_modules_lock mutex from these
+ndo ops functions.
+
+ndo_set_rx_mode() shouldn't be using a mutex as it is called from atomic
+context. In the case of ndo_set_rx_mode(), there can be call to this API
+without rtnl_lock held from an atomic context. As the underlying modules
+are expected to add address to a hardware table, it is to be protected
+across concurrent updates and hence a spin lock is used to synchronize
+the access. Same with ndo_vlan_rx_add_vid() & ndo_vlan_rx_kill_vid().
+
+Probably the netcp_modules_lock is used to protect the module not being
+removed as part of rmmod. Currently this is not fully implemented and
+assumes the interface is brought down before doing rmmod of modules.
+The support for rmmmod while interface is up is expected in a future
+patch set when additional modules such as pa, qos are added. For now
+all of the tests such as if up/down, reboot, iperf works fine with this
+patch applied.
+
+Deadlock trace seen with lockup detector enabled is shown below for
+reference.
+
+[   16.863014] ======================================================
+[   16.869183] [ INFO: possible circular locking dependency detected ]
+[   16.875441] 4.1.6-01265-gfb1e101 #1 Tainted: G        W
+[   16.881176] -------------------------------------------------------
+[   16.887432] ifconfig/1662 is trying to acquire lock:
+[   16.892386]  (netcp_modules_lock){+.+.+.}, at: [<c03e8110>]
+netcp_ndo_open+0x168/0x518
+[   16.900321]
+[   16.900321] but task is already holding lock:
+[   16.906144]  (rtnl_mutex){+.+.+.}, at: [<c053a418>] devinet_ioctl+0xf8/0x7e4
+[   16.913206]
+[   16.913206] which lock already depends on the new lock.
+[   16.913206]
+[   16.921372]
+[   16.921372] the existing dependency chain (in reverse order) is:
+[   16.928844]
+-> #1 (rtnl_mutex){+.+.+.}:
+[   16.932865]        [<c06023f0>] mutex_lock_nested+0x68/0x4a8
+[   16.938521]        [<c04c5758>] register_netdev+0xc/0x24
+[   16.943831]        [<c03e65c0>] netcp_module_probe+0x214/0x2ec
+[   16.949660]        [<c03e8a54>] netcp_register_module+0xd4/0x140
+[   16.955663]        [<c089654c>] keystone_gbe_init+0x10/0x28
+[   16.961233]        [<c000977c>] do_one_initcall+0xb8/0x1f8
+[   16.966714]        [<c0867e04>] kernel_init_freeable+0x148/0x1e8
+[   16.972720]        [<c05f9994>] kernel_init+0xc/0xe8
+[   16.977682]        [<c0010038>] ret_from_fork+0x14/0x3c
+[   16.982905]
+-> #0 (netcp_modules_lock){+.+.+.}:
+[   16.987619]        [<c006eab0>] lock_acquire+0x118/0x320
+[   16.992928]        [<c06023f0>] mutex_lock_nested+0x68/0x4a8
+[   16.998582]        [<c03e8110>] netcp_ndo_open+0x168/0x518
+[   17.004064]        [<c04c48f0>] __dev_open+0xa8/0x10c
+[   17.009112]        [<c04c4b74>] __dev_change_flags+0x94/0x144
+[   17.014853]        [<c04c4c3c>] dev_change_flags+0x18/0x48
+[   17.020334]        [<c053a9fc>] devinet_ioctl+0x6dc/0x7e4
+[   17.025729]        [<c04a59ec>] sock_ioctl+0x1d0/0x2a8
+[   17.030865]        [<c0142844>] do_vfs_ioctl+0x41c/0x688
+[   17.036173]        [<c0142ae4>] SyS_ioctl+0x34/0x5c
+[   17.041046]        [<c000ff60>] ret_fast_syscall+0x0/0x54
+[   17.046441]
+[   17.046441] other info that might help us debug this:
+[   17.046441]
+[   17.054434]  Possible unsafe locking scenario:
+[   17.054434]
+[   17.060343]        CPU0                    CPU1
+[   17.064862]        ----                    ----
+[   17.069381]   lock(rtnl_mutex);
+[   17.072522]                                lock(netcp_modules_lock);
+[   17.078875]                                lock(rtnl_mutex);
+[   17.084532]   lock(netcp_modules_lock);
+[   17.088366]
+[   17.088366]  *** DEADLOCK ***
+[   17.088366]
+[   17.094279] 1 lock held by ifconfig/1662:
+[   17.098278]  #0:  (rtnl_mutex){+.+.+.}, at: [<c053a418>]
+devinet_ioctl+0xf8/0x7e4
+[   17.105774]
+[   17.105774] stack backtrace:
+[   17.110124] CPU: 1 PID: 1662 Comm: ifconfig Tainted: G        W
+4.1.6-01265-gfb1e101 #1
+[   17.118637] Hardware name: Keystone
+[   17.122123] [<c00178e4>] (unwind_backtrace) from [<c0013cbc>]
+(show_stack+0x10/0x14)
+[   17.129862] [<c0013cbc>] (show_stack) from [<c05ff450>]
+(dump_stack+0x84/0xc4)
+[   17.137079] [<c05ff450>] (dump_stack) from [<c0068e34>]
+(print_circular_bug+0x210/0x330)
+[   17.145161] [<c0068e34>] (print_circular_bug) from [<c006ab7c>]
+(validate_chain.isra.35+0xf98/0x13ac)
+[   17.154372] [<c006ab7c>] (validate_chain.isra.35) from [<c006da60>]
+(__lock_acquire+0x52c/0xcc0)
+[   17.163149] [<c006da60>] (__lock_acquire) from [<c006eab0>]
+(lock_acquire+0x118/0x320)
+[   17.171058] [<c006eab0>] (lock_acquire) from [<c06023f0>]
+(mutex_lock_nested+0x68/0x4a8)
+[   17.179140] [<c06023f0>] (mutex_lock_nested) from [<c03e8110>]
+(netcp_ndo_open+0x168/0x518)
+[   17.187484] [<c03e8110>] (netcp_ndo_open) from [<c04c48f0>]
+(__dev_open+0xa8/0x10c)
+[   17.195133] [<c04c48f0>] (__dev_open) from [<c04c4b74>]
+(__dev_change_flags+0x94/0x144)
+[   17.203129] [<c04c4b74>] (__dev_change_flags) from [<c04c4c3c>]
+(dev_change_flags+0x18/0x48)
+[   17.211560] [<c04c4c3c>] (dev_change_flags) from [<c053a9fc>]
+(devinet_ioctl+0x6dc/0x7e4)
+[   17.219729] [<c053a9fc>] (devinet_ioctl) from [<c04a59ec>]
+(sock_ioctl+0x1d0/0x2a8)
+[   17.227378] [<c04a59ec>] (sock_ioctl) from [<c0142844>]
+(do_vfs_ioctl+0x41c/0x688)
+[   17.234939] [<c0142844>] (do_vfs_ioctl) from [<c0142ae4>]
+(SyS_ioctl+0x34/0x5c)
+[   17.242242] [<c0142ae4>] (SyS_ioctl) from [<c000ff60>]
+(ret_fast_syscall+0x0/0x54)
+[   17.258855] netcp-1.0 2620110.netcp eth0: Link is Up - 1Gbps/Full - flow
+control off
+[   17.271282] BUG: sleeping function called from invalid context at
+kernel/locking/mutex.c:616
+[   17.279712] in_atomic(): 1, irqs_disabled(): 0, pid: 1662, name: ifconfig
+[   17.286500] INFO: lockdep is turned off.
+[   17.290413] Preemption disabled at:[<  (null)>]   (null)
+[   17.295728]
+[   17.297214] CPU: 1 PID: 1662 Comm: ifconfig Tainted: G        W
+4.1.6-01265-gfb1e101 #1
+[   17.305735] Hardware name: Keystone
+[   17.309223] [<c00178e4>] (unwind_backtrace) from [<c0013cbc>]
+(show_stack+0x10/0x14)
+[   17.316970] [<c0013cbc>] (show_stack) from [<c05ff450>]
+(dump_stack+0x84/0xc4)
+[   17.324194] [<c05ff450>] (dump_stack) from [<c06023b0>]
+(mutex_lock_nested+0x28/0x4a8)
+[   17.332112] [<c06023b0>] (mutex_lock_nested) from [<c03e9840>]
+(netcp_set_rx_mode+0x160/0x210)
+[   17.340724] [<c03e9840>] (netcp_set_rx_mode) from [<c04c483c>]
+(dev_set_rx_mode+0x1c/0x28)
+[   17.348982] [<c04c483c>] (dev_set_rx_mode) from [<c04c490c>]
+(__dev_open+0xc4/0x10c)
+[   17.356724] [<c04c490c>] (__dev_open) from [<c04c4b74>]
+(__dev_change_flags+0x94/0x144)
+[   17.364729] [<c04c4b74>] (__dev_change_flags) from [<c04c4c3c>]
+(dev_change_flags+0x18/0x48)
+[   17.373166] [<c04c4c3c>] (dev_change_flags) from [<c053a9fc>]
+(devinet_ioctl+0x6dc/0x7e4)
+[   17.381344] [<c053a9fc>] (devinet_ioctl) from [<c04a59ec>]
+(sock_ioctl+0x1d0/0x2a8)
+[   17.388994] [<c04a59ec>] (sock_ioctl) from [<c0142844>]
+(do_vfs_ioctl+0x41c/0x688)
+[   17.396563] [<c0142844>] (do_vfs_ioctl) from [<c0142ae4>]
+(SyS_ioctl+0x34/0x5c)
+[   17.403873] [<c0142ae4>] (SyS_ioctl) from [<c000ff60>]
+(ret_fast_syscall+0x0/0x54)
+[   17.413772] IPv6: ADDRCONF(NETDEV_UP): eth0: link is not ready
+udhcpc (v1.20.2) started
+Sending discover...
+[   18.690666] netcp-1.0 2620110.netcp eth0: Link is Up - 1Gbps/Full - flow
+control off
+Sending discover...
+[   22.250972] netcp-1.0 2620110.netcp eth0: Link is Up - 1Gbps/Full - flow
+control off
+[   22.258721] IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready
+[   22.265458] BUG: sleeping function called from invalid context at
+kernel/locking/mutex.c:616
+[   22.273896] in_atomic(): 1, irqs_disabled(): 0, pid: 342, name: kworker/1:1
+[   22.280854] INFO: lockdep is turned off.
+[   22.284767] Preemption disabled at:[<  (null)>]   (null)
+[   22.290074]
+[   22.291568] CPU: 1 PID: 342 Comm: kworker/1:1 Tainted: G        W
+4.1.6-01265-gfb1e101 #1
+[   22.300255] Hardware name: Keystone
+[   22.303750] Workqueue: ipv6_addrconf addrconf_dad_work
+[   22.308895] [<c00178e4>] (unwind_backtrace) from [<c0013cbc>]
+(show_stack+0x10/0x14)
+[   22.316643] [<c0013cbc>] (show_stack) from [<c05ff450>]
+(dump_stack+0x84/0xc4)
+[   22.323867] [<c05ff450>] (dump_stack) from [<c06023b0>]
+(mutex_lock_nested+0x28/0x4a8)
+[   22.331786] [<c06023b0>] (mutex_lock_nested) from [<c03e9840>]
+(netcp_set_rx_mode+0x160/0x210)
+[   22.340394] [<c03e9840>] (netcp_set_rx_mode) from [<c04c9d18>]
+(__dev_mc_add+0x54/0x68)
+[   22.348401] [<c04c9d18>] (__dev_mc_add) from [<c05ab358>]
+(igmp6_group_added+0x168/0x1b4)
+[   22.356580] [<c05ab358>] (igmp6_group_added) from [<c05ad2cc>]
+(ipv6_dev_mc_inc+0x4f0/0x5a8)
+[   22.365019] [<c05ad2cc>] (ipv6_dev_mc_inc) from [<c058f0d0>]
+(addrconf_dad_work+0x21c/0x33c)
+[   22.373460] [<c058f0d0>] (addrconf_dad_work) from [<c0042850>]
+(process_one_work+0x214/0x8d0)
+[   22.381986] [<c0042850>] (process_one_work) from [<c0042f54>]
+(worker_thread+0x48/0x4bc)
+[   22.390071] [<c0042f54>] (worker_thread) from [<c004868c>]
+(kthread+0xf0/0x108)
+[   22.397381] [<c004868c>] (kthread) from [<c0010038>]
+
+Trace related to incorrect usage of mutex inside ndo_set_rx_mode
+
+[   24.086066] BUG: sleeping function called from invalid context at
+kernel/locking/mutex.c:616
+[   24.094506] in_atomic(): 1, irqs_disabled(): 0, pid: 1682, name: ifconfig
+[   24.101291] INFO: lockdep is turned off.
+[   24.105203] Preemption disabled at:[<  (null)>]   (null)
+[   24.110511]
+[   24.112005] CPU: 2 PID: 1682 Comm: ifconfig Tainted: G        W
+4.1.6-01265-gfb1e101 #1
+[   24.120518] Hardware name: Keystone
+[   24.124018] [<c00178e4>] (unwind_backtrace) from [<c0013cbc>]
+(show_stack+0x10/0x14)
+[   24.131772] [<c0013cbc>] (show_stack) from [<c05ff450>]
+(dump_stack+0x84/0xc4)
+[   24.138989] [<c05ff450>] (dump_stack) from [<c06023b0>]
+(mutex_lock_nested+0x28/0x4a8)
+[   24.146908] [<c06023b0>] (mutex_lock_nested) from [<c03e9840>]
+(netcp_set_rx_mode+0x160/0x210)
+[   24.155523] [<c03e9840>] (netcp_set_rx_mode) from [<c04c483c>]
+(dev_set_rx_mode+0x1c/0x28)
+[   24.163787] [<c04c483c>] (dev_set_rx_mode) from [<c04c490c>]
+(__dev_open+0xc4/0x10c)
+[   24.171531] [<c04c490c>] (__dev_open) from [<c04c4b74>]
+(__dev_change_flags+0x94/0x144)
+[   24.179528] [<c04c4b74>] (__dev_change_flags) from [<c04c4c3c>]
+(dev_change_flags+0x18/0x48)
+[   24.187966] [<c04c4c3c>] (dev_change_flags) from [<c053a9fc>]
+(devinet_ioctl+0x6dc/0x7e4)
+[   24.196145] [<c053a9fc>] (devinet_ioctl) from [<c04a59ec>]
+(sock_ioctl+0x1d0/0x2a8)
+[   24.203803] [<c04a59ec>] (sock_ioctl) from [<c0142844>]
+(do_vfs_ioctl+0x41c/0x688)
+[   24.211373] [<c0142844>] (do_vfs_ioctl) from [<c0142ae4>]
+(SyS_ioctl+0x34/0x5c)
+[   24.218676] [<c0142ae4>] (SyS_ioctl) from [<c000ff60>]
+(ret_fast_syscall+0x0/0x54)
+[   24.227156] IPv6: ADDRCONF(NETDEV_UP): eth1: link is not ready
+
+Signed-off-by: Murali Karicheri <m-karicheri2@ti.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

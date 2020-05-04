@@ -1,0 +1,158 @@
+Btrfs: fix stale dir entries after removing a link and fsync
+
+We have one more case where after a log tree is replayed we get
+inconsistent metadata leading to stale directory entries, due to
+some directories having entries pointing to some inode while the
+inode does not have a matching BTRFS_INODE_[REF|EXTREF]_KEY item.
+
+To trigger the problem we need to have a file with multiple hard links
+belonging to different parent directories. Then if one of those hard
+links is removed and we fsync the file using one of its other links
+that belongs to a different parent directory, we end up not logging
+the fact that the removed hard link doesn't exists anymore in the
+parent directory.
+
+Simple reproducer:
+
+  seq=`basename $0`
+  seqres=$RESULT_DIR/$seq
+  echo "QA output created by $seq"
+  tmp=/tmp/$$
+  status=1	# failure is the default!
+  trap "_cleanup; exit \$status" 0 1 2 3 15
+
+  _cleanup()
+  {
+      _cleanup_flakey
+      rm -f $tmp.*
+  }
+
+  # get standard environment, filters and checks
+  . ./common/rc
+  . ./common/filter
+  . ./common/dmflakey
+
+  # real QA test starts here
+  _need_to_be_root
+  _supported_fs generic
+  _supported_os Linux
+  _require_scratch
+  _require_dm_flakey
+  _require_metadata_journaling $SCRATCH_DEV
+
+  rm -f $seqres.full
+
+  _scratch_mkfs >>$seqres.full 2>&1
+  _init_flakey
+  _mount_flakey
+
+  # Create our test directory and file.
+  mkdir $SCRATCH_MNT/testdir
+  touch $SCRATCH_MNT/foo
+  ln $SCRATCH_MNT/foo $SCRATCH_MNT/testdir/foo2
+  ln $SCRATCH_MNT/foo $SCRATCH_MNT/testdir/foo3
+
+  # Make sure everything done so far is durably persisted.
+  sync
+
+  # Now we remove one of our file's hardlinks in the directory testdir.
+  unlink $SCRATCH_MNT/testdir/foo3
+
+  # We now fsync our file using the "foo" link, which has a parent that
+  # is not the directory "testdir".
+  $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foo
+
+  # Silently drop all writes and unmount to simulate a crash/power
+  # failure.
+  _load_flakey_table $FLAKEY_DROP_WRITES
+  _unmount_flakey
+
+  # Allow writes again, mount to trigger journal/log replay.
+  _load_flakey_table $FLAKEY_ALLOW_WRITES
+  _mount_flakey
+
+  # After the journal/log is replayed we expect to not see the "foo3"
+  # link anymore and we should be able to remove all names in the
+  # directory "testdir" and then remove it (no stale directory entries
+  # left after the journal/log replay).
+  echo "Entries in testdir:"
+  ls -1 $SCRATCH_MNT/testdir
+
+  rm -f $SCRATCH_MNT/testdir/*
+  rmdir $SCRATCH_MNT/testdir
+
+  _unmount_flakey
+
+  status=0
+  exit
+
+The test fails with:
+
+  $ ./check generic/107
+  FSTYP         -- btrfs
+  PLATFORM      -- Linux/x86_64 debian3 4.1.0-rc6-btrfs-next-11+
+  MKFS_OPTIONS  -- /dev/sdc
+  MOUNT_OPTIONS -- /dev/sdc /home/fdmanana/btrfs-tests/scratch_1
+
+  generic/107 3s ... - output mismatch (see .../results/generic/107.out.bad)
+    --- tests/generic/107.out	2015-08-01 01:39:45.807462161 +0100
+    +++ /home/fdmanana/git/hub/xfstests/results//generic/107.out.bad
+    @@ -1,3 +1,5 @@
+     QA output created by 107
+     Entries in testdir:
+     foo2
+    +foo3
+    +rmdir: failed to remove '/home/fdmanana/btrfs-tests/scratch_1/testdir': Directory not empty
+    ...
+    _check_btrfs_filesystem: filesystem on /dev/sdc is inconsistent \
+      (see /home/fdmanana/git/hub/xfstests/results//generic/107.full)
+    _check_dmesg: something found in dmesg (see .../results/generic/107.dmesg)
+  Ran: generic/107
+  Failures: generic/107
+  Failed 1 of 1 tests
+
+  $ cat /home/fdmanana/git/hub/xfstests/results//generic/107.full
+  (...)
+  checking fs roots
+  root 5 inode 257 errors 200, dir isize wrong
+	unresolved ref dir 257 index 3 namelen 4 name foo3 filetype 1 errors 5, no dir item, no inode ref
+  (...)
+
+And produces the following warning in dmesg:
+
+  [127298.759064] BTRFS info (device dm-0): failed to delete reference to foo3, inode 258 parent 257
+  [127298.762081] ------------[ cut here ]------------
+  [127298.763311] WARNING: CPU: 10 PID: 7891 at fs/btrfs/inode.c:3956 __btrfs_unlink_inode+0x182/0x35a [btrfs]()
+  [127298.767327] BTRFS: Transaction aborted (error -2)
+  (...)
+  [127298.788611] Call Trace:
+  [127298.789137]  [<ffffffff8145f077>] dump_stack+0x4f/0x7b
+  [127298.790090]  [<ffffffff81095de5>] ? console_unlock+0x356/0x3a2
+  [127298.791157]  [<ffffffff8104b3b0>] warn_slowpath_common+0xa1/0xbb
+  [127298.792323]  [<ffffffffa065ad09>] ? __btrfs_unlink_inode+0x182/0x35a [btrfs]
+  [127298.793633]  [<ffffffff8104b410>] warn_slowpath_fmt+0x46/0x48
+  [127298.794699]  [<ffffffffa065ad09>] __btrfs_unlink_inode+0x182/0x35a [btrfs]
+  [127298.797640]  [<ffffffffa065be8f>] btrfs_unlink_inode+0x1e/0x40 [btrfs]
+  [127298.798876]  [<ffffffffa065bf11>] btrfs_unlink+0x60/0x9b [btrfs]
+  [127298.800154]  [<ffffffff8116fb48>] vfs_unlink+0x9c/0xed
+  [127298.801303]  [<ffffffff81173481>] do_unlinkat+0x12b/0x1fb
+  [127298.802450]  [<ffffffff81253855>] ? lockdep_sys_exit_thunk+0x12/0x14
+  [127298.803797]  [<ffffffff81174056>] SyS_unlinkat+0x29/0x2b
+  [127298.805017]  [<ffffffff81465197>] system_call_fastpath+0x12/0x6f
+  [127298.806310] ---[ end trace bbfddacb7aaada7b ]---
+  [127298.807325] BTRFS warning (device dm-0): __btrfs_unlink_inode:3956: Aborting unused transaction(No such entry).
+
+So fix this by logging all parent inodes, current and old ones, to make
+sure we do not get stale entries after log replay. This is not a simple
+solution such as triggering a full transaction commit because it would
+imply full transaction commit when an inode is fsynced in the same
+transaction that modified it and reloaded it after eviction (because its
+last_unlink_trans is set to the same value as its last_trans as of the
+commit with the title "Btrfs: fix stale dir entries after unlink, inode
+eviction and fsync"), and it would also make fstest generic/066 fail
+since one of the fsyncs triggers a full commit and the next fsync will
+not find the inode in the log anymore (therefore not removing the xattr).
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

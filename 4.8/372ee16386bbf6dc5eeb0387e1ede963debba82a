@@ -1,0 +1,129 @@
+rxrpc: Fix races between skb free, ACK generation and replying
+
+Inside the kafs filesystem it is possible to occasionally have a call
+processed and terminated before we've had a chance to check whether we need
+to clean up the rx queue for that call because afs_send_simple_reply() ends
+the call when it is done, but this is done in a workqueue item that might
+happen to run to completion before afs_deliver_to_call() completes.
+
+Further, it is possible for rxrpc_kernel_send_data() to be called to send a
+reply before the last request-phase data skb is released.  The rxrpc skb
+destructor is where the ACK processing is done and the call state is
+advanced upon release of the last skb.  ACK generation is also deferred to
+a work item because it's possible that the skb destructor is not called in
+a context where kernel_sendmsg() can be invoked.
+
+To this end, the following changes are made:
+
+ (1) kernel_rxrpc_data_consumed() is added.  This should be called whenever
+     an skb is emptied so as to crank the ACK and call states.  This does
+     not release the skb, however.  kernel_rxrpc_free_skb() must now be
+     called to achieve that.  These together replace
+     rxrpc_kernel_data_delivered().
+
+ (2) kernel_rxrpc_data_consumed() is wrapped by afs_data_consumed().
+
+     This makes afs_deliver_to_call() easier to work as the skb can simply
+     be discarded unconditionally here without trying to work out what the
+     return value of the ->deliver() function means.
+
+     The ->deliver() functions can, via afs_data_complete(),
+     afs_transfer_reply() and afs_extract_data() mark that an skb has been
+     consumed (thereby cranking the state) without the need to
+     conditionally free the skb to make sure the state is correct on an
+     incoming call for when the call processor tries to send the reply.
+
+ (3) rxrpc_recvmsg() now has to call kernel_rxrpc_data_consumed() when it
+     has finished with a packet and MSG_PEEK isn't set.
+
+ (4) rxrpc_packet_destructor() no longer calls rxrpc_hard_ACK_data().
+
+     Because of this, we no longer need to clear the destructor and put the
+     call before we free the skb in cases where we don't want the ACK/call
+     state to be cranked.
+
+ (5) The ->deliver() call-type callbacks are made to return -EAGAIN rather
+     than 0 if they expect more data (afs_extract_data() returns -EAGAIN to
+     the delivery function already), and the caller is now responsible for
+     producing an abort if that was the last packet.
+
+ (6) There are many bits of unmarshalling code where:
+
+ 		ret = afs_extract_data(call, skb, last, ...);
+		switch (ret) {
+		case 0:		break;
+		case -EAGAIN:	return 0;
+		default:	return ret;
+		}
+
+     is to be found.  As -EAGAIN can now be passed back to the caller, we
+     now just return if ret < 0:
+
+ 		ret = afs_extract_data(call, skb, last, ...);
+		if (ret < 0)
+			return ret;
+
+ (7) Checks for trailing data and empty final data packets has been
+     consolidated as afs_data_complete().  So:
+
+		if (skb->len > 0)
+			return -EBADMSG;
+		if (!last)
+			return 0;
+
+     becomes:
+
+		ret = afs_data_complete(call, skb, last);
+		if (ret < 0)
+			return ret;
+
+ (8) afs_transfer_reply() now checks the amount of data it has against the
+     amount of data desired and the amount of data in the skb and returns
+     an error to induce an abort if we don't get exactly what we want.
+
+Without these changes, the following oops can occasionally be observed,
+particularly if some printks are inserted into the delivery path:
+
+general protection fault: 0000 [#1] SMP
+Modules linked in: kafs(E) af_rxrpc(E) [last unloaded: af_rxrpc]
+CPU: 0 PID: 1305 Comm: kworker/u8:3 Tainted: G            E   4.7.0-fsdevel+ #1303
+Hardware name: ASUS All Series/H97-PLUS, BIOS 2306 10/09/2014
+Workqueue: kafsd afs_async_workfn [kafs]
+task: ffff88040be041c0 ti: ffff88040c070000 task.ti: ffff88040c070000
+RIP: 0010:[<ffffffff8108fd3c>]  [<ffffffff8108fd3c>] __lock_acquire+0xcf/0x15a1
+RSP: 0018:ffff88040c073bc0  EFLAGS: 00010002
+RAX: 6b6b6b6b6b6b6b6b RBX: 0000000000000000 RCX: ffff88040d29a710
+RDX: 0000000000000000 RSI: 0000000000000000 RDI: ffff88040d29a710
+RBP: ffff88040c073c70 R08: 0000000000000001 R09: 0000000000000001
+R10: 0000000000000001 R11: 0000000000000000 R12: 0000000000000000
+R13: 0000000000000000 R14: ffff88040be041c0 R15: ffffffff814c928f
+FS:  0000000000000000(0000) GS:ffff88041fa00000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00007fa4595f4750 CR3: 0000000001c14000 CR4: 00000000001406f0
+Stack:
+ 0000000000000006 000000000be04930 0000000000000000 ffff880400000000
+ ffff880400000000 ffffffff8108f847 ffff88040be041c0 ffffffff81050446
+ ffff8803fc08a920 ffff8803fc08a958 ffff88040be041c0 ffff88040c073c38
+Call Trace:
+ [<ffffffff8108f847>] ? mark_held_locks+0x5e/0x74
+ [<ffffffff81050446>] ? __local_bh_enable_ip+0x9b/0xa1
+ [<ffffffff8108f9ca>] ? trace_hardirqs_on_caller+0x16d/0x189
+ [<ffffffff810915f4>] lock_acquire+0x122/0x1b6
+ [<ffffffff810915f4>] ? lock_acquire+0x122/0x1b6
+ [<ffffffff814c928f>] ? skb_dequeue+0x18/0x61
+ [<ffffffff81609dbf>] _raw_spin_lock_irqsave+0x35/0x49
+ [<ffffffff814c928f>] ? skb_dequeue+0x18/0x61
+ [<ffffffff814c928f>] skb_dequeue+0x18/0x61
+ [<ffffffffa009aa92>] afs_deliver_to_call+0x344/0x39d [kafs]
+ [<ffffffffa009ab37>] afs_process_async_call+0x4c/0xd5 [kafs]
+ [<ffffffffa0099e9c>] afs_async_workfn+0xe/0x10 [kafs]
+ [<ffffffff81063a3a>] process_one_work+0x29d/0x57c
+ [<ffffffff81064ac2>] worker_thread+0x24a/0x385
+ [<ffffffff81064878>] ? rescuer_thread+0x2d0/0x2d0
+ [<ffffffff810696f5>] kthread+0xf3/0xfb
+ [<ffffffff8160a6ff>] ret_from_fork+0x1f/0x40
+ [<ffffffff81069602>] ? kthread_create_on_node+0x1cf/0x1cf
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

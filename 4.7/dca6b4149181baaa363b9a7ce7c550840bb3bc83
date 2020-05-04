@@ -1,0 +1,54 @@
+Yama: fix double-spinlock and user access in atomic context
+
+Commit 8a56038c2aef ("Yama: consolidate error reporting") causes lockups
+when someone hits a Yama denial. Call chain:
+
+process_vm_readv -> process_vm_rw -> process_vm_rw_core -> mm_access
+-> ptrace_may_access
+task_lock(...) is taken
+__ptrace_may_access -> security_ptrace_access_check
+-> yama_ptrace_access_check -> report_access -> kstrdup_quotable_cmdline
+-> get_cmdline -> access_process_vm -> get_task_mm
+task_lock(...) is taken again
+
+task_lock(p) just calls spin_lock(&p->alloc_lock), so at this point,
+spin_lock() is called on a lock that is already held by the current
+process.
+
+Also: Since the alloc_lock is a spinlock, sleeping inside
+security_ptrace_access_check hooks is probably not allowed at all? So it's
+not even possible to print the cmdline from in there because that might
+involve paging in userspace memory.
+
+It would be tempting to rewrite ptrace_may_access() to drop the alloc_lock
+before calling the LSM, but even then, ptrace_may_access() itself might be
+called from various contexts in which you're not allowed to sleep; for
+example, as far as I understand, to be able to hold a reference to another
+task, usually an RCU read lock will be taken (see e.g. kcmp() and
+get_robust_list()), so that also prohibits sleeping. (And using e.g. FUSE,
+a user can cause pagefault handling to take arbitrary amounts of time -
+see https://bugs.chromium.org/p/project-zero/issues/detail?id=808.)
+
+Therefore, AFAIK, in order to print the name of a process below
+security_ptrace_access_check(), you'd have to either grab a reference to
+the mm_struct and defer the access violation reporting or just use the
+"comm" value that's stored in kernelspace and accessible without big
+complications. (Or you could try to use some kind of atomic remote VM
+access that fails if the memory isn't paged in, similar to
+copy_from_user_inatomic(), and if necessary fall back to comm, but
+that'd be kind of ugly because the comm/cmdline choice would look
+pretty random to the user.)
+
+Fix it by deferring reporting of the access violation until current
+exits kernelspace the next time.
+
+v2: Don't oops on PTRACE_TRACEME, call report_access under
+task_lock(current). Also fix nonsensical comment. And don't use
+GPF_ATOMIC for memory allocation with no locks held.
+This patch is tested both for ptrace attach and ptrace traceme.
+
+Fixes: 8a56038c2aef ("Yama: consolidate error reporting")
+Signed-off-by: Jann Horn <jann@thejh.net>
+Acked-by: Kees Cook <keescook@chromium.org>
+Signed-off-by: James Morris <james.l.morris@oracle.com>
+

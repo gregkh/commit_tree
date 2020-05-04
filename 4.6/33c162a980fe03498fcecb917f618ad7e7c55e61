@@ -1,0 +1,88 @@
+ipv6: datagram: Update dst cache of a connected datagram sk during pmtu update
+
+There is a case in connected UDP socket such that
+getsockopt(IPV6_MTU) will return a stale MTU value. The reproducible
+sequence could be the following:
+1. Create a connected UDP socket
+2. Send some datagrams out
+3. Receive a ICMPV6_PKT_TOOBIG
+4. No new outgoing datagrams to trigger the sk_dst_check()
+   logic to update the sk->sk_dst_cache.
+5. getsockopt(IPV6_MTU) returns the mtu from the invalid
+   sk->sk_dst_cache instead of the newly created RTF_CACHE clone.
+
+This patch updates the sk->sk_dst_cache for a connected datagram sk
+during pmtu-update code path.
+
+Note that the sk->sk_v6_daddr is used to do the route lookup
+instead of skb->data (i.e. iph).  It is because a UDP socket can become
+connected after sending out some datagrams in un-connected state.  or
+It can be connected multiple times to different destinations.  Hence,
+iph may not be related to where sk is currently connected to.
+
+It is done under '!sock_owned_by_user(sk)' condition because
+the user may make another ip6_datagram_connect()  (i.e changing
+the sk->sk_v6_daddr) while dst lookup is happening in the pmtu-update
+code path.
+
+For the sock_owned_by_user(sk) == true case, the next patch will
+introduce a release_cb() which will update the sk->sk_dst_cache.
+
+Test:
+
+Server (Connected UDP Socket):
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Route Details:
+[root@arch-fb-vm1 ~]# ip -6 r show | egrep '2fac'
+2fac::/64 dev eth0  proto kernel  metric 256  pref medium
+2fac:face::/64 via 2fac::face dev eth0  metric 1024  pref medium
+
+A simple python code to create a connected UDP socket:
+
+import socket
+import errno
+
+HOST = '2fac::1'
+PORT = 8080
+
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind((HOST, PORT))
+s.connect(('2fac:face::face', 53))
+print("connected")
+while True:
+    try:
+	data = s.recv(1024)
+    except socket.error as se:
+	if se.errno == errno.EMSGSIZE:
+		pmtu = s.getsockopt(41, 24)
+		print("PMTU:%d" % pmtu)
+		break
+s.close()
+
+Python program output after getting a ICMPV6_PKT_TOOBIG:
+[root@arch-fb-vm1 ~]# python2 ~/devshare/kernel/tasks/fib6/udp-connect-53-8080.py
+connected
+PMTU:1300
+
+Cache routes after recieving TOOBIG:
+[root@arch-fb-vm1 ~]# ip -6 r show table cache
+2fac:face::face via 2fac::face dev eth0  metric 0
+    cache  expires 463sec mtu 1300 pref medium
+
+Client (Send the ICMPV6_PKT_TOOBIG):
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+scapy is used to generate the TOOBIG message.  Here is the scapy script I have
+used:
+
+>>> p=Ether(src='da:75:4d:36:ac:32', dst='52:54:00:12:34:66', type=0x86dd)/IPv6(src='2fac::face', dst='2fac::1')/ICMPv6PacketTooBig(mtu=1300)/IPv6(src='2fac::
+1',dst='2fac:face::face', nh='UDP')/UDP(sport=8080,dport=53)
+>>> sendp(p, iface='qemubr0')
+
+Fixes: 45e4fd26683c ("ipv6: Only create RTF_CACHE routes after encountering pmtu exception")
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Reported-by: Wei Wang <weiwan@google.com>
+Cc: Cong Wang <xiyou.wangcong@gmail.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Wei Wang <weiwan@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

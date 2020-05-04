@@ -1,0 +1,66 @@
+mm: memcontrol: fix cgroup creation failure after many small jobs
+
+The memory controller has quite a bit of state that usually outlives the
+cgroup and pins its CSS until said state disappears.  At the same time
+it imposes a 16-bit limit on the CSS ID space to economically store IDs
+in the wild.  Consequently, when we use cgroups to contain frequent but
+small and short-lived jobs that leave behind some page cache, we quickly
+run into the 64k limitations of outstanding CSSs.  Creating a new cgroup
+fails with -ENOSPC while there are only a few, or even no user-visible
+cgroups in existence.
+
+Although pinning CSSs past cgroup removal is common, there are only two
+instances that actually need an ID after a cgroup is deleted: cache
+shadow entries and swapout records.
+
+Cache shadow entries reference the ID weakly and can deal with the CSS
+having disappeared when it's looked up later.  They pose no hurdle.
+
+Swap-out records do need to pin the css to hierarchically attribute
+swapins after the cgroup has been deleted; though the only pages that
+remain swapped out after offlining are tmpfs/shmem pages.  And those
+references are under the user's control, so they are manageable.
+
+This patch introduces a private 16-bit memcg ID and switches swap and
+cache shadow entries over to using that.  This ID can then be recycled
+after offlining when the CSS remains pinned only by objects that don't
+specifically need it.
+
+This script demonstrates the problem by faulting one cache page in a new
+cgroup and deleting it again:
+
+  set -e
+  mkdir -p pages
+  for x in `seq 128000`; do
+    [ $((x % 1000)) -eq 0 ] && echo $x
+    mkdir /cgroup/foo
+    echo $$ >/cgroup/foo/cgroup.procs
+    echo trex >pages/$x
+    echo $$ >/cgroup/cgroup.procs
+    rmdir /cgroup/foo
+  done
+
+When run on an unpatched kernel, we eventually run out of possible IDs
+even though there are no visible cgroups:
+
+  [root@ham ~]# ./cssidstress.sh
+  [...]
+  65000
+  mkdir: cannot create directory '/cgroup/foo': No space left on device
+
+After this patch, the IDs get released upon cgroup destruction and the
+cache and css objects get released once memory reclaim kicks in.
+
+[hannes@cmpxchg.org: init the IDR]
+  Link: http://lkml.kernel.org/r/20160621154601.GA22431@cmpxchg.org
+Fixes: b2052564e66d ("mm: memcontrol: continue cache reclaim from offlined groups")
+Link: http://lkml.kernel.org/r/20160617162516.GD19084@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reported-by: John Garcia <john.garcia@mesosphere.io>
+Reviewed-by: Vladimir Davydov <vdavydov@virtuozzo.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Cc: Nikolay Borisov <kernel@kyup.com>
+Cc: <stable@vger.kernel.org>	[3.19+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

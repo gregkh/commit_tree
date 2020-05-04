@@ -1,0 +1,68 @@
+mm: vma_merge: fix vm_page_prot SMP race condition against rmap_walk
+
+The rmap_walk can access vm_page_prot (and potentially vm_flags in the
+pte/pmd manipulations).  So it's not safe to wait the caller to update
+the vm_page_prot/vm_flags after vma_merge returned potentially removing
+the "next" vma and extending the "current" vma over the
+next->vm_start,vm_end range, but still with the "current" vma
+vm_page_prot, after releasing the rmap locks.
+
+The vm_page_prot/vm_flags must be transferred from the "next" vma to the
+current vma while vma_merge still holds the rmap locks.
+
+The side effect of this race condition is pte corruption during migrate
+as remove_migration_ptes when run on a address of the "next" vma that
+got removed, used the vm_page_prot of the current vma.
+
+  migrate   	      	        mprotect
+  ------------			-------------
+  migrating in "next" vma
+				vma_merge() # removes "next" vma and
+			        	    # extends "current" vma
+					    # current vma is not with
+					    # vm_page_prot updated
+  remove_migration_ptes
+  read vm_page_prot of current "vma"
+  establish pte with wrong permissions
+				vm_set_page_prot(vma) # too late!
+				change_protection in the old vma range
+				only, next range is not updated
+
+This caused segmentation faults and potentially memory corruption in
+heavy mprotect loads with some light page migration caused by compaction
+in the background.
+
+Hugh Dickins pointed out the comment about the Odd case 8 in vma_merge
+which confirms the case 8 is only buggy one where the race can trigger,
+in all other vma_merge cases the above cannot happen.
+
+This fix removes the oddness factor from case 8 and it converts it from:
+
+      AAAA
+  PPPPNNNNXXXX -> PPPPNNNNNNNN
+
+to:
+
+      AAAA
+  PPPPNNNNXXXX -> PPPPXXXXXXXX
+
+XXXX has the right vma properties for the whole merged vma returned by
+vma_adjust, so it solves the problem fully.  It has the added benefits
+that the callers could stop updating vma properties when vma_merge
+succeeds however the callers are not updated by this patch (there are
+bits like VM_SOFTDIRTY that still need special care for the whole range,
+as the vma merging ignores them, but as long as they're not processed by
+rmap walks and instead they're accessed with the mmap_sem at least for
+reading, they are fine not to be updated within vma_adjust before
+releasing the rmap_locks).
+
+Link: http://lkml.kernel.org/r/1474309513-20313-1-git-send-email-aarcange@redhat.com
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Reported-by: Aditya Mandaleeka <adityam@microsoft.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Jan Vorlicek <janvorli@microsoft.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,127 @@
+x86/ptrace: Fix the TIF_FORCED_TF logic in handle_signal()
+
+When the TIF_SINGLESTEP tracee dequeues a signal,
+handle_signal() clears TIF_FORCED_TF and X86_EFLAGS_TF but
+leaves TIF_SINGLESTEP set.
+
+If the tracer does PTRACE_SINGLESTEP again, enable_single_step()
+sets X86_EFLAGS_TF but not TIF_FORCED_TF.  This means that the
+subsequent PTRACE_CONT doesn't not clear X86_EFLAGS_TF, and the
+tracee gets the wrong SIGTRAP.
+
+Test-case (needs -O2 to avoid prologue insns in signal handler):
+
+	#include <unistd.h>
+	#include <stdio.h>
+	#include <sys/ptrace.h>
+	#include <sys/wait.h>
+	#include <sys/user.h>
+	#include <assert.h>
+	#include <stddef.h>
+
+	void handler(int n)
+	{
+		asm("nop");
+	}
+
+	int child(void)
+	{
+		assert(ptrace(PTRACE_TRACEME, 0,0,0) == 0);
+		signal(SIGALRM, handler);
+		kill(getpid(), SIGALRM);
+		return 0x23;
+	}
+
+	void *getip(int pid)
+	{
+		return (void*)ptrace(PTRACE_PEEKUSER, pid,
+					offsetof(struct user, regs.rip), 0);
+	}
+
+	int main(void)
+	{
+		int pid, status;
+
+		pid = fork();
+		if (!pid)
+			return child();
+
+		assert(wait(&status) == pid);
+		assert(WIFSTOPPED(status) && WSTOPSIG(status) == SIGALRM);
+
+		assert(ptrace(PTRACE_SINGLESTEP, pid, 0, SIGALRM) == 0);
+		assert(wait(&status) == pid);
+		assert(WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP);
+		assert((getip(pid) - (void*)handler) == 0);
+
+		assert(ptrace(PTRACE_SINGLESTEP, pid, 0, SIGALRM) == 0);
+		assert(wait(&status) == pid);
+		assert(WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP);
+		assert((getip(pid) - (void*)handler) == 1);
+
+		assert(ptrace(PTRACE_CONT, pid, 0,0) == 0);
+		assert(wait(&status) == pid);
+		assert(WIFEXITED(status) && WEXITSTATUS(status) == 0x23);
+
+		return 0;
+	}
+
+The last assert() fails because PTRACE_CONT wrongly triggers
+another single-step and X86_EFLAGS_TF can't be cleared by
+debugger until the tracee does sys_rt_sigreturn().
+
+Change handle_signal() to do user_disable_single_step() if
+stepping, we do not need to preserve TIF_SINGLESTEP because we
+are going to do ptrace_notify(), and it is simply wrong to leak
+this bit.
+
+While at it, change the comment to explain why we also need to
+clear TF unconditionally after setup_rt_frame().
+
+Note: in the longer term we should probably change
+setup_sigcontext() to use get_flags() and then just remove this
+user_disable_single_step().  And, the state of TIF_FORCED_TF can
+be wrong after restore_sigcontext() which can set/clear TF, this
+needs another fix.
+
+This fix fixes the 'single_step_syscall_32' testcase in
+the x86 testsuite:
+
+Before:
+
+	~/linux/tools/testing/selftests/x86> ./single_step_syscall_32
+	[RUN]   Set TF and check nop
+	[OK]    Survived with TF set and 9 traps
+	[RUN]   Set TF and check int80
+	[OK]    Survived with TF set and 9 traps
+	[RUN]   Set TF and check a fast syscall
+	[WARN]  Hit 10000 SIGTRAPs with si_addr 0xf7789cc0, ip 0xf7789cc0
+	Trace/breakpoint trap (core dumped)
+
+After:
+
+	~/linux/linux/tools/testing/selftests/x86> ./single_step_syscall_32
+	[RUN]   Set TF and check nop
+	[OK]    Survived with TF set and 9 traps
+	[RUN]   Set TF and check int80
+	[OK]    Survived with TF set and 9 traps
+	[RUN]   Set TF and check a fast syscall
+	[OK]    Survived with TF set and 39 traps
+	[RUN]   Fast syscall with TF cleared
+	[OK]    Nothing unexpected happened
+
+Reported-by: Evan Teran <eteran@alum.rit.edu>
+Reported-by: Pedro Alves <palves@redhat.com>
+Tested-by: Andres Freund <andres@anarazel.de>
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Brian Gerst <brgerst@gmail.com>
+Cc: Denys Vlasenko <dvlasenk@redhat.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+[ Added x86 self-test info. ]
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

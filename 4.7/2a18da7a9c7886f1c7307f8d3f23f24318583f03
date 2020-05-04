@@ -1,0 +1,84 @@
+fs/namei.c: Improve dcache hash function
+
+Patch 0fed3ac866 improved the hash mixing, but the function is slower
+than necessary; there's a 7-instruction dependency chain (10 on x86)
+each loop iteration.
+
+Word-at-a-time access is a very tight loop (which is good, because
+link_path_walk() is one of the hottest code paths in the entire kernel),
+and the hash mixing function must not have a longer latency to avoid
+slowing it down.
+
+There do not appear to be any published fast hash functions that:
+1) Operate on the input a word at a time, and
+2) Don't need to know the length of the input beforehand, and
+3) Have a single iterated mixing function, not needing conditional
+   branches or unrolling to distinguish different loop iterations.
+
+One of the algorithms which comes closest is Yann Collet's xxHash, but
+that's two dependent multiplies per word, which is too much.
+
+The key insights in this design are:
+
+1) Barring expensive ops like multiplies, to diffuse one input bit
+   across 64 bits of hash state takes at least log2(64) = 6 sequentially
+   dependent instructions.  That is more cycles than we'd like.
+2) An operation like "hash ^= hash << 13" requires a second temporary
+   register anyway, and on a 2-operand machine like x86, it's three
+   instructions.
+3) A better use of a second register is to hold a two-word hash state.
+   With careful design, no temporaries are needed at all, so it doesn't
+   increase register pressure.  And this gets rid of register copying
+   on 2-operand machines, so the code is smaller and faster.
+4) Using two words of state weakens the requirement for one-round mixing;
+   we now have two rounds of mixing before cancellation is possible.
+5) A two-word hash state also allows operations on both halves to be
+   done in parallel, so on a superscalar processor we get more mixing
+   in fewer cycles.
+
+I ended up using a mixing function inspired by the ChaCha and Speck
+round functions.  It is 6 simple instructions and 3 cycles per iteration
+(assuming multiply by 9 can be done by an "lea" instruction):
+
+		x ^= *input++;
+	y ^= x;	x = ROL(x, K1);
+	x += y;	y = ROL(y, K2);
+	y *= 9;
+
+Not only is this reversible, two consecutive rounds are reversible:
+if you are given the initial and final states, but not the intermediate
+state, it is possible to compute both input words.  This means that at
+least 3 words of input are required to create a collision.
+
+(It also has the property, used by hash_name() to avoid a branch, that
+it hashes all-zero to all-zero.)
+
+The rotate constants K1 and K2 were found by experiment.  The search took
+a sample of random initial states (I used 1023) and considered the effect
+of flipping each of the 64 input bits on each of the 128 output bits two
+rounds later.  Each of the 8192 pairs can be considered a biased coin, and
+adding up the Shannon entropy of all of them produces a score.
+
+The best-scoring shifts also did well in other tests (flipping bits in y,
+trying 3 or 4 rounds of mixing, flipping all 64*63/2 pairs of input bits),
+so the choice was made with the additional constraint that the sum of the
+shifts is odd and not too close to the word size.
+
+The final state is then folded into a 32-bit hash value by a less carefully
+optimized multiply-based scheme.  This also has to be fast, as pathname
+components tend to be short (the most common case is one iteration!), but
+there's some room for latency, as there is a fair bit of intervening logic
+before the hash value is used for anything.
+
+(Performance verified with "bonnie++ -s 0 -n 1536:-2" on tmpfs.  I need
+a better benchmark; the numbers seem to show a slight dip in performance
+between 4.6.0 and this patch, but they're too noisy to quote.)
+
+Special thanks to Bruce fields for diligent testing which uncovered a
+nasty fencepost error in an earlier version of this patch.
+
+[checkpatch.pl formatting complaints noted and respectfully disagreed with.]
+
+Signed-off-by: George Spelvin <linux@sciencehorizons.net>
+Tested-by: J. Bruce Fields <bfields@redhat.com>
+

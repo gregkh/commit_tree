@@ -1,0 +1,123 @@
+staging: unisys: visorhba: correct scsi task mgmt completion handling
+
+This patch is necessary to enable ANY task mgmt command to complete
+successfully via visorhba.
+
+When issuing a task mgmt command (CMD_SCSITASKMGMT_TYPE) to the IO
+partition (back-end), forward_taskmgmt_command() includes pointers
+within the command area that will be used to wake up the issuing
+process and provide the result when the command completes:
+
+    cmdrsp->scsitaskmgmt.notify_handle = (u64)&notifyevent;
+    cmdrsp->scsitaskmgmt.notifyresult_handle = (u64)&notifyresult;
+
+'notify_handle' is a pointer to a 'wait_queue_head_t' variable, and
+'notifyresult' is a pointer to an int.  Both of these are just local
+stack variables in the issuing process.
+
+The way it's supposed to happen is that when the IO partition completes
+the command, in our completion handling we get copies of those pointers
+back from the IO partition, where we stash the result of the command at
+'*notifyresult' (which should not be 0xffff, because that is the initial
+value that the caller is looking to see a change in), and wake up the
+wait queue at '*notify_handle'.  There are several places we do that dance,
+but prior to this patch, we always do it WRONG, like:
+
+    cmdrsp->scsitaskmgmt.notifyresult_handle = TASK_MGMT_FAILED;
+    wake_up_all((wait_queue_head_t *)cmdrsp->scsitaskmgmt.notify_handle);
+
+The wake_up_all() part is correct (albeit with the help of the sloppy
+pointer casting, but that's irrelevant to the bug), but the assignment of
+'notifyresult_handle' is WRONG, and SHOULD read:
+
+    *(int *)(cmdrsp->scsitaskmgmt.notifyresult_handle) = TASK_MGMT_FAILED;
+
+Without this change, the caller is NEVER going to notice a change in his
+local value of 'notifyresult' when he does the:
+
+    if (!wait_event_timeout(notifyevent, notifyresult != 0xffff,
+                            msecs_to_jiffies(45000)))
+
+and hence will be timing out EVERY taskmgmt command.
+
+This patch also eliminates the need for sloppy casting of pointers
+back-and-forth between u64 values, with the help of idr_alloc() to provide
+handles for us.  It is the generated int handles we pass to the IO
+partition to denote our completion context, and these are validated and
+converted back to the required pointers when the task mgmt commands are
+returned back to us by the IO partition.
+
+== Testing ==
+
+You must enable dynamic debugging in visorhba (build kernel with
+'CONFIG_DYNAMIC_DEBUG=y', provide kernel parameter 'visorhba.dyndbg=+p')
+to see kernel messages involved with visorhba scsi task mgmt commands,
+which were added in this patch in the form of a few dev_dbg() / pr_debug()
+messages.
+
+In order to inject faults necessary to get visorhba to actully issue scsi
+task mgmt commands, you will need to compile a kernel with
+CONFIG_FAIL_IO_TIMEOUT and friends, in the "Kernel hacking" section:
+* Enable "Fault-injection framework"
+  * Enable "Fault-injection capability for disk IO"
+  * Enable "Fault-injection capability for faking disk interrupts"
+* Enable "Debugfs entries for fault-injection capabilities"
+
+When running a kernel with those options, you can manually inject a fault
+that will force a scsi task mgmt command to be issued like this:
+
+    # mount -t debugfs nodev /sys/kernel/debug
+    # cd /sys/kernel/debug/fail_io_timeout
+    # cat interval
+    1
+    # cat probability
+    0
+    # cat times
+    1
+    # echo 100 >probability
+    # cd /sys/block/sda
+    # l | grep fail
+    -rw-r--r--  1 root root 4096 May  5 10:53 io-timeout-fail
+    -rw-r--r--  1 root root 4096 May  5 10:54 make-it-fail
+    # echo 1 >io-timeout-fail
+    # echo 1 >make-it-fail
+
+To test this patch, after performing the above steps, I did something to
+force a block device i/o, then shortly afterwards examined the kernel log.
+There I found evidence that visorhba had successfully issued a task mgmt
+command, and that it completed successfully:
+
+    [  333.352612] FAULT_INJECTION: forcing a failure.
+    name fail_io_timeout, interval 1, probability 100, space 0, times 1
+    [  333.352617] CPU: 0 PID: 295 Comm: vhba_incoming Tainted: G         C
+                   4.6.0-rc3-ARCH+ #2
+    [  333.352619] Hardware name: Dell Inc. PowerEdge T110/ ,
+                   BIOS 1.23 12/15/2009
+    [  333.352620]  0000000000000000 ffff88001d1a7dd0 ffffffff8125beeb
+                    ffffffff818507c0
+    [  333.352623]  0000000000000064 ffff88001d1a7df0 ffffffff8128047a
+                    ffff8800113462b0
+    [  333.352625]  ffff88000e523000 ffff88001d1a7e00 ffffffff81241c79
+                    ffff88001d1a7e18
+    [  333.352627] Call Trace:
+    [  333.352634]  [<ffffffff8125beeb>] dump_stack+0x4d/0x72
+    [  333.352637]  [<ffffffff8128047a>] should_fail+0x11a/0x120
+    [  333.352641]  [<ffffffff81241c79>] blk_should_fake_timeout+0x29/0x30
+    [  333.352643]  [<ffffffff81241c36>] blk_complete_request+0x16/0x30
+    [  333.352654]  [<ffffffffa0118b36>] scsi_done+0x26/0x80 [scsi_mod]
+    [  333.352657]  [<ffffffffa014a56c>] process_incoming_rsps+0x2bc/0x770
+                                         [visorhba]
+    [  333.352661]  [<ffffffff81095630>] ? wait_woken+0x80/0x80
+    [  333.352663]  [<ffffffffa014a2b0>] ? add_scsipending_entry+0x100/0x100
+                                         [visorhba]
+    [  333.352666]  [<ffffffff81077759>] kthread+0xc9/0xe0
+    [  333.352669]  [<ffffffff814609d2>] ret_from_fork+0x22/0x40
+    [  333.352671]  [<ffffffff81077690>] ? kthread_create_on_node+0x180/0x180
+    [  364.025672] sd 0:0:1:1: visorhba: initiating type=1 taskmgmt command
+    [  364.029721] visorhba: notifying initiator with result=0x1
+    [  364.029726] sd 0:0:1:1: visorhba: taskmgmt type=1 success; result=0x1
+
+Signed-off-by: Tim Sell <Timothy.Sell@unisys.com>
+Signed-off-by: David Kershner <david.kershner@unisys.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

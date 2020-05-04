@@ -1,0 +1,128 @@
+x86/boot: Move compressed kernel to the end of the decompression buffer
+
+This change makes later calculations about where the kernel is located
+easier to reason about. To better understand this change, we must first
+clarify what 'VO' and 'ZO' are. These values were introduced in commits
+by hpa:
+
+  77d1a4999502 ("x86, boot: make symbols from the main vmlinux available")
+  37ba7ab5e33c ("x86, boot: make kernel_alignment adjustable; new bzImage fields")
+
+Specifically:
+
+All names prefixed with 'VO_':
+
+ - relate to the uncompressed kernel image
+
+ - the size of the VO image is: VO__end-VO__text ("VO_INIT_SIZE" define)
+
+All names prefixed with 'ZO_':
+
+ - relate to the bootable compressed kernel image (boot/compressed/vmlinux),
+   which is composed of the following memory areas:
+     - head text
+     - compressed kernel (VO image and relocs table)
+     - decompressor code
+
+ - the size of the ZO image is: ZO__end - ZO_startup_32 ("ZO_INIT_SIZE" define, though see below)
+
+The 'INIT_SIZE' value is used to find the larger of the two image sizes:
+
+ #define ZO_INIT_SIZE    (ZO__end - ZO_startup_32 + ZO_z_extract_offset)
+ #define VO_INIT_SIZE    (VO__end - VO__text)
+
+ #if ZO_INIT_SIZE > VO_INIT_SIZE
+ # define INIT_SIZE ZO_INIT_SIZE
+ #else
+ # define INIT_SIZE VO_INIT_SIZE
+ #endif
+
+The current code uses extract_offset to decide where to position the
+copied ZO (i.e. ZO starts at extract_offset). (This is why ZO_INIT_SIZE
+currently includes the extract_offset.)
+
+Why does z_extract_offset exist? It's needed because we are trying to minimize
+the amount of RAM used for the whole act of creating an uncompressed, executable,
+properly relocation-linked kernel image in system memory. We do this so that
+kernels can be booted on even very small systems.
+
+To achieve the goal of minimal memory consumption we have implemented an in-place
+decompression strategy: instead of cleanly separating the VO and ZO images and
+also allocating some memory for the decompression code's runtime needs, we instead
+create this elaborate layout of memory buffers where the output (decompressed)
+stream, as it progresses, overlaps with and destroys the input (compressed)
+stream. This can only be done safely if the ZO image is placed to the end of the
+VO range, plus a certain amount of safety distance to make sure that when the last
+bytes of the VO range are decompressed, the compressed stream pointer is safely
+beyond the end of the VO range.
+
+z_extract_offset is calculated in arch/x86/boot/compressed/mkpiggy.c during
+the build process, at a point when we know the exact compressed and
+uncompressed size of the kernel images and can calculate this safe minimum
+offset value. (Note that the mkpiggy.c calculation is not perfect, because
+we don't know the decompressor used at that stage, so the z_extract_offset
+calculation is necessarily imprecise and is mostly based on gzip internals -
+we'll improve that in the next patch.)
+
+When INIT_SIZE is bigger than VO_INIT_SIZE (uncommon but possible),
+the copied ZO occupies the memory from extract_offset to the end of
+decompression buffer. It overlaps with the soon-to-be-uncompressed kernel
+like this:
+
+                            |-----compressed kernel image------|
+                            V                                  V
+0                       extract_offset                      +INIT_SIZE
+|-----------|---------------|-------------------------|--------|
+            |               |                         |        |
+          VO__text      startup_32 of ZO          VO__end    ZO__end
+            ^                                         ^
+            |-------uncompressed kernel image---------|
+
+When INIT_SIZE is equal to VO_INIT_SIZE (likely) there's still space
+left from end of ZO to the end of decompressing buffer, like below.
+
+                            |-compressed kernel image-|
+                            V                         V
+0                       extract_offset                      +INIT_SIZE
+|-----------|---------------|-------------------------|--------|
+            |               |                         |        |
+          VO__text      startup_32 of ZO          ZO__end    VO__end
+            ^                                                  ^
+            |------------uncompressed kernel image-------------|
+
+To simplify calculations and avoid special cases, it is cleaner to
+always place the compressed kernel image in memory so that ZO__end
+is at the end of the decompression buffer, instead of placing t at
+the start of extract_offset as is currently done.
+
+This patch adds BP_init_size (which is the INIT_SIZE as passed in from
+the boot_params) into asm-offsets.c to make it visible to the assembly
+code.
+
+Then when moving the ZO, it calculates the starting position of
+the copied ZO (via BP_init_size and the ZO run size) so that the VO__end
+will be at the end of the decompression buffer. To make the position
+calculation safe, the end of ZO is page aligned (and a comment is added
+to the existing VO alignment for good measure).
+
+Signed-off-by: Yinghai Lu <yinghai@kernel.org>
+[ Rewrote changelog and comments. ]
+Signed-off-by: Kees Cook <keescook@chromium.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Brian Gerst <brgerst@gmail.com>
+Cc: Dave Young <dyoung@redhat.com>
+Cc: Denys Vlasenko <dvlasenk@redhat.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vivek Goyal <vgoyal@redhat.com>
+Cc: lasse.collin@tukaani.org
+Link: http://lkml.kernel.org/r/1461888548-32439-3-git-send-email-keescook@chromium.org
+[ Rewrote the changelog some more. ]
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

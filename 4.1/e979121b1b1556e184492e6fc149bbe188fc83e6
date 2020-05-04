@@ -1,0 +1,100 @@
+perf/x86/intel: Implement cross-HT corruption bug workaround
+
+This patch implements a software workaround for a HW erratum
+on Intel SandyBridge, IvyBridge and Haswell processors
+with Hyperthreading enabled. The errata are documented for
+each processor in their respective specification update
+documents:
+
+  - SandyBridge: BJ122
+  - IvyBridge: BV98
+  - Haswell: HSD29
+
+The bug causes silent counter corruption across hyperthreads only
+when measuring certain memory events (0xd0, 0xd1, 0xd2, 0xd3).
+Counters measuring those events may leak counts to the sibling
+counter. For instance, counter 0, thread 0 measuring event 0xd0,
+may leak to counter 0, thread 1, regardless of the event measured
+there. The size of the leak is not predictible. It all depends on
+the workload and the state of each sibling hyper-thread. The
+corrupting events do undercount as a consequence of the leak. The
+leak is compensated automatically only when the sibling counter measures
+the exact same corrupting event AND the workload is on the two threads
+is the same. Given, there is no way to guarantee this, a work-around
+is necessary. Furthermore, there is a serious problem if the leaked count
+is added to a low-occurrence event. In that case the corruption on
+the low occurrence event can be very large, e.g., orders of magnitude.
+
+There is no HW or FW workaround for this problem.
+
+The bug is very easy to reproduce on a loaded system.
+Here is an example on a Haswell client, where CPU0, CPU4
+are siblings. We load the CPUs with a simple triad app
+streaming large floating-point vector. We use 0x81d0
+corrupting event (MEM_UOPS_RETIRED:ALL_LOADS) and
+0x20cc (ROB_MISC_EVENTS:LBR_INSERTS). Given we are not
+using the LBR, the 0x20cc event should be zero.
+
+  $ taskset -c 0 triad &
+  $ taskset -c 4 triad &
+  $ perf stat -a -C 0 -e r81d0 sleep 100 &
+  $ perf stat -a -C 4 -r20cc sleep 10
+  Performance counter stats for 'system wide':
+        139 277 291      r20cc
+       10,000969126 seconds time elapsed
+
+In this example, 0x81d0 and r20cc ar eusing sinling counters
+on CPU0 and CPU4. 0x81d0 leaks into 0x20cc and corrupts it
+from 0 to 139 millions occurrences.
+
+This patch provides a software workaround to this problem by modifying the
+way events are scheduled onto counters by the kernel. The patch forces
+cross-thread mutual exclusion between counters in case a corrupting event
+is measured by one of the hyper-threads. If thread 0, counter 0 is measuring
+event 0xd0, then nothing can be measured on counter 0, thread 1. If no corrupting
+event is measured on any hyper-thread, event scheduling proceeds as before.
+
+The same example run with the workaround enabled, yield the correct answer:
+
+  $ taskset -c 0 triad &
+  $ taskset -c 4 triad &
+  $ perf stat -a -C 0 -e r81d0 sleep 100 &
+  $ perf stat -a -C 4 -r20cc sleep 10
+  Performance counter stats for 'system wide':
+        0 r20cc
+       10,000969126 seconds time elapsed
+
+The patch does provide correctness for all non-corrupting events. It does not
+"repatriate" the leaked counts back to the leaking counter. This is planned
+for a second patch series. This patch series makes this repatriation more
+easy by guaranteeing the sibling counter is not measuring any useful event.
+
+The patch introduces dynamic constraints for events. That means that events which
+did not have constraints, i.e., could be measured on any counters, may now be
+constrained to a subset of the counters depending on what is going on the sibling
+thread. The algorithm is similar to a cache coherency protocol. We call it XSU
+in reference to Exclusive, Shared, Unused, the 3 possible states of a PMU
+counter.
+
+As a consequence of the workaround, users may see an increased amount of event
+multiplexing, even in situtations where there are fewer events than counters
+measured on a CPU.
+
+Patch has been tested on all three impacted processors. Note that when
+HT is off, there is no corruption. However, the workaround is still enabled,
+yet not costing too much. Adding a dynamic detection of HT on turned out to
+be complex are requiring too much to code to be justified.
+
+This patch addresses the issue when PEBS is not used. A subsequent patch
+fixes the problem when PEBS is used.
+
+Signed-off-by: Maria Dimakopoulou <maria.n.dimakopoulou@gmail.com>
+[spinlock_t -> raw_spinlock_t]
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Stephane Eranian <eranian@google.com>
+Cc: bp@alien8.de
+Cc: jolsa@redhat.com
+Cc: kan.liang@intel.com
+Link: http://lkml.kernel.org/r/1416251225-17721-7-git-send-email-eranian@google.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

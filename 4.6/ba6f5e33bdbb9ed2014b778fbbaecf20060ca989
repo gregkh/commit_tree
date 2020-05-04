@@ -1,0 +1,64 @@
+sctp: avoid refreshing heartbeat timer too often
+
+Currently on high rate SCTP streams the heartbeat timer refresh can
+consume quite a lot of resources as timer updates are costly and it
+contains a random factor, which a) is also costly and b) invalidates
+mod_timer() optimization for not editing a timer to the same value.
+It may even cause the timer to be slightly advanced, for no good reason.
+
+As suggested by David Laight this patch now removes this timer update
+from hot path by leaving the timer on and re-evaluating upon its
+expiration if the heartbeat is still needed or not, similarly to what is
+done for TCP. If it's not needed anymore the timer is re-scheduled to
+the new timeout, considering the time already elapsed.
+
+For this, we now record the last tx timestamp per transport, updated in
+the same spots as hb timer was restarted on tx. Also split up
+sctp_transport_reset_timers into sctp_transport_reset_t3_rtx and
+sctp_transport_reset_hb_timer, so we can re-arm T3 without re-arming the
+heartbeat one.
+
+On loopback with MTU of 65535 and data chunks with 1636, so that we
+have a considerable amount of chunks without stressing system calls,
+netperf -t SCTP_STREAM -l 30, perf looked like this before:
+
+Samples: 103K of event 'cpu-clock', Event count (approx.): 25833000000
+  Overhead  Command  Shared Object      Symbol
++    6,15%  netperf  [kernel.vmlinux]   [k] copy_user_enhanced_fast_string
+-    5,43%  netperf  [kernel.vmlinux]   [k] _raw_write_unlock_irqrestore
+   - _raw_write_unlock_irqrestore
+      - 96,54% _raw_spin_unlock_irqrestore
+         - 36,14% mod_timer
+            + 97,24% sctp_transport_reset_timers
+            + 2,76% sctp_do_sm
+         + 33,65% __wake_up_sync_key
+         + 28,77% sctp_ulpq_tail_event
+         + 1,40% del_timer
+      - 1,84% mod_timer
+         + 99,03% sctp_transport_reset_timers
+         + 0,97% sctp_do_sm
+      + 1,50% sctp_ulpq_tail_event
+
+And after this patch, now with netperf -l 60:
+
+Samples: 230K of event 'cpu-clock', Event count (approx.): 57707250000
+  Overhead  Command  Shared Object      Symbol
++    5,65%  netperf  [kernel.vmlinux]   [k] memcpy_erms
++    5,59%  netperf  [kernel.vmlinux]   [k] copy_user_enhanced_fast_string
+-    5,05%  netperf  [kernel.vmlinux]   [k] _raw_spin_unlock_irqrestore
+   - _raw_spin_unlock_irqrestore
+      + 49,89% __wake_up_sync_key
+      + 45,68% sctp_ulpq_tail_event
+      - 2,85% mod_timer
+         + 76,51% sctp_transport_reset_t3_rtx
+         + 23,49% sctp_do_sm
+      + 1,55% del_timer
++    2,50%  netperf  [sctp]             [k] sctp_datamsg_from_user
++    2,26%  netperf  [sctp]             [k] sctp_sendmsg
+
+Throughput-wise, from 6800mbps without the patch to 7050mbps with it,
+~3.7%.
+
+Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

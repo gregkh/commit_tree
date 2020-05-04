@@ -1,0 +1,75 @@
+ipv6: Fix a potential deadlock when creating pcpu rt
+
+rt6_make_pcpu_route() is called under read_lock(&table->tb6_lock).
+rt6_make_pcpu_route() calls ip6_rt_pcpu_alloc(rt) which then
+calls dst_alloc().  dst_alloc() _may_ call ip6_dst_gc() which takes
+the write_lock(&tabl->tb6_lock).  A visualized version:
+
+read_lock(&table->tb6_lock);
+rt6_make_pcpu_route();
+=> ip6_rt_pcpu_alloc();
+=> dst_alloc();
+=> ip6_dst_gc();
+=> write_lock(&table->tb6_lock); /* oops */
+
+The fix is to do a read_unlock first before calling ip6_rt_pcpu_alloc().
+
+A reported stack:
+
+[141625.537638] INFO: rcu_sched self-detected stall on CPU { 27}  (t=60000 jiffies g=4159086 c=4159085 q=2139)
+[141625.547469] Task dump for CPU 27:
+[141625.550881] mtr             R  running task        0 22121  22081 0x00000008
+[141625.558069]  0000000000000000 ffff88103f363d98 ffffffff8106e488 000000000000001b
+[141625.565641]  ffffffff81684900 ffff88103f363db8 ffffffff810702b0 0000000008000000
+[141625.573220]  ffffffff81684900 ffff88103f363de8 ffffffff8108df9f ffff88103f375a00
+[141625.580803] Call Trace:
+[141625.583345]  <IRQ>  [<ffffffff8106e488>] sched_show_task+0xc1/0xc6
+[141625.589650]  [<ffffffff810702b0>] dump_cpu_task+0x35/0x39
+[141625.595144]  [<ffffffff8108df9f>] rcu_dump_cpu_stacks+0x6a/0x8c
+[141625.601320]  [<ffffffff81090606>] rcu_check_callbacks+0x1f6/0x5d4
+[141625.607669]  [<ffffffff810940c8>] update_process_times+0x2a/0x4f
+[141625.613925]  [<ffffffff8109fbee>] tick_sched_handle+0x32/0x3e
+[141625.619923]  [<ffffffff8109fc2f>] tick_sched_timer+0x35/0x5c
+[141625.625830]  [<ffffffff81094a1f>] __hrtimer_run_queues+0x8f/0x18d
+[141625.632171]  [<ffffffff81094c9e>] hrtimer_interrupt+0xa0/0x166
+[141625.638258]  [<ffffffff8102bf2a>] local_apic_timer_interrupt+0x4e/0x52
+[141625.645036]  [<ffffffff8102c36f>] smp_apic_timer_interrupt+0x39/0x4a
+[141625.651643]  [<ffffffff8140b9e8>] apic_timer_interrupt+0x68/0x70
+[141625.657895]  <EOI>  [<ffffffff81346ee8>] ? dst_destroy+0x7c/0xb5
+[141625.664188]  [<ffffffff813d45b5>] ? fib6_flush_trees+0x20/0x20
+[141625.670272]  [<ffffffff81082b45>] ? queue_write_lock_slowpath+0x60/0x6f
+[141625.677140]  [<ffffffff8140aa33>] _raw_write_lock_bh+0x23/0x25
+[141625.683218]  [<ffffffff813d4553>] __fib6_clean_all+0x40/0x82
+[141625.689124]  [<ffffffff813d45b5>] ? fib6_flush_trees+0x20/0x20
+[141625.695207]  [<ffffffff813d6058>] fib6_clean_all+0xe/0x10
+[141625.700854]  [<ffffffff813d60d3>] fib6_run_gc+0x79/0xc8
+[141625.706329]  [<ffffffff813d0510>] ip6_dst_gc+0x85/0xf9
+[141625.711718]  [<ffffffff81346d68>] dst_alloc+0x55/0x159
+[141625.717105]  [<ffffffff813d09b5>] __ip6_dst_alloc.isra.32+0x19/0x63
+[141625.723620]  [<ffffffff813d1830>] ip6_pol_route+0x36a/0x3e8
+[141625.729441]  [<ffffffff813d18d6>] ip6_pol_route_output+0x11/0x13
+[141625.735700]  [<ffffffff813f02c8>] fib6_rule_action+0xa7/0x1bf
+[141625.741698]  [<ffffffff813d18c5>] ? ip6_pol_route_input+0x17/0x17
+[141625.748043]  [<ffffffff81357c48>] fib_rules_lookup+0xb5/0x12a
+[141625.754050]  [<ffffffff81141628>] ? poll_select_copy_remaining+0xf9/0xf9
+[141625.761002]  [<ffffffff813f0535>] fib6_rule_lookup+0x37/0x5c
+[141625.766914]  [<ffffffff813d18c5>] ? ip6_pol_route_input+0x17/0x17
+[141625.773260]  [<ffffffff813d008c>] ip6_route_output+0x7a/0x82
+[141625.779177]  [<ffffffff813c44c8>] ip6_dst_lookup_tail+0x53/0x112
+[141625.785437]  [<ffffffff813c45c3>] ip6_dst_lookup_flow+0x2a/0x6b
+[141625.791604]  [<ffffffff813ddaab>] rawv6_sendmsg+0x407/0x9b6
+[141625.797423]  [<ffffffff813d7914>] ? do_ipv6_setsockopt.isra.8+0xd87/0xde2
+[141625.804464]  [<ffffffff8139d4b4>] inet_sendmsg+0x57/0x8e
+[141625.810028]  [<ffffffff81329ba3>] sock_sendmsg+0x2e/0x3c
+[141625.815588]  [<ffffffff8132be57>] SyS_sendto+0xfe/0x143
+[141625.821063]  [<ffffffff813dd551>] ? rawv6_setsockopt+0x5e/0x67
+[141625.827146]  [<ffffffff8132c9f8>] ? sock_common_setsockopt+0xf/0x11
+[141625.833660]  [<ffffffff8132c08c>] ? SyS_setsockopt+0x81/0xa2
+[141625.839565]  [<ffffffff8140ac17>] entry_SYSCALL_64_fastpath+0x12/0x6a
+
+Fixes: d52d3997f843 ("pv6: Create percpu rt6_info")
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+CC: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Reported-by: Steinar H. Gunderson <sgunderson@bigfoot.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

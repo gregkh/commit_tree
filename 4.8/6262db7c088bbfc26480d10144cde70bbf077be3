@@ -1,0 +1,67 @@
+powerpc/spinlock: Fix spin_unlock_wait()
+
+There is an ordering issue with spin_unlock_wait() on powerpc, because
+the spin_lock primitive is an ACQUIRE and an ACQUIRE is only ordering
+the load part of the operation with memory operations following it.
+Therefore the following event sequence can happen:
+
+CPU 1			CPU 2			CPU 3
+
+==================	====================	==============
+						spin_unlock(&lock);
+			spin_lock(&lock):
+			  r1 = *lock; // r1 == 0;
+o = object;		o = READ_ONCE(object); // reordered here
+object = NULL;
+smp_mb();
+spin_unlock_wait(&lock);
+			  *lock = 1;
+smp_mb();
+o->dead = true;         < o = READ_ONCE(object); > // reordered upwards
+			if (o) // true
+				BUG_ON(o->dead); // true!!
+
+To fix this, we add a "nop" ll/sc loop in arch_spin_unlock_wait() on
+ppc, the "nop" ll/sc loop reads the lock
+value and writes it back atomically, in this way it will synchronize the
+view of the lock on CPU1 with that on CPU2. Therefore in the scenario
+above, either CPU2 will fail to get the lock at first or CPU1 will see
+the lock acquired by CPU2, both cases will eliminate this bug. This is a
+similar idea as what Will Deacon did for ARM64 in:
+
+  d86b8da04dfa ("arm64: spinlock: serialise spin_unlock_wait against concurrent lockers")
+
+Furthermore, if the "nop" ll/sc figures out the lock is locked, we
+actually don't need to do the "nop" ll/sc trick again, we can just do a
+normal load+check loop for the lock to be released, because in that
+case, spin_unlock_wait() is called when someone is holding the lock, and
+the store part of the "nop" ll/sc happens before the lock release of the
+current lock holder:
+
+	"nop" ll/sc -> spin_unlock()
+
+and the lock release happens before the next lock acquisition:
+
+	spin_unlock() -> spin_lock() <next holder>
+
+which means the "nop" ll/sc happens before the next lock acquisition:
+
+	"nop" ll/sc -> spin_unlock() -> spin_lock() <next holder>
+
+With a smp_mb() preceding spin_unlock_wait(), the store of object is
+guaranteed to be observed by the next lock holder:
+
+	STORE -> smp_mb() -> "nop" ll/sc
+	-> spin_unlock() -> spin_lock() <next holder>
+
+This patch therefore fixes the issue and also cleans the
+arch_spin_unlock_wait() a little bit by removing superfluous memory
+barriers in loops and consolidating the implementations for PPC32 and
+PPC64 into one.
+
+Suggested-by: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+Reviewed-by: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+[mpe: Inline the "nop" ll/sc loop and set EH=0, munge change log]
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+

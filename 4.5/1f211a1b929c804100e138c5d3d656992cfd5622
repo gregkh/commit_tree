@@ -1,0 +1,101 @@
+net, sched: add clsact qdisc
+
+This work adds a generalization of the ingress qdisc as a qdisc holding
+only classifiers. The clsact qdisc works on ingress, but also on egress.
+In both cases, it's execution happens without taking the qdisc lock, and
+the main difference for the egress part compared to prior version of [1]
+is that this can be applied with _any_ underlying real egress qdisc (also
+classless ones).
+
+Besides solving the use-case of [1], that is, allowing for more programmability
+on assigning skb->priority for the mqprio case that is supported by most
+popular 10G+ NICs, it also opens up a lot more flexibility for other tc
+applications. The main work on classification can already be done at clsact
+egress time if the use-case allows and state stored for later retrieval
+f.e. again in skb->priority with major/minors (which is checked by most
+classful qdiscs before consulting tc_classify()) and/or in other skb fields
+like skb->tc_index for some light-weight post-processing to get to the
+eventual classid in case of a classful qdisc. Another use case is that
+the clsact egress part allows to have a central egress counterpart to
+the ingress classifiers, so that classifiers can easily share state (e.g.
+in cls_bpf via eBPF maps) for ingress and egress.
+
+Currently, default setups like mq + pfifo_fast would require for this to
+use, for example, prio qdisc instead (to get a tc_classify() run) and to
+duplicate the egress classifier for each queue. With clsact, it allows
+for leaving the setup as is, it can additionally assign skb->priority to
+put the skb in one of pfifo_fast's bands and it can share state with maps.
+Moreover, we can access the skb's dst entry (f.e. to retrieve tclassid)
+w/o the need to perform a skb_dst_force() to hold on to it any longer. In
+lwt case, we can also use this facility to setup dst metadata via cls_bpf
+(bpf_skb_set_tunnel_key()) without needing a real egress qdisc just for
+that (case of IFF_NO_QUEUE devices, for example).
+
+The realization can be done without any changes to the scheduler core
+framework. All it takes is that we have two a-priori defined minors/child
+classes, where we can mux between ingress and egress classifier list
+(dev->ingress_cl_list and dev->egress_cl_list, latter stored close to
+dev->_tx to avoid extra cacheline miss for moderate loads). The egress
+part is a bit similar modelled to handle_ing() and patched to a noop in
+case the functionality is not used. Both handlers are now called
+sch_handle_ingress() and sch_handle_egress(), code sharing among the two
+doesn't seem practical as there are various minor differences in both
+paths, so that making them conditional in a single handler would rather
+slow things down.
+
+Full compatibility to ingress qdisc is provided as well. Since both
+piggyback on TC_H_CLSACT, only one of them (ingress/clsact) can exist
+per netdevice, and thus ingress qdisc specific behaviour can be retained
+for user space. This means, either a user does 'tc qdisc add dev foo ingress'
+and configures ingress qdisc as usual, or the 'tc qdisc add dev foo clsact'
+alternative, where both, ingress and egress classifier can be configured
+as in the below example. ingress qdisc supports attaching classifier to any
+minor number whereas clsact has two fixed minors for muxing between the
+lists, therefore to not break user space setups, they are better done as
+two separate qdiscs.
+
+I decided to extend the sch_ingress module with clsact functionality so
+that commonly used code can be reused, the module is being aliased with
+sch_clsact so that it can be auto-loaded properly. Alternative would have been
+to add a flag when initializing ingress to alter its behaviour plus aliasing
+to a different name (as it's more than just ingress). However, the first would
+end up, based on the flag, choosing the new/old behaviour by calling different
+function implementations to handle each anyway, the latter would require to
+register ingress qdisc once again under different alias. So, this really begs
+to provide a minimal, cleaner approach to have Qdisc_ops and Qdisc_class_ops
+by its own that share callbacks used by both.
+
+Example, adding qdisc:
+
+   # tc qdisc add dev foo clsact
+   # tc qdisc show dev foo
+   qdisc mq 0: root
+   qdisc pfifo_fast 0: parent :1 bands 3 priomap  1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+   qdisc pfifo_fast 0: parent :2 bands 3 priomap  1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+   qdisc pfifo_fast 0: parent :3 bands 3 priomap  1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+   qdisc pfifo_fast 0: parent :4 bands 3 priomap  1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+   qdisc clsact ffff: parent ffff:fff1
+
+Adding filters (deleting, etc works analogous by specifying ingress/egress):
+
+   # tc filter add dev foo ingress bpf da obj bar.o sec ingress
+   # tc filter add dev foo egress  bpf da obj bar.o sec egress
+   # tc filter show dev foo ingress
+   filter protocol all pref 49152 bpf
+   filter protocol all pref 49152 bpf handle 0x1 bar.o:[ingress] direct-action
+   # tc filter show dev foo egress
+   filter protocol all pref 49152 bpf
+   filter protocol all pref 49152 bpf handle 0x1 bar.o:[egress] direct-action
+
+A 'tc filter show dev foo' or 'tc filter show dev foo parent ffff:' will
+show an empty list for clsact. Either using the parent names (ingress/egress)
+or specifying the full major/minor will then show the related filter lists.
+
+Prior work on a mqprio prequeue() facility [1] was done mainly by John Fastabend.
+
+  [1] http://patchwork.ozlabs.org/patch/512949/
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: John Fastabend <john.r.fastabend@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

@@ -1,0 +1,55 @@
+net/mlx4_en: protect ring->xdp_prog with rcu_read_lock
+
+Depending on the preempt mode, the bpf_prog stored in xdp_prog may be
+freed despite the use of call_rcu inside bpf_prog_put. The situation is
+possible when running in PREEMPT_RCU=y mode, for instance, since the rcu
+callback for destroying the bpf prog can run even during the bh handling
+in the mlx4 rx path.
+
+Several options were considered before this patch was settled on:
+
+Add a napi_synchronize loop in mlx4_xdp_set, which would occur after all
+of the rings are updated with the new program.
+This approach has the disadvantage that as the number of rings
+increases, the speed of update will slow down significantly due to
+napi_synchronize's msleep(1).
+
+Add a new rcu_head in bpf_prog_aux, to be used by a new bpf_prog_put_bh.
+The action of the bpf_prog_put_bh would be to then call bpf_prog_put
+later. Those drivers that consume a bpf prog in a bh context (like mlx4)
+would then use the bpf_prog_put_bh instead when the ring is up. This has
+the problem of complexity, in maintaining proper refcnts and rcu lists,
+and would likely be harder to review. In addition, this approach to
+freeing must be exclusive with other frees of the bpf prog, for instance
+a _bh prog must not be referenced from a prog array that is consumed by
+a non-_bh prog.
+
+The placement of rcu_read_lock in this patch is functionally the same as
+putting an rcu_read_lock in napi_poll. Actually doing so could be a
+potentially controversial change, but would bring the implementation in
+line with sk_busy_loop (though of course the nature of those two paths
+is substantially different), and would also avoid future copy/paste
+problems with future supporters of XDP. Still, this patch does not take
+that opinionated option.
+
+Testing was done with kernels in either PREEMPT_RCU=y or
+CONFIG_PREEMPT_VOLUNTARY=y+PREEMPT_RCU=n modes, with neither exhibiting
+any drawback. With PREEMPT_RCU=n, the extra call to rcu_read_lock did
+not show up in the perf report whatsoever, and with PREEMPT_RCU=y the
+overhead of rcu_read_lock (according to perf) was the same before/after.
+In the rx path, rcu_read_lock is eventually called for every packet
+from netif_receive_skb_internal, so the napi poll call's rcu_read_lock
+is easily amortized.
+
+v2:
+Remove extra rcu_read_lock in mlx4_en_process_rx_cq body
+Annotate xdp_prog with __rcu, and convert all usages to rcu_assign or
+rcu_dereference[_protected] as appropriate.
+Add explicit mutex lock around rcu_assign instead of xchg loop.
+
+Fixes: d576acf0a22 ("net/mlx4_en: add page recycle to prepare rx ring for tx support")
+Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <alexei.starovoitov@gmail.com>
+Signed-off-by: Brenden Blanco <bblanco@plumgrid.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

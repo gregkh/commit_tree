@@ -1,0 +1,76 @@
+sctp: fix race on protocol/netns initialization
+
+Consider sctp module is unloaded and is being requested because an user
+is creating a sctp socket.
+
+During initialization, sctp will add the new protocol type and then
+initialize pernet subsys:
+
+        status = sctp_v4_protosw_init();
+        if (status)
+                goto err_protosw_init;
+
+        status = sctp_v6_protosw_init();
+        if (status)
+                goto err_v6_protosw_init;
+
+        status = register_pernet_subsys(&sctp_net_ops);
+
+The problem is that after those calls to sctp_v{4,6}_protosw_init(), it
+is possible for userspace to create SCTP sockets like if the module is
+already fully loaded. If that happens, one of the possible effects is
+that we will have readers for net->sctp.local_addr_list list earlier
+than expected and sctp_net_init() does not take precautions while
+dealing with that list, leading to a potential panic but not limited to
+that, as sctp_sock_init() will copy a bunch of blank/partially
+initialized values from net->sctp.
+
+The race happens like this:
+
+     CPU 0                           |  CPU 1
+  socket()                           |
+   __sock_create                     | socket()
+    inet_create                      |  __sock_create
+     list_for_each_entry_rcu(        |
+        answer, &inetsw[sock->type], |
+        list) {                      |   inet_create
+      /* no hits */                  |
+     if (unlikely(err)) {            |
+      ...                            |
+      request_module()               |
+      /* socket creation is blocked  |
+       * the module is fully loaded  |
+       */                            |
+       sctp_init                     |
+        sctp_v4_protosw_init         |
+         inet_register_protosw       |
+          list_add_rcu(&p->list,     |
+                       last_perm);   |
+                                     |  list_for_each_entry_rcu(
+                                     |     answer, &inetsw[sock->type],
+        sctp_v6_protosw_init         |     list) {
+                                     |     /* hit, so assumes protocol
+                                     |      * is already loaded
+                                     |      */
+                                     |  /* socket creation continues
+                                     |   * before netns is initialized
+                                     |   */
+        register_pernet_subsys       |
+
+Simply inverting the initialization order between
+register_pernet_subsys() and sctp_v4_protosw_init() is not possible
+because register_pernet_subsys() will create a control sctp socket, so
+the protocol must be already visible by then. Deferring the socket
+creation to a work-queue is not good specially because we loose the
+ability to handle its errors.
+
+So, as suggested by Vlad, the fix is to split netns initialization in
+two moments: defaults and control socket, so that the defaults are
+already loaded by when we register the protocol, while control socket
+initialization is kept at the same moment it is today.
+
+Fixes: 4db67e808640 ("sctp: Make the address lists per network namespace")
+Signed-off-by: Vlad Yasevich <vyasevich@gmail.com>
+Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

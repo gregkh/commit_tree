@@ -1,0 +1,65 @@
+KVM: PPC: Book3S HV: Fix TB corruption in guest exit path on HMI interrupt
+
+When a guest is assigned to a core it converts the host Timebase (TB)
+into guest TB by adding guest timebase offset before entering into
+guest. During guest exit it restores the guest TB to host TB. This means
+under certain conditions (Guest migration) host TB and guest TB can differ.
+
+When we get an HMI for TB related issues the opal HMI handler would
+try fixing errors and restore the correct host TB value. With no guest
+running, we don't have any issues. But with guest running on the core
+we run into TB corruption issues.
+
+If we get an HMI while in the guest, the current HMI handler invokes opal
+hmi handler before forcing guest to exit. The guest exit path subtracts
+the guest TB offset from the current TB value which may have already
+been restored with host value by opal hmi handler. This leads to incorrect
+host and guest TB values.
+
+With split-core, things become more complex. With split-core, TB also gets
+split and each subcore gets its own TB register. When a hmi handler fixes
+a TB error and restores the TB value, it affects all the TB values of
+sibling subcores on the same core. On TB errors all the thread in the core
+gets HMI. With existing code, the individual threads call opal hmi handle
+independently which can easily throw TB out of sync if we have guest
+running on subcores. Hence we will need to co-ordinate with all the
+threads before making opal hmi handler call followed by TB resync.
+
+This patch introduces a sibling subcore state structure (shared by all
+threads in the core) in paca which holds information about whether sibling
+subcores are in Guest mode or host mode. An array in_guest[] of size
+MAX_SUBCORE_PER_CORE=4 is used to maintain the state of each subcore.
+The subcore id is used as index into in_guest[] array. Only primary
+thread entering/exiting the guest is responsible to set/unset its
+designated array element.
+
+On TB error, we get HMI interrupt on every thread on the core. Upon HMI,
+this patch will now force guest to vacate the core/subcore. Primary
+thread from each subcore will then turn off its respective bit
+from the above bitmap during the guest exit path just after the
+guest->host partition switch is complete.
+
+All other threads that have just exited the guest OR were already in host
+will wait until all other subcores clears their respective bit.
+Once all the subcores turn off their respective bit, all threads will
+will make call to opal hmi handler.
+
+It is not necessary that opal hmi handler would resync the TB value for
+every HMI interrupts. It would do so only for the HMI caused due to
+TB errors. For rest, it would not touch TB value. Hence to make things
+simpler, primary thread would call TB resync explicitly once for each
+core immediately after opal hmi handler instead of subtracting guest
+offset from TB. TB resync call will restore the TB with host value.
+Thus we can be sure about the TB state.
+
+One of the primary threads exiting the guest will take up the
+responsibility of calling TB resync. It will use one of the top bits
+(bit 63) from subcore state flags bitmap to make the decision. The first
+primary thread (among the subcores) that is able to set the bit will
+have to call the TB resync. Rest all other threads will wait until TB
+resync is complete.  Once TB resync is complete all threads will then
+proceed.
+
+Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+

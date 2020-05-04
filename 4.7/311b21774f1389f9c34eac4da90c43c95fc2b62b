@@ -1,0 +1,53 @@
+sctp: simplify sk_receive_queue locking
+
+SCTP already serializes access to rcvbuf through its sock lock:
+sctp_recvmsg takes it right in the start and release at the end, while
+rx path will also take the lock before doing any socket processing. On
+sctp_rcv() it will check if there is an user using the socket and, if
+there is, it will queue incoming packets to the backlog. The backlog
+processing will do the same. Even timers will do such check and
+re-schedule if an user is using the socket.
+
+Simplifying this will allow us to remove sctp_skb_list_tail and get ride
+of some expensive lockings.  The lists that it is used on are also
+mangled with functions like __skb_queue_tail and __skb_unlink in the
+same context, like on sctp_ulpq_tail_event() and sctp_clear_pd().
+sctp_close() will also purge those while using only the sock lock.
+
+Therefore the lockings performed by sctp_skb_list_tail() are not
+necessary. This patch removes this function and replaces its calls with
+just skb_queue_splice_tail_init() instead.
+
+The biggest gain is at sctp_ulpq_tail_event(), because the events always
+contain a list, even if it's queueing a single skb and this was
+triggering expensive calls to spin_lock_irqsave/_irqrestore for every
+data chunk received.
+
+As SCTP will deliver each data chunk on a corresponding recvmsg, the
+more effective the change will be.
+Before this patch, with chunks with 30 bytes:
+netperf -t SCTP_STREAM -H 192.168.1.2 -cC -l 60 -- -m 30 -S 400000
+400000 -s 400000 400000
+on a 10Gbit link with 1500 MTU:
+
+SCTP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 192.168.1.1 () port 0 AF_INET
+Recv   Send    Send                          Utilization       Service Demand
+Socket Socket  Message  Elapsed              Send     Recv     Send    Recv
+Size   Size    Size     Time     Throughput  local    remote   local   remote
+bytes  bytes   bytes    secs.    10^6bits/s  % S      % S      us/KB   us/KB
+
+425984 425984     30    60.00       137.45   7.34     7.36     52.504  52.608
+
+With it:
+
+SCTP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 192.168.1.1 () port 0 AF_INET
+Recv   Send    Send                          Utilization       Service Demand
+Socket Socket  Message  Elapsed              Send     Recv     Send    Recv
+Size   Size    Size     Time     Throughput  local    remote   local   remote
+bytes  bytes   bytes    secs.    10^6bits/s  % S      % S      us/KB   us/KB
+
+425984 425984     30    60.00       179.10   7.97     6.70     43.740  36.788
+
+Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

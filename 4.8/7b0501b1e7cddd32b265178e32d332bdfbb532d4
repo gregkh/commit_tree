@@ -1,0 +1,126 @@
+x86/smp: Fix __max_logical_packages value setup
+
+Frank reported kernel panic when he disabled several cores in BIOS
+via following option:
+
+  Core Disable Bitmap(Hex)   [0]
+
+with number 0xFFE, which leaves 16 CPUs in system (out of 48).
+
+The kernel panic below goes along with following messages:
+
+ smpboot: Max logical packages: 2^M
+ smpboot: APIC(0) Converting physical 0 to logical package 0^M
+ smpboot: APIC(20) Converting physical 1 to logical package 1^M
+ smpboot: APIC(40) Package 2 exceeds logical package map^M
+ smpboot: CPU 8 APICId 40 disabled^M
+ smpboot: APIC(60) Package 3 exceeds logical package map^M
+ smpboot: CPU 12 APICId 60 disabled^M
+ ...
+ general protection fault: 0000 [#1] SMP^M
+ Modules linked in:^M
+ CPU: 15 PID: 1 Comm: swapper/0 Not tainted 4.7.0-rc5+ #1^M
+ Hardware name: SGI UV300/UV300, BIOS SGI UV 300 series BIOS 05/25/2016^M
+ task: ffff8801673e0000 ti: ffff8801673ac000 task.ti: ffff8801673ac000^M
+ RIP: 0010:[<ffffffff81014d54>]  [<ffffffff81014d54>] uncore_change_context+0xd4/0x180^M
+ ...
+  [<ffffffff810158ac>] uncore_event_init_cpu+0x6c/0x70^M
+  [<ffffffff81d8c91c>] intel_uncore_init+0x1c2/0x2dd^M
+  [<ffffffff81d8c75a>] ? uncore_cpu_setup+0x17/0x17^M
+  [<ffffffff81002190>] do_one_initcall+0x50/0x190^M
+  [<ffffffff810ab193>] ? parse_args+0x293/0x480^M
+  [<ffffffff81d87365>] kernel_init_freeable+0x1a5/0x249^M
+  [<ffffffff81d86a35>] ? set_debug_rodata+0x12/0x12^M
+  [<ffffffff816dc19e>] kernel_init+0xe/0x110^M
+  [<ffffffff816e93bf>] ret_from_fork+0x1f/0x40^M
+  [<ffffffff816dc190>] ? rest_init+0x80/0x80^M
+
+The reason for the panic is wrong value of __max_logical_packages,
+which lets logical_package_map uninitialized and the uncore code
+relying on this map being properly initialized (maybe we should
+add some safety checks there as well).
+
+The __max_logical_packages is computed as:
+
+  DIV_ROUND_UP(total_cpus, ncpus);
+  - ncpus being number of cores
+
+With above BIOS setup we get total_cpus == 16 which set
+__max_logical_packages to 2 (ncpus is 12).
+
+Once topology_update_package_map processes CPU with logical
+pkg over 2 we display above messages and fail to initialize
+the physical_to_logical_pkg map, which makes the uncore code
+crash.
+
+The fix is to remove logical_package_map bitmap completely
+and keep and update the logical_packages number instead.
+
+After we enumerate all the present CPUs, we check if the
+enumerated logical packages count is within its computed
+maximum from BIOS data.
+
+If it's not the case, we set this maximum to the new enumerated
+value and freeze any new addition of logical packages.
+
+The freeze is because lot of init code like uncore/rapl/cqm
+depends on having maximum logical package value set to allocate
+their data, so we can't change it later on.
+
+Prarit Bhargava tested the patch and confirms that it solves
+the problem:
+
+  From dmidecode:
+          Core Count: 24
+          Core Enabled: 24
+          Thread Count: 48
+
+Orig kernel boot log:
+
+ [    0.464981] smpboot: Max logical packages: 19
+ [    0.469861] smpboot: APIC(0) Converting physical 0 to logical package 0
+ [    0.477261] smpboot: APIC(40) Converting physical 1 to logical package 1
+ [    0.484760] smpboot: APIC(80) Converting physical 2 to logical package 2
+ [    0.492258] smpboot: APIC(c0) Converting physical 3 to logical package 3
+
+1.  nr_cpus=8, should stop enumerating in package 0:
+
+ [    0.533664] smpboot: APIC(0) Converting physical 0 to logical package 0
+ [    0.539596] smpboot: Max logical packages: 19
+
+2.  max_cpus=8, should still enumerate all packages:
+
+ [    0.526494] smpboot: APIC(0) Converting physical 0 to logical package 0
+ [    0.532428] smpboot: APIC(40) Converting physical 1 to logical package 1
+ [    0.538456] smpboot: APIC(80) Converting physical 2 to logical package 2
+ [    0.544486] smpboot: APIC(c0) Converting physical 3 to logical package 3
+ [    0.550524] smpboot: Max logical packages: 19
+
+3.  nr_cpus=49 ( 2 socket + 1 core on 3rd socket), should stop enumerating in
+    package 2:
+
+ [    0.521378] smpboot: APIC(0) Converting physical 0 to logical package 0
+ [    0.527314] smpboot: APIC(40) Converting physical 1 to logical package 1
+ [    0.533345] smpboot: APIC(80) Converting physical 2 to logical package 2
+ [    0.539368] smpboot: Max logical packages: 19
+
+4.  maxcpus=49, should still enumerate all packages:
+
+ [    0.525591] smpboot: APIC(0) Converting physical 0 to logical package 0
+ [    0.531525] smpboot: APIC(40) Converting physical 1 to logical package 1
+ [    0.537547] smpboot: APIC(80) Converting physical 2 to logical package 2
+ [    0.543579] smpboot: APIC(c0) Converting physical 3 to logical package 3
+ [    0.549624] smpboot: Max logical packages: 19
+
+5.  kdump (nr_cpus=1) works as well.
+
+Reported-by: Frank Ramsay <framsay@redhat.com>
+Tested-by: Prarit Bhargava <prarit@redhat.com>
+Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+Reviewed-by: Prarit Bhargava <prarit@redhat.com>
+Acked-by: Peter Zijlstra <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20160815101700.GA30090@krava
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

@@ -1,0 +1,90 @@
+Btrfs: incremental send, don't delay directory renames unnecessarily
+
+Even though we delay the rename of directories when they become
+descendents of other directories that were also renamed in the send
+root to prevent infinite path build loops, we were doing it in cases
+where this was not needed and was actually harmful resulting in
+infinite path build loops as we ended up with a circular dependency
+of delayed directory renames.
+
+Consider the following reproducer:
+
+  $ mkfs.btrfs -f /dev/sdb
+  $ mount /dev/sdb /mnt
+  $ mkfs.btrfs -f /dev/sdc
+  $ mount /dev/sdc /mnt2
+
+  $ mkdir /mnt/data
+  $ mkdir /mnt/data/n1
+  $ mkdir /mnt/data/n1/n2
+  $ mkdir /mnt/data/n4
+  $ mkdir /mnt/data/n1/n2/p1
+  $ mkdir /mnt/data/n1/n2/p1/p2
+  $ mkdir /mnt/data/t6
+  $ mkdir /mnt/data/t7
+  $ mkdir -p /mnt/data/t5/t7
+  $ mkdir /mnt/data/t2
+  $ mkdir /mnt/data/t4
+  $ mkdir -p /mnt/data/t1/t3
+  $ mkdir /mnt/data/p1
+  $ mv /mnt/data/t1 /mnt/data/p1
+  $ mkdir -p /mnt/data/p1/p2
+  $ mv /mnt/data/t4 /mnt/data/p1/p2/t1
+  $ mv /mnt/data/t5 /mnt/data/n4/t5
+  $ mv /mnt/data/n1/n2/p1/p2 /mnt/data/n4/t5/p2
+  $ mv /mnt/data/t7 /mnt/data/n4/t5/p2/t7
+  $ mv /mnt/data/t2 /mnt/data/n4/t1
+  $ mv /mnt/data/p1 /mnt/data/n4/t5/p2/p1
+  $ mv /mnt/data/n1/n2 /mnt/data/n4/t5/p2/p1/p2/n2
+  $ mv /mnt/data/n4/t5/p2/p1/p2/t1 /mnt/data/n4/t5/p2/p1/p2/n2/t1
+  $ mv /mnt/data/n4/t5/t7 /mnt/data/n4/t5/p2/p1/p2/n2/t1/t7
+  $ mv /mnt/data/n4/t5/p2/p1/t1/t3 /mnt/data/n4/t5/p2/p1/p2/n2/t1/t3
+  $ mv /mnt/data/n4/t5/p2/p1/p2/n2/p1 /mnt/data/n4/t5/p2/p1/p2/n2/t1/t7/p1
+  $ mv /mnt/data/t6 /mnt/data/n4/t5/p2/p1/p2/n2/t1/t3/t5
+  $ mv /mnt/data/n4/t5/p2/p1/t1 /mnt/data/n4/t5/p2/p1/p2/n2/t1/t3/t1
+  $ mv /mnt/data/n1 /mnt/data/n4/t5/p2/p1/p2/n2/t1/t7/p1/n1
+
+  $ btrfs subvolume snapshot -r /mnt /mnt/snap1
+
+  $ mv /mnt/data/n4/t1 /mnt/data/n4/t5/p2/p1/p2/n2/t1/t7/p1/t1
+  $ mv /mnt/data/n4/t5/p2/p1/p2/n2/t1 /mnt/data/n4/
+  $ mv /mnt/data/n4/t5/p2/p1/p2/n2 /mnt/data/n4/t1/n2
+  $ mv /mnt/data/n4/t1/t7/p1 /mnt/data/n4/t1/n2/p1
+  $ mv /mnt/data/n4/t1/t3/t1 /mnt/data/n4/t1/n2/t1
+  $ mv /mnt/data/n4/t1/t3 /mnt/data/n4/t1/n2/t1/t3
+  $ mv /mnt/data/n4/t5/p2/p1/p2 /mnt/data/n4/t1/n2/p1/p2
+  $ mv /mnt/data/n4/t1/t7 /mnt/data/n4/t1/n2/p1/t7
+  $ mv /mnt/data/n4/t5/p2/p1 /mnt/data/n4/t1/n2/p1/p2/p1
+  $ mv /mnt/data/n4/t1/n2/t1/t3/t5 /mnt/data/n4/t1/n2/p1/p2/t5
+  $ mv /mnt/data/n4/t5 /mnt/data/n4/t1/n2/p1/p2/p1/t5
+  $ mv /mnt/data/n4/t1/n2/p1/p2/p1/t5/p2 /mnt/data/n4/t1/n2/p1/p2/p1/p2
+  $ mv /mnt/data/n4/t1/n2/p1/p2/p1/p2/t7 /mnt/data/n4/t1/t7
+
+  $ btrfs subvolume snapshot -r /mnt /mnt/snap2
+
+  $ btrfs send /mnt/snap1 | btrfs receive /mnt2
+  $ btrfs send -p /mnt/snap1 /mnt/snap2 | btrfs receive -vv /mnt2
+  ERROR: send ioctl failed with -12: Cannot allocate memory
+
+This reproducer resulted in an infinite path build loop when building the
+path for inode 266 because the following circular dependency of delayed
+directory renames was created:
+
+   ino 272 <- ino 261 <- ino 259 <- ino 268 <- ino 267 <- ino 261
+
+Where the notation "X <- Y" means the rename of inode X is delayed by the
+rename of inode Y (X will be renamed after Y is renamed). This resulted
+in an infinite path build loop of inode 266 because that inode has inode
+261 as an ancestor in the send root and inode 261 is in the circular
+dependency of delayed renames listed above.
+
+Fix this by not delaying the rename of a directory inode if an ancestor of
+the inode in the send root, which has a delayed rename operation, is not
+also a descendent of the inode in the parent root.
+
+Thanks to Robbie Ko for sending the reproducer example.
+A test case for xfstests follows soon.
+
+Reported-by: Robbie Ko <robbieko@synology.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+

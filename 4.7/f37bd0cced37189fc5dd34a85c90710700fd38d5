@@ -1,0 +1,50 @@
+cnic: call cp->stop_hw() in cnic_start_hw() on allocation failure
+
+We recently had a system crash in the cnic module. Vmcore analysis confirmed
+that "ip link up" was executed which failed due to an allocation failure
+because of memory fragmentation. Futher analysis revealed that the cnic irq
+vector was still allocated after the "ip link up" that failed. When
+"ip link down" was executed it called free_msi_irqs() which crashed the system
+because the cnic irq was still inuse.
+
+PANIC: "kernel BUG at drivers/pci/msi.c:411!"
+
+The code execution was:
+
+cnic_netdev_event()
+if (event == NETDEV_UP) {
+.
+.
+       ▹       if (!cnic_start_hw(dev))
+cnic_start_hw()
+calls cnic_cm_open() which failed with -ENOMEM
+cnic_start_hw() then took the err1 path:
+
+err1:↩
+       cp->free_resc(dev);↩ <---- frees resources but not irq vector
+       pci_dev_put(dev->pcidev);↩
+       return err;↩
+}↩
+
+This returns control back to cnic_netdev_event() but now the cnic irq vector
+is still allocated even although cnic_cm_open() failed. The next
+"ip link down" while trigger the crash.
+
+The cnic_start_hw() routine is not handling the allocation failure correctly.
+Fix this by checking whether CNIC_DRV_STATE_HANDLES_IRQ flag is set indicating
+that the hardware has been started in cnic_start_hw(). If it has then call
+cp->stop_hw() which frees the cnic irq vector and cnic resources. Otherwise
+just maintain the previous behaviour and free cnic resources.
+
+I reproduced this by injecting an ENOMEM error into cnic_cm_alloc_mem()s return
+code.
+
+# ip link set dev enpX down
+# ip link set dev enpX up <--- hit's allocation failure
+# ip link set dev enpX down <--- crashes here
+
+With this patch I confirmed there was no crash in the reproducer.
+
+Signed-off-by: Jon Maxwell <jmaxwell37@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

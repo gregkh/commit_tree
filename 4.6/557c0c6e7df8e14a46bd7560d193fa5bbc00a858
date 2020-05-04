@@ -1,0 +1,39 @@
+bpf: convert stackmap to pre-allocation
+
+It was observed that calling bpf_get_stackid() from a kprobe inside
+slub or from spin_unlock causes similar deadlock as with hashmap,
+therefore convert stackmap to use pre-allocated memory.
+
+The call_rcu is no longer feasible mechanism, since delayed freeing
+causes bpf_get_stackid() to fail unpredictably when number of actual
+stacks is significantly less than user requested max_entries.
+Since elements are no longer freed into slub, we can push elements into
+freelist immediately and let them be recycled.
+However the very unlikley race between user space map_lookup() and
+program-side recycling is possible:
+     cpu0                          cpu1
+     ----                          ----
+user does lookup(stackidX)
+starts copying ips into buffer
+                                   delete(stackidX)
+                                   calls bpf_get_stackid()
+				   which recyles the element and
+                                   overwrites with new stack trace
+
+To avoid user space seeing a partial stack trace consisting of two
+merged stack traces, do bucket = xchg(, NULL); copy; xchg(,bucket);
+to preserve consistent stack trace delivery to user space.
+Now we can move memset(,0) of left-over element value from critical
+path of bpf_get_stackid() into slow-path of user space lookup.
+Also disallow lookup() from bpf program, since it's useless and
+program shouldn't be messing with collected stack trace.
+
+Note that similar race between user space lookup and kernel side updates
+is also present in hashmap, but it's not a new race. bpf programs were
+always allowed to modify hash and array map elements while user space
+is copying them.
+
+Fixes: d5a3b1f69186 ("bpf: introduce BPF_MAP_TYPE_STACK_TRACE")
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

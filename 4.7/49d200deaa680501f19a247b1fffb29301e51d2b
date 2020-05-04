@@ -1,0 +1,98 @@
+debugfs: prevent access to removed files' private data
+
+Upon return of debugfs_remove()/debugfs_remove_recursive(), it might
+still be attempted to access associated private file data through
+previously opened struct file objects. If that data has been freed by
+the caller of debugfs_remove*() in the meanwhile, the reading/writing
+process would either encounter a fault or, if the memory address in
+question has been reassigned again, unrelated data structures could get
+overwritten.
+
+However, since debugfs files are seldomly removed, usually from module
+exit handlers only, the impact is very low.
+
+Currently, there are ~1000 call sites of debugfs_create_file() spread
+throughout the whole tree and touching all of those struct file_operations
+in order to make them file removal aware by means of checking the result of
+debugfs_use_file_start() from within their methods is unfeasible.
+
+Instead, wrap the struct file_operations by a lifetime managing proxy at
+file open:
+- In debugfs_create_file(), the original fops handed in has got stashed
+  away in ->d_fsdata already.
+- In debugfs_create_file(), install a proxy file_operations factory,
+  debugfs_full_proxy_file_operations, at ->i_fop.
+
+This proxy factory has got an ->open() method only. It carries out some
+lifetime checks and if successful, dynamically allocates and sets up a new
+struct file_operations proxy at ->f_op. Afterwards, it forwards to the
+->open() of the original struct file_operations in ->d_fsdata, if any.
+
+The dynamically set up proxy at ->f_op has got a lifetime managing wrapper
+set for each of the methods defined in the original struct file_operations
+in ->d_fsdata.
+
+Its ->release()er frees the proxy again and forwards to the original
+->release(), if any.
+
+In order not to mislead the VFS layer, it is strictly necessary to leave
+those fields blank in the proxy that have been NULL in the original
+struct file_operations also, i.e. aren't supported. This is why there is a
+need for dynamically allocated proxies. The choice made not to allocate a
+proxy instance for every dentry at file creation, but for every
+struct file object instantiated thereof is justified by the expected usage
+pattern of debugfs, namely that in general very few files get opened more
+than once at a time.
+
+The wrapper methods set in the struct file_operations implement lifetime
+managing by means of the SRCU protection facilities already in place for
+debugfs:
+They set up a SRCU read side critical section and check whether the dentry
+is still alive by means of debugfs_use_file_start(). If so, they forward
+the call to the original struct file_operation stored in ->d_fsdata, still
+under the protection of the SRCU read side critical section.
+This SRCU read side critical section prevents any pending debugfs_remove()
+and friends to return to their callers. Since a file's private data must
+only be freed after the return of debugfs_remove(), the ongoing proxied
+call is guarded against any file removal race.
+
+If, on the other hand, the initial call to debugfs_use_file_start() detects
+that the dentry is dead, the wrapper simply returns -EIO and does not
+forward the call. Note that the ->poll() wrapper is special in that its
+signature does not allow for the return of arbitrary -EXXX values and thus,
+POLLHUP is returned here.
+
+In order not to pollute debugfs with wrapper definitions that aren't ever
+needed, I chose not to define a wrapper for every struct file_operations
+method possible. Instead, a wrapper is defined only for the subset of
+methods which are actually set by any debugfs users.
+Currently, these are:
+
+  ->llseek()
+  ->read()
+  ->write()
+  ->unlocked_ioctl()
+  ->poll()
+
+The ->release() wrapper is special in that it does not protect the original
+->release() in any way from dead files in order not to leak resources.
+Thus, any ->release() handed to debugfs must implement file lifetime
+management manually, if needed.
+For only 33 out of a total of 434 releasers handed in to debugfs, it could
+not be verified immediately whether they access data structures that might
+have been freed upon a debugfs_remove() return in the meanwhile.
+
+Export debugfs_use_file_start() and debugfs_use_file_finish() in order to
+allow any ->release() to manually implement file lifetime management.
+
+For a set of common cases of struct file_operations implemented by the
+debugfs_core itself, future patches will incorporate file lifetime
+management directly within those in order to allow for their unproxied
+operation. Rename the original, non-proxying "debugfs_create_file()" to
+"debugfs_create_file_unsafe()" and keep it for future internal use by
+debugfs itself. Factor out code common to both into the new
+__debugfs_create_file().
+
+Signed-off-by: Nicolai Stange <nicstange@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

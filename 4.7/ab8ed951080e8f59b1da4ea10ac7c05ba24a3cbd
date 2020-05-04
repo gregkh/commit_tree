@@ -1,0 +1,78 @@
+connector: fix out-of-order cn_proc netlink message delivery
+
+The proc connector messages include a sequence number, allowing userspace
+programs to detect lost messages.  However, performing this detection is
+currently more difficult than necessary, since netlink messages can be
+delivered to the application out-of-order.  To fix this, leave pre-emption
+disabled during cn_netlink_send(), and use GFP_NOWAIT.
+
+The following was written as a test case.  Building the kernel w/ make -j32
+proved a reliable way to generate out-of-order cn_proc messages.
+
+int
+main(int argc, char *argv[])
+{
+	static uint32_t last_seq[CPU_SETSIZE], seq;
+	int cpu, fd;
+	struct sockaddr_nl sa;
+	struct __attribute__((aligned(NLMSG_ALIGNTO))) {
+		struct nlmsghdr nl_hdr;
+		struct __attribute__((__packed__)) {
+			struct cn_msg cn_msg;
+			struct proc_event cn_proc;
+		};
+	} rmsg;
+	struct __attribute__((aligned(NLMSG_ALIGNTO))) {
+		struct nlmsghdr nl_hdr;
+		struct __attribute__((__packed__)) {
+			struct cn_msg cn_msg;
+			enum proc_cn_mcast_op cn_mcast;
+		};
+	} smsg;
+
+	fd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
+	if (fd < 0) {
+		perror("socket");
+	}
+
+	sa.nl_family = AF_NETLINK;
+	sa.nl_groups = CN_IDX_PROC;
+	sa.nl_pid = getpid();
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		perror("bind");
+	}
+
+	memset(&smsg, 0, sizeof(smsg));
+	smsg.nl_hdr.nlmsg_len = sizeof(smsg);
+	smsg.nl_hdr.nlmsg_pid = getpid();
+	smsg.nl_hdr.nlmsg_type = NLMSG_DONE;
+	smsg.cn_msg.id.idx = CN_IDX_PROC;
+	smsg.cn_msg.id.val = CN_VAL_PROC;
+	smsg.cn_msg.len = sizeof(enum proc_cn_mcast_op);
+	smsg.cn_mcast = PROC_CN_MCAST_LISTEN;
+	if (send(fd, &smsg, sizeof(smsg), 0) != sizeof(smsg)) {
+		perror("send");
+	}
+
+	while (recv(fd, &rmsg, sizeof(rmsg), 0) == sizeof(rmsg)) {
+		cpu = rmsg.cn_proc.cpu;
+		if (cpu < 0) {
+			continue;
+		}
+		seq = rmsg.cn_msg.seq;
+		if ((last_seq[cpu] != 0) && (seq != last_seq[cpu] + 1)) {
+			printf("out-of-order seq=%d on cpu=%d\n", seq, cpu);
+		}
+		last_seq[cpu] = seq;
+	}
+
+	/* NOTREACHED */
+
+	perror("recv");
+
+	return -1;
+}
+
+Signed-off-by: Aaron Campbell <aaron@monkey.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

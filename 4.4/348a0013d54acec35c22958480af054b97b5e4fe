@@ -1,0 +1,87 @@
+Btrfs: fix unprotected list move from unused_bgs to deleted_bgs list
+
+As of my previous change titled "Btrfs: fix scrub preventing unused block
+groups from being deleted", the following warning at
+extent-tree.c:btrfs_delete_unused_bgs() can be hit when we mount the a
+filesysten with "-o discard":
+
+ 10263  void btrfs_delete_unused_bgs(struct btrfs_fs_info *fs_info)
+ 10264  {
+ (...)
+ 10405                  if (trimming) {
+ 10406                          WARN_ON(!list_empty(&block_group->bg_list));
+ 10407                          spin_lock(&trans->transaction->deleted_bgs_lock);
+ 10408                          list_move(&block_group->bg_list,
+ 10409                                    &trans->transaction->deleted_bgs);
+ 10410                          spin_unlock(&trans->transaction->deleted_bgs_lock);
+ 10411                          btrfs_get_block_group(block_group);
+ 10412                  }
+ (...)
+
+This happens because scrub can now add back the block group to the list of
+unused block groups (fs_info->unused_bgs). This is dangerous because we
+are moving the block group from the unused block groups list to the list
+of deleted block groups without holding the lock that protects the source
+list (fs_info->unused_bgs_lock).
+
+The following diagram illustrates how this happens:
+
+            CPU 1                                     CPU 2
+
+ cleaner_kthread()
+   btrfs_delete_unused_bgs()
+
+     sees bg X in list
+      fs_info->unused_bgs
+
+     deletes bg X from list
+      fs_info->unused_bgs
+
+                                            scrub_enumerate_chunks()
+
+                                              searches device tree using
+                                              its commit root
+
+                                              finds device extent for
+                                              block group X
+
+                                              gets block group X from the tree
+                                              fs_info->block_group_cache_tree
+                                              (via btrfs_lookup_block_group())
+
+                                              sets bg X to RO (again)
+
+                                              scrub_chunk(bg X)
+
+                                              sets bg X back to RW mode
+
+                                              adds bg X to the list
+                                              fs_info->unused_bgs again,
+                                              since it's still unused and
+                                              currently not in that list
+
+     sets bg X to RO mode
+
+     btrfs_remove_chunk(bg X)
+
+     --> discard is enabled and bg X
+         is in the fs_info->unused_bgs
+         list again so the warning is
+         triggered
+     --> we move it from that list into
+         the transaction's delete_bgs
+         list, but we can have another
+         task currently manipulating
+         the first list (fs_info->unused_bgs)
+
+Fix this by using the same lock (fs_info->unused_bgs_lock) to protect both
+the list of unused block groups and the list of deleted block groups. This
+makes it safe and there's not much worry for more lock contention, as this
+lock is seldom used and only the cleaner kthread adds elements to the list
+of deleted block groups. The warning goes away too, as this was previously
+an impossible case (and would have been better a BUG_ON/ASSERT) but it's
+not impossible anymore.
+Reproduced with fstest btrfs/073 (using MOUNT_OPTIONS="-o discard").
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+

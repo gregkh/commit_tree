@@ -1,0 +1,117 @@
+rxrpc: Rewrite the data and ack handling code
+
+Rewrite the data and ack handling code such that:
+
+ (1) Parsing of received ACK and ABORT packets and the distribution and the
+     filing of DATA packets happens entirely within the data_ready context
+     called from the UDP socket.  This allows us to process and discard ACK
+     and ABORT packets much more quickly (they're no longer stashed on a
+     queue for a background thread to process).
+
+ (2) We avoid calling skb_clone(), pskb_pull() and pskb_trim().  We instead
+     keep track of the offset and length of the content of each packet in
+     the sk_buff metadata.  This means we don't do any allocation in the
+     receive path.
+
+ (3) Jumbo DATA packet parsing is now done in data_ready context.  Rather
+     than cloning the packet once for each subpacket and pulling/trimming
+     it, we file the packet multiple times with an annotation for each
+     indicating which subpacket is there.  From that we can directly
+     calculate the offset and length.
+
+ (4) A call's receive queue can be accessed without taking locks (memory
+     barriers do have to be used, though).
+
+ (5) Incoming calls are set up from preallocated resources and immediately
+     made live.  They can than have packets queued upon them and ACKs
+     generated.  If insufficient resources exist, DATA packet #1 is given a
+     BUSY reply and other DATA packets are discarded).
+
+ (6) sk_buffs no longer take a ref on their parent call.
+
+To make this work, the following changes are made:
+
+ (1) Each call's receive buffer is now a circular buffer of sk_buff
+     pointers (rxtx_buffer) rather than a number of sk_buff_heads spread
+     between the call and the socket.  This permits each sk_buff to be in
+     the buffer multiple times.  The receive buffer is reused for the
+     transmit buffer.
+
+ (2) A circular buffer of annotations (rxtx_annotations) is kept parallel
+     to the data buffer.  Transmission phase annotations indicate whether a
+     buffered packet has been ACK'd or not and whether it needs
+     retransmission.
+
+     Receive phase annotations indicate whether a slot holds a whole packet
+     or a jumbo subpacket and, if the latter, which subpacket.  They also
+     note whether the packet has been decrypted in place.
+
+ (3) DATA packet window tracking is much simplified.  Each phase has just
+     two numbers representing the window (rx_hard_ack/rx_top and
+     tx_hard_ack/tx_top).
+
+     The hard_ack number is the sequence number before base of the window,
+     representing the last packet the other side says it has consumed.
+     hard_ack starts from 0 and the first packet is sequence number 1.
+
+     The top number is the sequence number of the highest-numbered packet
+     residing in the buffer.  Packets between hard_ack+1 and top are
+     soft-ACK'd to indicate they've been received, but not yet consumed.
+
+     Four macros, before(), before_eq(), after() and after_eq() are added
+     to compare sequence numbers within the window.  This allows for the
+     top of the window to wrap when the hard-ack sequence number gets close
+     to the limit.
+
+     Two flags, RXRPC_CALL_RX_LAST and RXRPC_CALL_TX_LAST, are added also
+     to indicate when rx_top and tx_top point at the packets with the
+     LAST_PACKET bit set, indicating the end of the phase.
+
+ (4) Calls are queued on the socket 'receive queue' rather than packets.
+     This means that we don't need have to invent dummy packets to queue to
+     indicate abnormal/terminal states and we don't have to keep metadata
+     packets (such as ABORTs) around
+
+ (5) The offset and length of a (sub)packet's content are now passed to
+     the verify_packet security op.  This is currently expected to decrypt
+     the packet in place and validate it.
+
+     However, there's now nowhere to store the revised offset and length of
+     the actual data within the decrypted blob (there may be a header and
+     padding to skip) because an sk_buff may represent multiple packets, so
+     a locate_data security op is added to retrieve these details from the
+     sk_buff content when needed.
+
+ (6) recvmsg() now has to handle jumbo subpackets, where each subpacket is
+     individually secured and needs to be individually decrypted.  The code
+     to do this is broken out into rxrpc_recvmsg_data() and shared with the
+     kernel API.  It now iterates over the call's receive buffer rather
+     than walking the socket receive queue.
+
+Additional changes:
+
+ (1) The timers are condensed to a single timer that is set for the soonest
+     of three timeouts (delayed ACK generation, DATA retransmission and
+     call lifespan).
+
+ (2) Transmission of ACK and ABORT packets is effected immediately from
+     process-context socket ops/kernel API calls that cause them instead of
+     them being punted off to a background work item.  The data_ready
+     handler still has to defer to the background, though.
+
+ (3) A shutdown op is added to the AF_RXRPC socket so that the AFS
+     filesystem can shut down the socket and flush its own work items
+     before closing the socket to deal with any in-progress service calls.
+
+Future additional changes that will need to be considered:
+
+ (1) Make sure that a call doesn't hog the front of the queue by receiving
+     data from the network as fast as userspace is consuming it to the
+     exclusion of other calls.
+
+ (2) Transmit delayed ACKs from within recvmsg() when we've consumed
+     sufficiently more packets to avoid the background work item needing to
+     run.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+

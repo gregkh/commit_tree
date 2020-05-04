@@ -1,0 +1,111 @@
+timers: Switch to a non-cascading wheel
+
+The current timer wheel has some drawbacks:
+
+1) Cascading:
+
+   Cascading can be an unbound operation and is completely pointless in most
+   cases because the vast majority of the timer wheel timers are canceled or
+   rearmed before expiration. (They are used as timeout safeguards, not as
+   real timers to measure time.)
+
+2) No fast lookup of the next expiring timer:
+
+   In NOHZ scenarios the first timer soft interrupt after a long NOHZ period
+   must fast forward the base time to the current value of jiffies. As we
+   have no way to find the next expiring timer fast, the code loops linearly
+   and increments the base time one by one and checks for expired timers
+   in each step. This causes unbound overhead spikes exactly in the moment
+   when we should wake up as fast as possible.
+
+After a thorough analysis of real world data gathered on laptops,
+workstations, webservers and other machines (thanks Chris!) I came to the
+conclusion that the current 'classic' timer wheel implementation can be
+modified to address the above issues.
+
+The vast majority of timer wheel timers is canceled or rearmed before
+expiry. Most of them are timeouts for networking and other I/O tasks. The
+nature of timeouts is to catch the exception from normal operation (TCP ack
+timed out, disk does not respond, etc.). For these kinds of timeouts the
+accuracy of the timeout is not really a concern. Timeouts are very often
+approximate worst-case values and in case the timeout fires, we already
+waited for a long time and performance is down the drain already.
+
+The few timers which actually expire can be split into two categories:
+
+ 1) Short expiry times which expect halfways accurate expiry
+
+ 2) Long term expiry times are inaccurate today already due to the
+    batching which is done for NOHZ automatically and also via the
+    set_timer_slack() API.
+
+So for long term expiry timers we can avoid the cascading property and just
+leave them in the less granular outer wheels until expiry or
+cancelation. Timers which are armed with a timeout larger than the wheel
+capacity are no longer cascaded. We expire them with the longest possible
+timeout (6+ days). We have not observed such timeouts in our data collection,
+but at least we handle them, applying the rule of the least surprise.
+
+To avoid extending the wheel levels for HZ=1000 so we can accomodate the
+longest observed timeouts (5 days in the network conntrack code) we reduce the
+first level granularity on HZ=1000 to 4ms, which effectively is the same as
+the HZ=250 behaviour. From our data analysis there is nothing which relies on
+that 1ms granularity and as a side effect we get better batching and timer
+locality for the networking code as well.
+
+Contrary to the classic wheel the granularity of the next wheel is not the
+capacity of the first wheel. The granularities of the wheels are in the
+currently chosen setting 8 times the granularity of the previous wheel.
+
+So for HZ=250 we end up with the following granularity levels:
+
+ Level Offset   Granularity                  Range
+     0      0          4 ms                 0 ms -        252 ms
+     1     64         32 ms               256 ms -       2044 ms (256ms - ~2s)
+     2    128        256 ms              2048 ms -      16380 ms (~2s   - ~16s)
+     3    192       2048 ms (~2s)       16384 ms -     131068 ms (~16s  - ~2m)
+     4    256      16384 ms (~16s)     131072 ms -    1048572 ms (~2m   - ~17m)
+     5    320     131072 ms (~2m)     1048576 ms -    8388604 ms (~17m  - ~2h)
+     6    384    1048576 ms (~17m)    8388608 ms -   67108863 ms (~2h   - ~18h)
+     7    448    8388608 ms (~2h)    67108864 ms -  536870911 ms (~18h  - ~6d)
+
+That's a worst case inaccuracy of 12.5% for the timers which are queued at the
+beginning of a level.
+
+So the new wheel concept addresses the old issues:
+
+1) Cascading is avoided completely
+
+2) By keeping the timers in the bucket until expiry/cancelation we can track
+   the buckets which have timers enqueued in a bucket bitmap and therefore can
+   look up the next expiring timer very fast and O(1).
+
+A further benefit of the concept is that the slack calculation which is done
+on every timer start is no longer necessary because the granularity levels
+provide natural batching already.
+
+Our extensive testing with various loads did not show any performance
+degradation vs. the current wheel implementation.
+
+This patch does not address the 'fast lookup' issue as we wanted to make sure
+that there is no regression introduced by the wheel redesign. The
+optimizations are in follow up patches.
+
+This patch contains fixes from Anna-Maria Gleixner and Richard Cochran.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Arjan van de Ven <arjan@infradead.org>
+Cc: Chris Mason <clm@fb.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Frederic Weisbecker <fweisbec@gmail.com>
+Cc: George Spelvin <linux@sciencehorizons.net>
+Cc: Josh Triplett <josh@joshtriplett.org>
+Cc: Len Brown <lenb@kernel.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: rt@linutronix.de
+Link: http://lkml.kernel.org/r/20160704094342.108621834@linutronix.de
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

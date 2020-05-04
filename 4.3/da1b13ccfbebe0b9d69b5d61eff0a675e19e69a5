@@ -1,0 +1,82 @@
+mm/hwpoison: fix race between soft_offline_page and unpoison_memory
+
+Wanpeng Li reported a race between soft_offline_page() and
+unpoison_memory(), which causes the following kernel panic:
+
+   BUG: Bad page state in process bash  pfn:97000
+   page:ffffea00025c0000 count:0 mapcount:1 mapping:          (null) index:0x7f4fdbe00
+   flags: 0x1fffff80080048(uptodate|active|swapbacked)
+   page dumped because: PAGE_FLAGS_CHECK_AT_FREE flag(s) set
+   bad because of flags:
+   flags: 0x40(active)
+   Modules linked in: snd_hda_codec_hdmi i915 rpcsec_gss_krb5 nfsv4 dns_resolver bnep rfcomm nfsd bluetooth auth_rpcgss nfs_acl nfs rfkill lockd grace sunrpc i2c_algo_bit drm_kms_helper snd_hda_codec_realtek snd_hda_codec_generic drm snd_hda_intel fscache snd_hda_codec x86_pkg_temp_thermal coretemp kvm_intel snd_hda_core snd_hwdep kvm snd_pcm snd_seq_dummy snd_seq_oss crct10dif_pclmul snd_seq_midi crc32_pclmul snd_seq_midi_event ghash_clmulni_intel snd_rawmidi aesni_intel lrw gf128mul snd_seq glue_helper ablk_helper snd_seq_device cryptd fuse snd_timer dcdbas serio_raw mei_me parport_pc snd mei ppdev i2c_core video lp soundcore parport lpc_ich shpchp mfd_core ext4 mbcache jbd2 sd_mod e1000e ahci ptp libahci crc32c_intel libata pps_core
+   CPU: 3 PID: 2211 Comm: bash Not tainted 4.2.0-rc5-mm1+ #45
+   Hardware name: Dell Inc. OptiPlex 7020/0F5C5X, BIOS A03 01/08/2015
+   Call Trace:
+     dump_stack+0x48/0x5c
+     bad_page+0xe6/0x140
+     free_pages_prepare+0x2f9/0x320
+     ? uncharge_list+0xdd/0x100
+     free_hot_cold_page+0x40/0x170
+     __put_single_page+0x20/0x30
+     put_page+0x25/0x40
+     unmap_and_move+0x1a6/0x1f0
+     migrate_pages+0x100/0x1d0
+     ? kill_procs+0x100/0x100
+     ? unlock_page+0x6f/0x90
+     __soft_offline_page+0x127/0x2a0
+     soft_offline_page+0xa6/0x200
+
+This race is explained like below:
+
+  CPU0                    CPU1
+
+  soft_offline_page
+  __soft_offline_page
+  TestSetPageHWPoison
+                        unpoison_memory
+                        PageHWPoison check (true)
+                        TestClearPageHWPoison
+                        put_page    -> release refcount held by get_hwpoison_page in unpoison_memory
+                        put_page    -> release refcount held by isolate_lru_page in __soft_offline_page
+  migrate_pages
+
+The second put_page() releases refcount held by isolate_lru_page() which
+will lead to unmap_and_move() releases the last refcount of page and w/
+mapcount still 1 since try_to_unmap() is not called if there is only one
+user map the page.  Anyway, the page refcount and mapcount will still
+mess if the page is mapped by multiple users.
+
+This race was introduced by commit 4491f71260 ("mm/memory-failure: set
+PageHWPoison before migrate_pages()"), which focuses on preventing the
+reuse of successfully migrated page.  Before this commit we prevent the
+reuse by changing the migratetype to MIGRATE_ISOLATE during soft
+offlining, which has the following problems, so simply reverting the
+commit is not a best option:
+
+  1) it doesn't eliminate the reuse completely, because
+     set_migratetype_isolate() can fail to set MIGRATE_ISOLATE to the
+     target page if the pageblock of the page contains one or more
+     unmovable pages (i.e.  has_unmovable_pages() returns true).
+
+  2) the original code changes migratetype to MIGRATE_ISOLATE
+     forcibly, and sets it to MIGRATE_MOVABLE forcibly after soft offline,
+     regardless of the original migratetype state, which could impact
+     other subsystems like memory hotplug or compaction.
+
+This patch moves PageSetHWPoison just after put_page() in
+unmap_and_move(), which closes up the reported race window and minimizes
+another race window b/w SetPageHWPoison and reallocation (which causes
+the reuse of soft-offlined page.) The latter race window still exists
+but it's acceptable, because it's rare and effectively the same as
+ordinary "containment failure" case even if it happens, so keep the
+window open is acceptable.
+
+Fixes: 4491f71260 ("mm/memory-failure: set PageHWPoison before migrate_pages()")
+Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Reported-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Tested-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

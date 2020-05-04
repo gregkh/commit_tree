@@ -1,0 +1,60 @@
+ACPI / SMBus: Fix boot stalls / high CPU caused by reentrant code
+
+In the SBS initialisation, a reentrant call to wait_event_timeout()
+causes an intermittent boot stall of several minutes usually following
+the "Switching to clocksource tsc" message. Another symptom of this bug
+is high CPU usage from programs (Firefox, upowerd) querying the battery
+state. This is caused by:
+
+ 1. drivers/acpi/sbshc.c wait_transaction_complete() calls
+    wait_event_timeout():
+
+ 	if (wait_event_timeout(hc->wait, smb_check_done(hc),
+ 			       msecs_to_jiffies(timeout)))
+
+ 2. ___wait_event sets task state to uninterruptible
+
+ 3. ___wait_event calls the "condition" smb_check_done()
+
+ 4. smb_check_done (sbshc.c) calls through to ec_read() in
+    drivers/acpi/ec.c
+
+ 5. ec_guard() is reached which calls wait_event_timeout()
+
+ 	if (wait_event_timeout(ec->wait,
+ 			       ec_transaction_completed(ec),
+ 			       guard))
+
+    ie. wait_event_timeout() is being called again inside evaluation of
+    the previous wait_event_timeout() condition
+
+ 5. The EC IRQ handler calls wake_up() and wakes up the sleeping task in
+    ec_guard()
+
+ 6. The task is now in state running even though the wait "condition" is
+    still being evaluated
+
+ 7. The "condition" check returns false so ___wait_event calls
+    schedule_timeout()
+
+ 8. Since the task state is running, the scheduler immediately schedules
+    it again
+
+ 9. This loop usually repeats for around 250 seconds even though the
+    original wait_event_timeout was only 1000ms.
+
+    The timeout is incorrect because each call to schedule_timeout()
+    usually returns immediately, taking less than 1ms, so the jiffies
+    timeout counter is not decremented. The task is now stuck in a
+    running state, and so is highly likely to be immediately
+    rescheduled, which takes less than a jiffy. The loop will never exit
+    if all schedule_timeout() calls take less than a jiffy.
+
+Fix this by replacing SMBus reads in the wait_event_timeout condition
+with checks of a boolean value that is updated by the EC query handler.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=107191
+Link: https://lkml.org/lkml/2015/11/6/776
+Signed-off-by: Chris Bainbridge <chris.bainbridge@gmail.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

@@ -1,0 +1,183 @@
+mm: consider compaction feedback also for costly allocation
+
+PAGE_ALLOC_COSTLY_ORDER retry logic is mostly handled inside
+should_reclaim_retry currently where we decide to not retry after at
+least order worth of pages were reclaimed or the watermark check for at
+least one zone would succeed after reclaiming all pages if the reclaim
+hasn't made any progress.  Compaction feedback is mostly ignored and we
+just try to make sure that the compaction did at least something before
+giving up.
+
+The first condition was added by a41f24ea9fd6 ("page allocator: smarter
+retry of costly-order allocations) and it assumed that lumpy reclaim
+could have created a page of the sufficient order.  Lumpy reclaim, has
+been removed quite some time ago so the assumption doesn't hold anymore.
+Remove the check for the number of reclaimed pages and rely on the
+compaction feedback solely.  should_reclaim_retry now only makes sure
+that we keep retrying reclaim for high order pages only if they are
+hidden by watermaks so order-0 reclaim makes really sense.
+
+should_compact_retry now keeps retrying even for the costly allocations.
+The number of retries is reduced wrt.  !costly requests because they are
+less important and harder to grant and so their pressure shouldn't cause
+contention for other requests or cause an over reclaim.  We also do not
+reset no_progress_loops for costly request to make sure we do not keep
+reclaiming too agressively.
+
+This has been tested by running a process which fragments memory:
+	- compact memory
+	- mmap large portion of the memory (1920M on 2GRAM machine with 2G
+	  of swapspace)
+	- MADV_DONTNEED single page in PAGE_SIZE*((1UL<<MAX_ORDER)-1)
+	  steps until certain amount of memory is freed (250M in my test)
+	  and reduce the step to (step / 2) + 1 after reaching the end of
+	  the mapping
+	- then run a script which populates the page cache 2G (MemTotal)
+	  from /dev/zero to a new file
+And then tries to allocate
+nr_hugepages=$(awk '/MemAvailable/{printf "%d\n", $2/(2*1024)}' /proc/meminfo)
+huge pages.
+
+root@test1:~# echo 1 > /proc/sys/vm/overcommit_memory;echo 1 > /proc/sys/vm/compact_memory; ./fragment-mem-and-run /root/alloc_hugepages.sh 1920M 250M
+Node 0, zone      DMA     31     28     31     10      2      0      2      1      2      3      1
+Node 0, zone    DMA32    437    319    171     50     28     25     20     16     16     14    437
+
+* This is the /proc/buddyinfo after the compaction
+
+Done fragmenting. size=2013265920 freed=262144000
+Node 0, zone      DMA    165     48      3      1      2      0      2      2      2      2      0
+Node 0, zone    DMA32  35109  14575    185     51     41     12      6      0      0      0      0
+
+* /proc/buddyinfo after memory got fragmented
+
+Executing "/root/alloc_hugepages.sh"
+Eating some pagecache
+508623+0 records in
+508623+0 records out
+2083319808 bytes (2.1 GB) copied, 11.7292 s, 178 MB/s
+Node 0, zone      DMA      3      5      3      1      2      0      2      2      2      2      0
+Node 0, zone    DMA32    111    344    153     20     24     10      3      0      0      0      0
+
+* /proc/buddyinfo after page cache got eaten
+
+Trying to allocate 129
+129
+
+* 129 hugepages requested and all of them granted.
+
+Node 0, zone      DMA      3      5      3      1      2      0      2      2      2      2      0
+Node 0, zone    DMA32    127     97     30     99     11      6      2      1      4      0      0
+
+* /proc/buddyinfo after hugetlb allocation.
+
+10 runs will behave as follows:
+Trying to allocate 130
+130
+--
+Trying to allocate 129
+129
+--
+Trying to allocate 128
+128
+--
+Trying to allocate 129
+129
+--
+Trying to allocate 128
+128
+--
+Trying to allocate 129
+129
+--
+Trying to allocate 132
+132
+--
+Trying to allocate 129
+129
+--
+Trying to allocate 128
+128
+--
+Trying to allocate 129
+129
+
+So basically 100% success for all 10 attempts.
+Without the patch numbers looked much worse:
+Trying to allocate 128
+12
+--
+Trying to allocate 129
+14
+--
+Trying to allocate 129
+7
+--
+Trying to allocate 129
+16
+--
+Trying to allocate 129
+30
+--
+Trying to allocate 129
+38
+--
+Trying to allocate 129
+19
+--
+Trying to allocate 129
+37
+--
+Trying to allocate 129
+28
+--
+Trying to allocate 129
+37
+
+Just for completness the base kernel without oom detection rework looks
+as follows:
+Trying to allocate 127
+30
+--
+Trying to allocate 129
+12
+--
+Trying to allocate 129
+52
+--
+Trying to allocate 128
+32
+--
+Trying to allocate 129
+12
+--
+Trying to allocate 129
+10
+--
+Trying to allocate 129
+32
+--
+Trying to allocate 128
+14
+--
+Trying to allocate 128
+16
+--
+Trying to allocate 129
+8
+
+As we can see the success rate is much more volatile and smaller without
+this patch. So the patch not only makes the retry logic for costly
+requests more sensible the success rate is even higher.
+
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Joonsoo Kim <js1304@gmail.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Cc: Vladimir Davydov <vdavydov@virtuozzo.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

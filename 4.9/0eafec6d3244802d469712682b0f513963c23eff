@@ -1,0 +1,62 @@
+drm/i915: Enable lockless lookup of request tracking via RCU
+
+If we enable RCU for the requests (providing a grace period where we can
+inspect a "dead" request before it is freed), we can allow callers to
+carefully perform lockless lookup of an active request.
+
+However, by enabling deferred freeing of requests, we can potentially
+hog a lot of memory when dealing with tens of thousands of requests per
+second - with a quick insertion of a synchronize_rcu() inside our
+shrinker callback, that issue disappears.
+
+v2: Currently, it is our responsibility to handle reclaim i.e. to avoid
+hogging memory with the delayed slab frees. At the moment, we wait for a
+grace period in the shrinker, and block for all RCU callbacks on oom.
+Suggested alternatives focus on flushing our RCU callback when we have a
+certain number of outstanding request frees, and blocking on that flush
+after a second high watermark. (So rather than wait for the system to
+run out of memory, we stop issuing requests - both are nondeterministic.)
+
+Paul E. McKenney wrote:
+
+Another approach is synchronize_rcu() after some largish number of
+requests.  The advantage of this approach is that it throttles the
+production of callbacks at the source.  The corresponding disadvantage
+is that it slows things up.
+
+Another approach is to use call_rcu(), but if the previous call_rcu()
+is still in flight, block waiting for it.  Yet another approach is
+the get_state_synchronize_rcu() / cond_synchronize_rcu() pair.  The
+idea is to do something like this:
+
+        cond_synchronize_rcu(cookie);
+        cookie = get_state_synchronize_rcu();
+
+You would of course do an initial get_state_synchronize_rcu() to
+get things going.  This would not block unless there was less than
+one grace period's worth of time between invocations.  But this
+assumes a busy system, where there is almost always a grace period
+in flight.  But you can make that happen as follows:
+
+        cond_synchronize_rcu(cookie);
+        cookie = get_state_synchronize_rcu();
+        call_rcu(&my_rcu_head, noop_function);
+
+Note that you need additional code to make sure that the old callback
+has completed before doing a new one.  Setting and clearing a flag
+with appropriate memory ordering control suffices (e.g,. smp_load_acquire()
+and smp_store_release()).
+
+v3: More comments on compiler and processor order of operations within
+the RCU lookup and discover we can use rcu_access_pointer() here instead.
+
+v4: Wrap i915_gem_active_get_rcu() to take the rcu_read_lock itself.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Cc: "Goel, Akash" <akash.goel@intel.com>
+Cc: Josh Triplett <josh@joshtriplett.org>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/1470324762-2545-25-git-send-email-chris@chris-wilson.co.uk
+

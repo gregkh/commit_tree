@@ -1,0 +1,129 @@
+ARM: 8504/1: __arch_xprod_64(): small optimization
+
+The tmp variable is used twice: first to pose as a register containing
+a value of zero, and then to provide a temporary register that initially
+is zero and get added some value. But somehow gcc decides to split those
+two usages in different registers.
+
+Example code:
+
+u64 div64const1000(u64 x)
+{
+	u32 y = 1000;
+	do_div(x, y);
+	return x;
+}
+
+Result:
+
+div64const1000:
+	push	{r4, r5, r6, r7, lr}
+	mov	lr, #0
+	mov	r6, r0
+	mov	r7, r1
+	adr	r5, .L8
+	ldrd	r4, [r5]
+	mov	r1, lr
+	umull	r2, r3, r4, r6
+	cmn	r2, r4
+	adcs	r3, r3, r5
+	adc	r2, lr, #0
+	umlal	r3, r2, r5, r6
+	umlal	r3, r1, r4, r7
+	mov	r3, #0
+	adds	r2, r1, r2
+	adc	r3, r3, #0
+	umlal	r2, r3, r5, r7
+	lsr	r0, r2, #9
+	lsr	r1, r3, #9
+	orr	r0, r0, r3, lsl #23
+	pop	{r4, r5, r6, r7, pc}
+	.align	3
+.L8:
+	.word	-1924145349
+	.word	-2095944041
+
+Full kernel build size:
+
+   text	   data	    bss	    dec	    hex	filename
+13663814	1553940	 351368	15569122	 ed90e2	vmlinux
+
+Here the two instances of 'tmp' are assigned to r1 and lr.
+
+To avoid that, let's mark the first 'tmp' usage in __arch_xprod_64()
+with a "+r" constraint even if the register is not written to, so to
+create a dependency for the second usage with the effect of enforcing
+a single temporary register throughout.
+
+Result:
+
+div64const1000:
+	push	{r4, r5, r6, r7}
+	movs	r3, #0
+	adr	r5, .L8
+	ldrd	r4, [r5]
+	umull	r6, r7, r4, r0
+	cmn	r6, r4
+	adcs	r7, r7, r5
+	adc	r6, r3, #0
+	umlal	r7, r6, r5, r0
+	umlal	r7, r3, r4, r1
+	mov	r7, #0
+	adds	r6, r3, r6
+	adc	r7, r7, #0
+	umlal	r6, r7, r5, r1
+	lsr	r0, r6, #9
+	lsr	r1, r7, #9
+	orr	r0, r0, r7, lsl #23
+	pop	{r4, r5, r6, r7}
+	bx	lr
+	.align	3
+.L8:
+	.word	-1924145349
+	.word	-2095944041
+
+   text	   data	    bss	    dec	    hex	filename
+13663438	1553940	 351368	15568746	 ed8f6a	vmlinux
+
+This time 'tmp' is assigned to r3 and used throughout. However, by being
+assigned to r3, that blocks usage of the r2-r3 double register slot for
+64-bit values, forcing more registers to be spilled on the stack. Let's
+try to help it by forcing 'tmp' to the caller-saved ip register.
+
+Result:
+
+div64const1000:
+	stmfd	sp!, {r4, r5}
+	mov	ip, #0
+	adr	r5, .L8
+	ldrd	r4, [r5]
+	umull	r2, r3, r4, r0
+	cmn	r2, r4
+	adcs	r3, r3, r5
+	adc	r2, ip, #0
+	umlal	r3, r2, r5, r0
+	umlal	r3, ip, r4, r1
+	mov	r3, #0
+	adds	r2, ip, r2
+	adc	r3, r3, #0
+	umlal	r2, r3, r5, r1
+	mov	r0, r2, lsr #9
+	mov	r1, r3, lsr #9
+	orr	r0, r0, r3, asl #23
+	ldmfd	sp!, {r4, r5}
+	bx	lr
+	.align	3
+.L8:
+	.word	-1924145349
+	.word	-2095944041
+
+   text	   data	    bss	    dec	    hex	filename
+13662838	1553940	 351368	15568146	 ed8d12	vmlinux
+
+We could make the code marginally smaller yet by forcing 'tmp' to lr
+instead, but that would have a negative inpact on branch prediction for
+which "bx lr" is optimal.
+
+Signed-off-by: Nicolas Pitre <nico@linaro.org>
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+

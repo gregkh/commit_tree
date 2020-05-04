@@ -1,0 +1,89 @@
+userfaultfd: solve the race between UFFDIO_COPY|ZEROPAGE and read
+
+Solve in-kernel the race between UFFDIO_COPY|ZEROPAGE and
+userfaultfd_read if they are run on different threads simultaneously.
+
+Until now qemu solved the race in userland: the race was explicitly
+and intentionally left for userland to solve. However we can also
+solve it in kernel.
+
+Requiring all users to solve this race if they use two threads (one
+for the background transfer and one for the userfault reads) isn't
+very attractive from an API prospective, furthermore this allows to
+remove a whole bunch of mutex and bitmap code from qemu, making it
+faster. The cost of __get_user_pages_fast should be insignificant
+considering it scales perfectly and the pagetables are already hot in
+the CPU cache, compared to the overhead in userland to maintain those
+structures.
+
+Applying this patch is backwards compatible with respect to the
+userfaultfd userland API, however reverting this change wouldn't be
+backwards compatible anymore.
+
+Without this patch qemu in the background transfer thread, has to read
+the old state, and do UFFDIO_WAKE if old_state is missing but it
+become REQUESTED by the time it tries to set it to RECEIVED (signaling
+the other side received an userfault).
+
+    vcpu                background_thr userfault_thr
+    -----               -----          -----
+    vcpu0 handle_mm_fault()
+
+                        postcopy_place_page
+                        read old_state -> MISSING
+                        UFFDIO_COPY 0x7fb76a139000 (no wakeup, still pending)
+
+    vcpu0 fault at 0x7fb76a139000 enters handle_userfault
+    poll() is kicked
+
+                                        poll() -> POLLIN
+                                        read() -> 0x7fb76a139000
+                                        postcopy_pmi_change_state(MISSING, REQUESTED) -> REQUESTED
+
+                        tmp_state = postcopy_pmi_change_state(old_state, RECEIVED) -> REQUESTED
+                        /* check that no userfault raced with UFFDIO_COPY */
+                        if (old_state == MISSING && tmp_state == REQUESTED)
+                                UFFDIO_WAKE from background thread
+
+And a second case where a UFFDIO_WAKE would be needed is in the userfault thread:
+
+    vcpu                background_thr userfault_thr
+    -----               -----          -----
+    vcpu0 handle_mm_fault()
+
+                        postcopy_place_page
+                        read old_state -> MISSING
+                        UFFDIO_COPY 0x7fb76a139000 (no wakeup, still pending)
+                        tmp_state = postcopy_pmi_change_state(old_state, RECEIVED) -> RECEIVED
+
+    vcpu0 fault at 0x7fb76a139000 enters handle_userfault
+    poll() is kicked
+
+                                        poll() -> POLLIN
+                                        read() -> 0x7fb76a139000
+
+                                        if (postcopy_pmi_change_state(MISSING, REQUESTED) == RECEIVED)
+                                                UFFDIO_WAKE from userfault thread
+
+This patch removes the need of both UFFDIO_WAKE and of the associated
+per-page tristate as well.
+
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Acked-by: Pavel Emelyanov <xemul@parallels.com>
+Cc: Sanidhya Kashyap <sanidhya.gatech@gmail.com>
+Cc: zhang.zhanghailiang@huawei.com
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Cc: Andres Lagar-Cavilla <andreslc@google.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Peter Feiner <pfeiner@google.com>
+Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: "Huangpeng (Peter)" <peter.huangpeng@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

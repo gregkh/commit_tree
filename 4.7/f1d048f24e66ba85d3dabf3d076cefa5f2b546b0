@@ -1,0 +1,44 @@
+tipc: fix socket timer deadlock
+
+We sometimes observe a 'deadly embrace' type deadlock occurring
+between mutually connected sockets on the same node. This happens
+when the one-hour peer supervision timers happen to expire
+simultaneously in both sockets.
+
+The scenario is as follows:
+
+CPU 1:                          CPU 2:
+--------                        --------
+tipc_sk_timeout(sk1)            tipc_sk_timeout(sk2)
+  lock(sk1.slock)                 lock(sk2.slock)
+  msg_create(probe)               msg_create(probe)
+  unlock(sk1.slock)               unlock(sk2.slock)
+  tipc_node_xmit_skb()            tipc_node_xmit_skb()
+    tipc_node_xmit()                tipc_node_xmit()
+      tipc_sk_rcv(sk2)                tipc_sk_rcv(sk1)
+        lock(sk2.slock)                 lock((sk1.slock)
+        filter_rcv()                    filter_rcv()
+          tipc_sk_proto_rcv()             tipc_sk_proto_rcv()
+            msg_create(probe_rsp)           msg_create(probe_rsp)
+            tipc_sk_respond()               tipc_sk_respond()
+              tipc_node_xmit_skb()            tipc_node_xmit_skb()
+                tipc_node_xmit()                tipc_node_xmit()
+                  tipc_sk_rcv(sk1)                tipc_sk_rcv(sk2)
+                    lock((sk1.slock)                lock((sk2.slock)
+                    ===> DEADLOCK                   ===> DEADLOCK
+
+Further analysis reveals that there are three different locations in the
+socket code where tipc_sk_respond() is called within the context of the
+socket lock, with ensuing risk of similar deadlocks.
+
+We now solve this by passing a buffer queue along with all upcalls where
+sk_lock.slock may potentially be held. Response or rejected message
+buffers are accumulated into this queue instead of being sent out
+directly, and only sent once we know we are safely outside the slock
+context.
+
+Reported-by: GUNA <gbalasun@gmail.com>
+Acked-by: Ying Xue <ying.xue@windriver.com>
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

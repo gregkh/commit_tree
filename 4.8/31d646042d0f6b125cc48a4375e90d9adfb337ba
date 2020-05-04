@@ -1,0 +1,59 @@
+drbd: disallow promotion during resync handshake, avoid deadlock and hard reset
+
+We already serialize connection state changes,
+and other, non-connection state changes (role changes)
+while we are establishing a connection.
+
+But if we have an established connection,
+then trigger a resync handshake (by primary --force or similar),
+until now we just had to be "lucky".
+
+Consider this sequence (e.g. deployment scenario):
+create-md; up;
+  -> Connected Secondary/Secondary Inconsistent/Inconsistent
+then do a racy primary --force on both peers.
+
+ block drbd0: drbd_sync_handshake:
+ block drbd0: self 0000000000000004:0000000000000000:0000000000000000:0000000000000000 bits:25590 flags:0
+ block drbd0: peer 0000000000000004:0000000000000000:0000000000000000:0000000000000000 bits:25590 flags:0
+ block drbd0: peer( Unknown -> Secondary ) conn( WFReportParams -> Connected ) pdsk( DUnknown -> Inconsistent )
+ block drbd0: peer( Secondary -> Primary ) pdsk( Inconsistent -> UpToDate )
+  *** HERE things go wrong. ***
+ block drbd0: role( Secondary -> Primary )
+ block drbd0: drbd_sync_handshake:
+ block drbd0: self 0000000000000005:0000000000000000:0000000000000000:0000000000000000 bits:25590 flags:0
+ block drbd0: peer C90D2FC716D232AB:0000000000000004:0000000000000000:0000000000000000 bits:25590 flags:0
+ block drbd0: Becoming sync target due to disk states.
+ block drbd0: Writing the whole bitmap, full sync required after drbd_sync_handshake.
+ block drbd0: Remote failed to finish a request within 6007ms > ko-count (2) * timeout (30 * 0.1s)
+ drbd s0: peer( Primary -> Unknown ) conn( Connected -> Timeout ) pdsk( UpToDate -> DUnknown )
+
+The problem here is that the local promotion happens before the sync handshake
+triggered by the remote promotion was completed.  Some assumptions elsewhere
+become wrong, and when the expected resync handshake is then received and
+processed, we get stuck in a deadlock, which can only be recovered by reboot :-(
+
+Fix: if we know the peer has good data,
+and our own disk is present, but NOT good,
+and there is no resync going on yet,
+we expect a sync handshake to happen "soon".
+So reject a racy promotion with SS_IN_TRANSIENT_STATE.
+
+Result:
+ ... as above ...
+ block drbd0: peer( Secondary -> Primary ) pdsk( Inconsistent -> UpToDate )
+  *** local promotion being postponed until ... ***
+ block drbd0: drbd_sync_handshake:
+ block drbd0: self 0000000000000004:0000000000000000:0000000000000000:0000000000000000 bits:25590 flags:0
+ block drbd0: peer 77868BDA836E12A5:0000000000000004:0000000000000000:0000000000000000 bits:25590 flags:0
+  ...
+ block drbd0: conn( WFBitMapT -> WFSyncUUID )
+ block drbd0: updated sync uuid 85D06D0E8887AD44:0000000000000000:0000000000000000:0000000000000000
+ block drbd0: conn( WFSyncUUID -> SyncTarget )
+  *** ... after the resync handshake ***
+ block drbd0: role( Secondary -> Primary )
+
+Signed-off-by: Philipp Reisner <philipp.reisner@linbit.com>
+Signed-off-by: Lars Ellenberg <lars.ellenberg@linbit.com>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+

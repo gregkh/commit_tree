@@ -1,0 +1,60 @@
+xfs: allocate log vector buffers outside CIL context lock
+
+One of the problems we currently have with delayed logging is that
+under serious memory pressure we can deadlock memory reclaim. THis
+occurs when memory reclaim (such as run by kswapd) is reclaiming XFS
+inodes and issues a log force to unpin inodes that are dirty in the
+CIL.
+
+The CIL is pushed, but this will only occur once it gets the CIL
+context lock to ensure that all committing transactions are complete
+and no new transactions start being committed to the CIL while the
+push switches to a new context.
+
+The deadlock occurs when the CIL context lock is held by a
+committing process that is doing memory allocation for log vector
+buffers, and that allocation is then blocked on memory reclaim
+making progress. Memory reclaim, however, is blocked waiting for
+a log force to make progress, and so we effectively deadlock at this
+point.
+
+To solve this problem, we have to move the CIL log vector buffer
+allocation outside of the context lock so that memory reclaim can
+always make progress when it needs to force the log. The problem
+with doing this is that a CIL push can take place while we are
+determining if we need to allocate a new log vector buffer for
+an item and hence the current log vector may go away without
+warning. That means we canot rely on the existing log vector being
+present when we finally grab the context lock and so we must have a
+replacement buffer ready to go at all times.
+
+To ensure this, introduce a "shadow log vector" buffer that is
+always guaranteed to be present when we gain the CIL context lock
+and format the item. This shadow buffer may or may not be used
+during the formatting, but if the log item does not have an existing
+log vector buffer or that buffer is too small for the new
+modifications, we swap it for the new shadow buffer and format
+the modifications into that new log vector buffer.
+
+The result of this is that for any object we modify more than once
+in a given CIL checkpoint, we double the memory required
+to track dirty regions in the log. For single modifications then
+we consume the shadow log vectorwe allocate on commit, and that gets
+consumed by the checkpoint. However, if we make multiple
+modifications, then the second transaction commit will allocate a
+shadow log vector and hence we will end up with double the memory
+usage as only one of the log vectors is consumed by the CIL
+checkpoint. The remaining shadow vector will be freed when th elog
+item is freed.
+
+This can probably be optimised in future - access to the shadow log
+vector is serialised by the object lock (as opposited to the active
+log vector, which is controlled by the CIL context lock) and so we
+can probably free shadow log vector from some objects when the log
+item is marked clean on removal from the AIL.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+

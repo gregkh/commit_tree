@@ -1,0 +1,82 @@
+md/raid5: per hash value and exclusive wait_for_stripe
+
+I noticed heavy spin lock contention at get_active_stripe() with fsmark
+multiple thread write workloads.
+
+Here is how this hot contention comes from. We have limited stripes, and
+it's a multiple thread write workload. Hence, those stripes will be taken
+soon, which puts later processes to sleep for waiting free stripes. When
+enough stripes(>= 1/4 total stripes) are released, all process are woken,
+trying to get the lock. But there is one only being able to get this lock
+for each hash lock, making other processes spinning out there for acquiring
+the lock.
+
+Thus, it's effectiveless to wakeup all processes and let them battle for
+a lock that permits one to access only each time. Instead, we could make
+it be a exclusive wake up: wake up one process only. That avoids the heavy
+spin lock contention naturally.
+
+To do the exclusive wake up, we've to split wait_for_stripe into multiple
+wait queues, to make it per hash value, just like the hash lock.
+
+Here are some test results I have got with this patch applied(all test run
+3 times):
+
+`fsmark.files_per_sec'
+=====================
+
+next-20150317                 this patch
+-------------------------     -------------------------
+metric_value     ±stddev      metric_value     ±stddev     change      testbox/benchmark/testcase-params
+-------------------------     -------------------------   --------     ------------------------------
+      25.600     ±0.0              92.700     ±2.5          262.1%     ivb44/fsmark/1x-64t-4BRD_12G-RAID5-btrfs-4M-30G-fsyncBeforeClose
+      25.600     ±0.0              77.800     ±0.6          203.9%     ivb44/fsmark/1x-64t-9BRD_6G-RAID5-btrfs-4M-30G-fsyncBeforeClose
+      32.000     ±0.0              93.800     ±1.7          193.1%     ivb44/fsmark/1x-64t-4BRD_12G-RAID5-ext4-4M-30G-fsyncBeforeClose
+      32.000     ±0.0              81.233     ±1.7          153.9%     ivb44/fsmark/1x-64t-9BRD_6G-RAID5-ext4-4M-30G-fsyncBeforeClose
+      48.800     ±14.5             99.667     ±2.0          104.2%     ivb44/fsmark/1x-64t-4BRD_12G-RAID5-xfs-4M-30G-fsyncBeforeClose
+       6.400     ±0.0              12.800     ±0.0          100.0%     ivb44/fsmark/1x-64t-3HDD-RAID5-btrfs-4M-40G-fsyncBeforeClose
+      63.133     ±8.2              82.800     ±0.7           31.2%     ivb44/fsmark/1x-64t-9BRD_6G-RAID5-xfs-4M-30G-fsyncBeforeClose
+     245.067     ±0.7             306.567     ±7.9           25.1%     ivb44/fsmark/1x-64t-4BRD_12G-RAID5-f2fs-4M-30G-fsyncBeforeClose
+      17.533     ±0.3              21.000     ±0.8           19.8%     ivb44/fsmark/1x-1t-3HDD-RAID5-xfs-4M-40G-fsyncBeforeClose
+     188.167     ±1.9             215.033     ±3.1           14.3%     ivb44/fsmark/1x-1t-4BRD_12G-RAID5-btrfs-4M-30G-NoSync
+     254.500     ±1.8             290.733     ±2.4           14.2%     ivb44/fsmark/1x-1t-9BRD_6G-RAID5-btrfs-4M-30G-NoSync
+
+`time.system_time'
+=====================
+
+next-20150317                 this patch
+-------------------------    -------------------------
+metric_value     ±stddev     metric_value     ±stddev     change       testbox/benchmark/testcase-params
+-------------------------    -------------------------    --------     ------------------------------
+    7235.603     ±1.2             185.163     ±1.9          -97.4%     ivb44/fsmark/1x-64t-4BRD_12G-RAID5-btrfs-4M-30G-fsyncBeforeClose
+    7666.883     ±2.9             202.750     ±1.0          -97.4%     ivb44/fsmark/1x-64t-9BRD_6G-RAID5-btrfs-4M-30G-fsyncBeforeClose
+   14567.893     ±0.7             421.230     ±0.4          -97.1%     ivb44/fsmark/1x-64t-3HDD-RAID5-btrfs-4M-40G-fsyncBeforeClose
+    3697.667     ±14.0            148.190     ±1.7          -96.0%     ivb44/fsmark/1x-64t-4BRD_12G-RAID5-xfs-4M-30G-fsyncBeforeClose
+    5572.867     ±3.8             310.717     ±1.4          -94.4%     ivb44/fsmark/1x-64t-9BRD_6G-RAID5-ext4-4M-30G-fsyncBeforeClose
+    5565.050     ±0.5             313.277     ±1.5          -94.4%     ivb44/fsmark/1x-64t-4BRD_12G-RAID5-ext4-4M-30G-fsyncBeforeClose
+    2420.707     ±17.1            171.043     ±2.7          -92.9%     ivb44/fsmark/1x-64t-9BRD_6G-RAID5-xfs-4M-30G-fsyncBeforeClose
+    3743.300     ±4.6             379.827     ±3.5          -89.9%     ivb44/fsmark/1x-64t-3HDD-RAID5-ext4-4M-40G-fsyncBeforeClose
+    3308.687     ±6.3             363.050     ±2.0          -89.0%     ivb44/fsmark/1x-64t-3HDD-RAID5-xfs-4M-40G-fsyncBeforeClose
+
+Where,
+
+     1x: where 'x' means iterations or loop, corresponding to the 'L' option of fsmark
+
+     1t, 64t: where 't' means thread
+
+     4M: means the single file size, corresponding to the '-s' option of fsmark
+     40G, 30G, 120G: means the total test size
+
+     4BRD_12G: BRD is the ramdisk, where '4' means 4 ramdisk, and where '12G' means
+               the size of one ramdisk. So, it would be 48G in total. And we made a
+               raid on those ramdisk
+
+As you can see, though there are no much performance gain for hard disk
+workload, the system time is dropped heavily, up to 97%. And as expected,
+the performance increased a lot, up to 260%, for fast device(ram disk).
+
+v2: use bits instead of array to note down wait queue need to wake up.
+
+Signed-off-by: Yuanhan Liu <yuanhan.liu@linux.intel.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+

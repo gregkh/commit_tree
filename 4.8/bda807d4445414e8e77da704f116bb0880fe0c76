@@ -1,0 +1,123 @@
+mm: migrate: support non-lru movable page migration
+
+We have allowed migration for only LRU pages until now and it was enough
+to make high-order pages.  But recently, embedded system(e.g., webOS,
+android) uses lots of non-movable pages(e.g., zram, GPU memory) so we
+have seen several reports about troubles of small high-order allocation.
+For fixing the problem, there were several efforts (e,g,.  enhance
+compaction algorithm, SLUB fallback to 0-order page, reserved memory,
+vmalloc and so on) but if there are lots of non-movable pages in system,
+their solutions are void in the long run.
+
+So, this patch is to support facility to change non-movable pages with
+movable.  For the feature, this patch introduces functions related to
+migration to address_space_operations as well as some page flags.
+
+If a driver want to make own pages movable, it should define three
+functions which are function pointers of struct
+address_space_operations.
+
+1. bool (*isolate_page) (struct page *page, isolate_mode_t mode);
+
+What VM expects on isolate_page function of driver is to return *true*
+if driver isolates page successfully.  On returing true, VM marks the
+page as PG_isolated so concurrent isolation in several CPUs skip the
+page for isolation.  If a driver cannot isolate the page, it should
+return *false*.
+
+Once page is successfully isolated, VM uses page.lru fields so driver
+shouldn't expect to preserve values in that fields.
+
+2. int (*migratepage) (struct address_space *mapping,
+		struct page *newpage, struct page *oldpage, enum migrate_mode);
+
+After isolation, VM calls migratepage of driver with isolated page.  The
+function of migratepage is to move content of the old page to new page
+and set up fields of struct page newpage.  Keep in mind that you should
+indicate to the VM the oldpage is no longer movable via
+__ClearPageMovable() under page_lock if you migrated the oldpage
+successfully and returns 0.  If driver cannot migrate the page at the
+moment, driver can return -EAGAIN.  On -EAGAIN, VM will retry page
+migration in a short time because VM interprets -EAGAIN as "temporal
+migration failure".  On returning any error except -EAGAIN, VM will give
+up the page migration without retrying in this time.
+
+Driver shouldn't touch page.lru field VM using in the functions.
+
+3. void (*putback_page)(struct page *);
+
+If migration fails on isolated page, VM should return the isolated page
+to the driver so VM calls driver's putback_page with migration failed
+page.  In this function, driver should put the isolated page back to the
+own data structure.
+
+4. non-lru movable page flags
+
+There are two page flags for supporting non-lru movable page.
+
+* PG_movable
+
+Driver should use the below function to make page movable under
+page_lock.
+
+	void __SetPageMovable(struct page *page, struct address_space *mapping)
+
+It needs argument of address_space for registering migration family
+functions which will be called by VM.  Exactly speaking, PG_movable is
+not a real flag of struct page.  Rather than, VM reuses page->mapping's
+lower bits to represent it.
+
+	#define PAGE_MAPPING_MOVABLE 0x2
+	page->mapping = page->mapping | PAGE_MAPPING_MOVABLE;
+
+so driver shouldn't access page->mapping directly.  Instead, driver
+should use page_mapping which mask off the low two bits of page->mapping
+so it can get right struct address_space.
+
+For testing of non-lru movable page, VM supports __PageMovable function.
+However, it doesn't guarantee to identify non-lru movable page because
+page->mapping field is unified with other variables in struct page.  As
+well, if driver releases the page after isolation by VM, page->mapping
+doesn't have stable value although it has PAGE_MAPPING_MOVABLE (Look at
+__ClearPageMovable).  But __PageMovable is cheap to catch whether page
+is LRU or non-lru movable once the page has been isolated.  Because LRU
+pages never can have PAGE_MAPPING_MOVABLE in page->mapping.  It is also
+good for just peeking to test non-lru movable pages before more
+expensive checking with lock_page in pfn scanning to select victim.
+
+For guaranteeing non-lru movable page, VM provides PageMovable function.
+Unlike __PageMovable, PageMovable functions validates page->mapping and
+mapping->a_ops->isolate_page under lock_page.  The lock_page prevents
+sudden destroying of page->mapping.
+
+Driver using __SetPageMovable should clear the flag via
+__ClearMovablePage under page_lock before the releasing the page.
+
+* PG_isolated
+
+To prevent concurrent isolation among several CPUs, VM marks isolated
+page as PG_isolated under lock_page.  So if a CPU encounters PG_isolated
+non-lru movable page, it can skip it.  Driver doesn't need to manipulate
+the flag because VM will set/clear it automatically.  Keep in mind that
+if driver sees PG_isolated page, it means the page have been isolated by
+VM so it shouldn't touch page.lru field.  PG_isolated is alias with
+PG_reclaim flag so driver shouldn't use the flag for own purpose.
+
+[opensource.ganesh@gmail.com: mm/compaction: remove local variable is_lru]
+  Link: http://lkml.kernel.org/r/20160618014841.GA7422@leo-test
+Link: http://lkml.kernel.org/r/1464736881-24886-3-git-send-email-minchan@kernel.org
+Signed-off-by: Gioh Kim <gi-oh.kim@profitbricks.com>
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Signed-off-by: Ganesh Mahendran <opensource.ganesh@gmail.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Rafael Aquini <aquini@redhat.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: John Einar Reitan <john.reitan@foss.arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,94 @@
+bpf: pre-allocate hash map elements
+
+If kprobe is placed on spin_unlock then calling kmalloc/kfree from
+bpf programs is not safe, since the following dead lock is possible:
+kfree->spin_lock(kmem_cache_node->lock)...spin_unlock->kprobe->
+bpf_prog->map_update->kmalloc->spin_lock(of the same kmem_cache_node->lock)
+and deadlocks.
+
+The following solutions were considered and some implemented, but
+eventually discarded
+- kmem_cache_create for every map
+- add recursion check to slow-path of slub
+- use reserved memory in bpf_map_update for in_irq or in preempt_disabled
+- kmalloc via irq_work
+
+At the end pre-allocation of all map elements turned out to be the simplest
+solution and since the user is charged upfront for all the memory, such
+pre-allocation doesn't affect the user space visible behavior.
+
+Since it's impossible to tell whether kprobe is triggered in a safe
+location from kmalloc point of view, use pre-allocation by default
+and introduce new BPF_F_NO_PREALLOC flag.
+
+While testing of per-cpu hash maps it was discovered
+that alloc_percpu(GFP_ATOMIC) has odd corner cases and often
+fails to allocate memory even when 90% of it is free.
+The pre-allocation of per-cpu hash elements solves this problem as well.
+
+Turned out that bpf_map_update() quickly followed by
+bpf_map_lookup()+bpf_map_delete() is very common pattern used
+in many of iovisor/bcc/tools, so there is additional benefit of
+pre-allocation, since such use cases are must faster.
+
+Since all hash map elements are now pre-allocated we can remove
+atomic increment of htab->count and save few more cycles.
+
+Also add bpf_map_precharge_memlock() to check rlimit_memlock early to avoid
+large malloc/free done by users who don't have sufficient limits.
+
+Pre-allocation is done with vmalloc and alloc/free is done
+via percpu_freelist. Here are performance numbers for different
+pre-allocation algorithms that were implemented, but discarded
+in favor of percpu_freelist:
+
+1 cpu:
+pcpu_ida	2.1M
+pcpu_ida nolock	2.3M
+bt		2.4M
+kmalloc		1.8M
+hlist+spinlock	2.3M
+pcpu_freelist	2.6M
+
+4 cpu:
+pcpu_ida	1.5M
+pcpu_ida nolock	1.8M
+bt w/smp_align	1.7M
+bt no/smp_align	1.1M
+kmalloc		0.7M
+hlist+spinlock	0.2M
+pcpu_freelist	2.0M
+
+8 cpu:
+pcpu_ida	0.7M
+bt w/smp_align	0.8M
+kmalloc		0.4M
+pcpu_freelist	1.5M
+
+32 cpu:
+kmalloc		0.13M
+pcpu_freelist	0.49M
+
+pcpu_ida nolock is a modified percpu_ida algorithm without
+percpu_ida_cpu locks and without cross-cpu tag stealing.
+It's faster than existing percpu_ida, but not as fast as pcpu_freelist.
+
+bt is a variant of block/blk-mq-tag.c simlified and customized
+for bpf use case. bt w/smp_align is using cache line for every 'long'
+(similar to blk-mq-tag). bt no/smp_align allocates 'long'
+bitmasks continuously to save memory. It's comparable to percpu_ida
+and in some cases faster, but slower than percpu_freelist
+
+hlist+spinlock is the simplest free list with single spinlock.
+As expeceted it has very bad scaling in SMP.
+
+kmalloc is existing implementation which is still available via
+BPF_F_NO_PREALLOC flag. It's significantly slower in single cpu and
+in 8 cpu setup it's 3 times slower than pre-allocation with pcpu_freelist,
+but saves memory, so in cases where map->max_entries can be large
+and number of map update/delete per second is low, it may make
+sense to use it.
+
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

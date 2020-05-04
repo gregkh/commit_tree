@@ -1,0 +1,60 @@
+block: detach bdev inode from its wb in __blkdev_put()
+
+Since 52ebea749aae ("writeback: make backing_dev_info host
+cgroup-specific bdi_writebacks") inode, at some point in its lifetime,
+gets attached to a wb (struct bdi_writeback).  Detaching happens on
+evict, in inode_detach_wb() called from __destroy_inode(), and involves
+updating wb.
+
+However, detaching an internal bdev inode from its wb in
+__destroy_inode() is too late.  Its bdi and by extension root wb are
+embedded into struct request_queue, which has different lifetime rules
+and can be freed long before the final bdput() is called (can be from
+__fput() of a corresponding /dev inode, through dput() - evict() -
+bd_forget().  bdevs hold onto the underlying disk/queue pair only while
+opened; as soon as bdev is closed all bets are off.  In fact,
+disk/queue can be gone before __blkdev_put() even returns:
+
+1499 static void __blkdev_put(struct block_device *bdev, fmode_t mode, int for_part)
+1500 {
+...
+1518         if (bdev->bd_contains == bdev) {
+1519                 if (disk->fops->release)
+1520                         disk->fops->release(disk, mode);
+
+[ Driver puts its references to disk/queue ]
+
+1521         }
+1522         if (!bdev->bd_openers) {
+1523                 struct module *owner = disk->fops->owner;
+1524
+1525                 disk_put_part(bdev->bd_part);
+1526                 bdev->bd_part = NULL;
+1527                 bdev->bd_disk = NULL;
+1528                 if (bdev != bdev->bd_contains)
+1529                         victim = bdev->bd_contains;
+1530                 bdev->bd_contains = NULL;
+1531
+1532                 put_disk(disk);
+
+[ We put ours, the queue is gone
+  The last bdput() would result in a write to invalid memory ]
+
+1533                 module_put(owner);
+...
+1539 }
+
+Since bdev inodes are special anyway, detach them in __blkdev_put()
+after clearing inode's dirty bits, turning the problematic
+inode_detach_wb() in __destroy_inode() into a noop.
+
+add_disk() grabs its disk->queue since 523e1d399ce0 ("block: make
+gendisk hold a reference to its queue"), so the old ->release comment
+is removed in favor of the new inode_detach_wb() comment.
+
+Cc: stable@vger.kernel.org # 4.2+, needs backporting
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Tested-by: Raghavendra K T <raghavendra.kt@linux.vnet.ibm.com>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+

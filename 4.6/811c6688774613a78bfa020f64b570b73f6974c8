@@ -1,0 +1,63 @@
+rbd: fix rbd map vs notify races
+
+A while ago, commit 9875201e1049 ("rbd: fix use-after free of
+rbd_dev->disk") fixed rbd unmap vs notify race by introducing
+an exported wrapper for flushing notifies and sticking it into
+do_rbd_remove().
+
+A similar problem exists on the rbd map path, though: the watch is
+registered in rbd_dev_image_probe(), while the disk is set up quite
+a few steps later, in rbd_dev_device_setup().  Nothing prevents
+a notify from coming in and crashing on a NULL rbd_dev->disk:
+
+    BUG: unable to handle kernel NULL pointer dereference at 0000000000000050
+    Call Trace:
+     [<ffffffffa0508344>] rbd_watch_cb+0x34/0x180 [rbd]
+     [<ffffffffa04bd290>] do_event_work+0x40/0xb0 [libceph]
+     [<ffffffff8109d5db>] process_one_work+0x17b/0x470
+     [<ffffffff8109e3ab>] worker_thread+0x11b/0x400
+     [<ffffffff8109e290>] ? rescuer_thread+0x400/0x400
+     [<ffffffff810a5acf>] kthread+0xcf/0xe0
+     [<ffffffff810b41b3>] ? finish_task_switch+0x53/0x170
+     [<ffffffff810a5a00>] ? kthread_create_on_node+0x140/0x140
+     [<ffffffff81645dd8>] ret_from_fork+0x58/0x90
+     [<ffffffff810a5a00>] ? kthread_create_on_node+0x140/0x140
+    RIP  [<ffffffffa050828a>] rbd_dev_refresh+0xfa/0x180 [rbd]
+
+If an error occurs during rbd map, we have to error out, potentially
+tearing down a watch.  Just like on rbd unmap, notifies have to be
+flushed, otherwise rbd_watch_cb() may end up trying to read in the
+image header after rbd_dev_image_release() has run:
+
+    Assertion failure in rbd_dev_header_info() at line 4722:
+
+     rbd_assert(rbd_image_format_valid(rbd_dev->image_format));
+
+    Call Trace:
+     [<ffffffff81cccee0>] ? rbd_parent_request_create+0x150/0x150
+     [<ffffffff81cd4e59>] rbd_dev_refresh+0x59/0x390
+     [<ffffffff81cd5229>] rbd_watch_cb+0x69/0x290
+     [<ffffffff81fde9bf>] do_event_work+0x10f/0x1c0
+     [<ffffffff81107799>] process_one_work+0x689/0x1a80
+     [<ffffffff811076f7>] ? process_one_work+0x5e7/0x1a80
+     [<ffffffff81132065>] ? finish_task_switch+0x225/0x640
+     [<ffffffff81107110>] ? pwq_dec_nr_in_flight+0x2b0/0x2b0
+     [<ffffffff81108c69>] worker_thread+0xd9/0x1320
+     [<ffffffff81108b90>] ? process_one_work+0x1a80/0x1a80
+     [<ffffffff8111b02d>] kthread+0x21d/0x2e0
+     [<ffffffff8111ae10>] ? kthread_stop+0x550/0x550
+     [<ffffffff82022802>] ret_from_fork+0x22/0x40
+     [<ffffffff8111ae10>] ? kthread_stop+0x550/0x550
+    RIP  [<ffffffff81ccd8f9>] rbd_dev_header_info+0xa19/0x1e30
+
+To fix this, a) check if RBD_DEV_FLAG_EXISTS is set before calling
+revalidate_disk(), b) move ceph_osdc_flush_notifies() call into
+rbd_dev_header_unwatch_sync() to cover rbd map error paths and c) turn
+header read-in into a critical section.  The latter also happens to
+take care of rbd map foo@bar vs rbd snap rm foo@bar race.
+
+Fixes: http://tracker.ceph.com/issues/15490
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Reviewed-by: Josh Durgin <jdurgin@redhat.com>
+
