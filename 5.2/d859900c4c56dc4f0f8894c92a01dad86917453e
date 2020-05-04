@@ -1,0 +1,160 @@
+bpf, libbpf: support global data/bss/rodata sections
+
+This work adds BPF loader support for global data sections
+to libbpf. This allows to write BPF programs in more natural
+C-like way by being able to define global variables and const
+data.
+
+Back at LPC 2018 [0] we presented a first prototype which
+implemented support for global data sections by extending BPF
+syscall where union bpf_attr would get additional memory/size
+pair for each section passed during prog load in order to later
+add this base address into the ldimm64 instruction along with
+the user provided offset when accessing a variable. Consensus
+from LPC was that for proper upstream support, it would be
+more desirable to use maps instead of bpf_attr extension as
+this would allow for introspection of these sections as well
+as potential live updates of their content. This work follows
+this path by taking the following steps from loader side:
+
+ 1) In bpf_object__elf_collect() step we pick up ".data",
+    ".rodata", and ".bss" section information.
+
+ 2) If present, in bpf_object__init_internal_map() we add
+    maps to the obj's map array that corresponds to each
+    of the present sections. Given section size and access
+    properties can differ, a single entry array map is
+    created with value size that is corresponding to the
+    ELF section size of .data, .bss or .rodata. These
+    internal maps are integrated into the normal map
+    handling of libbpf such that when user traverses all
+    obj maps, they can be differentiated from user-created
+    ones via bpf_map__is_internal(). In later steps when
+    we actually create these maps in the kernel via
+    bpf_object__create_maps(), then for .data and .rodata
+    sections their content is copied into the map through
+    bpf_map_update_elem(). For .bss this is not necessary
+    since array map is already zero-initialized by default.
+    Additionally, for .rodata the map is frozen as read-only
+    after setup, such that neither from program nor syscall
+    side writes would be possible.
+
+ 3) In bpf_program__collect_reloc() step, we record the
+    corresponding map, insn index, and relocation type for
+    the global data.
+
+ 4) And last but not least in the actual relocation step in
+    bpf_program__relocate(), we mark the ldimm64 instruction
+    with src_reg = BPF_PSEUDO_MAP_VALUE where in the first
+    imm field the map's file descriptor is stored as similarly
+    done as in BPF_PSEUDO_MAP_FD, and in the second imm field
+    (as ldimm64 is 2-insn wide) we store the access offset
+    into the section. Given these maps have only single element
+    ldimm64's off remains zero in both parts.
+
+ 5) On kernel side, this special marked BPF_PSEUDO_MAP_VALUE
+    load will then store the actual target address in order
+    to have a 'map-lookup'-free access. That is, the actual
+    map value base address + offset. The destination register
+    in the verifier will then be marked as PTR_TO_MAP_VALUE,
+    containing the fixed offset as reg->off and backing BPF
+    map as reg->map_ptr. Meaning, it's treated as any other
+    normal map value from verification side, only with
+    efficient, direct value access instead of actual call to
+    map lookup helper as in the typical case.
+
+Currently, only support for static global variables has been
+added, and libbpf rejects non-static global variables from
+loading. This can be lifted until we have proper semantics
+for how BPF will treat multi-object BPF loads. From BTF side,
+libbpf will set the value type id of the types corresponding
+to the ".bss", ".data" and ".rodata" names which LLVM will
+emit without the object name prefix. The key type will be
+left as zero, thus making use of the key-less BTF option in
+array maps.
+
+Simple example dump of program using globals vars in each
+section:
+
+  # bpftool prog
+  [...]
+  6784: sched_cls  name load_static_dat  tag a7e1291567277844  gpl
+        loaded_at 2019-03-11T15:39:34+0000  uid 0
+        xlated 1776B  jited 993B  memlock 4096B  map_ids 2238,2237,2235,2236,2239,2240
+
+  # bpftool map show id 2237
+  2237: array  name test_glo.bss  flags 0x0
+        key 4B  value 64B  max_entries 1  memlock 4096B
+  # bpftool map show id 2235
+  2235: array  name test_glo.data  flags 0x0
+        key 4B  value 64B  max_entries 1  memlock 4096B
+  # bpftool map show id 2236
+  2236: array  name test_glo.rodata  flags 0x80
+        key 4B  value 96B  max_entries 1  memlock 4096B
+
+  # bpftool prog dump xlated id 6784
+  int load_static_data(struct __sk_buff * skb):
+  ; int load_static_data(struct __sk_buff *skb)
+     0: (b7) r6 = 0
+  ; test_reloc(number, 0, &num0);
+     1: (63) *(u32 *)(r10 -4) = r6
+     2: (bf) r2 = r10
+  ; int load_static_data(struct __sk_buff *skb)
+     3: (07) r2 += -4
+  ; test_reloc(number, 0, &num0);
+     4: (18) r1 = map[id:2238]
+     6: (18) r3 = map[id:2237][0]+0    <-- direct addr in .bss area
+     8: (b7) r4 = 0
+     9: (85) call array_map_update_elem#100464
+    10: (b7) r1 = 1
+  ; test_reloc(number, 1, &num1);
+  [...]
+  ; test_reloc(string, 2, str2);
+   120: (18) r8 = map[id:2237][0]+16   <-- same here at offset +16
+   122: (18) r1 = map[id:2239]
+   124: (18) r3 = map[id:2237][0]+16
+   126: (b7) r4 = 0
+   127: (85) call array_map_update_elem#100464
+   128: (b7) r1 = 120
+  ; str1[5] = 'x';
+   129: (73) *(u8 *)(r9 +5) = r1
+  ; test_reloc(string, 3, str1);
+   130: (b7) r1 = 3
+   131: (63) *(u32 *)(r10 -4) = r1
+   132: (b7) r9 = 3
+   133: (bf) r2 = r10
+  ; int load_static_data(struct __sk_buff *skb)
+   134: (07) r2 += -4
+  ; test_reloc(string, 3, str1);
+   135: (18) r1 = map[id:2239]
+   137: (18) r3 = map[id:2235][0]+16   <-- direct addr in .data area
+   139: (b7) r4 = 0
+   140: (85) call array_map_update_elem#100464
+   141: (b7) r1 = 111
+  ; __builtin_memcpy(&str2[2], "hello", sizeof("hello"));
+   142: (73) *(u8 *)(r8 +6) = r1       <-- further access based on .bss data
+   143: (b7) r1 = 108
+   144: (73) *(u8 *)(r8 +5) = r1
+  [...]
+
+For Cilium use-case in particular, this enables migrating configuration
+constants from Cilium daemon's generated header defines into global
+data sections such that expensive runtime recompilations with LLVM can
+be avoided altogether. Instead, the ELF file becomes effectively a
+"template", meaning, it is compiled only once (!) and the Cilium daemon
+will then rewrite relevant configuration data from the ELF's .data or
+.rodata sections directly instead of recompiling the program. The
+updated ELF is then loaded into the kernel and atomically replaces
+the existing program in the networking datapath. More info in [0].
+
+Based upon recent fix in LLVM, commit c0db6b6bd444 ("[BPF] Don't fail
+for static variables").
+
+  [0] LPC 2018, BPF track, "ELF relocation for static data in BPF",
+      http://vger.kernel.org/lpc-bpf2018.html#session-3
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Andrii Nakryiko <andriin@fb.com>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

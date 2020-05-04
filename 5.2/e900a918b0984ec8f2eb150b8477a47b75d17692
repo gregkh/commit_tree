@@ -1,0 +1,155 @@
+mm: shuffle initial free memory to improve memory-side-cache utilization
+
+Patch series "mm: Randomize free memory", v10.
+
+This patch (of 3):
+
+Randomization of the page allocator improves the average utilization of
+a direct-mapped memory-side-cache.  Memory side caching is a platform
+capability that Linux has been previously exposed to in HPC
+(high-performance computing) environments on specialty platforms.  In
+that instance it was a smaller pool of high-bandwidth-memory relative to
+higher-capacity / lower-bandwidth DRAM.  Now, this capability is going
+to be found on general purpose server platforms where DRAM is a cache in
+front of higher latency persistent memory [1].
+
+Robert offered an explanation of the state of the art of Linux
+interactions with memory-side-caches [2], and I copy it here:
+
+    It's been a problem in the HPC space:
+    http://www.nersc.gov/research-and-development/knl-cache-mode-performance-coe/
+
+    A kernel module called zonesort is available to try to help:
+    https://software.intel.com/en-us/articles/xeon-phi-software
+
+    and this abandoned patch series proposed that for the kernel:
+    https://lkml.kernel.org/r/20170823100205.17311-1-lukasz.daniluk@intel.com
+
+    Dan's patch series doesn't attempt to ensure buffers won't conflict, but
+    also reduces the chance that the buffers will. This will make performance
+    more consistent, albeit slower than "optimal" (which is near impossible
+    to attain in a general-purpose kernel).  That's better than forcing
+    users to deploy remedies like:
+        "To eliminate this gradual degradation, we have added a Stream
+         measurement to the Node Health Check that follows each job;
+         nodes are rebooted whenever their measured memory bandwidth
+         falls below 300 GB/s."
+
+A replacement for zonesort was merged upstream in commit cc9aec03e58f
+("x86/numa_emulation: Introduce uniform split capability").  With this
+numa_emulation capability, memory can be split into cache sized
+("near-memory" sized) numa nodes.  A bind operation to such a node, and
+disabling workloads on other nodes, enables full cache performance.
+However, once the workload exceeds the cache size then cache conflicts
+are unavoidable.  While HPC environments might be able to tolerate
+time-scheduling of cache sized workloads, for general purpose server
+platforms, the oversubscribed cache case will be the common case.
+
+The worst case scenario is that a server system owner benchmarks a
+workload at boot with an un-contended cache only to see that performance
+degrade over time, even below the average cache performance due to
+excessive conflicts.  Randomization clips the peaks and fills in the
+valleys of cache utilization to yield steady average performance.
+
+Here are some performance impact details of the patches:
+
+1/ An Intel internal synthetic memory bandwidth measurement tool, saw a
+   3X speedup in a contrived case that tries to force cache conflicts.
+   The contrived cased used the numa_emulation capability to force an
+   instance of the benchmark to be run in two of the near-memory sized
+   numa nodes.  If both instances were placed on the same emulated they
+   would fit and cause zero conflicts.  While on separate emulated nodes
+   without randomization they underutilized the cache and conflicted
+   unnecessarily due to the in-order allocation per node.
+
+2/ A well known Java server application benchmark was run with a heap
+   size that exceeded cache size by 3X.  The cache conflict rate was 8%
+   for the first run and degraded to 21% after page allocator aging.  With
+   randomization enabled the rate levelled out at 11%.
+
+3/ A MongoDB workload did not observe measurable difference in
+   cache-conflict rates, but the overall throughput dropped by 7% with
+   randomization in one case.
+
+4/ Mel Gorman ran his suite of performance workloads with randomization
+   enabled on platforms without a memory-side-cache and saw a mix of some
+   improvements and some losses [3].
+
+While there is potentially significant improvement for applications that
+depend on low latency access across a wide working-set, the performance
+may be negligible to negative for other workloads.  For this reason the
+shuffle capability defaults to off unless a direct-mapped
+memory-side-cache is detected.  Even then, the page_alloc.shuffle=0
+parameter can be specified to disable the randomization on those systems.
+
+Outside of memory-side-cache utilization concerns there is potentially
+security benefit from randomization.  Some data exfiltration and
+return-oriented-programming attacks rely on the ability to infer the
+location of sensitive data objects.  The kernel page allocator, especially
+early in system boot, has predictable first-in-first out behavior for
+physical pages.  Pages are freed in physical address order when first
+onlined.
+
+Quoting Kees:
+    "While we already have a base-address randomization
+     (CONFIG_RANDOMIZE_MEMORY), attacks against the same hardware and
+     memory layouts would certainly be using the predictability of
+     allocation ordering (i.e. for attacks where the base address isn't
+     important: only the relative positions between allocated memory).
+     This is common in lots of heap-style attacks. They try to gain
+     control over ordering by spraying allocations, etc.
+
+     I'd really like to see this because it gives us something similar
+     to CONFIG_SLAB_FREELIST_RANDOM but for the page allocator."
+
+While SLAB_FREELIST_RANDOM reduces the predictability of some local slab
+caches it leaves vast bulk of memory to be predictably in order allocated.
+However, it should be noted, the concrete security benefits are hard to
+quantify, and no known CVE is mitigated by this randomization.
+
+Introduce shuffle_free_memory(), and its helper shuffle_zone(), to perform
+a Fisher-Yates shuffle of the page allocator 'free_area' lists when they
+are initially populated with free memory at boot and at hotplug time.  Do
+this based on either the presence of a page_alloc.shuffle=Y command line
+parameter, or autodetection of a memory-side-cache (to be added in a
+follow-on patch).
+
+The shuffling is done in terms of CONFIG_SHUFFLE_PAGE_ORDER sized free
+pages where the default CONFIG_SHUFFLE_PAGE_ORDER is MAX_ORDER-1 i.e.  10,
+4MB this trades off randomization granularity for time spent shuffling.
+MAX_ORDER-1 was chosen to be minimally invasive to the page allocator
+while still showing memory-side cache behavior improvements, and the
+expectation that the security implications of finer granularity
+randomization is mitigated by CONFIG_SLAB_FREELIST_RANDOM.  The
+performance impact of the shuffling appears to be in the noise compared to
+other memory initialization work.
+
+This initial randomization can be undone over time so a follow-on patch is
+introduced to inject entropy on page free decisions.  It is reasonable to
+ask if the page free entropy is sufficient, but it is not enough due to
+the in-order initial freeing of pages.  At the start of that process
+putting page1 in front or behind page0 still keeps them close together,
+page2 is still near page1 and has a high chance of being adjacent.  As
+more pages are added ordering diversity improves, but there is still high
+page locality for the low address pages and this leads to no significant
+impact to the cache conflict rate.
+
+[1]: https://itpeernetwork.intel.com/intel-optane-dc-persistent-memory-operating-modes/
+[2]: https://lkml.kernel.org/r/AT5PR8401MB1169D656C8B5E121752FC0F8AB120@AT5PR8401MB1169.NAMPRD84.PROD.OUTLOOK.COM
+[3]: https://lkml.org/lkml/2018/10/12/309
+
+[dan.j.williams@intel.com: fix shuffle enable]
+  Link: http://lkml.kernel.org/r/154943713038.3858443.4125180191382062871.stgit@dwillia2-desk3.amr.corp.intel.com
+[cai@lca.pw: fix SHUFFLE_PAGE_ALLOCATOR help texts]
+  Link: http://lkml.kernel.org/r/20190425201300.75650-1-cai@lca.pw
+Link: http://lkml.kernel.org/r/154899811738.3165233.12325692939590944259.stgit@dwillia2-desk3.amr.corp.intel.com
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Qian Cai <cai@lca.pw>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Keith Busch <keith.busch@intel.com>
+Cc: Robert Elliott <elliott@hpe.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,62 @@
+aio: simplify - and fix - fget/fput for io_submit()
+
+Al Viro root-caused a race where the IOCB_CMD_POLL handling of
+fget/fput() could cause us to access the file pointer after it had
+already been freed:
+
+ "In more details - normally IOCB_CMD_POLL handling looks so:
+
+   1) io_submit(2) allocates aio_kiocb instance and passes it to
+      aio_poll()
+
+   2) aio_poll() resolves the descriptor to struct file by req->file =
+      fget(iocb->aio_fildes)
+
+   3) aio_poll() sets ->woken to false and raises ->ki_refcnt of that
+      aio_kiocb to 2 (bumps by 1, that is).
+
+   4) aio_poll() calls vfs_poll(). After sanity checks (basically,
+      "poll_wait() had been called and only once") it locks the queue.
+      That's what the extra reference to iocb had been for - we know we
+      can safely access it.
+
+   5) With queue locked, we check if ->woken has already been set to
+      true (by aio_poll_wake()) and, if it had been, we unlock the
+      queue, drop a reference to aio_kiocb and bugger off - at that
+      point it's a responsibility to aio_poll_wake() and the stuff
+      called/scheduled by it. That code will drop the reference to file
+      in req->file, along with the other reference to our aio_kiocb.
+
+   6) otherwise, we see whether we need to wait. If we do, we unlock the
+      queue, drop one reference to aio_kiocb and go away - eventual
+      wakeup (or cancel) will deal with the reference to file and with
+      the other reference to aio_kiocb
+
+   7) otherwise we remove ourselves from waitqueue (still under the
+      queue lock), so that wakeup won't get us. No async activity will
+      be happening, so we can safely drop req->file and iocb ourselves.
+
+  If wakeup happens while we are in vfs_poll(), we are fine - aio_kiocb
+  won't get freed under us, so we can do all the checks and locking
+  safely. And we don't touch ->file if we detect that case.
+
+  However, vfs_poll() most certainly *does* touch the file it had been
+  given. So wakeup coming while we are still in ->poll() might end up
+  doing fput() on that file. That case is not too rare, and usually we
+  are saved by the still present reference from descriptor table - that
+  fput() is not the final one.
+
+  But if another thread closes that descriptor right after our fget()
+  and wakeup does happen before ->poll() returns, we are in trouble -
+  final fput() done while we are in the middle of a method:
+
+Al also wrote a patch to take an extra reference to the file descriptor
+to fix this, but I instead suggested we just streamline the whole file
+pointer handling by submit_io() so that the generic aio submission code
+simply keeps the file pointer around until the aio has completed.
+
+Fixes: bfe4037e722e ("aio: implement IOCB_CMD_POLL")
+Acked-by: Al Viro <viro@zeniv.linux.org.uk>
+Reported-by: syzbot+503d4cc169fcec1cb18c@syzkaller.appspotmail.com
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

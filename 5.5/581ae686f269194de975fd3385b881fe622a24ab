@@ -1,0 +1,51 @@
+race in exportfs_decode_fh()
+
+On Sat, Nov 02, 2019 at 06:08:42PM +0000, Al Viro wrote:
+
+> It is converging to a reasonably small and understandable surface, actually,
+> most of that being in core pathname resolution.  Two big piles of nightmares
+> left to review - overlayfs and (somewhat surprisingly) setxattr call chains,
+> the latter due to IMA/EVM/LSM insanity...
+
+Oh, lovely - in exportfs_decode_fh() we have this:
+                err = exportfs_get_name(mnt, target_dir, nbuf, result);
+                if (!err) {
+                        inode_lock(target_dir->d_inode);
+                        nresult = lookup_one_len(nbuf, target_dir,
+                                                 strlen(nbuf));
+                        inode_unlock(target_dir->d_inode);
+                        if (!IS_ERR(nresult)) {
+                                if (nresult->d_inode) {
+                                        dput(result);
+                                        result = nresult;
+                                } else
+                                        dput(nresult);
+                        }
+                }
+We have derived the parent from fhandle, we have a disconnected dentry for child,
+we go look for the name.  We even find it.  Now, we want to look it up.  And
+some bastard goes and unlinks it, just as we are trying to lock the parent.
+We do a lookup, and get a negative dentry.  Then we unlock the parent... and
+some other bastard does e.g. mkdir with the same name.  OK, nresult->d_inode
+is not NULL (anymore).  It has fuck-all to do with the original fhandle
+(different inumber, etc.) but we happily accept it.
+
+Even better, we have no barriers between our check and nresult becoming positive.
+IOW, having observed non-NULL ->d_inode doesn't give us enough - e.g. we might
+still see the old ->d_flags value, from back when ->d_inode used to be NULL.
+On something like alpha we also have no promises that we'll observe anything
+about the fields of nresult->d_inode, but ->d_flags alone is enough for fun.
+The callers can't e.g. expect d_is_reg() et.al. to match the reality.
+
+This is obviously bogus.  And the fix is obvious: check that nresult->d_inode is
+equal to result->d_inode before unlocking the parent.  Note that we'd *already* had
+the original result and all of its aliases rejected by the 'acceptable' predicate,
+so if nresult doesn't supply us a better alias, we are SOL.
+
+Does anyone see objections to the following patch?  Christoph, that seems to
+be your code; am I missing something subtle here?  AFAICS, that goes back to
+2007 or so...
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+

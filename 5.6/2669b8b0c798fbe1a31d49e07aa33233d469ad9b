@@ -1,0 +1,84 @@
+binder: prevent UAF for binderfs devices
+
+On binder_release(), binder_defer_work(proc, BINDER_DEFERRED_RELEASE) is
+called which punts the actual cleanup operation to a workqueue. At some
+point, binder_deferred_func() will be called which will end up calling
+binder_deferred_release() which will retrieve and cleanup the
+binder_context attach to this struct binder_proc.
+
+If we trace back where this binder_context is attached to binder_proc we
+see that it is set in binder_open() and is taken from the struct
+binder_device it is associated with. This obviously assumes that the
+struct binder_device that context is attached to is _never_ freed. While
+that might be true for devtmpfs binder devices it is most certainly
+wrong for binderfs binder devices.
+
+So, assume binder_open() is called on a binderfs binder devices. We now
+stash away the struct binder_context associated with that struct
+binder_devices:
+	proc->context = &binder_dev->context;
+	/* binderfs stashes devices in i_private */
+	if (is_binderfs_device(nodp)) {
+		binder_dev = nodp->i_private;
+		info = nodp->i_sb->s_fs_info;
+		binder_binderfs_dir_entry_proc = info->proc_log_dir;
+	} else {
+	.
+	.
+	.
+	proc->context = &binder_dev->context;
+
+Now let's assume that the binderfs instance for that binder devices is
+shutdown via umount() and/or the mount namespace associated with it goes
+away. As long as there is still an fd open for that binderfs binder
+device things are fine. But let's assume we now close the last fd for
+that binderfs binder device. Now binder_release() is called and punts to
+the workqueue. Assume that the workqueue has quite a bit of stuff to do
+and doesn't get to cleaning up the struct binder_proc and the associated
+struct binder_context with it for that binderfs binder device right
+away. In the meantime, the VFS is killing the super block and is
+ultimately calling sb->evict_inode() which means it will call
+binderfs_evict_inode() which does:
+
+static void binderfs_evict_inode(struct inode *inode)
+{
+	struct binder_device *device = inode->i_private;
+	struct binderfs_info *info = BINDERFS_I(inode);
+
+	clear_inode(inode);
+
+	if (!S_ISCHR(inode->i_mode) || !device)
+		return;
+
+	mutex_lock(&binderfs_minors_mutex);
+	--info->device_count;
+	ida_free(&binderfs_minors, device->miscdev.minor);
+	mutex_unlock(&binderfs_minors_mutex);
+
+	kfree(device->context.name);
+	kfree(device);
+}
+
+thereby freeing the struct binder_device including struct
+binder_context.
+
+Now the workqueue finally has time to get around to cleaning up struct
+binder_proc and is now trying to access the associate struct
+binder_context. Since it's already freed it will OOPs.
+
+Fix this by holding an additional reference to the inode that is only
+released once the workqueue is done cleaning up struct binder_proc. This
+is an easy alternative to introducing separate refcounting on struct
+binder_device which we can always do later if it becomes necessary.
+
+This is an alternative fix to 51d8a7eca677 ("binder: prevent UAF read in
+print_binder_transaction_log_entry()").
+
+Fixes: 3ad20fe393b3 ("binder: implement binderfs")
+Fixes: 03e2e07e3814 ("binder: Make transaction_log available in binderfs")
+Related : 51d8a7eca677 ("binder: prevent UAF read in print_binder_transaction_log_entry()")
+Cc: stable@vger.kernel.org
+Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+Acked-by: Todd Kjos <tkjos@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

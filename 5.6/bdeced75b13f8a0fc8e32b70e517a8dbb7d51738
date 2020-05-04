@@ -1,0 +1,104 @@
+net: dsa: felix: Add PCS operations for PHYLINK
+
+Layerscape SoCs traditionally expose the SerDes configuration/status for
+Ethernet protocols (PCS for SGMII/USXGMII/10GBase-R etc etc) in a register
+format that is compatible with clause 22 or clause 45 (depending on
+SerDes protocol). Each MAC has its own internal MDIO bus on which there
+is one or more of these PCS's, responding to commands at a configurable
+PHY address. The per-port internal MDIO bus (which is just for PCSs) is
+totally separate and has nothing to do with the dedicated external MDIO
+controller (which is just for PHYs), but the register map for the MDIO
+controller is the same.
+
+The VSC9959 (Felix) switch instantiated in the LS1028A is integrated
+in hardware with the ENETC PCS of its DSA master, and reuses its MDIO
+controller driver, so Felix has been made to depend on it in Kconfig.
+
+ +------------------------------------------------------------------------+
+ |                   +--------+ GMII (typically disabled via RCW)         |
+ | ENETC PCI         |  ENETC |--------------------------+                |
+ | Root Complex      | port 3 |-----------------------+  |                |
+ | Integrated        +--------+                       |  |                |
+ | Endpoint                                           |  |                |
+ |                   +--------+ 2.5G GMII             |  |                |
+ |                   |  ENETC |--------------+        |  |                |
+ |                   | port 2 |-----------+  |        |  |                |
+ |                   +--------+           |  |        |  |                |
+ |                                     +--------+  +--------+             |
+ |                                     |  Felix |  |  Felix |             |
+ |                                     | port 4 |  | port 5 |             |
+ |                                     +--------+  +--------+             |
+ |                                                                        |
+ | +--------+  +--------+  +--------+  +--------+  +--------+  +--------+ |
+ | |  ENETC |  |  ENETC |  |  Felix |  |  Felix |  |  Felix |  |  Felix | |
+ | | port 0 |  | port 1 |  | port 0 |  | port 1 |  | port 2 |  | port 3 | |
+ +------------------------------------------------------------------------+
+ |    ||||  SerDes |          ||||        ||||        ||||        ||||    |
+ | +--------+block |       +--------------------------------------------+ |
+ | |  ENETC |      |       |       ENETC port 2 internal MDIO bus       | |
+ | | port 0 |      |       |  PCS         PCS          PCS        PCS   | |
+ | |   PCS  |      |       |   0           1            2          3    | |
+ +-----------------|------------------------------------------------------+
+        v          v           v           v            v          v
+     SGMII/      RGMII    QSGMII/QSXGMII/4xSGMII/4x1000Base-X/4x2500Base-X
+    USXGMII/   (bypasses
+  1000Base-X/   SerDes)
+  2500Base-X
+
+In the LS1028A SoC described above, the VSC9959 Felix switch is PF5 of
+the ENETC root complex, and has 2 BARs:
+- BAR 4: the switch's effective registers
+- BAR 0: the MDIO controller register map lended from ENETC port 2
+         (PF2), for accessing its associated PCS's.
+
+This explanation is necessary because the patch does some renaming
+"pci_bar" -> "switch_pci_bar" for clarity, which would otherwise appear
+a bit obtuse.
+
+The fact that the internal MDIO bus is "borrowed" is relevant because
+the register map is found in PF5 (the switch) but it triggers an access
+fault if PF2 (the ENETC DSA master) is not enabled. This is not treated
+in any way (and I don't think it can be treated).
+
+All of this is so SoC-specific, that it was contained as much as
+possible in the platform-integration file felix_vsc9959.c.
+
+We need to parse and pre-validate the device tree because of 2 reasons:
+- The PHY mode (SerDes protocol) cannot change at runtime due to SoC
+  design.
+- There is a circular dependency in that we need to know what clause the
+  PCS speaks in order to find it on the internal MDIO bus. But the
+  clause of the PCS depends on what phy-mode it is configured for.
+
+The goal of this patch is to make steps towards removing the bootloader
+dependency for SGMII PCS pre-configuration, as well as to add support
+for monitoring the in-band SGMII AN between the PCS and the system-side
+link partner (PHY or other MAC).
+
+In practice the bootloader dependency is not completely removed. U-Boot
+pre-programs the PHY address at which each PCS can be found on the
+internal MDIO bus (MDEV_PORT). This is needed because the PCS of each
+port has the same out-of-reset PHY address of zero. The SerDes register
+for changing MDEV_PORT is pretty deep in the SoC (outside the addresses
+of the ENETC PCI BARs) and therefore inaccessible to us from here.
+
+Felix VSC9959 and Ocelot VSC7514 are integrated very differently in
+their respective SoCs, and for that reason Felix does not use the Ocelot
+core library for PHYLINK. On one hand we don't want to impose the
+fixed phy-mode limitation to Ocelot, and on the other hand Felix doesn't
+need to force the MAC link speed the way Ocelot does, since the MAC is
+connected to the PCS through a fixed GMII, and the PCS is the one who
+does the rate adaptation at lower link speeds, which the MAC does not
+even need to know about. In fact changing the GMII speed for Felix
+irrecoverably breaks transmission through that port until a reset.
+
+The pair with ENETC port 3 and Felix port 5 is optional and doesn't
+support tagging. When we enable it, swp5 is a regular slave port, albeit
+an internal one. The trouble is that it doesn't work, and that is
+because the DSA PHYLIB adaptation layer doesn't treat fixed-link slave
+ports. So that is yet another reason for wanting to convert Felix to the
+native PHYLINK API.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

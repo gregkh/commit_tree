@@ -1,0 +1,146 @@
+kasan: support backing vmalloc space with real shadow memory
+
+Patch series "kasan: support backing vmalloc space with real shadow
+memory", v11.
+
+Currently, vmalloc space is backed by the early shadow page.  This means
+that kasan is incompatible with VMAP_STACK.
+
+This series provides a mechanism to back vmalloc space with real,
+dynamically allocated memory.  I have only wired up x86, because that's
+the only currently supported arch I can work with easily, but it's very
+easy to wire up other architectures, and it appears that there is some
+work-in-progress code to do this on arm64 and s390.
+
+This has been discussed before in the context of VMAP_STACK:
+ - https://bugzilla.kernel.org/show_bug.cgi?id=202009
+ - https://lkml.org/lkml/2018/7/22/198
+ - https://lkml.org/lkml/2019/7/19/822
+
+In terms of implementation details:
+
+Most mappings in vmalloc space are small, requiring less than a full
+page of shadow space.  Allocating a full shadow page per mapping would
+therefore be wasteful.  Furthermore, to ensure that different mappings
+use different shadow pages, mappings would have to be aligned to
+KASAN_SHADOW_SCALE_SIZE * PAGE_SIZE.
+
+Instead, share backing space across multiple mappings.  Allocate a
+backing page when a mapping in vmalloc space uses a particular page of
+the shadow region.  This page can be shared by other vmalloc mappings
+later on.
+
+We hook in to the vmap infrastructure to lazily clean up unused shadow
+memory.
+
+Testing with test_vmalloc.sh on an x86 VM with 2 vCPUs shows that:
+
+ - Turning on KASAN, inline instrumentation, without vmalloc, introuduces
+   a 4.1x-4.2x slowdown in vmalloc operations.
+
+ - Turning this on introduces the following slowdowns over KASAN:
+     * ~1.76x slower single-threaded (test_vmalloc.sh performance)
+     * ~2.18x slower when both cpus are performing operations
+       simultaneously (test_vmalloc.sh sequential_test_order=1)
+
+This is unfortunate but given that this is a debug feature only, not the
+end of the world.  The benchmarks are also a stress-test for the vmalloc
+subsystem: they're not indicative of an overall 2x slowdown!
+
+This patch (of 4):
+
+Hook into vmalloc and vmap, and dynamically allocate real shadow memory
+to back the mappings.
+
+Most mappings in vmalloc space are small, requiring less than a full
+page of shadow space.  Allocating a full shadow page per mapping would
+therefore be wasteful.  Furthermore, to ensure that different mappings
+use different shadow pages, mappings would have to be aligned to
+KASAN_SHADOW_SCALE_SIZE * PAGE_SIZE.
+
+Instead, share backing space across multiple mappings.  Allocate a
+backing page when a mapping in vmalloc space uses a particular page of
+the shadow region.  This page can be shared by other vmalloc mappings
+later on.
+
+We hook in to the vmap infrastructure to lazily clean up unused shadow
+memory.
+
+To avoid the difficulties around swapping mappings around, this code
+expects that the part of the shadow region that covers the vmalloc space
+will not be covered by the early shadow page, but will be left unmapped.
+This will require changes in arch-specific code.
+
+This allows KASAN with VMAP_STACK, and may be helpful for architectures
+that do not have a separate module space (e.g.  powerpc64, which I am
+currently working on).  It also allows relaxing the module alignment
+back to PAGE_SIZE.
+
+Testing with test_vmalloc.sh on an x86 VM with 2 vCPUs shows that:
+
+ - Turning on KASAN, inline instrumentation, without vmalloc, introuduces
+   a 4.1x-4.2x slowdown in vmalloc operations.
+
+ - Turning this on introduces the following slowdowns over KASAN:
+     * ~1.76x slower single-threaded (test_vmalloc.sh performance)
+     * ~2.18x slower when both cpus are performing operations
+       simultaneously (test_vmalloc.sh sequential_test_order=3D1)
+
+This is unfortunate but given that this is a debug feature only, not the
+end of the world.
+
+The full benchmark results are:
+
+Performance
+
+                              No KASAN      KASAN original x baseline  KASAN vmalloc x baseline    x KASAN
+
+fix_size_alloc_test             662004            11404956      17.23       19144610      28.92       1.68
+full_fit_alloc_test             710950            12029752      16.92       13184651      18.55       1.10
+long_busy_list_alloc_test      9431875            43990172       4.66       82970178       8.80       1.89
+random_size_alloc_test         5033626            23061762       4.58       47158834       9.37       2.04
+fix_align_alloc_test           1252514            15276910      12.20       31266116      24.96       2.05
+random_size_align_alloc_te     1648501            14578321       8.84       25560052      15.51       1.75
+align_shift_alloc_test             147                 830       5.65           5692      38.72       6.86
+pcpu_alloc_test                  80732              125520       1.55         140864       1.74       1.12
+Total Cycles              119240774314        763211341128       6.40  1390338696894      11.66       1.82
+
+Sequential, 2 cpus
+
+                              No KASAN      KASAN original x baseline  KASAN vmalloc x baseline    x KASAN
+
+fix_size_alloc_test            1423150            14276550      10.03       27733022      19.49       1.94
+full_fit_alloc_test            1754219            14722640       8.39       15030786       8.57       1.02
+long_busy_list_alloc_test     11451858            52154973       4.55      107016027       9.34       2.05
+random_size_alloc_test         5989020            26735276       4.46       68885923      11.50       2.58
+fix_align_alloc_test           2050976            20166900       9.83       50491675      24.62       2.50
+random_size_align_alloc_te     2858229            17971700       6.29       38730225      13.55       2.16
+align_shift_alloc_test             405                6428      15.87          26253      64.82       4.08
+pcpu_alloc_test                 127183              151464       1.19         216263       1.70       1.43
+Total Cycles               54181269392        308723699764       5.70   650772566394      12.01       2.11
+fix_size_alloc_test            1420404            14289308      10.06       27790035      19.56       1.94
+full_fit_alloc_test            1736145            14806234       8.53       15274301       8.80       1.03
+long_busy_list_alloc_test     11404638            52270785       4.58      107550254       9.43       2.06
+random_size_alloc_test         6017006            26650625       4.43       68696127      11.42       2.58
+fix_align_alloc_test           2045504            20280985       9.91       50414862      24.65       2.49
+random_size_align_alloc_te     2845338            17931018       6.30       38510276      13.53       2.15
+align_shift_alloc_test             472                3760       7.97           9656      20.46       2.57
+pcpu_alloc_test                 118643              132732       1.12         146504       1.23       1.10
+Total Cycles               54040011688        309102805492       5.72   651325675652      12.05       2.11
+
+[dja@axtens.net: fixups]
+  Link: http://lkml.kernel.org/r/20191120052719.7201-1-dja@axtens.net
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=3D202009
+Link: http://lkml.kernel.org/r/20191031093909.9228-2-dja@axtens.net
+Signed-off-by: Mark Rutland <mark.rutland@arm.com> [shadow rework]
+Signed-off-by: Daniel Axtens <dja@axtens.net>
+Co-developed-by: Mark Rutland <mark.rutland@arm.com>
+Acked-by: Vasily Gorbik <gor@linux.ibm.com>
+Reviewed-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Christophe Leroy <christophe.leroy@c-s.fr>
+Cc: Qian Cai <cai@lca.pw>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

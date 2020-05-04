@@ -1,0 +1,120 @@
+drm/dp_mst: Start tracking per-port VCPI allocations
+
+There has been a TODO waiting for quite a long time in
+drm_dp_mst_topology.c:
+
+	/* We cannot rely on port->vcpi.num_slots to update
+	 * topology_state->avail_slots as the port may not exist if the parent
+	 * branch device was unplugged. This should be fixed by tracking
+	 * per-port slot allocation in drm_dp_mst_topology_state instead of
+	 * depending on the caller to tell us how many slots to release.
+	 */
+
+That's not the only reason we should fix this: forcing the driver to
+track the VCPI allocations throughout a state's atomic check is
+error prone, because it means that extra care has to be taken with the
+order that drm_dp_atomic_find_vcpi_slots() and
+drm_dp_atomic_release_vcpi_slots() are called in in order to ensure
+idempotency. Currently the only driver actually using these helpers,
+i915, doesn't even do this correctly: multiple ->best_encoder() checks
+with i915's current implementation would not be idempotent and would
+over-allocate VCPI slots, something I learned trying to implement
+fallback retraining in MST.
+
+So: simplify this whole mess, and teach drm_dp_atomic_find_vcpi_slots()
+and drm_dp_atomic_release_vcpi_slots() to track the VCPI allocations for
+each port. This allows us to ensure idempotency without having to rely
+on the driver as much. Additionally: the driver doesn't need to do any
+kind of VCPI slot tracking anymore if it doesn't need it for it's own
+internal state.
+
+Additionally; this adds a new drm_dp_mst_atomic_check() helper which
+must be used by atomic drivers to perform validity checks for the new
+VCPI allocations incurred by a state.
+
+Also: update the documentation and make it more obvious that these
+/must/ be called by /all/ atomic drivers supporting MST.
+
+Changes since v9:
+* Add some missing changes that were requested by danvet that I forgot
+  about after I redid all of the kref stuff:
+  * Remove unnecessary state changes in intel_dp_mst_atomic_check
+  * Cleanup atomic check logic for VCPI allocations - all we need to check in
+    compute_config is whether or not this state disables a CRTC, then free
+    VCPI based off that
+
+Changes since v8:
+ * Fix compile errors, whoops!
+
+Changes since v7:
+ - Don't check for mixed stale/valid VCPI allocations, just rely on
+ connector registration to stop such erroneous modesets
+
+Changes since v6:
+ - Keep a kref to all of the ports we have allocations on. This required
+   a good bit of changing to when we call drm_dp_find_vcpi_slots(),
+   mainly that we need to ensure that we only redo VCPI allocations on
+   actual mode or CRTC changes, not crtc_state->active changes.
+   Additionally, we no longer take the registration of the DRM connector
+   for each port into account because so long as we have a kref to the
+   port in the new or previous atomic state, the connector will stay
+   registered.
+ - Use the small changes to drm_dp_put_port() to add even more error
+   checking to make misusage of the helpers more obvious. I added this
+   after having to chase down various use-after-free conditions that
+   started popping up from the new helpers so no one else has to
+   troubleshoot that.
+ - Move some accidental DRM_DEBUG_KMS() calls to DRM_DEBUG_ATOMIC()
+ - Update documentation again, note that find/release() should both not be
+   called on the same port in a single atomic check phase (but multiple
+   calls to one or the other is OK)
+
+Changes since v4:
+ - Don't skip the atomic checks for VCPI allocations if no new VCPI
+   allocations happen in a state. This makes the next change I'm about
+   to list here a lot easier to implement.
+ - Don't ignore VCPI allocations on destroyed ports, instead ensure that
+   when ports are destroyed and still have VCPI allocations in the
+   topology state, the only state changes allowed are releasing said
+   ports' VCPI. This prevents a state with a mix of VCPI allocations
+   from destroyed ports, and allocations from valid ports.
+
+Changes since v3:
+ - Don't release VCPI allocations in the topology state immediately in
+   drm_dp_atomic_release_vcpi_slots(), instead mark them as 0 and skip
+   over them in drm_dp_mst_duplicate_state(). This makes it so
+   drm_dp_atomic_release_vcpi_slots() is still idempotent while also
+   throwing warnings if the driver messes up it's book keeping and tries
+   to release VCPI slots on a port that doesn't have any pre-existing
+   VCPI allocation - danvet
+ - Change mst_state/state in some debugging messages to "mst state"
+
+Changes since v2:
+ - Use kmemdup() for duplicating MST state - danvet
+ - Move port validation out of duplicate state callback - danvet
+ - Handle looping through MST topology states in
+   drm_dp_mst_atomic_check() so the driver doesn't have to do it
+ - Fix documentation in drm_dp_atomic_find_vcpi_slots()
+ - Move the atomic check for each individual topology state into it's
+   own function, reduces indenting
+ - Don't consider "stale" MST ports when calculating the bandwidth
+   requirements. This is needed because originally we relied on the
+   state duplication functions to prune any stale ports from the new
+   state, which would prevent us from incorrectly considering their
+   bandwidth requirements alongside legitimate new payloads.
+ - Add function references in drm_dp_atomic_release_vcpi_slots() - danvet
+ - Annotate atomic VCPI and atomic check functions with __must_check
+   - danvet
+
+Changes since v1:
+ - Don't use the now-removed ->atomic_check() for private objects hook,
+   just give drivers a function to call themselves
+
+Signed-off-by: Lyude Paul <lyude@redhat.com>
+Reviewed-by: Daniel Vetter <daniel@ffwll.ch>
+Cc: David Airlie <airlied@redhat.com>
+Cc: Jerry Zuo <Jerry.Zuo@amd.com>
+Cc: Harry Wentland <harry.wentland@amd.com>
+Cc: Juston Li <juston.li@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190111005343.17443-19-lyude@redhat.com
+

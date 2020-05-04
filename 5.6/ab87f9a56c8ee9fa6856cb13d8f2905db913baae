@@ -1,0 +1,66 @@
+namei: LOOKUP_{IN_ROOT,BENEATH}: permit limited ".." resolution
+
+Allow LOOKUP_BENEATH and LOOKUP_IN_ROOT to safely permit ".." resolution
+(in the case of LOOKUP_BENEATH the resolution will still fail if ".."
+resolution would resolve a path outside of the root -- while
+LOOKUP_IN_ROOT will chroot(2)-style scope it). Magic-link jumps are
+still disallowed entirely[*].
+
+As Jann explains[1,2], the need for this patch (and the original no-".."
+restriction) is explained by observing there is a fairly easy-to-exploit
+race condition with chroot(2) (and thus by extension LOOKUP_IN_ROOT and
+LOOKUP_BENEATH if ".." is allowed) where a rename(2) of a path can be
+used to "skip over" nd->root and thus escape to the filesystem above
+nd->root.
+
+  thread1 [attacker]:
+    for (;;)
+      renameat2(AT_FDCWD, "/a/b/c", AT_FDCWD, "/a/d", RENAME_EXCHANGE);
+  thread2 [victim]:
+    for (;;)
+      openat2(dirb, "b/c/../../etc/shadow",
+              { .flags = O_PATH, .resolve = RESOLVE_IN_ROOT } );
+
+With fairly significant regularity, thread2 will resolve to
+"/etc/shadow" rather than "/a/b/etc/shadow". There is also a similar
+(though somewhat more privileged) attack using MS_MOVE.
+
+With this patch, such cases will be detected *during* ".." resolution
+and will return -EAGAIN for userspace to decide to either retry or abort
+the lookup. It should be noted that ".." is the weak point of chroot(2)
+-- walking *into* a subdirectory tautologically cannot result in you
+walking *outside* nd->root (except through a bind-mount or magic-link).
+There is also no other way for a directory's parent to change (which is
+the primary worry with ".." resolution here) other than a rename or
+MS_MOVE.
+
+The primary reason for deferring to userspace with -EAGAIN is that an
+in-kernel retry loop (or doing a path_is_under() check after re-taking
+the relevant seqlocks) can become unreasonably expensive on machines
+with lots of VFS activity (nfsd can cause lots of rename_lock updates).
+Thus it should be up to userspace how many times they wish to retry the
+lookup -- the selftests for this attack indicate that there is a ~35%
+chance of the lookup succeeding on the first try even with an attacker
+thrashing rename_lock.
+
+A variant of the above attack is included in the selftests for
+openat2(2) later in this patch series. I've run this test on several
+machines for several days and no instances of a breakout were detected.
+While this is not concrete proof that this is safe, when combined with
+the above argument it should lend some trustworthiness to this
+construction.
+
+[*] It may be acceptable in the future to do a path_is_under() check for
+    magic-links after they are resolved. However this seems unlikely to
+    be a feature that people *really* need -- it can be added later if
+    it turns out a lot of people want it.
+
+[1]: https://lore.kernel.org/lkml/CAG48ez1jzNvxB+bfOBnERFGp=oMM0vHWuLD6EULmne3R6xa53w@mail.gmail.com/
+[2]: https://lore.kernel.org/lkml/CAG48ez30WJhbsro2HOc_DR7V91M+hNFzBP5ogRMZaxbAORvqzg@mail.gmail.com/
+
+Cc: Christian Brauner <christian.brauner@ubuntu.com>
+Suggested-by: Jann Horn <jannh@google.com>
+Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Aleksa Sarai <cyphar@cyphar.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

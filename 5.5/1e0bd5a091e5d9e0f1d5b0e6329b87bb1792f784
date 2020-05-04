@@ -1,0 +1,119 @@
+bpf: Switch bpf_map ref counter to atomic64_t so bpf_map_inc() never fails
+
+92117d8443bc ("bpf: fix refcnt overflow") turned refcounting of bpf_map into
+potentially failing operation, when refcount reaches BPF_MAX_REFCNT limit
+(32k). Due to using 32-bit counter, it's possible in practice to overflow
+refcounter and make it wrap around to 0, causing erroneous map free, while
+there are still references to it, causing use-after-free problems.
+
+But having a failing refcounting operations are problematic in some cases. One
+example is mmap() interface. After establishing initial memory-mapping, user
+is allowed to arbitrarily map/remap/unmap parts of mapped memory, arbitrarily
+splitting it into multiple non-contiguous regions. All this happening without
+any control from the users of mmap subsystem. Rather mmap subsystem sends
+notifications to original creator of memory mapping through open/close
+callbacks, which are optionally specified during initial memory mapping
+creation. These callbacks are used to maintain accurate refcount for bpf_map
+(see next patch in this series). The problem is that open() callback is not
+supposed to fail, because memory-mapped resource is set up and properly
+referenced. This is posing a problem for using memory-mapping with BPF maps.
+
+One solution to this is to maintain separate refcount for just memory-mappings
+and do single bpf_map_inc/bpf_map_put when it goes from/to zero, respectively.
+There are similar use cases in current work on tcp-bpf, necessitating extra
+counter as well. This seems like a rather unfortunate and ugly solution that
+doesn't scale well to various new use cases.
+
+Another approach to solve this is to use non-failing refcount_t type, which
+uses 32-bit counter internally, but, once reaching overflow state at UINT_MAX,
+stays there. This utlimately causes memory leak, but prevents use after free.
+
+But given refcounting is not the most performance-critical operation with BPF
+maps (it's not used from running BPF program code), we can also just switch to
+64-bit counter that can't overflow in practice, potentially disadvantaging
+32-bit platforms a tiny bit. This simplifies semantics and allows above
+described scenarios to not worry about failing refcount increment operation.
+
+In terms of struct bpf_map size, we are still good and use the same amount of
+space:
+
+BEFORE (3 cache lines, 8 bytes of padding at the end):
+struct bpf_map {
+	const struct bpf_map_ops  * ops __attribute__((__aligned__(64))); /*     0     8 */
+	struct bpf_map *           inner_map_meta;       /*     8     8 */
+	void *                     security;             /*    16     8 */
+	enum bpf_map_type  map_type;                     /*    24     4 */
+	u32                        key_size;             /*    28     4 */
+	u32                        value_size;           /*    32     4 */
+	u32                        max_entries;          /*    36     4 */
+	u32                        map_flags;            /*    40     4 */
+	int                        spin_lock_off;        /*    44     4 */
+	u32                        id;                   /*    48     4 */
+	int                        numa_node;            /*    52     4 */
+	u32                        btf_key_type_id;      /*    56     4 */
+	u32                        btf_value_type_id;    /*    60     4 */
+	/* --- cacheline 1 boundary (64 bytes) --- */
+	struct btf *               btf;                  /*    64     8 */
+	struct bpf_map_memory memory;                    /*    72    16 */
+	bool                       unpriv_array;         /*    88     1 */
+	bool                       frozen;               /*    89     1 */
+
+	/* XXX 38 bytes hole, try to pack */
+
+	/* --- cacheline 2 boundary (128 bytes) --- */
+	atomic_t                   refcnt __attribute__((__aligned__(64))); /*   128     4 */
+	atomic_t                   usercnt;              /*   132     4 */
+	struct work_struct work;                         /*   136    32 */
+	char                       name[16];             /*   168    16 */
+
+	/* size: 192, cachelines: 3, members: 21 */
+	/* sum members: 146, holes: 1, sum holes: 38 */
+	/* padding: 8 */
+	/* forced alignments: 2, forced holes: 1, sum forced holes: 38 */
+} __attribute__((__aligned__(64)));
+
+AFTER (same 3 cache lines, no extra padding now):
+struct bpf_map {
+	const struct bpf_map_ops  * ops __attribute__((__aligned__(64))); /*     0     8 */
+	struct bpf_map *           inner_map_meta;       /*     8     8 */
+	void *                     security;             /*    16     8 */
+	enum bpf_map_type  map_type;                     /*    24     4 */
+	u32                        key_size;             /*    28     4 */
+	u32                        value_size;           /*    32     4 */
+	u32                        max_entries;          /*    36     4 */
+	u32                        map_flags;            /*    40     4 */
+	int                        spin_lock_off;        /*    44     4 */
+	u32                        id;                   /*    48     4 */
+	int                        numa_node;            /*    52     4 */
+	u32                        btf_key_type_id;      /*    56     4 */
+	u32                        btf_value_type_id;    /*    60     4 */
+	/* --- cacheline 1 boundary (64 bytes) --- */
+	struct btf *               btf;                  /*    64     8 */
+	struct bpf_map_memory memory;                    /*    72    16 */
+	bool                       unpriv_array;         /*    88     1 */
+	bool                       frozen;               /*    89     1 */
+
+	/* XXX 38 bytes hole, try to pack */
+
+	/* --- cacheline 2 boundary (128 bytes) --- */
+	atomic64_t                 refcnt __attribute__((__aligned__(64))); /*   128     8 */
+	atomic64_t                 usercnt;              /*   136     8 */
+	struct work_struct work;                         /*   144    32 */
+	char                       name[16];             /*   176    16 */
+
+	/* size: 192, cachelines: 3, members: 21 */
+	/* sum members: 154, holes: 1, sum holes: 38 */
+	/* forced alignments: 2, forced holes: 1, sum forced holes: 38 */
+} __attribute__((__aligned__(64)));
+
+This patch, while modifying all users of bpf_map_inc, also cleans up its
+interface to match bpf_map_put with separate operations for bpf_map_inc and
+bpf_map_inc_with_uref (to match bpf_map_put and bpf_map_put_with_uref,
+respectively). Also, given there are no users of bpf_map_inc_not_zero
+specifying uref=true, remove uref flag and default to uref=false internally.
+
+Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20191117172806.2195367-2-andriin@fb.com
+

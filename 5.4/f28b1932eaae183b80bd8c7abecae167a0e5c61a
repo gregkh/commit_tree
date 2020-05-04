@@ -1,0 +1,39 @@
+RDMA/mlx5: Fix a race with mlx5_ib_update_xlt on an implicit MR
+
+mlx5_ib_update_xlt() must be protected against parallel free of the MR it
+is accessing, also it must be called single threaded while updating the
+HW. Otherwise we can have races of the form:
+
+    CPU0                               CPU1
+  mlx5_ib_update_xlt()
+   mlx5_odp_populate_klm()
+     odp_lookup() == NULL
+     pklm = ZAP
+                                      implicit_mr_get_data()
+ 				        implicit_mr_alloc()
+ 					  <update interval tree>
+					mlx5_ib_update_xlt
+					  mlx5_odp_populate_klm()
+					    odp_lookup() != NULL
+					    pklm = VALID
+					   mlx5_ib_post_send_wait()
+
+    mlx5_ib_post_send_wait() // Replaces VALID with ZAP
+
+This can be solved by putting both the SRCU and the umem_mutex lock around
+every call to mlx5_ib_update_xlt(). This ensures that the content of the
+interval tree relavent to mlx5_odp_populate_klm() (ie mr->parent == mr)
+will not change while it is running, and thus the posted WRs to update the
+KLM will always reflect the correct information.
+
+The race above will resolve by either having CPU1 wait till CPU0 completes
+the ZAP or CPU0 will run after the add and instead store VALID.
+
+The pagefault path adding children already holds the umem_mutex and SRCU,
+so the only missed lock is during MR destruction.
+
+Fixes: 81713d3788d2 ("IB/mlx5: Add implicit MR support")
+Link: https://lore.kernel.org/r/20191001153821.23621-3-jgg@ziepe.ca
+Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+

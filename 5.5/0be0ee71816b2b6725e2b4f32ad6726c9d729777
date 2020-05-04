@@ -1,0 +1,92 @@
+vfs: properly and reliably lock f_pos in fdget_pos()
+
+fdget_pos() is used by file operations that will read and update f_pos:
+things like "read()", "write()" and "lseek()" (but not, for example,
+"pread()/pwrite" that get their file positions elsewhere).
+
+However, it had two separate escape clauses for this, because not
+everybody wants or needs serialization of the file position.
+
+The first and most obvious case is the "file descriptor doesn't have a
+position at all", ie a stream-like file.  Except we didn't actually use
+FMODE_STREAM, but instead used FMODE_ATOMIC_POS.  The reason for that
+was that FMODE_STREAM didn't exist back in the days, but also that we
+didn't want to mark all the special cases, so we only marked the ones
+that _required_ position atomicity according to POSIX - regular files
+and directories.
+
+The case one was intentionally lazy, but now that we _do_ have
+FMODE_STREAM we could and should just use it.  With the change to use
+FMODE_STREAM, there are no remaining uses for FMODE_ATOMIC_POS, and all
+the code to set it is deleted.
+
+Any cases where we don't want the serialization because the driver (or
+subsystem) doesn't use the file position should just be updated to do
+"stream_open()".  We've done that for all the obvious and common
+situations, we may need a few more.  Quoting Kirill Smelkov in the
+original FMODE_STREAM thread (see link below for full email):
+
+ "And I appreciate if people could help at least somehow with "getting
+  rid of mixed case entirely" (i.e. always lock f_pos_lock on
+  !FMODE_STREAM), because this transition starts to diverge from my
+  particular use-case too far. To me it makes sense to do that
+  transition as follows:
+
+   - convert nonseekable_open -> stream_open via stream_open.cocci;
+   - audit other nonseekable_open calls and convert left users that
+     truly don't depend on position to stream_open;
+   - extend stream_open.cocci to analyze alloc_file_pseudo as well (this
+     will cover pipes and sockets), or maybe convert pipes and sockets
+     to FMODE_STREAM manually;
+   - extend stream_open.cocci to analyze file_operations that use
+     no_llseek or noop_llseek, but do not use nonseekable_open or
+     alloc_file_pseudo. This might find files that have stream semantic
+     but are opened differently;
+   - extend stream_open.cocci to analyze file_operations whose
+     .read/.write do not use ppos at all (independently of how file was
+     opened);
+   - ...
+   - after that remove FMODE_ATOMIC_POS and always take f_pos_lock if
+     !FMODE_STREAM;
+   - gather bug reports for deadlocked read/write and convert missed
+     cases to FMODE_STREAM, probably extending stream_open.cocci along
+     the road to catch similar cases
+
+  i.e. always take f_pos_lock unless a file is explicitly marked as
+  being stream, and try to find and cover all files that are streams"
+
+We have not done the "extend stream_open.cocci to analyze
+alloc_file_pseudo" as well, but the previous commit did manually handle
+the case of pipes and sockets.
+
+The other case where we can avoid locking f_pos is the "this file
+descriptor only has a single user and it is us, and thus there is no
+need to lock it".
+
+The second test was correct, although a bit subtle and worth just
+re-iterating here.  There are two kinds of other sources of references
+to the same file descriptor: file descriptors that have been explicitly
+shared across fork() or with dup(), and file tables having elevated
+reference counts due to threading (or explicit file sharing with
+clone()).
+
+The first case would have incremented the file count explicitly, and in
+the second case the previous __fdget() would have incremented it for us
+and set the FDPUT_FPUT flag.
+
+But in both cases the file count would be greater than one, so the
+"file_count(file) > 1" test catches both situations.  Also note that if
+file_count is 1, that also means that no other thread can have access to
+the file table, so there also cannot be races with concurrent calls to
+dup()/fork()/clone() that would increment the file count any other way.
+
+Link: https://lore.kernel.org/linux-fsdevel/20190413184404.GA13490@deco.navytux.spb.ru
+Cc: Kirill Smelkov <kirr@nexedi.com>
+Cc: Eic Dumazet <edumazet@google.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Cc: Marco Elver <elver@google.com>
+Cc: Andrea Parri <parri.andrea@gmail.com>
+Cc: Paul McKenney <paulmck@kernel.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

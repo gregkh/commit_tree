@@ -1,0 +1,124 @@
+perf map_groups: Auto sort maps by name, if needed
+
+There are still lots of lookups by name, even if just when loading
+vmlinux, till that code is studied to figure out if its possible to do
+away with those map lookup by names, provide a way to sort it using
+libc's qsort/bsearch.
+
+Doing it at the first lookup defers the sorting a bit, and as the code
+stands now, is never done for user maps, just for the kernel ones.
+
+  # perf probe -l
+  # perf probe -x ~/bin/perf -L __map_groups__find_by_name
+  <__map_groups__find_by_name@/home/acme/git/perf/tools/perf/util/symbol.c:0>
+        0  static struct map *__map_groups__find_by_name(struct map_groups *mg, const char *name)
+        1  {
+                  struct map **mapp;
+
+        4         if (mg->maps_by_name == NULL &&
+        5             map__groups__sort_by_name_from_rbtree(mg))
+        6                 return NULL;
+
+        8         mapp = bsearch(name, mg->maps_by_name, mg->nr_maps, sizeof(*mapp), map__strcmp_name);
+        9         if (mapp)
+       10                 return *mapp;
+       11         return NULL;
+       12  }
+
+           struct map *map_groups__find_by_name(struct map_groups *mg, const char *name)
+           {
+
+  # perf probe -x ~/bin/perf 'found=__map_groups__find_by_name:10 name:string'
+  Added new event:
+    probe_perf:found     (on __map_groups__find_by_name:10 in /home/acme/bin/perf with name:string)
+
+  You can now use it in all perf tools, such as:
+
+  	perf record -e probe_perf:found -aR sleep 1
+
+  #
+  # perf probe -x ~/bin/perf -L map_groups__find_by_name
+  <map_groups__find_by_name@/home/acme/git/perf/tools/perf/util/symbol.c:0>
+        0  struct map *map_groups__find_by_name(struct map_groups *mg, const char *name)
+        1  {
+        2         struct maps *maps = &mg->maps;
+                  struct map *map;
+
+        5         down_read(&maps->lock);
+
+        7         if (mg->last_search_by_name && strcmp(mg->last_search_by_name->dso->short_name, name) == 0) {
+        8                 map = mg->last_search_by_name;
+        9                 goto out_unlock;
+                  }
+                  /*
+                   * If we have mg->maps_by_name, then the name isn't in the rbtree,
+                   * as mg->maps_by_name mirrors the rbtree when lookups by name are
+                   * made.
+                   */
+       16         map = __map_groups__find_by_name(mg, name);
+       17         if (map || mg->maps_by_name != NULL)
+       18                 goto out_unlock;
+
+                  /* Fallback to traversing the rbtree... */
+       21         maps__for_each_entry(maps, map)
+       22                 if (strcmp(map->dso->short_name, name) == 0) {
+       23                         mg->last_search_by_name = map;
+       24                         goto out_unlock;
+                          }
+
+       27         map = NULL;
+
+           out_unlock:
+       30         up_read(&maps->lock);
+       31         return map;
+       32  }
+
+           int dso__load_vmlinux(struct dso *dso, struct map *map,
+                                const char *vmlinux, bool vmlinux_allocated)
+
+  # perf probe -x ~/bin/perf 'fallback=map_groups__find_by_name:21 name:string'
+  Added new events:
+    probe_perf:fallback  (on map_groups__find_by_name:21 in /home/acme/bin/perf with name:string)
+    probe_perf:fallback_1 (on map_groups__find_by_name:21 in /home/acme/bin/perf with name:string)
+
+  You can now use it in all perf tools, such as:
+
+  	perf record -e probe_perf:fallback_1 -aR sleep 1
+
+  #
+  # perf probe -l
+    probe_perf:fallback  (on map_groups__find_by_name:21@util/symbol.c in /home/acme/bin/perf with name_string)
+    probe_perf:fallback_1 (on map_groups__find_by_name:21@util/symbol.c in /home/acme/bin/perf with name_string)
+    probe_perf:found     (on __map_groups__find_by_name:10@util/symbol.c in /home/acme/bin/perf with name_string)
+  #
+  # perf stat -e probe_perf:*
+
+Now run 'perf top' in another term and then, after a while, stop 'perf stat':
+
+Furthermore, if we ask for interval printing, we can see that that is done just
+at the start of the workload:
+
+  # perf stat -I1000 -e probe_perf:*
+  #           time             counts unit events
+       1.000319513                  0      probe_perf:found
+       1.000319513                  0      probe_perf:fallback_1
+       1.000319513                  0      probe_perf:fallback
+       2.001868092             23,251      probe_perf:found
+       2.001868092                  0      probe_perf:fallback_1
+       2.001868092                  0      probe_perf:fallback
+       3.002901597                  0      probe_perf:found
+       3.002901597                  0      probe_perf:fallback_1
+       3.002901597                  0      probe_perf:fallback
+       4.003358591                  0      probe_perf:found
+       4.003358591                  0      probe_perf:fallback_1
+       4.003358591                  0      probe_perf:fallback
+  ^C
+  #
+
+Cc: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/n/tip-c5lmbyr14x448rcfii7y6t3k@git.kernel.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

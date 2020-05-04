@@ -1,0 +1,69 @@
+fuse: fix deadlock with aio poll and fuse_iqueue::waitq.lock
+
+When IOCB_CMD_POLL is used on the FUSE device, aio_poll() disables IRQs
+and takes kioctx::ctx_lock, then fuse_iqueue::waitq.lock.
+
+This may have to wait for fuse_iqueue::waitq.lock to be released by one
+of many places that take it with IRQs enabled.  Since the IRQ handler
+may take kioctx::ctx_lock, lockdep reports that a deadlock is possible.
+
+Fix it by protecting the state of struct fuse_iqueue with a separate
+spinlock, and only accessing fuse_iqueue::waitq using the versions of
+the waitqueue functions which do IRQ-safe locking internally.
+
+Reproducer:
+
+	#include <fcntl.h>
+	#include <stdio.h>
+	#include <sys/mount.h>
+	#include <sys/stat.h>
+	#include <sys/syscall.h>
+	#include <unistd.h>
+	#include <linux/aio_abi.h>
+
+	int main()
+	{
+		char opts[128];
+		int fd = open("/dev/fuse", O_RDWR);
+		aio_context_t ctx = 0;
+		struct iocb cb = { .aio_lio_opcode = IOCB_CMD_POLL, .aio_fildes = fd };
+		struct iocb *cbp = &cb;
+
+		sprintf(opts, "fd=%d,rootmode=040000,user_id=0,group_id=0", fd);
+		mkdir("mnt", 0700);
+		mount("foo",  "mnt", "fuse", 0, opts);
+		syscall(__NR_io_setup, 1, &ctx);
+		syscall(__NR_io_submit, ctx, 1, &cbp);
+	}
+
+Beginning of lockdep output:
+
+	=====================================================
+	WARNING: SOFTIRQ-safe -> SOFTIRQ-unsafe lock order detected
+	5.3.0-rc5 #9 Not tainted
+	-----------------------------------------------------
+	syz_fuse/135 [HC0[0]:SC0[0]:HE0:SE1] is trying to acquire:
+	000000003590ceda (&fiq->waitq){+.+.}, at: spin_lock include/linux/spinlock.h:338 [inline]
+	000000003590ceda (&fiq->waitq){+.+.}, at: aio_poll fs/aio.c:1751 [inline]
+	000000003590ceda (&fiq->waitq){+.+.}, at: __io_submit_one.constprop.0+0x203/0x5b0 fs/aio.c:1825
+
+	and this task is already holding:
+	0000000075037284 (&(&ctx->ctx_lock)->rlock){..-.}, at: spin_lock_irq include/linux/spinlock.h:363 [inline]
+	0000000075037284 (&(&ctx->ctx_lock)->rlock){..-.}, at: aio_poll fs/aio.c:1749 [inline]
+	0000000075037284 (&(&ctx->ctx_lock)->rlock){..-.}, at: __io_submit_one.constprop.0+0x1f4/0x5b0 fs/aio.c:1825
+	which would create a new lock dependency:
+	 (&(&ctx->ctx_lock)->rlock){..-.} -> (&fiq->waitq){+.+.}
+
+	but this new dependency connects a SOFTIRQ-irq-safe lock:
+	 (&(&ctx->ctx_lock)->rlock){..-.}
+
+	[...]
+
+Reported-by: syzbot+af05535bb79520f95431@syzkaller.appspotmail.com
+Reported-by: syzbot+d86c4426a01f60feddc7@syzkaller.appspotmail.com
+Fixes: bfe4037e722e ("aio: implement IOCB_CMD_POLL")
+Cc: <stable@vger.kernel.org> # v4.19+
+Cc: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+

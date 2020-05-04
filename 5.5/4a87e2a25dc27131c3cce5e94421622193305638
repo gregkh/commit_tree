@@ -1,0 +1,68 @@
+mm: memcg/slab: fix percpu slab vmstats flushing
+
+Currently slab percpu vmstats are flushed twice: during the memcg
+offlining and just before freeing the memcg structure.  Each time percpu
+counters are summed, added to the atomic counterparts and propagated up
+by the cgroup tree.
+
+The second flushing is required due to how recursive vmstats are
+implemented: counters are batched in percpu variables on a local level,
+and once a percpu value is crossing some predefined threshold, it spills
+over to atomic values on the local and each ascendant levels.  It means
+that without flushing some numbers cached in percpu variables will be
+dropped on floor each time a cgroup is destroyed.  And with uptime the
+error on upper levels might become noticeable.
+
+The first flushing aims to make counters on ancestor levels more
+precise.  Dying cgroups may resume in the dying state for a long time.
+After kmem_cache reparenting which is performed during the offlining
+slab counters of the dying cgroup don't have any chances to be updated,
+because any slab operations will be performed on the parent level.  It
+means that the inaccuracy caused by percpu batching will not decrease up
+to the final destruction of the cgroup.  By the original idea flushing
+slab counters during the offlining should minimize the visible
+inaccuracy of slab counters on the parent level.
+
+The problem is that percpu counters are not zeroed after the first
+flushing.  So every cached percpu value is summed twice.  It creates a
+small error (up to 32 pages per cpu, but usually less) which accumulates
+on parent cgroup level.  After creating and destroying of thousands of
+child cgroups, slab counter on parent level can be way off the real
+value.
+
+For now, let's just stop flushing slab counters on memcg offlining.  It
+can't be done correctly without scheduling a work on each cpu: reading
+and zeroing it during css offlining can race with an asynchronous
+update, which doesn't expect values to be changed underneath.
+
+With this change, slab counters on parent level will become eventually
+consistent.  Once all dying children are gone, values are correct.  And
+if not, the error is capped by 32 * NR_CPUS pages per dying cgroup.
+
+It's not perfect, as slab are reparented, so any updates after the
+reparenting will happen on the parent level.  It means that if a slab
+page was allocated, a counter on child level was bumped, then the page
+was reparented and freed, the annihilation of positive and negative
+counter values will not happen until the child cgroup is released.  It
+makes slab counters different from others, and it might want us to
+implement flushing in a correct form again.  But it's also a question of
+performance: scheduling a work on each cpu isn't free, and it's an open
+question if the benefit of having more accurate counters is worth it.
+
+We might also consider flushing all counters on offlining, not only slab
+counters.
+
+So let's fix the main problem now: make the slab counters eventually
+consistent, so at least the error won't grow with uptime (or more
+precisely the number of created and destroyed cgroups).  And think about
+the accuracy of counters separately.
+
+Link: http://lkml.kernel.org/r/20191220042728.1045881-1-guro@fb.com
+Fixes: bee07b33db78 ("mm: memcontrol: flush percpu slab vmstats on kmem offlining")
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

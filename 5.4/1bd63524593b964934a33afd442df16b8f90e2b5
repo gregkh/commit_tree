@@ -1,0 +1,77 @@
+libbpf: handle symbol versioning properly for libbpf.a
+
+bcc uses libbpf repo as a submodule. It brings in libbpf source
+code and builds everything together to produce shared libraries.
+With latest libbpf, I got the following errors:
+  /bin/ld: libbcc_bpf.so.0.10.0: version node not found for symbol xsk_umem__create@LIBBPF_0.0.2
+  /bin/ld: failed to set dynamic section sizes: Bad value
+  collect2: error: ld returned 1 exit status
+  make[2]: *** [src/cc/libbcc_bpf.so.0.10.0] Error 1
+
+In xsk.c, we have
+  asm(".symver xsk_umem__create_v0_0_2, xsk_umem__create@LIBBPF_0.0.2");
+  asm(".symver xsk_umem__create_v0_0_4, xsk_umem__create@@LIBBPF_0.0.4");
+The linker thinks the built is for LIBBPF but cannot find proper version
+LIBBPF_0.0.2/4, so emit errors.
+
+I also confirmed that using libbpf.a to produce a shared library also
+has issues:
+  -bash-4.4$ cat t.c
+  extern void *xsk_umem__create;
+  void * test() { return xsk_umem__create; }
+  -bash-4.4$ gcc -c -fPIC t.c
+  -bash-4.4$ gcc -shared t.o libbpf.a -o t.so
+  /bin/ld: t.so: version node not found for symbol xsk_umem__create@LIBBPF_0.0.2
+  /bin/ld: failed to set dynamic section sizes: Bad value
+  collect2: error: ld returned 1 exit status
+  -bash-4.4$
+
+Symbol versioning does happens in commonly used libraries, e.g., elfutils
+and glibc. For static libraries, for a versioned symbol, the old definitions
+will be ignored, and the symbol will be an alias to the latest definition.
+For example, glibc sched_setaffinity is versioned.
+  -bash-4.4$ readelf -s /usr/lib64/libc.so.6 | grep sched_setaffinity
+     756: 000000000013d3d0    13 FUNC    GLOBAL DEFAULT   13 sched_setaffinity@GLIBC_2.3.3
+     757: 00000000000e2e70   455 FUNC    GLOBAL DEFAULT   13 sched_setaffinity@@GLIBC_2.3.4
+    1800: 0000000000000000     0 FILE    LOCAL  DEFAULT  ABS sched_setaffinity.c
+    4228: 00000000000e2e70   455 FUNC    LOCAL  DEFAULT   13 __sched_setaffinity_new
+    4648: 000000000013d3d0    13 FUNC    LOCAL  DEFAULT   13 __sched_setaffinity_old
+    7338: 000000000013d3d0    13 FUNC    GLOBAL DEFAULT   13 sched_setaffinity@GLIBC_2
+    7380: 00000000000e2e70   455 FUNC    GLOBAL DEFAULT   13 sched_setaffinity@@GLIBC_
+  -bash-4.4$
+For static library, the definition of sched_setaffinity aliases to the new definition.
+  -bash-4.4$ readelf -s /usr/lib64/libc.a | grep sched_setaffinity
+  File: /usr/lib64/libc.a(sched_setaffinity.o)
+     8: 0000000000000000   455 FUNC    GLOBAL DEFAULT    1 __sched_setaffinity_new
+    12: 0000000000000000   455 FUNC    WEAK   DEFAULT    1 sched_setaffinity
+
+For both elfutils and glibc, additional macros are used to control different handling
+of symbol versioning w.r.t static and shared libraries.
+For elfutils, the macro is SYMBOL_VERSIONING
+(https://sourceware.org/git/?p=elfutils.git;a=blob;f=lib/eu-config.h).
+For glibc, the macro is SHARED
+(https://sourceware.org/git/?p=glibc.git;a=blob;f=include/shlib-compat.h;hb=refs/heads/master)
+
+This patch used SHARED as the macro name. After this patch, the libbpf.a has
+  -bash-4.4$ readelf -s libbpf.a | grep xsk_umem__create
+     372: 0000000000017145  1190 FUNC    GLOBAL DEFAULT    1 xsk_umem__create_v0_0_4
+     405: 0000000000017145  1190 FUNC    GLOBAL DEFAULT    1 xsk_umem__create
+     499: 00000000000175eb   103 FUNC    GLOBAL DEFAULT    1 xsk_umem__create_v0_0_2
+  -bash-4.4$
+No versioned symbols for xsk_umem__create.
+The libbpf.a can be used to build a shared library succesfully.
+  -bash-4.4$ cat t.c
+  extern void *xsk_umem__create;
+  void * test() { return xsk_umem__create; }
+  -bash-4.4$ gcc -c -fPIC t.c
+  -bash-4.4$ gcc -shared t.o libbpf.a -o t.so
+  -bash-4.4$
+
+Fixes: 10d30e301732 ("libbpf: add flags to umem config")
+Cc: Kevin Laatz <kevin.laatz@intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Andrii Nakryiko <andriin@fb.com>
+Acked-by: Andrii Nakryiko <andriin@fb.com>
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

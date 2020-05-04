@@ -1,0 +1,118 @@
+x86/platform/intel/iosf_mbi Rewrite locking
+
+There are 2 problems with the old iosf PMIC I2C bus arbritration code which
+need to be addressed:
+
+1. The lockdep code complains about a possible deadlock in the
+iosf_mbi_[un]block_punit_i2c_access code:
+
+[    6.712662] ======================================================
+[    6.712673] WARNING: possible circular locking dependency detected
+[    6.712685] 5.3.0-rc2+ #79 Not tainted
+[    6.712692] ------------------------------------------------------
+[    6.712702] kworker/0:1/7 is trying to acquire lock:
+[    6.712712] 00000000df1c5681 (iosf_mbi_block_punit_i2c_access_count_mutex){+.+.}, at: iosf_mbi_unblock_punit_i2c_access+0x13/0x90
+[    6.712739]
+               but task is already holding lock:
+[    6.712749] 0000000067cb23e7 (iosf_mbi_punit_mutex){+.+.}, at: iosf_mbi_block_punit_i2c_access+0x97/0x186
+[    6.712768]
+               which lock already depends on the new lock.
+
+[    6.712780]
+               the existing dependency chain (in reverse order) is:
+[    6.712792]
+               -> #1 (iosf_mbi_punit_mutex){+.+.}:
+[    6.712808]        __mutex_lock+0xa8/0x9a0
+[    6.712818]        iosf_mbi_block_punit_i2c_access+0x97/0x186
+[    6.712831]        i2c_dw_acquire_lock+0x20/0x30
+[    6.712841]        i2c_dw_set_reg_access+0x15/0xb0
+[    6.712851]        i2c_dw_probe+0x57/0x473
+[    6.712861]        dw_i2c_plat_probe+0x33e/0x640
+[    6.712874]        platform_drv_probe+0x38/0x80
+[    6.712884]        really_probe+0xf3/0x380
+[    6.712894]        driver_probe_device+0x59/0xd0
+[    6.712905]        bus_for_each_drv+0x84/0xd0
+[    6.712915]        __device_attach+0xe4/0x170
+[    6.712925]        bus_probe_device+0x9f/0xb0
+[    6.712935]        deferred_probe_work_func+0x79/0xd0
+[    6.712946]        process_one_work+0x234/0x560
+[    6.712957]        worker_thread+0x50/0x3b0
+[    6.712967]        kthread+0x10a/0x140
+[    6.712977]        ret_from_fork+0x3a/0x50
+[    6.712986]
+               -> #0 (iosf_mbi_block_punit_i2c_access_count_mutex){+.+.}:
+[    6.713004]        __lock_acquire+0xe07/0x1930
+[    6.713015]        lock_acquire+0x9d/0x1a0
+[    6.713025]        __mutex_lock+0xa8/0x9a0
+[    6.713035]        iosf_mbi_unblock_punit_i2c_access+0x13/0x90
+[    6.713047]        i2c_dw_set_reg_access+0x4d/0xb0
+[    6.713058]        i2c_dw_probe+0x57/0x473
+[    6.713068]        dw_i2c_plat_probe+0x33e/0x640
+[    6.713079]        platform_drv_probe+0x38/0x80
+[    6.713089]        really_probe+0xf3/0x380
+[    6.713099]        driver_probe_device+0x59/0xd0
+[    6.713109]        bus_for_each_drv+0x84/0xd0
+[    6.713119]        __device_attach+0xe4/0x170
+[    6.713129]        bus_probe_device+0x9f/0xb0
+[    6.713140]        deferred_probe_work_func+0x79/0xd0
+[    6.713150]        process_one_work+0x234/0x560
+[    6.713160]        worker_thread+0x50/0x3b0
+[    6.713170]        kthread+0x10a/0x140
+[    6.713180]        ret_from_fork+0x3a/0x50
+[    6.713189]
+               other info that might help us debug this:
+
+[    6.713202]  Possible unsafe locking scenario:
+
+[    6.713212]        CPU0                    CPU1
+[    6.713221]        ----                    ----
+[    6.713229]   lock(iosf_mbi_punit_mutex);
+[    6.713239]                                lock(iosf_mbi_block_punit_i2c_access_count_mutex);
+[    6.713253]                                lock(iosf_mbi_punit_mutex);
+[    6.713265]   lock(iosf_mbi_block_punit_i2c_access_count_mutex);
+[    6.713276]
+                *** DEADLOCK ***
+
+In practice can never happen because only the first caller which
+increments iosf_mbi_block_punit_i2c_access_count will also take
+iosf_mbi_punit_mutex, that is the whole purpose of the counter, which
+itself is protected by iosf_mbi_block_punit_i2c_access_count_mutex.
+
+But there is no way to tell the lockdep code about this and we really
+want to be able to run a kernel with lockdep enabled without these
+warnings being triggered.
+
+2. The lockdep warning also points out another real problem, if 2 threads
+both are in a block of code protected by iosf_mbi_block_punit_i2c_access
+and the first thread to acquire the block exits before the second thread
+then the second thread will call mutex_unlock on iosf_mbi_punit_mutex,
+but it is not the thread which took the mutex and unlocking by another
+thread is not allowed.
+
+Fix this by getting rid of the notion of holding a mutex for the entire
+duration of the PMIC accesses, be it either from the PUnit side, or from an
+in kernel I2C driver. In general holding a mutex after exiting a function
+is a bad idea and the above problems show this case is no different.
+
+Instead 2 counters are now used, one for PMIC accesses from the PUnit
+and one for accesses from in kernel I2C code. When access is requested
+now the code will wait (using a waitqueue) for the counter of the other
+type of access to reach 0 and on release, if the counter reaches 0 the
+wakequeue is woken.
+
+Note that the counter approach is necessary to allow nested calls.
+The main reason for this is so that a series of i2c transfers can be done
+with the punit blocked from accessing the bus the whole time. This is
+necessary to be able to safely read/modify/write a PMIC register without
+racing with the PUNIT doing the same thing.
+
+Allowing nested iosf_mbi_block_punit_i2c_access() calls also is desirable
+from a performance pov since the whole dance necessary to block the PUnit
+from accessing the PMIC I2C bus is somewhat expensive.
+
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Andy Shevchenko <andy.shevchenko@gmail.com>
+Link: https://lkml.kernel.org/r/20190812102113.95794-1-hdegoede@redhat.com
+
+

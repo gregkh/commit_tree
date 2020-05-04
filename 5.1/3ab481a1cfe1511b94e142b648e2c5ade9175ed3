@@ -1,0 +1,129 @@
+perf script: Support insn output for normal samples
+
+perf script -F +insn was only working for PT traces because the PT
+instruction decoder was filling in the insn/insn_len sample attributes.
+Support it for non PT samples too on x86 using the existing x86
+instruction decoder.
+
+This adds some extra checking to ensure that we don't try to decode
+instructions when using perf.data from a different architecture.
+
+  % perf record -a sleep 1
+  % perf script -F ip,sym,insn --xed
+   ffffffff811704c9 remote_function               movl  %eax, 0x18(%rbx)
+   ffffffff8100bb50 intel_bts_enable_local                retq
+   ffffffff81048612 native_apic_mem_write                 movl  %esi, -0xa04000(%rdi)
+   ffffffff81048612 native_apic_mem_write                 movl  %esi, -0xa04000(%rdi)
+   ffffffff81048612 native_apic_mem_write                 movl  %esi, -0xa04000(%rdi)
+   ffffffff810f1f79 generic_exec_single           xor %eax, %eax
+   ffffffff811704c9 remote_function               movl  %eax, 0x18(%rbx)
+   ffffffff8100bb34 intel_bts_enable_local                movl  0x2000(%rax), %edx
+   ffffffff81048610 native_apic_mem_write                 mov %edi, %edi
+  ...
+
+Committer testing:
+
+Before:
+
+  # perf script -F ip,sym,insn --xed | head -5
+   ffffffffa4068804 native_write_msr 		addb  %al, (%rax)
+   ffffffffa4068804 native_write_msr 		addb  %al, (%rax)
+   ffffffffa4068804 native_write_msr 		addb  %al, (%rax)
+   ffffffffa4068806 native_write_msr 		addb  %al, (%rax)
+   ffffffffa4068806 native_write_msr 		addb  %al, (%rax)
+  # perf script -F ip,sym,insn --xed | grep -v "addb  %al, (%rax)"
+  #
+
+After:
+
+  # perf script -F ip,sym,insn --xed | head -5
+   ffffffffa4068804 native_write_msr 		wrmsr
+   ffffffffa4068804 native_write_msr 		wrmsr
+   ffffffffa4068804 native_write_msr 		wrmsr
+   ffffffffa4068806 native_write_msr 		nopl  %eax, (%rax,%rax,1)
+   ffffffffa4068806 native_write_msr 		nopl  %eax, (%rax,%rax,1)
+  # perf script -F ip,sym,insn --xed | grep -v "addb  %al, (%rax)" | head -5
+   ffffffffa4068804 native_write_msr 		wrmsr
+   ffffffffa4068804 native_write_msr 		wrmsr
+   ffffffffa4068804 native_write_msr 		wrmsr
+   ffffffffa4068806 native_write_msr 		nopl  %eax, (%rax,%rax,1)
+   ffffffffa4068806 native_write_msr 		nopl  %eax, (%rax,%rax,1)
+  #
+
+More examples:
+
+  # perf script -F ip,sym,insn --xed | grep -v native_write_msr | head
+   ffffffffa416b90e tick_check_broadcast_expired 		btq  %rax, 0x1a5f42a(%rip)
+   ffffffffa4956bd0 nmi_cpu_backtrace 		pushq  %r13
+   ffffffffa415b95e __hrtimer_next_event_base 		movq  0x18(%rax), %rdx
+   ffffffffa4956bf3 nmi_cpu_backtrace 		popq  %r12
+   ffffffffa4171d5c smp_call_function_single 		pause
+   ffffffffa4956bdd nmi_cpu_backtrace 		mov %ebp, %r12d
+   ffffffffa4797e4d menu_select 		cmp $0x190, %rax
+   ffffffffa4171d5c smp_call_function_single 		pause
+   ffffffffa405a7d8 nmi_cpu_backtrace_handler 		callq  0xffffffffa4956bd0
+   ffffffffa4797f7a menu_select 		shr $0x3, %rax
+  #
+
+Which matches the annotate output modulo resolving callqs:
+
+  # perf annotate --stdio2 nmi_cpu_backtrace_handler
+  Samples: 4  of event 'cycles:ppp', 4000 Hz, Event count (approx.): 35908, [percent: local period]
+  nmi_cpu_backtrace_handler() /lib/modules/5.0.0+/build/vmlinux
+  Percent
+              Disassembly of section .text:
+
+              ffffffff8105a7d0 <nmi_cpu_backtrace_handler>:
+              nmi_cpu_backtrace_handler():
+                      nmi_trigger_cpumask_backtrace(mask, exclude_self,
+                                                    nmi_raise_cpu_backtrace);
+              }
+
+              static int nmi_cpu_backtrace_handler(unsigned int cmd, struct pt_regs *regs)
+              {
+   24.45      → callq  __fentry__
+                      if (nmi_cpu_backtrace(regs))
+                mov    %rsi,%rdi
+   75.55      → callq  nmi_cpu_backtrace
+                              return NMI_HANDLED;
+                movzbl %al,%eax
+
+                      return NMI_DONE;
+              }
+              ← retq
+    #
+
+  # perf annotate --stdio2 __hrtimer_next_event_base
+  Samples: 4  of event 'cycles:ppp', 4000 Hz, Event count (approx.): 767977, [percent: local period]
+  __hrtimer_next_event_base() /lib/modules/5.0.0+/build/vmlinux
+  Percent
+              Disassembly of section .text:
+
+              ffffffff8115b910 <__hrtimer_next_event_base>:
+              __hrtimer_next_event_base():
+
+              static ktime_t __hrtimer_next_event_base(struct hrtimer_cpu_base *cpu_base,
+                                                       const struct hrtimer *exclude,
+                                                       unsigned int active,
+                                                       ktime_t expires_next)
+              {
+              → callq  __fentry__
+<SNIP>
+          4a:   add    $0x1,%r14
+   77.31        mov    0x18(%rax),%rdx
+                shl    $0x6,%r14
+                sub    0x38(%rbx,%r14,1),%rdx
+                              if (expires < expires_next) {
+                cmp    %r12,%rdx
+              ↓ jge    68
+<SNIP>
+
+Signed-off-by: Andi Kleen <ak@linux.intel.com>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Link: http://lkml.kernel.org/r/20190305144758.12397-3-andi@firstfloor.org
+[ Converted fetch_exe() to use the name it ended up having when merged: thread__memcpy() ]
+[ archinsn.c needs the instruction decoder that is only build when CONFIG_AUXTRACE=y, fix that ]
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

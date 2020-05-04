@@ -1,0 +1,129 @@
+oom: decouple mems_allowed from oom_unkillable_task
+
+Commit ef08e3b4981a ("[PATCH] cpusets: confine oom_killer to
+mem_exclusive cpuset") introduces a heuristic where a potential
+oom-killer victim is skipped if the intersection of the potential victim
+and the current (the process triggered the oom) is empty based on the
+reason that killing such victim most probably will not help the current
+allocating process.
+
+However the commit 7887a3da753e ("[PATCH] oom: cpuset hint") changed the
+heuristic to just decrease the oom_badness scores of such potential
+victim based on the reason that the cpuset of such processes might have
+changed and previously they may have allocated memory on mems where the
+current allocating process can allocate from.
+
+Unintentionally 7887a3da753e ("[PATCH] oom: cpuset hint") introduced a
+side effect as the oom_badness is also exposed to the user space through
+/proc/[pid]/oom_score, so, readers with different cpusets can read
+different oom_score of the same process.
+
+Later, commit 6cf86ac6f36b ("oom: filter tasks not sharing the same
+cpuset") fixed the side effect introduced by 7887a3da753e by moving the
+cpuset intersection back to only oom-killer context and out of
+oom_badness.  However the combination of ab290adbaf8f ("oom: make
+oom_unkillable_task() helper function") and 26ebc984913b ("oom:
+/proc/<pid>/oom_score treat kernel thread honestly") unintentionally
+brought back the cpuset intersection check into the oom_badness
+calculation function.
+
+Other than doing cpuset/mempolicy intersection from oom_badness, the memcg
+oom context is also doing cpuset/mempolicy intersection which is quite
+wrong and is caught by syzcaller with the following report:
+
+kasan: CONFIG_KASAN_INLINE enabled
+kasan: GPF could be caused by NULL-ptr deref or user memory access
+general protection fault: 0000 [#1] PREEMPT SMP KASAN
+CPU: 0 PID: 28426 Comm: syz-executor.5 Not tainted 5.2.0-rc3-next-20190607
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS
+Google 01/01/2011
+RIP: 0010:__read_once_size include/linux/compiler.h:194 [inline]
+RIP: 0010:has_intersects_mems_allowed mm/oom_kill.c:84 [inline]
+RIP: 0010:oom_unkillable_task mm/oom_kill.c:168 [inline]
+RIP: 0010:oom_unkillable_task+0x180/0x400 mm/oom_kill.c:155
+Code: c1 ea 03 80 3c 02 00 0f 85 80 02 00 00 4c 8b a3 10 07 00 00 48 b8 00
+00 00 00 00 fc ff df 4d 8d 74 24 10 4c 89 f2 48 c1 ea 03 <80> 3c 02 00 0f
+85 67 02 00 00 49 8b 44 24 10 4c 8d a0 68 fa ff ff
+RSP: 0018:ffff888000127490 EFLAGS: 00010a03
+RAX: dffffc0000000000 RBX: ffff8880a4cd5438 RCX: ffffffff818dae9c
+RDX: 100000000c3cc602 RSI: ffffffff818dac8d RDI: 0000000000000001
+RBP: ffff8880001274d0 R08: ffff888000086180 R09: ffffed1015d26be0
+R10: ffffed1015d26bdf R11: ffff8880ae935efb R12: 8000000061e63007
+R13: 0000000000000000 R14: 8000000061e63017 R15: 1ffff11000024ea6
+FS:  00005555561f5940(0000) GS:ffff8880ae800000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 0000000000607304 CR3: 000000009237e000 CR4: 00000000001426f0
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000600
+Call Trace:
+  oom_evaluate_task+0x49/0x520 mm/oom_kill.c:321
+  mem_cgroup_scan_tasks+0xcc/0x180 mm/memcontrol.c:1169
+  select_bad_process mm/oom_kill.c:374 [inline]
+  out_of_memory mm/oom_kill.c:1088 [inline]
+  out_of_memory+0x6b2/0x1280 mm/oom_kill.c:1035
+  mem_cgroup_out_of_memory+0x1ca/0x230 mm/memcontrol.c:1573
+  mem_cgroup_oom mm/memcontrol.c:1905 [inline]
+  try_charge+0xfbe/0x1480 mm/memcontrol.c:2468
+  mem_cgroup_try_charge+0x24d/0x5e0 mm/memcontrol.c:6073
+  mem_cgroup_try_charge_delay+0x1f/0xa0 mm/memcontrol.c:6088
+  do_huge_pmd_wp_page_fallback+0x24f/0x1680 mm/huge_memory.c:1201
+  do_huge_pmd_wp_page+0x7fc/0x2160 mm/huge_memory.c:1359
+  wp_huge_pmd mm/memory.c:3793 [inline]
+  __handle_mm_fault+0x164c/0x3eb0 mm/memory.c:4006
+  handle_mm_fault+0x3b7/0xa90 mm/memory.c:4053
+  do_user_addr_fault arch/x86/mm/fault.c:1455 [inline]
+  __do_page_fault+0x5ef/0xda0 arch/x86/mm/fault.c:1521
+  do_page_fault+0x71/0x57d arch/x86/mm/fault.c:1552
+  page_fault+0x1e/0x30 arch/x86/entry/entry_64.S:1156
+RIP: 0033:0x400590
+Code: 06 e9 49 01 00 00 48 8b 44 24 10 48 0b 44 24 28 75 1f 48 8b 14 24 48
+8b 7c 24 20 be 04 00 00 00 e8 f5 56 00 00 48 8b 74 24 08 <89> 06 e9 1e 01
+00 00 48 8b 44 24 08 48 8b 14 24 be 04 00 00 00 8b
+RSP: 002b:00007fff7bc49780 EFLAGS: 00010206
+RAX: 0000000000000001 RBX: 0000000000760000 RCX: 0000000000000000
+RDX: 0000000000000000 RSI: 000000002000cffc RDI: 0000000000000001
+RBP: fffffffffffffffe R08: 0000000000000000 R09: 0000000000000000
+R10: 0000000000000075 R11: 0000000000000246 R12: 0000000000760008
+R13: 00000000004c55f2 R14: 0000000000000000 R15: 00007fff7bc499b0
+Modules linked in:
+---[ end trace a65689219582ffff ]---
+RIP: 0010:__read_once_size include/linux/compiler.h:194 [inline]
+RIP: 0010:has_intersects_mems_allowed mm/oom_kill.c:84 [inline]
+RIP: 0010:oom_unkillable_task mm/oom_kill.c:168 [inline]
+RIP: 0010:oom_unkillable_task+0x180/0x400 mm/oom_kill.c:155
+Code: c1 ea 03 80 3c 02 00 0f 85 80 02 00 00 4c 8b a3 10 07 00 00 48 b8 00
+00 00 00 00 fc ff df 4d 8d 74 24 10 4c 89 f2 48 c1 ea 03 <80> 3c 02 00 0f
+85 67 02 00 00 49 8b 44 24 10 4c 8d a0 68 fa ff ff
+RSP: 0018:ffff888000127490 EFLAGS: 00010a03
+RAX: dffffc0000000000 RBX: ffff8880a4cd5438 RCX: ffffffff818dae9c
+RDX: 100000000c3cc602 RSI: ffffffff818dac8d RDI: 0000000000000001
+RBP: ffff8880001274d0 R08: ffff888000086180 R09: ffffed1015d26be0
+R10: ffffed1015d26bdf R11: ffff8880ae935efb R12: 8000000061e63007
+R13: 0000000000000000 R14: 8000000061e63017 R15: 1ffff11000024ea6
+FS:  00005555561f5940(0000) GS:ffff8880ae800000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 0000001b2f823000 CR3: 000000009237e000 CR4: 00000000001426f0
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000600
+
+The fix is to decouple the cpuset/mempolicy intersection check from
+oom_unkillable_task() and make sure cpuset/mempolicy intersection check is
+only done in the global oom context.
+
+[shakeelb@google.com: change function name and update comment]
+  Link: http://lkml.kernel.org/r/20190628152421.198994-3-shakeelb@google.com
+Link: http://lkml.kernel.org/r/20190624212631.87212-3-shakeelb@google.com
+Signed-off-by: Shakeel Butt <shakeelb@google.com>
+Reported-by: syzbot+d0fc9d3c166bc5e4a94b@syzkaller.appspotmail.com
+Acked-by: Roman Gushchin <guro@fb.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+Cc: Nick Piggin <npiggin@suse.de>
+Cc: Paul Jackson <pj@sgi.com>
+Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,61 @@
+mptcp: avoid a lockdep splat when mcast group was joined
+
+syzbot triggered following lockdep splat:
+
+ffffffff82d2cd40 (rtnl_mutex){+.+.}, at: ip_mc_drop_socket+0x52/0x180
+but task is already holding lock:
+ffff8881187a2310 (sk_lock-AF_INET){+.+.}, at: mptcp_close+0x18/0x30
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+-> #1 (sk_lock-AF_INET){+.+.}:
+       lock_acquire+0xee/0x230
+       lock_sock_nested+0x89/0xc0
+       do_ip_setsockopt.isra.0+0x335/0x22f0
+       ip_setsockopt+0x35/0x60
+       tcp_setsockopt+0x5d/0x90
+       __sys_setsockopt+0xf3/0x190
+       __x64_sys_setsockopt+0x61/0x70
+       do_syscall_64+0x72/0x300
+       entry_SYSCALL_64_after_hwframe+0x49/0xbe
+-> #0 (rtnl_mutex){+.+.}:
+       check_prevs_add+0x2b7/0x1210
+       __lock_acquire+0x10b6/0x1400
+       lock_acquire+0xee/0x230
+       __mutex_lock+0x120/0xc70
+       ip_mc_drop_socket+0x52/0x180
+       inet_release+0x36/0xe0
+       __sock_release+0xfd/0x130
+       __mptcp_close+0xa8/0x1f0
+       inet_release+0x7f/0xe0
+       __sock_release+0x69/0x130
+       sock_close+0x18/0x20
+       __fput+0x179/0x400
+       task_work_run+0xd5/0x110
+       do_exit+0x685/0x1510
+       do_group_exit+0x7e/0x170
+       __x64_sys_exit_group+0x28/0x30
+       do_syscall_64+0x72/0x300
+       entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+The trigger is:
+  socket(AF_INET, SOCK_STREAM, 0x106 /* IPPROTO_MPTCP */) = 4
+  setsockopt(4, SOL_IP, MCAST_JOIN_GROUP, {gr_interface=7, gr_group={sa_family=AF_INET, sin_port=htons(20003), sin_addr=inet_addr("224.0.0.2")}}, 136) = 0
+  exit(0)
+
+Which results in a call to rtnl_lock while we are holding
+the parent mptcp socket lock via
+mptcp_close -> lock_sock(msk) -> inet_release -> ip_mc_drop_socket -> rtnl_lock().
+
+>From lockdep point of view we thus have both
+'rtnl_lock; lock_sock' and 'lock_sock; rtnl_lock'.
+
+Fix this by stealing the msk conn_list and doing the subflow close
+without holding the msk lock.
+
+Fixes: cec37a6e41aae7bf ("mptcp: Handle MP_CAPABLE options for outgoing connections")
+Reported-by: Christoph Paasch <cpaasch@apple.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

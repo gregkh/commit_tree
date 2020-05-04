@@ -1,0 +1,166 @@
+spi: core: avoid waking pump thread from spi_sync instead run teardown delayed
+
+When spi_sync is running alone with no other spi devices connected
+to the bus the worker thread is woken during spi_finalize_current_message
+to run the teardown code every time.
+
+This is totally unnecessary in the case that there is no message queued.
+
+On a multi-core system this results in one wakeup of the thread for each
+spi_message processed via spi_sync where in most cases the teardown does
+not happen as the hw is already in use.
+
+This patch now delays the teardown by 1 second by using a separate
+kthread_delayed_work for the teardown.
+
+This avoids waking the kthread too often.
+
+For spi_sync transfers in a tight loop (say 40k messages/s) this
+avoids the penalty of waking the worker thread 40k times/s.
+On a rasperry pi 3 with 4 cores the results in 32% of a single core
+only to find out that there is nothing in the queue and it can go back
+to sleep.
+
+With this patch applied the spi-worker is woken exactly once: after
+the load finishes and the spi bus is idle for 1 second.
+
+I believe I have also seen situations where during a spi_sync loop
+the worker thread (triggered by the last message finished) is slightly
+faster and _wins_ the race to process the message, so we are actually
+running the kthread and letting it do some work...
+
+This is also no longer observed with this patch applied as.
+
+Tested with a new CAN controller driver for the mcp2517fd which
+uses spi_sync for interrupt handling and spi_async for scheduling
+of can frames for transmission (in a different thread)
+
+Some statistics when receiving 100000 CAN frames with the mcp25xxfd driver
+on a Raspberry pi 3:
+
+without the patch:
+------------------
+root@raspcm3:~# for x in $(pgrep spi0) $(pgrep irq/94-mcp25xxf) ; do awk '{printf "%-20s %6i\n", $2,$15}' /proc/$x/stat; done
+(spi0)                    5
+(irq/94-mcp25xxf)         0
+root@raspcm3:~# vmstat 1
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 1  0      0 821960  13592  50848    0    0    80     2 1986  105  1  2 97  0  0
+ 0  0      0 821968  13592  50876    0    0     0     0 8046   30  0  0 100  0  0
+ 0  0      0 821936  13592  50876    0    0     0     0 8032   24  0  0 100  0  0
+ 0  0      0 821936  13592  50876    0    0     0     0 8035   30  0  0 100  0  0
+ 0  0      0 821936  13592  50876    0    0     0     0 8033   22  0  0 100  0  0
+ 2  0      0 821936  13592  50876    0    0     0     0 11598 7129  0  3 97  0  0
+ 1  0      0 821872  13592  50876    0    0     0     0 37741 59003  0 31 69  0  0
+ 2  0      0 821840  13592  50876    0    0     0     0 37762 59078  0 29 71  0  0
+ 2  0      0 821776  13592  50876    0    0     0     0 37593 58792  0 28 72  0  0
+ 1  0      0 821744  13592  50876    0    0     0     0 37642 58881  0 30 70  0  0
+ 2  0      0 821680  13592  50876    0    0     0     0 37490 58602  0 27 73  0  0
+ 1  0      0 821648  13592  50876    0    0     0     0 37412 58418  0 29 71  0  0
+ 1  0      0 821584  13592  50876    0    0     0     0 37337 58288  0 27 73  0  0
+ 1  0      0 821552  13592  50876    0    0     0     0 37584 58774  0 27 73  0  0
+ 0  0      0 821520  13592  50876    0    0     0     0 18363 20566  0  9 91  0  0
+ 0  0      0 821520  13592  50876    0    0     0     0 8037   32  0  0 100  0  0
+ 0  0      0 821520  13592  50876    0    0     0     0 8031   23  0  0 100  0  0
+ 0  0      0 821520  13592  50876    0    0     0     0 8034   26  0  0 100  0  0
+ 0  0      0 821520  13592  50876    0    0     0     0 8033   24  0  0 100  0  0
+^C
+root@raspcm3:~# for x in $(pgrep spi0) $(pgrep irq/94-mcp25xxf) ; do awk '{printf "%-20s %6i\n", $2,$15}' /proc/$x/stat; done
+(spi0)                  228
+(irq/94-mcp25xxf)       794
+root@raspcm3:~# cat /proc/interrupts
+           CPU0       CPU1       CPU2       CPU3
+ 17:         34          0          0          0  ARMCTRL-level   1 Edge      3f00b880.mailbox
+ 27:          1          0          0          0  ARMCTRL-level  35 Edge      timer
+ 33:    1416870          0          0          0  ARMCTRL-level  41 Edge      3f980000.usb, dwc2_hsotg:usb1
+ 34:          1          0          0          0  ARMCTRL-level  42 Edge      vc4
+ 35:          0          0          0          0  ARMCTRL-level  43 Edge      3f004000.txp
+ 40:       1753          0          0          0  ARMCTRL-level  48 Edge      DMA IRQ
+ 42:         11          0          0          0  ARMCTRL-level  50 Edge      DMA IRQ
+ 44:         11          0          0          0  ARMCTRL-level  52 Edge      DMA IRQ
+ 45:          0          0          0          0  ARMCTRL-level  53 Edge      DMA IRQ
+ 66:          0          0          0          0  ARMCTRL-level  74 Edge      vc4 crtc
+ 69:          0          0          0          0  ARMCTRL-level  77 Edge      vc4 crtc
+ 70:          0          0          0          0  ARMCTRL-level  78 Edge      vc4 crtc
+ 77:         20          0          0          0  ARMCTRL-level  85 Edge      3f205000.i2c, 3f804000.i2c, 3f805000.i2c
+ 78:       6346          0          0          0  ARMCTRL-level  86 Edge      3f204000.spi
+ 80:        205          0          0          0  ARMCTRL-level  88 Edge      mmc0
+ 81:        493          0          0          0  ARMCTRL-level  89 Edge      uart-pl011
+ 89:          0          0          0          0  bcm2836-timer   0 Edge      arch_timer
+ 90:       4291       3821       2180       1649  bcm2836-timer   1 Edge      arch_timer
+ 94:      14289          0          0          0  pinctrl-bcm2835  16 Level     mcp25xxfd
+IPI0:          0          0          0          0  CPU wakeup interrupts
+IPI1:          0          0          0          0  Timer broadcast interrupts
+IPI2:       3645     242371       7919       1328  Rescheduling interrupts
+IPI3:        112        543        273        194  Function call interrupts
+IPI4:          0          0          0          0  CPU stop interrupts
+IPI5:          1          0          0          0  IRQ work interrupts
+IPI6:          0          0          0          0  completion interrupts
+Err:          0
+
+top shows 93% for the mcp25xxfd interrupt handler, 31% for spi0.
+
+with the patch:
+---------------
+root@raspcm3:~# for x in $(pgrep spi0) $(pgrep irq/94-mcp25xxf) ; do awk '{printf "%-20s %6i\n", $2,$15}' /proc/$x/stat; done
+(spi0)                    0
+(irq/94-mcp25xxf)         0
+root@raspcm3:~# vmstat 1
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ 0  0      0 804768  13584  62628    0    0     0     0 8038   24  0  0 100  0  0
+ 0  0      0 804768  13584  62628    0    0     0     0 8042   25  0  0 100  0  0
+ 1  0      0 804704  13584  62628    0    0     0     0 9603 2967  0 20 80  0  0
+ 1  0      0 804672  13584  62628    0    0     0     0 9828 3380  0 24 76  0  0
+ 1  0      0 804608  13584  62628    0    0     0     0 9823 3375  0 23 77  0  0
+ 1  0      0 804608  13584  62628    0    0     0    12 9829 3394  0 23 77  0  0
+ 1  0      0 804544  13584  62628    0    0     0     0 9816 3362  0 22 78  0  0
+ 1  0      0 804512  13584  62628    0    0     0     0 9817 3367  0 23 77  0  0
+ 1  0      0 804448  13584  62628    0    0     0     0 9822 3370  0 22 78  0  0
+ 1  0      0 804416  13584  62628    0    0     0     0 9815 3367  0 23 77  0  0
+ 0  0      0 804352  13584  62628    0    0     0    84 9222 2250  0 14 86  0  0
+ 0  0      0 804352  13592  62620    0    0     0    24 8131  209  0  0 93  7  0
+ 0  0      0 804320  13592  62628    0    0     0     0 8041   27  0  0 100  0  0
+ 0  0      0 804352  13592  62628    0    0     0     0 8040   26  0  0 100  0  0
+root@raspcm3:~# for x in $(pgrep spi0) $(pgrep irq/94-mcp25xxf) ; do awk '{printf "%-20s %6i\n", $2,$15}' /proc/$x/stat; done
+(spi0)                    0
+(irq/94-mcp25xxf)       767
+root@raspcm3:~# cat /proc/interrupts
+           CPU0       CPU1       CPU2       CPU3
+ 17:         29          0          0          0  ARMCTRL-level   1 Edge      3f00b880.mailbox
+ 27:          1          0          0          0  ARMCTRL-level  35 Edge      timer
+ 33:    1024412          0          0          0  ARMCTRL-level  41 Edge      3f980000.usb, dwc2_hsotg:usb1
+ 34:          1          0          0          0  ARMCTRL-level  42 Edge      vc4
+ 35:          0          0          0          0  ARMCTRL-level  43 Edge      3f004000.txp
+ 40:       1773          0          0          0  ARMCTRL-level  48 Edge      DMA IRQ
+ 42:         11          0          0          0  ARMCTRL-level  50 Edge      DMA IRQ
+ 44:         11          0          0          0  ARMCTRL-level  52 Edge      DMA IRQ
+ 45:          0          0          0          0  ARMCTRL-level  53 Edge      DMA IRQ
+ 66:          0          0          0          0  ARMCTRL-level  74 Edge      vc4 crtc
+ 69:          0          0          0          0  ARMCTRL-level  77 Edge      vc4 crtc
+ 70:          0          0          0          0  ARMCTRL-level  78 Edge      vc4 crtc
+ 77:         20          0          0          0  ARMCTRL-level  85 Edge      3f205000.i2c, 3f804000.i2c, 3f805000.i2c
+ 78:       6417          0          0          0  ARMCTRL-level  86 Edge      3f204000.spi
+ 80:        237          0          0          0  ARMCTRL-level  88 Edge      mmc0
+ 81:        489          0          0          0  ARMCTRL-level  89 Edge      uart-pl011
+ 89:          0          0          0          0  bcm2836-timer   0 Edge      arch_timer
+ 90:       4048       3704       2383       1892  bcm2836-timer   1 Edge      arch_timer
+ 94:      14287          0          0          0  pinctrl-bcm2835  16 Level     mcp25xxfd
+IPI0:          0          0          0          0  CPU wakeup interrupts
+IPI1:          0          0          0          0  Timer broadcast interrupts
+IPI2:       2361       2948       7890       1616  Rescheduling interrupts
+IPI3:         65        617        301        166  Function call interrupts
+IPI4:          0          0          0          0  CPU stop interrupts
+IPI5:          1          0          0          0  IRQ work interrupts
+IPI6:          0          0          0          0  completion interrupts
+Err:          0
+top shows 91% for the mcp25xxfd interrupt handler, 0% for spi0
+
+So we see that spi0 is no longer getting scheduled wasting CPU cycles
+There are a lot less context switches and corresponding Rescheduling interrupts
+All of these show that this improves efficiency of the system and reduces
+CPU utilization.
+
+Signed-off-by: Martin Sperl <kernel@martin.sperl.org>
+Signed-off-by: Mark Brown <broonie@kernel.org>
+

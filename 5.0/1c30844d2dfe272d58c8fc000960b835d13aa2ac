@@ -1,0 +1,133 @@
+mm: reclaim small amounts of memory when an external fragmentation event occurs
+
+An external fragmentation event was previously described as
+
+    When the page allocator fragments memory, it records the event using
+    the mm_page_alloc_extfrag event. If the fallback_order is smaller
+    than a pageblock order (order-9 on 64-bit x86) then it's considered
+    an event that will cause external fragmentation issues in the future.
+
+The kernel reduces the probability of such events by increasing the
+watermark sizes by calling set_recommended_min_free_kbytes early in the
+lifetime of the system.  This works reasonably well in general but if
+there are enough sparsely populated pageblocks then the problem can still
+occur as enough memory is free overall and kswapd stays asleep.
+
+This patch introduces a watermark_boost_factor sysctl that allows a zone
+watermark to be temporarily boosted when an external fragmentation causing
+events occurs.  The boosting will stall allocations that would decrease
+free memory below the boosted low watermark and kswapd is woken if the
+calling context allows to reclaim an amount of memory relative to the size
+of the high watermark and the watermark_boost_factor until the boost is
+cleared.  When kswapd finishes, it wakes kcompactd at the pageblock order
+to clean some of the pageblocks that may have been affected by the
+fragmentation event.  kswapd avoids any writeback, slab shrinkage and swap
+from reclaim context during this operation to avoid excessive system
+disruption in the name of fragmentation avoidance.  Care is taken so that
+kswapd will do normal reclaim work if the system is really low on memory.
+
+This was evaluated using the same workloads as "mm, page_alloc: Spread
+allocations across zones before introducing fragmentation".
+
+1-socket Skylake machine
+config-global-dhp__workload_thpfioscale XFS (no special madvise)
+4 fio threads, 1 THP allocating thread
+--------------------------------------
+
+4.20-rc3 extfrag events < order 9:   804694
+4.20-rc3+patch:                      408912 (49% reduction)
+4.20-rc3+patch1-4:                    18421 (98% reduction)
+
+                                   4.20.0-rc3             4.20.0-rc3
+                                 lowzone-v5r8             boost-v5r8
+Amean     fault-base-1      653.58 (   0.00%)      652.71 (   0.13%)
+Amean     fault-huge-1        0.00 (   0.00%)      178.93 * -99.00%*
+
+                              4.20.0-rc3             4.20.0-rc3
+                            lowzone-v5r8             boost-v5r8
+Percentage huge-1        0.00 (   0.00%)        5.12 ( 100.00%)
+
+Note that external fragmentation causing events are massively reduced by
+this path whether in comparison to the previous kernel or the vanilla
+kernel.  The fault latency for huge pages appears to be increased but that
+is only because THP allocations were successful with the patch applied.
+
+1-socket Skylake machine
+global-dhp__workload_thpfioscale-madvhugepage-xfs (MADV_HUGEPAGE)
+-----------------------------------------------------------------
+
+4.20-rc3 extfrag events < order 9:  291392
+4.20-rc3+patch:                     191187 (34% reduction)
+4.20-rc3+patch1-4:                   13464 (95% reduction)
+
+thpfioscale Fault Latencies
+                                   4.20.0-rc3             4.20.0-rc3
+                                 lowzone-v5r8             boost-v5r8
+Min       fault-base-1      912.00 (   0.00%)      905.00 (   0.77%)
+Min       fault-huge-1      127.00 (   0.00%)      135.00 (  -6.30%)
+Amean     fault-base-1     1467.55 (   0.00%)     1481.67 (  -0.96%)
+Amean     fault-huge-1     1127.11 (   0.00%)     1063.88 *   5.61%*
+
+                              4.20.0-rc3             4.20.0-rc3
+                            lowzone-v5r8             boost-v5r8
+Percentage huge-1       77.64 (   0.00%)       83.46 (   7.49%)
+
+As before, massive reduction in external fragmentation events, some jitter
+on latencies and an increase in THP allocation success rates.
+
+2-socket Haswell machine
+config-global-dhp__workload_thpfioscale XFS (no special madvise)
+4 fio threads, 5 THP allocating threads
+----------------------------------------------------------------
+
+4.20-rc3 extfrag events < order 9:  215698
+4.20-rc3+patch:                     200210 (7% reduction)
+4.20-rc3+patch1-4:                   14263 (93% reduction)
+
+                                   4.20.0-rc3             4.20.0-rc3
+                                 lowzone-v5r8             boost-v5r8
+Amean     fault-base-5     1346.45 (   0.00%)     1306.87 (   2.94%)
+Amean     fault-huge-5     3418.60 (   0.00%)     1348.94 (  60.54%)
+
+                              4.20.0-rc3             4.20.0-rc3
+                            lowzone-v5r8             boost-v5r8
+Percentage huge-5        0.78 (   0.00%)        7.91 ( 910.64%)
+
+There is a 93% reduction in fragmentation causing events, there is a big
+reduction in the huge page fault latency and allocation success rate is
+higher.
+
+2-socket Haswell machine
+global-dhp__workload_thpfioscale-madvhugepage-xfs (MADV_HUGEPAGE)
+-----------------------------------------------------------------
+
+4.20-rc3 extfrag events < order 9: 166352
+4.20-rc3+patch:                    147463 (11% reduction)
+4.20-rc3+patch1-4:                  11095 (93% reduction)
+
+thpfioscale Fault Latencies
+                                   4.20.0-rc3             4.20.0-rc3
+                                 lowzone-v5r8             boost-v5r8
+Amean     fault-base-5     6217.43 (   0.00%)     7419.67 * -19.34%*
+Amean     fault-huge-5     3163.33 (   0.00%)     3263.80 (  -3.18%)
+
+                              4.20.0-rc3             4.20.0-rc3
+                            lowzone-v5r8             boost-v5r8
+Percentage huge-5       95.14 (   0.00%)       87.98 (  -7.53%)
+
+There is a large reduction in fragmentation events with some jitter around
+the latencies and success rates.  As before, the high THP allocation
+success rate does mean the system is under a lot of pressure.  However, as
+the fragmentation events are reduced, it would be expected that the
+long-term allocation success rate would be higher.
+
+Link: http://lkml.kernel.org/r/20181123114528.28802-5-mgorman@techsingularity.net
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Zi Yan <zi.yan@cs.rutgers.edu>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

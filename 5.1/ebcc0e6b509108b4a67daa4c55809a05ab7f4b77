@@ -1,0 +1,137 @@
+drm/dp_mst: Introduce new refcounting scheme for mstbs and ports
+
+The current way of handling refcounting in the DP MST helpers is really
+confusing and probably just plain wrong because it's been hacked up many
+times over the years without anyone actually going over the code and
+seeing if things could be simplified.
+
+To the best of my understanding, the current scheme works like this:
+drm_dp_mst_port and drm_dp_mst_branch both have a single refcount. When
+this refcount hits 0 for either of the two, they're removed from the
+topology state, but not immediately freed. Both ports and branch devices
+will reinitialize their kref once it's hit 0 before actually destroying
+themselves. The intended purpose behind this is so that we can avoid
+problems like not being able to free a remote payload that might still
+be active, due to us having removed all of the port/branch device
+structures in memory, as per:
+
+commit 91a25e463130 ("drm/dp/mst: deallocate payload on port destruction")
+
+Which may have worked, but then it caused use-after-free errors. Being
+new to MST at the time, I tried fixing it;
+
+commit 263efde31f97 ("drm/dp/mst: Get validated port ref in drm_dp_update_payload_part1()")
+
+But, that was broken: both drm_dp_mst_port and drm_dp_mst_branch structs
+are validated in almost every DP MST helper function. Simply put, this
+means we go through the topology and try to see if the given
+drm_dp_mst_branch or drm_dp_mst_port is still attached to something
+before trying to use it in order to avoid dereferencing freed memory
+(something that has happened a LOT in the past with this library).
+Because of this it doesn't actually matter whether or not we keep keep
+the ports and branches around in memory as that's not enough, because
+any function that validates the branches and ports passed to it will
+still reject them anyway since they're no longer in the topology
+structure. So, use-after-free errors were fixed but payload deallocation
+was completely broken.
+
+Two years later, AMD informed me about this issue and I attempted to
+come up with a temporary fix, pending a long-overdue cleanup of this
+library:
+
+commit c54c7374ff44 ("drm/dp_mst: Skip validating ports during destruction, just ref")
+
+But then that introduced use-after-free errors, so I quickly reverted
+it:
+
+commit 9765635b3075 ("Revert "drm/dp_mst: Skip validating ports during destruction, just ref"")
+
+And in the process, learned that there is just no simple fix for this:
+the design is just broken. Unfortunately, the usage of these helpers are
+quite broken as well. Some drivers like i915 have been smart enough to
+avoid accessing any kind of information from MST port structures, but
+others like nouveau have assumed, understandably so, that
+drm_dp_mst_port structures are normal and can just be accessed at any
+time without worrying about use-after-free errors.
+
+After a lot of discussion, me and Daniel Vetter came up with a better
+idea to replace all of this.
+
+To summarize, since this is documented far more indepth in the
+documentation this patch introduces, we make it so that drm_dp_mst_port
+and drm_dp_mst_branch structures have two different classes of
+refcounts: topology_kref, and malloc_kref. topology_kref corresponds to
+the lifetime of the given drm_dp_mst_port or drm_dp_mst_branch in it's
+given topology. Once it hits zero, any associated connectors are removed
+and the branch or port can no longer be validated. malloc_kref
+corresponds to the lifetime of the memory allocation for the actual
+structure, and will always be non-zero so long as the topology_kref is
+non-zero. This gives us a way to allow callers to hold onto port and
+branch device structures past their topology lifetime, and dramatically
+simplifies the lifetimes of both structures. This also finally fixes the
+port deallocation problem, properly.
+
+Additionally: since this now means that we can keep ports and branch
+devices allocated in memory for however long we need, we no longer need
+a significant amount of the port validation that we currently do.
+
+Additionally, there is one last scenario that this fixes, which couldn't
+have been fixed properly beforehand:
+
+- CPU1 unrefs port from topology (refcount 1->0)
+- CPU2 refs port in topology(refcount 0->1)
+
+Since we now can guarantee memory safety for ports and branches
+as-needed, we also can make our main reference counting functions fix
+this problem by using kref_get_unless_zero() internally so that topology
+refcounts can only ever reach 0 once.
+
+Changes since v4:
+* Change the kernel-figure summary for dp-mst/topology-figure-1.dot a
+  bit - danvet
+* Remove figure numbers - danvet
+
+Changes since v3:
+* Remove rebase detritus - danvet
+* Split out purely style changes into separate patches - hwentlan
+
+Changes since v2:
+* Fix commit message - checkpatch
+* s/)-1/) - 1/g - checkpatch
+
+Changes since v1:
+* Remove forward declarations - danvet
+* Move "Branch device and port refcounting" section from documentation
+  into kernel-doc comments - danvet
+* Export internal topology lifetime functions into their own section in
+  the kernel-docs - danvet
+* s/@/&/g for struct references in kernel-docs - danvet
+* Drop the "when they are no longer being used" bits from the kernel
+  docs - danvet
+* Modify diagrams to show how the DRM driver interacts with the topology
+  and payloads - danvet
+* Make suggested documentation changes for
+  drm_dp_mst_topology_get_mstb() and drm_dp_mst_topology_get_port() -
+  danvet
+* Better explain the relationship between malloc refs and topology krefs
+  in the documentation for drm_dp_mst_topology_get_port() and
+  drm_dp_mst_topology_get_mstb() - danvet
+* Fix "See also" in drm_dp_mst_topology_get_mstb() - danvet
+* Rename drm_dp_mst_topology_get_(port|mstb)() ->
+  drm_dp_mst_topology_try_get_(port|mstb)() and
+  drm_dp_mst_topology_ref_(port|mstb)() ->
+  drm_dp_mst_topology_get_(port|mstb)() - danvet
+* s/should/must in docs - danvet
+* WARN_ON(refcount == 0) in topology_get_(mstb|port) - danvet
+* Move kdocs for mstb/port structs inline - danvet
+* Split drm_dp_get_last_connected_port_and_mstb() changes into their own
+  commit - danvet
+
+Signed-off-by: Lyude Paul <lyude@redhat.com>
+Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+Reviewed-by: Daniel Vetter <daniel@ffwll.ch>
+Cc: David Airlie <airlied@redhat.com>
+Cc: Jerry Zuo <Jerry.Zuo@amd.com>
+Cc: Juston Li <juston.li@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190111005343.17443-7-lyude@redhat.com
+

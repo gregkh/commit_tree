@@ -1,0 +1,82 @@
+iwlwifi: mvm: add a loose synchronization of the NSSN across Rx queues
+
+In order to support MSI-X efficiently, we want to avoid
+communication across Rx queues. Each Rx queue should have
+all the data it needs to process a packet.
+
+The reordering buffer is a challenge in the MSI-X world
+since we can have a single BA session whose packets are
+directed to different queues. This is why each queue has
+its own reordering buffer. The hardware is able to hint
+the driver whether we have a hole or not, which allows
+the driver to know whether it can release a packet or not.
+This indication is called NSSN. Roughly, if the packet's
+SN is lower than the NSSN, we can release the packet to
+the stack. The NSSN is the SN of the newest packet received
+without any holes + 1.
+
+This is working as long as we don't have packets that we
+release because of a timeout. When that happens, we could
+have taken the decision to release a packet after we have
+been waiting for its predecessor for too long. If this
+predecessor comes later, we have to drop it because we
+can't release packets out of order. In that case, the
+hardware will give us an indication that we can we release
+the packet (SN < NSSN), but the packet still needs to be
+dropped.
+This is why we sometimes need to ignore the NSSN and we
+track the head_sn in software.
+Here is a specific example of this:
+
+1) Rx queue 1 got packets: 480, 482, 483
+2) We release 480 to to the stack and wait for 481
+3) NSSN is now 481
+4) The timeout expires
+5) We release 482 and 483, NSSN is still 480
+6) 481 arrives its NSSN is 484.
+
+We need to drop 481 even if 481 < 484. This is why we'll
+update the head_sn to 484 at step 2. The flow now is:
+
+1) Rx queue 1 got packets: 480, 482, 483
+2) We release 480 to to the stack and wait for 481
+3) NSSN is now 481 / head_sn is 481
+4) The timeout expires
+5) We release 482 and 483, NSSN is still 480 but head_sn is 484.
+6) 481 arrives its NSSN is 484, but head_sn is 484 and we drop it.
+
+This code introduces another problem in case all the traffic
+goes well (no hole, no timeout):
+
+Rx queue 1: 0   -> 483   (head_sn = 484)
+Rx queue 2: 501 -> 4095  (head_sn = 0)
+Rx queue 2: 0   -> 480   (head_sn = 481)
+Rx queue 1: 481 but head_sn = 484 and we drop it.
+
+At this point, the SN of queue 1 is far behind: more than
+4040 packets behind. Queue 1 will consider 481 "old"
+because 481 is in [501-64:501] whereas it is a very new
+packet.
+
+In order to fix that, send an Rx notification from time to
+time (twice across the full set of 4096 packets) to make
+sure no Rx queue is lagging too far behind.
+
+What will happen then is:
+
+Rx queue 1: 0    -> 483       (head_sn = 484)
+Rx queue 2: 501  -> 2047      (head_sn = 2048)
+Rx queue 1: Sync nofication   (head_sn = 2048)
+Rx queue 2: 2048 -> 4095      (head_sn = 0)
+Rx queue 1: Sync notification (head_sn = 0)
+Rx queue 2: 1    -> 481       (head_sn = 482)
+Rx queue 1: 481 and head_sn = 0.
+
+In queue 1's data, head_sn is now 0, the packet coming in
+is 481, it'll understand that the new packet is new and it
+won't be dropped.
+
+Signed-off-by: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+

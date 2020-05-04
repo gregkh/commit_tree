@@ -1,0 +1,65 @@
+x86/kprobes: Fix ordering while text-patching
+
+Kprobes does something like:
+
+register:
+	arch_arm_kprobe()
+	  text_poke(INT3)
+          /* guarantees nothing, INT3 will become visible at some point, maybe */
+
+        kprobe_optimizer()
+	  /* guarantees the bytes after INT3 are unused */
+	  synchronize_rcu_tasks();
+	  text_poke_bp(JMP32);
+	  /* implies IPI-sync, kprobe really is enabled */
+
+unregister:
+	__disarm_kprobe()
+	  unoptimize_kprobe()
+	    text_poke_bp(INT3 + tail);
+	    /* implies IPI-sync, so tail is guaranteed visible */
+          arch_disarm_kprobe()
+            text_poke(old);
+	    /* guarantees nothing, old will maybe become visible */
+
+	synchronize_rcu()
+
+        free-stuff
+
+Now the problem is that on register, the synchronize_rcu_tasks() does
+not imply sufficient to guarantee all CPUs have already observed INT3
+(although in practice this is exceedingly unlikely not to have
+happened) (similar to how MEMBARRIER_CMD_PRIVATE_EXPEDITED does not
+imply MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE).
+
+Worse, even if it did, we'd have to do 2 synchronize calls to provide
+the guarantee we're looking for, the first to ensure INT3 is visible,
+the second to guarantee nobody is then still using the instruction
+bytes after INT3.
+
+Similar on unregister; the synchronize_rcu() between
+__unregister_kprobe_top() and __unregister_kprobe_bottom() does not
+guarantee all CPUs are free of the INT3 (and observe the old text).
+
+Therefore, sprinkle some IPI-sync love around. This guarantees that
+all CPUs agree on the text and RCU once again provides the required
+guaranteed.
+
+Tested-by: Alexei Starovoitov <ast@kernel.org>
+Tested-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Paul E. McKenney <paulmck@kernel.org>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Brian Gerst <brgerst@gmail.com>
+Cc: Denys Vlasenko <dvlasenk@redhat.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20191111132458.162172862@infradead.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

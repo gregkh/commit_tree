@@ -1,0 +1,65 @@
+tcp: fix rejected syncookies due to stale timestamps
+
+If no synflood happens for a long enough period of time, then the
+synflood timestamp isn't refreshed and jiffies can advance so much
+that time_after32() can't accurately compare them any more.
+
+Therefore, we can end up in a situation where time_after32(now,
+last_overflow + HZ) returns false, just because these two values are
+too far apart. In that case, the synflood timestamp isn't updated as
+it should be, which can trick tcp_synq_no_recent_overflow() into
+rejecting valid syncookies.
+
+For example, let's consider the following scenario on a system
+with HZ=1000:
+
+  * The synflood timestamp is 0, either because that's the timestamp
+    of the last synflood or, more commonly, because we're working with
+    a freshly created socket.
+
+  * We receive a new SYN, which triggers synflood protection. Let's say
+    that this happens when jiffies == 2147484649 (that is,
+    'synflood timestamp' + HZ + 2^31 + 1).
+
+  * Then tcp_synq_overflow() doesn't update the synflood timestamp,
+    because time_after32(2147484649, 1000) returns false.
+    With:
+      - 2147484649: the value of jiffies, aka. 'now'.
+      - 1000: the value of 'last_overflow' + HZ.
+
+  * A bit later, we receive the ACK completing the 3WHS. But
+    cookie_v[46]_check() rejects it because tcp_synq_no_recent_overflow()
+    says that we're not under synflood. That's because
+    time_after32(2147484649, 120000) returns false.
+    With:
+      - 2147484649: the value of jiffies, aka. 'now'.
+      - 120000: the value of 'last_overflow' + TCP_SYNCOOKIE_VALID.
+
+    Of course, in reality jiffies would have increased a bit, but this
+    condition will last for the next 119 seconds, which is far enough
+    to accommodate for jiffie's growth.
+
+Fix this by updating the overflow timestamp whenever jiffies isn't
+within the [last_overflow, last_overflow + HZ] range. That shouldn't
+have any performance impact since the update still happens at most once
+per second.
+
+Now we're guaranteed to have fresh timestamps while under synflood, so
+tcp_synq_no_recent_overflow() can safely use it with time_after32() in
+such situations.
+
+Stale timestamps can still make tcp_synq_no_recent_overflow() return
+the wrong verdict when not under synflood. This will be handled in the
+next patch.
+
+For 64 bits architectures, the problem was introduced with the
+conversion of ->tw_ts_recent_stamp to 32 bits integer by commit
+cca9bab1b72c ("tcp: use monotonic timestamps for PAWS").
+The problem has always been there on 32 bits architectures.
+
+Fixes: cca9bab1b72c ("tcp: use monotonic timestamps for PAWS")
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Guillaume Nault <gnault@redhat.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

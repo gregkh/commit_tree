@@ -1,0 +1,88 @@
+selinux: overhaul sidtab to fix bug and improve performance
+
+Before this patch, during a policy reload the sidtab would become frozen
+and trying to map a new context to SID would be unable to add a new
+entry to sidtab and fail with -ENOMEM.
+
+Such failures are usually propagated into userspace, which has no way of
+distignuishing them from actual allocation failures and thus doesn't
+handle them gracefully. Such situation can be triggered e.g. by the
+following reproducer:
+
+    while true; do load_policy; echo -n .; sleep 0.1; done &
+    for (( i = 0; i < 1024; i++ )); do
+        runcon -l s0:c$i echo -n x || break
+        # or:
+        # chcon -l s0:c$i <some_file> || break
+    done
+
+This patch overhauls the sidtab so it doesn't need to be frozen during
+policy reload, thus solving the above problem.
+
+The new SID table leverages the fact that SIDs are allocated
+sequentially and are never invalidated and stores them in linear buckets
+indexed by a tree structure. This brings several advantages:
+  1. Fast SID -> context lookup - this lookup can now be done in
+     logarithmic time complexity (usually in less than 4 array lookups)
+     and can still be done safely without locking.
+  2. No need to re-search the whole table on reverse lookup miss - after
+     acquiring the spinlock only the newly added entries need to be
+     searched, which means that reverse lookups that end up inserting a
+     new entry are now about twice as fast.
+  3. No need to freeze sidtab during policy reload - it is now possible
+     to handle insertion of new entries even during sidtab conversion.
+
+The tree structure of the new sidtab is able to grow automatically to up
+to about 2^31 entries (at which point it should not have more than about
+4 tree levels). The old sidtab had a theoretical capacity of almost 2^32
+entries, but half of that is still more than enough since by that point
+the reverse table lookups would become unusably slow anyway...
+
+The number of entries per tree node is selected automatically so that
+each node fits into a single page, which should be the easiest size for
+kmalloc() to handle.
+
+Note that the cache for reverse lookup is preserved with equivalent
+logic. The only difference is that instead of storing pointers to the
+hash table nodes it stores just the indices of the cached entries.
+
+The new cache ensures that the indices are loaded/stored atomically, but
+it still has the drawback that concurrent cache updates may mess up the
+contents of the cache. Such situation however only reduces its
+effectivity, not the correctness of lookups.
+
+Tested by selinux-testsuite and thoroughly tortured by this simple
+stress test:
+```
+function rand_cat() {
+	echo $(( $RANDOM % 1024 ))
+}
+
+function do_work() {
+	while true; do
+		echo -n "system_u:system_r:kernel_t:s0:c$(rand_cat),c$(rand_cat)" \
+			>/sys/fs/selinux/context 2>/dev/null || true
+	done
+}
+
+do_work >/dev/null &
+do_work >/dev/null &
+do_work >/dev/null &
+
+while load_policy; do echo -n .; sleep 0.1; done
+
+kill %1
+kill %2
+kill %3
+```
+
+Link: https://github.com/SELinuxProject/selinux-kernel/issues/38
+
+Reported-by: Orion Poplawski <orion@nwra.com>
+Reported-by: Li Kun <hw.likun@huawei.com>
+Signed-off-by: Ondrej Mosnacek <omosnace@redhat.com>
+Reviewed-by: Stephen Smalley <sds@tycho.nsa.gov>
+[PM: most of sidtab.c merged by hand due to conflicts]
+[PM: checkpatch fixes in mls.c, services.c, sidtab.c]
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+

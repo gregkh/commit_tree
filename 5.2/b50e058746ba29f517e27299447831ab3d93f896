@@ -1,0 +1,95 @@
+net: rds: fix memory leak when unload rds_rdma
+
+When KASAN is enabled, after several rds connections are
+created, then "rmmod rds_rdma" is run. The following will
+appear.
+
+"
+BUG rds_ib_incoming (Not tainted): Objects remaining
+in rds_ib_incoming on __kmem_cache_shutdown()
+
+Call Trace:
+ dump_stack+0x71/0xab
+ slab_err+0xad/0xd0
+ __kmem_cache_shutdown+0x17d/0x370
+ shutdown_cache+0x17/0x130
+ kmem_cache_destroy+0x1df/0x210
+ rds_ib_recv_exit+0x11/0x20 [rds_rdma]
+ rds_ib_exit+0x7a/0x90 [rds_rdma]
+ __x64_sys_delete_module+0x224/0x2c0
+ ? __ia32_sys_delete_module+0x2c0/0x2c0
+ do_syscall_64+0x73/0x190
+ entry_SYSCALL_64_after_hwframe+0x44/0xa9
+"
+This is rds connection memory leak. The root cause is:
+When "rmmod rds_rdma" is run, rds_ib_remove_one will call
+rds_ib_dev_shutdown to drop the rds connections.
+rds_ib_dev_shutdown will call rds_conn_drop to drop rds
+connections as below.
+"
+rds_conn_path_drop(&conn->c_path[0], false);
+"
+In the above, destroy is set to false.
+void rds_conn_path_drop(struct rds_conn_path *cp, bool destroy)
+{
+        atomic_set(&cp->cp_state, RDS_CONN_ERROR);
+
+        rcu_read_lock();
+        if (!destroy && rds_destroy_pending(cp->cp_conn)) {
+                rcu_read_unlock();
+                return;
+        }
+        queue_work(rds_wq, &cp->cp_down_w);
+        rcu_read_unlock();
+}
+In the above function, destroy is set to false. rds_destroy_pending
+is called. This does not move rds connections to ib_nodev_conns.
+So destroy is set to true to move rds connections to ib_nodev_conns.
+In rds_ib_unregister_client, flush_workqueue is called to make rds_wq
+finsh shutdown rds connections. The function rds_ib_destroy_nodev_conns
+is called to shutdown rds connections finally.
+Then rds_ib_recv_exit is called to destroy slab.
+
+void rds_ib_recv_exit(void)
+{
+        kmem_cache_destroy(rds_ib_incoming_slab);
+        kmem_cache_destroy(rds_ib_frag_slab);
+}
+The above slab memory leak will not occur again.
+
+>From tests,
+256 rds connections
+[root@ca-dev14 ~]# time rmmod rds_rdma
+
+real    0m16.522s
+user    0m0.000s
+sys     0m8.152s
+512 rds connections
+[root@ca-dev14 ~]# time rmmod rds_rdma
+
+real    0m32.054s
+user    0m0.000s
+sys     0m15.568s
+
+To rmmod rds_rdma with 256 rds connections, about 16 seconds are needed.
+And with 512 rds connections, about 32 seconds are needed.
+>From ftrace, when one rds connection is destroyed,
+
+"
+ 19)               |  rds_conn_destroy [rds]() {
+ 19)   7.782 us    |    rds_conn_path_drop [rds]();
+ 15)               |  rds_shutdown_worker [rds]() {
+ 15)               |    rds_conn_shutdown [rds]() {
+ 15)   1.651 us    |      rds_send_path_reset [rds]();
+ 15)   7.195 us    |    }
+ 15) + 11.434 us   |  }
+ 19)   2.285 us    |    rds_cong_remove_conn [rds]();
+ 19) * 24062.76 us |  }
+"
+So if many rds connections will be destroyed, this function
+rds_ib_destroy_nodev_conns uses most of time.
+
+Suggested-by: Håkon Bugge <haakon.bugge@oracle.com>
+Signed-off-by: Zhu Yanjun <yanjun.zhu@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

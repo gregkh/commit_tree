@@ -1,0 +1,86 @@
+perf/core: Fix race between close() and fork()
+
+Syzcaller reported the following Use-after-Free bug:
+
+	close()						clone()
+
+							  copy_process()
+							    perf_event_init_task()
+							      perf_event_init_context()
+							        mutex_lock(parent_ctx->mutex)
+								inherit_task_group()
+								  inherit_group()
+								    inherit_event()
+								      mutex_lock(event->child_mutex)
+								      // expose event on child list
+								      list_add_tail()
+								      mutex_unlock(event->child_mutex)
+							        mutex_unlock(parent_ctx->mutex)
+
+							    ...
+							    goto bad_fork_*
+
+							  bad_fork_cleanup_perf:
+							    perf_event_free_task()
+
+	  perf_release()
+	    perf_event_release_kernel()
+	      list_for_each_entry()
+		mutex_lock(ctx->mutex)
+		mutex_lock(event->child_mutex)
+		// event is from the failing inherit
+		// on the other CPU
+		perf_remove_from_context()
+		list_move()
+		mutex_unlock(event->child_mutex)
+		mutex_unlock(ctx->mutex)
+
+							      mutex_lock(ctx->mutex)
+							      list_for_each_entry_safe()
+							        // event already stolen
+							      mutex_unlock(ctx->mutex)
+
+							    delayed_free_task()
+							      free_task()
+
+	     list_for_each_entry_safe()
+	       list_del()
+	       free_event()
+	         _free_event()
+		   // and so event->hw.target
+		   // is the already freed failed clone()
+		   if (event->hw.target)
+		     put_task_struct(event->hw.target)
+		       // WHOOPSIE, already quite dead
+
+Which puts the lie to the the comment on perf_event_free_task():
+'unexposed, unused context' not so much.
+
+Which is a 'fun' confluence of fail; copy_process() doing an
+unconditional free_task() and not respecting refcounts, and perf having
+creative locking. In particular:
+
+  82d94856fa22 ("perf/core: Fix lock inversion between perf,trace,cpuhp")
+
+seems to have overlooked this 'fun' parade.
+
+Solve it by using the fact that detached events still have a reference
+count on their (previous) context. With this perf_event_free_task()
+can detect when events have escaped and wait for their destruction.
+
+Debugged-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Reported-by: syzbot+a24c397a29ad22d86c98@syzkaller.appspotmail.com
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Mark Rutland <mark.rutland@arm.com>
+Cc: <stable@vger.kernel.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vince Weaver <vincent.weaver@maine.edu>
+Fixes: 82d94856fa22 ("perf/core: Fix lock inversion between perf,trace,cpuhp")
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

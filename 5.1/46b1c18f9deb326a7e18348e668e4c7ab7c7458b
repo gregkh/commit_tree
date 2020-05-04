@@ -1,0 +1,58 @@
+net: sched: put back q.qlen into a single location
+
+In the series fc8b81a5981f ("Merge branch 'lockless-qdisc-series'")
+John made the assumption that the data path had no need to read
+the qdisc qlen (number of packets in the qdisc).
+
+It is true when pfifo_fast is used as the root qdisc, or as direct MQ/MQPRIO
+children.
+
+But pfifo_fast can be used as leaf in class full qdiscs, and existing
+logic needs to access the child qlen in an efficient way.
+
+HTB breaks badly, since it uses cl->leaf.q->q.qlen in :
+  htb_activate() -> WARN_ON()
+  htb_dequeue_tree() to decide if a class can be htb_deactivated
+  when it has no more packets.
+
+HFSC, DRR, CBQ, QFQ have similar issues, and some calls to
+qdisc_tree_reduce_backlog() also read q.qlen directly.
+
+Using qdisc_qlen_sum() (which iterates over all possible cpus)
+in the data path is a non starter.
+
+It seems we have to put back qlen in a central location,
+at least for stable kernels.
+
+For all qdisc but pfifo_fast, qlen is guarded by the qdisc lock,
+so the existing q.qlen{++|--} are correct.
+
+For 'lockless' qdisc (pfifo_fast so far), we need to use atomic_{inc|dec}()
+because the spinlock might be not held (for example from
+pfifo_fast_enqueue() and pfifo_fast_dequeue())
+
+This patch adds atomic_qlen (in the same location than qlen)
+and renames the following helpers, since we want to express
+they can be used without qdisc lock, and that qlen is no longer percpu.
+
+- qdisc_qstats_cpu_qlen_dec -> qdisc_qstats_atomic_qlen_dec()
+- qdisc_qstats_cpu_qlen_inc -> qdisc_qstats_atomic_qlen_inc()
+
+Later (net-next) we might revert this patch by tracking all these
+qlen uses and replace them by a more efficient method (not having
+to access a precise qlen, but an empty/non_empty status that might
+be less expensive to maintain/track).
+
+Another possibility is to have a legacy pfifo_fast version that would
+be used when used a a child qdisc, since the parent qdisc needs
+a spinlock anyway. But then, future lockless qdiscs would also
+have the same problem.
+
+Fixes: 7e66016f2c65 ("net: sched: helpers to sum qlen and qlen for per cpu logic")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: John Fastabend <john.fastabend@gmail.com>
+Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+Cc: Cong Wang <xiyou.wangcong@gmail.com>
+Cc: Jiri Pirko <jiri@resnulli.us>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

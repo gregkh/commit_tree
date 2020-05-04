@@ -1,0 +1,46 @@
+ext4: fix race between writepages and enabling EXT4_EXTENTS_FL
+
+If EXT4_EXTENTS_FL is set on an inode while ext4_writepages() is running
+on it, the following warning in ext4_add_complete_io() can be hit:
+
+WARNING: CPU: 1 PID: 0 at fs/ext4/page-io.c:234 ext4_put_io_end_defer+0xf0/0x120
+
+Here's a minimal reproducer (not 100% reliable) (root isn't required):
+
+        while true; do
+                sync
+        done &
+        while true; do
+                rm -f file
+                touch file
+                chattr -e file
+                echo X >> file
+                chattr +e file
+        done
+
+The problem is that in ext4_writepages(), ext4_should_dioread_nolock()
+(which only returns true on extent-based files) is checked once to set
+the number of reserved journal credits, and also again later to select
+the flags for ext4_map_blocks() and copy the reserved journal handle to
+ext4_io_end::handle.  But if EXT4_EXTENTS_FL is being concurrently set,
+the first check can see dioread_nolock disabled while the later one can
+see it enabled, causing the reserved handle to unexpectedly be NULL.
+
+Since changing EXT4_EXTENTS_FL is uncommon, and there may be other races
+related to doing so as well, fix this by synchronizing changing
+EXT4_EXTENTS_FL with ext4_writepages() via the existing
+s_writepages_rwsem (previously called s_journal_flag_rwsem).
+
+This was originally reported by syzbot without a reproducer at
+https://syzkaller.appspot.com/bug?extid=2202a584a00fffd19fbf,
+but now that dioread_nolock is the default I also started seeing this
+when running syzkaller locally.
+
+Link: https://lore.kernel.org/r/20200219183047.47417-3-ebiggers@kernel.org
+Reported-by: syzbot+2202a584a00fffd19fbf@syzkaller.appspotmail.com
+Fixes: 6b523df4fb5a ("ext4: use transaction reservation for extent conversion in ext4_end_io")
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: stable@kernel.org
+

@@ -1,0 +1,83 @@
+btrfs: scrub: Require mandatory block group RO for dev-replace
+
+[BUG]
+For dev-replace test cases with fsstress, like btrfs/06[45] btrfs/071,
+looped runs can lead to random failure, where scrub finds csum error.
+
+The possibility is not high, around 1/20 to 1/100, but it's causing data
+corruption.
+
+The bug is observable after commit b12de52896c0 ("btrfs: scrub: Don't
+check free space before marking a block group RO")
+
+[CAUSE]
+Dev-replace has two source of writes:
+
+- Write duplication
+  All writes to source device will also be duplicated to target device.
+
+  Content:	Not yet persisted data/meta
+
+- Scrub copy
+  Dev-replace reused scrub code to iterate through existing extents, and
+  copy the verified data to target device.
+
+  Content:	Previously persisted data and metadata
+
+The difference in contents makes the following race possible:
+	Regular Writer		|	Dev-replace
+-----------------------------------------------------------------
+  ^                             |
+  | Preallocate one data extent |
+  | at bytenr X, len 1M		|
+  v				|
+  ^ Commit transaction		|
+  | Now extent [X, X+1M) is in  |
+  v commit root			|
+ ================== Dev replace starts =========================
+  				| ^
+				| | Scrub extent [X, X+1M)
+				| | Read [X, X+1M)
+				| | (The content are mostly garbage
+				| |  since it's preallocated)
+  ^				| v
+  | Write back happens for	|
+  | extent [X, X+512K)		|
+  | New data writes to both	|
+  | source and target dev.	|
+  v				|
+				| ^
+				| | Scrub writes back extent [X, X+1M)
+				| | to target device.
+				| | This will over write the new data in
+				| | [X, X+512K)
+				| v
+
+This race can only happen for nocow writes. Thus metadata and data cow
+writes are safe, as COW will never overwrite extents of previous
+transaction (in commit root).
+
+This behavior can be confirmed by disabling all fallocate related calls
+in fsstress (*), then all related tests can pass a 2000 run loop.
+
+*: FSSTRESS_AVOID="-f fallocate=0 -f allocsp=0 -f zero=0 -f insert=0 \
+		   -f collapse=0 -f punch=0 -f resvsp=0"
+   I didn't expect resvsp ioctl will fallback to fallocate in VFS...
+
+[FIX]
+Make dev-replace to require mandatory block group RO, and wait for current
+nocow writes before calling scrub_chunk().
+
+This patch will mostly revert commit 76a8efa171bf ("btrfs: Continue replace
+when set_block_ro failed") for dev-replace path.
+
+The side effect is, dev-replace can be more strict on avaialble space, but
+definitely worth to avoid data corruption.
+
+Reported-by: Filipe Manana <fdmanana@suse.com>
+Fixes: 76a8efa171bf ("btrfs: Continue replace when set_block_ro failed")
+Fixes: b12de52896c0 ("btrfs: scrub: Don't check free space before marking a block group RO")
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

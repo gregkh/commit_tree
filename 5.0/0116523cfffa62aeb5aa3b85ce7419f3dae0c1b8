@@ -1,0 +1,261 @@
+kasan, mm: change hooks signatures
+
+Patch series "kasan: add software tag-based mode for arm64", v13.
+
+This patchset adds a new software tag-based mode to KASAN [1].  (Initially
+this mode was called KHWASAN, but it got renamed, see the naming rationale
+at the end of this section).
+
+The plan is to implement HWASan [2] for the kernel with the incentive,
+that it's going to have comparable to KASAN performance, but in the same
+time consume much less memory, trading that off for somewhat imprecise bug
+detection and being supported only for arm64.
+
+The underlying ideas of the approach used by software tag-based KASAN are:
+
+1. By using the Top Byte Ignore (TBI) arm64 CPU feature, we can store
+   pointer tags in the top byte of each kernel pointer.
+
+2. Using shadow memory, we can store memory tags for each chunk of kernel
+   memory.
+
+3. On each memory allocation, we can generate a random tag, embed it into
+   the returned pointer and set the memory tags that correspond to this
+   chunk of memory to the same value.
+
+4. By using compiler instrumentation, before each memory access we can add
+   a check that the pointer tag matches the tag of the memory that is being
+   accessed.
+
+5. On a tag mismatch we report an error.
+
+With this patchset the existing KASAN mode gets renamed to generic KASAN,
+with the word "generic" meaning that the implementation can be supported
+by any architecture as it is purely software.
+
+The new mode this patchset adds is called software tag-based KASAN.  The
+word "tag-based" refers to the fact that this mode uses tags embedded into
+the top byte of kernel pointers and the TBI arm64 CPU feature that allows
+to dereference such pointers.  The word "software" here means that shadow
+memory manipulation and tag checking on pointer dereference is done in
+software.  As it is the only tag-based implementation right now, "software
+tag-based" KASAN is sometimes referred to as simply "tag-based" in this
+patchset.
+
+A potential expansion of this mode is a hardware tag-based mode, which
+would use hardware memory tagging support (announced by Arm [3]) instead
+of compiler instrumentation and manual shadow memory manipulation.
+
+Same as generic KASAN, software tag-based KASAN is strictly a debugging
+feature.
+
+[1] https://www.kernel.org/doc/html/latest/dev-tools/kasan.html
+
+[2] http://clang.llvm.org/docs/HardwareAssistedAddressSanitizerDesign.html
+
+[3] https://community.arm.com/processors/b/blog/posts/arm-a-profile-architecture-2018-developments-armv85a
+
+====== Rationale
+
+On mobile devices generic KASAN's memory usage is significant problem.
+One of the main reasons to have tag-based KASAN is to be able to perform a
+similar set of checks as the generic one does, but with lower memory
+requirements.
+
+Comment from Vishwath Mohan <vishwath@google.com>:
+
+I don't have data on-hand, but anecdotally both ASAN and KASAN have proven
+problematic to enable for environments that don't tolerate the increased
+memory pressure well.  This includes
+
+(a) Low-memory form factors - Wear, TV, Things, lower-tier phones like Go,
+(c) Connected components like Pixel's visual core [1].
+
+These are both places I'd love to have a low(er) memory footprint option at
+my disposal.
+
+Comment from Evgenii Stepanov <eugenis@google.com>:
+
+Looking at a live Android device under load, slab (according to
+/proc/meminfo) + kernel stack take 8-10% available RAM (~350MB).  KASAN's
+overhead of 2x - 3x on top of it is not insignificant.
+
+Not having this overhead enables near-production use - ex.  running
+KASAN/KHWASAN kernel on a personal, daily-use device to catch bugs that do
+not reproduce in test configuration.  These are the ones that often cost
+the most engineering time to track down.
+
+CPU overhead is bad, but generally tolerable.  RAM is critical, in our
+experience.  Once it gets low enough, OOM-killer makes your life
+miserable.
+
+[1] https://www.blog.google/products/pixel/pixel-visual-core-image-processing-and-machine-learning-pixel-2/
+
+====== Technical details
+
+Software tag-based KASAN mode is implemented in a very similar way to the
+generic one. This patchset essentially does the following:
+
+1. TCR_TBI1 is set to enable Top Byte Ignore.
+
+2. Shadow memory is used (with a different scale, 1:16, so each shadow
+   byte corresponds to 16 bytes of kernel memory) to store memory tags.
+
+3. All slab objects are aligned to shadow scale, which is 16 bytes.
+
+4. All pointers returned from the slab allocator are tagged with a random
+   tag and the corresponding shadow memory is poisoned with the same value.
+
+5. Compiler instrumentation is used to insert tag checks. Either by
+   calling callbacks or by inlining them (CONFIG_KASAN_OUTLINE and
+   CONFIG_KASAN_INLINE flags are reused).
+
+6. When a tag mismatch is detected in callback instrumentation mode
+   KASAN simply prints a bug report. In case of inline instrumentation,
+   clang inserts a brk instruction, and KASAN has it's own brk handler,
+   which reports the bug.
+
+7. The memory in between slab objects is marked with a reserved tag, and
+   acts as a redzone.
+
+8. When a slab object is freed it's marked with a reserved tag.
+
+Bug detection is imprecise for two reasons:
+
+1. We won't catch some small out-of-bounds accesses, that fall into the
+   same shadow cell, as the last byte of a slab object.
+
+2. We only have 1 byte to store tags, which means we have a 1/256
+   probability of a tag match for an incorrect access (actually even
+   slightly less due to reserved tag values).
+
+Despite that there's a particular type of bugs that tag-based KASAN can
+detect compared to generic KASAN: use-after-free after the object has been
+allocated by someone else.
+
+====== Testing
+
+Some kernel developers voiced a concern that changing the top byte of
+kernel pointers may lead to subtle bugs that are difficult to discover.
+To address this concern deliberate testing has been performed.
+
+It doesn't seem feasible to do some kind of static checking to find
+potential issues with pointer tagging, so a dynamic approach was taken.
+All pointer comparisons/subtractions have been instrumented in an LLVM
+compiler pass and a kernel module that would print a bug report whenever
+two pointers with different tags are being compared/subtracted (ignoring
+comparisons with NULL pointers and with pointers obtained by casting an
+error code to a pointer type) has been used.  Then the kernel has been
+booted in QEMU and on an Odroid C2 board and syzkaller has been run.
+
+This yielded the following results.
+
+The two places that look interesting are:
+
+is_vmalloc_addr in include/linux/mm.h
+is_kernel_rodata in mm/util.c
+
+Here we compare a pointer with some fixed untagged values to make sure
+that the pointer lies in a particular part of the kernel address space.
+Since tag-based KASAN doesn't add tags to pointers that belong to rodata
+or vmalloc regions, this should work as is.  To make sure debug checks to
+those two functions that check that the result doesn't change whether we
+operate on pointers with or without untagging has been added.
+
+A few other cases that don't look that interesting:
+
+Comparing pointers to achieve unique sorting order of pointee objects
+(e.g. sorting locks addresses before performing a double lock):
+
+tty_ldisc_lock_pair_timeout in drivers/tty/tty_ldisc.c
+pipe_double_lock in fs/pipe.c
+unix_state_double_lock in net/unix/af_unix.c
+lock_two_nondirectories in fs/inode.c
+mutex_lock_double in kernel/events/core.c
+
+ep_cmp_ffd in fs/eventpoll.c
+fsnotify_compare_groups fs/notify/mark.c
+
+Nothing needs to be done here, since the tags embedded into pointers
+don't change, so the sorting order would still be unique.
+
+Checks that a pointer belongs to some particular allocation:
+
+is_sibling_entry in lib/radix-tree.c
+object_is_on_stack in include/linux/sched/task_stack.h
+
+Nothing needs to be done here either, since two pointers can only belong
+to the same allocation if they have the same tag.
+
+Overall, since the kernel boots and works, there are no critical bugs.
+As for the rest, the traditional kernel testing way (use until fails) is
+the only one that looks feasible.
+
+Another point here is that tag-based KASAN is available under a separate
+config option that needs to be deliberately enabled. Even though it might
+be used in a "near-production" environment to find bugs that are not found
+during fuzzing or running tests, it is still a debug tool.
+
+====== Benchmarks
+
+The following numbers were collected on Odroid C2 board. Both generic and
+tag-based KASAN were used in inline instrumentation mode.
+
+Boot time [1]:
+* ~1.7 sec for clean kernel
+* ~5.0 sec for generic KASAN
+* ~5.0 sec for tag-based KASAN
+
+Network performance [2]:
+* 8.33 Gbits/sec for clean kernel
+* 3.17 Gbits/sec for generic KASAN
+* 2.85 Gbits/sec for tag-based KASAN
+
+Slab memory usage after boot [3]:
+* ~40 kb for clean kernel
+* ~105 kb (~260% overhead) for generic KASAN
+* ~47 kb (~20% overhead) for tag-based KASAN
+
+KASAN memory overhead consists of three main parts:
+1. Increased slab memory usage due to redzones.
+2. Shadow memory (the whole reserved once during boot).
+3. Quaratine (grows gradually until some preset limit; the more the limit,
+   the more the chance to detect a use-after-free).
+
+Comparing tag-based vs generic KASAN for each of these points:
+1. 20% vs 260% overhead.
+2. 1/16th vs 1/8th of physical memory.
+3. Tag-based KASAN doesn't require quarantine.
+
+[1] Time before the ext4 driver is initialized.
+[2] Measured as `iperf -s & iperf -c 127.0.0.1 -t 30`.
+[3] Measured as `cat /proc/meminfo | grep Slab`.
+
+====== Some notes
+
+A few notes:
+
+1. The patchset can be found here:
+   https://github.com/xairy/kasan-prototype/tree/khwasan
+
+2. Building requires a recent Clang version (7.0.0 or later).
+
+3. Stack instrumentation is not supported yet and will be added later.
+
+This patch (of 25):
+
+Tag-based KASAN changes the value of the top byte of pointers returned
+from the kernel allocation functions (such as kmalloc).  This patch
+updates KASAN hooks signatures and their usage in SLAB and SLUB code to
+reflect that.
+
+Link: http://lkml.kernel.org/r/aec2b5e3973781ff8a6bb6760f8543643202c451.1544099024.git.andreyknvl@google.com
+Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Reviewed-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

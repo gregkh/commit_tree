@@ -1,0 +1,68 @@
+spi: bcm2835: Speed up TX-only DMA transfers by clearing RX FIFO
+
+The BCM2835 SPI driver currently sets the SPI_CONTROLLER_MUST_RX flag.
+When performing a TX-only transfer, this flag causes the SPI core to
+allocate and DMA-map a dummy buffer into which the RX FIFO contents are
+copied.  The dummy buffer is necessary because the chip is not capable
+of disabling the receiver or automatically throwing away received data.
+Not reading the RX FIFO isn't an option either since transmission is
+halted once it's full.
+
+Avoid the overhead induced by the dummy buffer by preallocating a
+reusable DMA transaction which cyclically clears the RX FIFO.  The
+transaction requires very little CPU time to submit and generates no
+interrupts while running.  Specifics are provided in kerneldoc comments.
+
+With a ks8851 Ethernet chip attached to the SPI controller, I am seeing
+a 30 us reduction in ping time with this commit (1.819 ms vs. 1.849 ms,
+average of 100,000 packets) as well as a 2% reduction in CPU time
+(75:08 vs. 76:39 for transmission of 5 GByte over the SPI bus).
+
+The commit uses the TX DMA interrupt to signal completion of a transfer.
+This interrupt is raised once all bytes have been written to the
+TX FIFO and it is then necessary to busy-wait for the TX FIFO to become
+empty before the transfer can be finalized.  As an alternative approach,
+I have explored using the SPI controller's DONE interrupt to detect
+completion.  This interrupt is signaled when the TX FIFO becomes empty,
+avoiding the need to busy-wait.  However latency deteriorates compared
+to the present commit and surprisingly, CPU time is slightly higher as
+well:
+
+It turns out that in 45% of the cases, no busy-waiting is needed at all
+and in 76% of the cases, less than 10 busy-wait iterations are
+sufficient for the TX FIFO to drain.  This was measured on an RT kernel.
+On a vanilla kernel, wakeup latency is worse and thus fewer iterations
+are needed.  The measurements were made with an SPI clock of 20 MHz,
+they may differ slightly for slower or faster clock speeds.
+
+Previously we always used the RX DMA interrupt to signal completion of a
+transfer.  Using the TX DMA interrupt now introduces a race condition:
+TX DMA is always started before RX DMA so that bytes are already clocked
+out while RX DMA is still being set up.  But if a TX-only transfer is
+very short, then the TX DMA interrupt may occur before RX DMA is set up.
+If the interrupt happens to occur on the same CPU, setup of RX DMA may
+even be delayed until after the interrupt was handled.
+
+I've solved this by having the TX DMA callback clear the RX FIFO while
+busy-waiting for the TX FIFO to drain, thus avoiding a dependency on
+setup of RX DMA.  Additionally, I am using a lock-free mechanism with
+two flags, tx_dma_active and rx_dma_active plus memory barriers to
+terminate RX DMA either by the TX DMA callback or immediately after
+setting it up, whichever wins the race.  I've explored an alternative
+approach which temporarily disables the TX DMA callback until RX DMA
+has been set up (using tasklet_disable(), local_bh_disable() or
+local_irq_save()), but the performance was minimally worse.
+
+[Nathan Chancellor contributed a DMA mapping fixup for an early version
+of this commit, hence his Signed-off-by.]
+
+Tested-by: Nuno Sá <nuno.sa@analog.com>
+Tested-by: Noralf Trønnes <noralf@tronnes.org>
+Signed-off-by: Nathan Chancellor <natechancellor@gmail.com>
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Acked-by: Stefan Wahren <wahrenst@gmx.net>
+Acked-by: Martin Sperl <kernel@martin.sperl.org>
+Cc: Robert Jarzmik <robert.jarzmik@free.fr>
+Link: https://lore.kernel.org/r/874949385f28251e2dcaa9494e39a27b50e9f9e4.1568187525.git.lukas@wunner.de
+Signed-off-by: Mark Brown <broonie@kernel.org>
+

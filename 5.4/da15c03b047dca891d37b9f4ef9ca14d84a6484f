@@ -1,0 +1,69 @@
+powerpc/xive: Implement get_irqchip_state method for XIVE to fix shutdown race
+
+Testing has revealed the existence of a race condition where a XIVE
+interrupt being shut down can be in one of the XIVE interrupt queues
+(of which there are up to 8 per CPU, one for each priority) at the
+point where free_irq() is called.  If this happens, can return an
+interrupt number which has been shut down.  This can lead to various
+symptoms:
+
+- irq_to_desc(irq) can be NULL.  In this case, no end-of-interrupt
+  function gets called, resulting in the CPU's elevated interrupt
+  priority (numerically lowered CPPR) never gets reset.  That then
+  means that the CPU stops processing interrupts, causing device
+  timeouts and other errors in various device drivers.
+
+- The irq descriptor or related data structures can be in the process
+  of being freed as the interrupt code is using them.  This typically
+  leads to crashes due to bad pointer dereferences.
+
+This race is basically what commit 62e0468650c3 ("genirq: Add optional
+hardware synchronization for shutdown", 2019-06-28) is intended to
+fix, given a get_irqchip_state() method for the interrupt controller
+being used.  It works by polling the interrupt controller when an
+interrupt is being freed until the controller says it is not pending.
+
+With XIVE, the PQ bits of the interrupt source indicate the state of
+the interrupt source, and in particular the P bit goes from 0 to 1 at
+the point where the hardware writes an entry into the interrupt queue
+that this interrupt is directed towards.  Normally, the code will then
+process the interrupt and do an end-of-interrupt (EOI) operation which
+will reset PQ to 00 (assuming another interrupt hasn't been generated
+in the meantime).  However, there are situations where the code resets
+P even though a queue entry exists (for example, by setting PQ to 01,
+which disables the interrupt source), and also situations where the
+code leaves P at 1 after removing the queue entry (for example, this
+is done for escalation interrupts so they cannot fire again until
+they are explicitly re-enabled).
+
+The code already has a 'saved_p' flag for the interrupt source which
+indicates that a queue entry exists, although it isn't maintained
+consistently.  This patch adds a 'stale_p' flag to indicate that
+P has been left at 1 after processing a queue entry, and adds code
+to set and clear saved_p and stale_p as necessary to maintain a
+consistent indication of whether a queue entry may or may not exist.
+
+With this, we can implement xive_get_irqchip_state() by looking at
+stale_p, saved_p and the ESB PQ bits for the interrupt.
+
+There is some additional code to handle escalation interrupts
+properly; because they are enabled and disabled in KVM assembly code,
+which does not have access to the xive_irq_data struct for the
+escalation interrupt.  Hence, stale_p may be incorrect when the
+escalation interrupt is freed in kvmppc_xive_{,native_}cleanup_vcpu().
+Fortunately, we can fix it up by looking at vcpu->arch.xive_esc_on,
+with some careful attention to barriers in order to ensure the correct
+result if xive_esc_irq() races with kvmppc_xive_cleanup_vcpu().
+
+Finally, this adds code to make noise on the console (pr_crit and
+WARN_ON(1)) if we find an interrupt queue entry for an interrupt
+which does not have a descriptor.  While this won't catch the race
+reliably, if it does get triggered it will be an indication that
+the race is occurring and needs to be debugged.
+
+Fixes: 243e25112d06 ("powerpc/xive: Native exploitation of the XIVE interrupt controller")
+Cc: stable@vger.kernel.org # v4.12+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20190813100648.GE9567@blackberry
+

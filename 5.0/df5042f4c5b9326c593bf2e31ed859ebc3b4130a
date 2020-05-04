@@ -1,0 +1,82 @@
+sk_buff: add skb extension infrastructure
+
+This adds an optional extension infrastructure, with ispec (xfrm) and
+bridge netfilter as first users.
+objdiff shows no changes if kernel is built without xfrm and br_netfilter
+support.
+
+The third (planned future) user is Multipath TCP which is still
+out-of-tree.
+MPTCP needs to map logical mptcp sequence numbers to the tcp sequence
+numbers used by individual subflows.
+
+This DSS mapping is read/written from tcp option space on receive and
+written to tcp option space on transmitted tcp packets that are part of
+and MPTCP connection.
+
+Extending skb_shared_info or adding a private data field to skb fclones
+doesn't work for incoming skb, so a different DSS propagation method would
+be required for the receive side.
+
+mptcp has same requirements as secpath/bridge netfilter:
+
+1. extension memory is released when the sk_buff is free'd.
+2. data is shared after cloning an skb (clone inherits extension)
+3. adding extension to an skb will COW the extension buffer if needed.
+
+The "MPTCP upstreaming" effort adds SKB_EXT_MPTCP extension to store the
+mapping for tx and rx processing.
+
+Two new members are added to sk_buff:
+1. 'active_extensions' byte (filling a hole), telling which extensions
+   are available for this skb.
+   This has two purposes.
+   a) avoids the need to initialize the pointer.
+   b) allows to "delete" an extension by clearing its bit
+   value in ->active_extensions.
+
+   While it would be possible to store the active_extensions byte
+   in the extension struct instead of sk_buff, there is one problem
+   with this:
+    When an extension has to be disabled, we can always clear the
+    bit in skb->active_extensions.  But in case it would be stored in the
+    extension buffer itself, we might have to COW it first, if
+    we are dealing with a cloned skb.  On kmalloc failure we would
+    be unable to turn an extension off.
+
+2. extension pointer, located at the end of the sk_buff.
+   If the active_extensions byte is 0, the pointer is undefined,
+   it is not initialized on skb allocation.
+
+This adds extra code to skb clone and free paths (to deal with
+refcount/free of extension area) but this replaces similar code that
+manages skb->nf_bridge and skb->sp structs in the followup patches of
+the series.
+
+It is possible to add support for extensions that are not preseved on
+clones/copies.
+
+To do this, it would be needed to define a bitmask of all extensions that
+need copy/cow semantics, and change __skb_ext_copy() to check
+->active_extensions & SKB_EXT_PRESERVE_ON_CLONE, then just set
+->active_extensions to 0 on the new clone.
+
+This isn't done here because all extensions that get added here
+need the copy/cow semantics.
+
+v2:
+Allocate entire extension space using kmem_cache.
+Upside is that this allows better tracking of used memory,
+downside is that we will allocate more space than strictly needed in
+most cases (its unlikely that all extensions are active/needed at same
+time for same skb).
+The allocated memory (except the small extension header) is not cleared,
+so no additonal overhead aside from memory usage.
+
+Avoid atomic_dec_and_test operation on skb_ext_put()
+by using similar trick as kfree_skbmem() does with fclone_ref:
+If recount is 1, there is no concurrent user and we can free right away.
+
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

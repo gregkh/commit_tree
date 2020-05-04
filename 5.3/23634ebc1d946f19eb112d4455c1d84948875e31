@@ -1,0 +1,79 @@
+rcu: Check for wakeup-safe conditions in rcu_read_unlock_special()
+
+When RCU core processing is offloaded from RCU_SOFTIRQ to the rcuc
+kthreads, a full and unconditional wakeup is required to initiate RCU
+core processing.  In contrast, when RCU core processing is carried
+out by RCU_SOFTIRQ, a raise_softirq() suffices.  Of course, there are
+situations where raise_softirq() does a full wakeup, but these do not
+occur with normal usage of rcu_read_unlock().
+
+The reason that full wakeups can be problematic is that the scheduler
+sometimes invokes rcu_read_unlock() with its pi or rq locks held,
+which can of course result in deadlock in CONFIG_PREEMPT=y kernels when
+rcu_read_unlock() invokes the scheduler.  Scheduler invocations can happen
+in the following situations: (1) The just-ended reader has been subjected
+to RCU priority boosting, in which case rcu_read_unlock() must deboost,
+(2) Interrupts were disabled across the call to rcu_read_unlock(), so
+the quiescent state must be deferred, requiring a wakeup of the rcuc
+kthread corresponding to the current CPU.
+
+Now, the scheduler may hold one of its locks across rcu_read_unlock()
+only if preemption has been disabled across the entire RCU read-side
+critical section, which in the days prior to RCU flavor consolidation
+meant that rcu_read_unlock() never needed to do wakeups.  However, this
+is no longer the case for any but the first rcu_read_unlock() following a
+condition (e.g., preempted RCU reader) requiring special rcu_read_unlock()
+attention.  For example, an RCU read-side critical section might be
+preempted, but preemption might be disabled across the rcu_read_unlock().
+The rcu_read_unlock() must defer the quiescent state, and therefore
+leaves the task queued on its leaf rcu_node structure.  If a scheduler
+interrupt occurs, the scheduler might well invoke rcu_read_unlock() with
+one of its locks held.  However, the preempted task is still queued, so
+rcu_read_unlock() will attempt to defer the quiescent state once more.
+When RCU core processing is carried out by RCU_SOFTIRQ, this works just
+fine: The raise_softirq() function simply sets a bit in a per-CPU mask
+and the RCU core processing will be undertaken upon return from interrupt.
+
+Not so when RCU core processing is carried out by the rcuc kthread: In this
+case, the required wakeup can result in deadlock.
+
+The initial solution to this problem was to use set_tsk_need_resched() and
+set_preempt_need_resched() to force a future context switch, which allows
+rcu_preempt_note_context_switch() to report the deferred quiescent state
+to RCU's core processing.  Unfortunately for expedited grace periods,
+there can be a significant delay between the call for a context switch
+and the actual context switch.
+
+This commit therefore introduces a ->deferred_qs flag to the task_struct
+structure's rcu_special structure.  This flag is initially false, and
+is set to true by the first call to rcu_read_unlock() requiring special
+attention, then finally reset back to false when the quiescent state is
+finally reported.  Then rcu_read_unlock() attempts full wakeups only when
+->deferred_qs is false, that is, on the first rcu_read_unlock() requiring
+special attention.  Note that a chain of RCU readers linked by some other
+sort of reader may find that a later rcu_read_unlock() is once again able
+to do a full wakeup, courtesy of an intervening preemption:
+
+	rcu_read_lock();
+	/* preempted */
+	local_irq_disable();
+	rcu_read_unlock(); /* Can do full wakeup, sets ->deferred_qs. */
+	rcu_read_lock();
+	local_irq_enable();
+	preempt_disable()
+	rcu_read_unlock(); /* Cannot do full wakeup, ->deferred_qs set. */
+	rcu_read_lock();
+	preempt_enable();
+	/* preempted, >deferred_qs reset. */
+	local_irq_disable();
+	rcu_read_unlock(); /* Can again do full wakeup, sets ->deferred_qs. */
+
+Such linked RCU readers do not yet seem to appear in the Linux kernel, and
+it is probably best if they don't.  However, RCU needs to handle them, and
+some variations on this theme could make even raise_softirq() unsafe due to
+the possibility of its doing a full wakeup.  This commit therefore also
+avoids invoking raise_softirq() when the ->deferred_qs set flag is set.
+
+Signed-off-by: Paul E. McKenney <paulmck@linux.ibm.com>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+

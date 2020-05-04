@@ -1,0 +1,106 @@
+xfs: fix inode fork extent count overflow
+
+[commit message is verbose for discussion purposes - will trim it
+down later. Some questions about implementation details at the end.]
+
+Zorro Lang recently ran a new test to stress single inode extent
+counts now that they are no longer limited by memory allocation.
+The test was simply:
+
+# xfs_io -f -c "falloc 0 40t" /mnt/scratch/big-file
+# ~/src/xfstests-dev/punch-alternating /mnt/scratch/big-file
+
+This test uncovered a problem where the hole punching operation
+appeared to finish with no error, but apparently only created 268M
+extents instead of the 10 billion it was supposed to.
+
+Further, trying to punch out extents that should have been present
+resulted in success, but no change in the extent count. It looked
+like a silent failure.
+
+While running the test and observing the behaviour in real time,
+I observed the extent coutn growing at ~2M extents/minute, and saw
+this after about an hour:
+
+# xfs_io -f -c "stat" /mnt/scratch/big-file |grep next ; \
+> sleep 60 ; \
+> xfs_io -f -c "stat" /mnt/scratch/big-file |grep next
+fsxattr.nextents = 127657993
+fsxattr.nextents = 129683339
+#
+
+And a few minutes later this:
+
+# xfs_io -f -c "stat" /mnt/scratch/big-file |grep next
+fsxattr.nextents = 4177861124
+#
+
+Ah, what? Where did that 4 billion extra extents suddenly come from?
+
+Stop the workload, unmount, mount:
+
+# xfs_io -f -c "stat" /mnt/scratch/big-file |grep next
+fsxattr.nextents = 166044375
+#
+
+And it's back at the expected number. i.e. the extent count is
+correct on disk, but it's screwed up in memory. I loaded up the
+extent list, and immediately:
+
+# xfs_io -f -c "stat" /mnt/scratch/big-file |grep next
+fsxattr.nextents = 4192576215
+#
+
+It's bad again. So, where does that number come from?
+xfs_fill_fsxattr():
+
+                if (ip->i_df.if_flags & XFS_IFEXTENTS)
+                        fa->fsx_nextents = xfs_iext_count(&ip->i_df);
+                else
+                        fa->fsx_nextents = ip->i_d.di_nextents;
+
+And that's the behaviour I just saw in a nutshell. The on disk count
+is correct, but once the tree is loaded into memory, it goes whacky.
+Clearly there's something wrong with xfs_iext_count():
+
+inline xfs_extnum_t xfs_iext_count(struct xfs_ifork *ifp)
+{
+        return ifp->if_bytes / sizeof(struct xfs_iext_rec);
+}
+
+Simple enough, but 134M extents is 2**27, and that's right about
+where things went wrong. A struct xfs_iext_rec is 16 bytes in size,
+which means 2**27 * 2**4 = 2**31 and we're right on target for an
+integer overflow. And, sure enough:
+
+struct xfs_ifork {
+        int                     if_bytes;       /* bytes in if_u1 */
+....
+
+Once we get 2**27 extents in a file, we overflow if_bytes and the
+in-core extent count goes wrong. And when we reach 2**28 extents,
+if_bytes wraps back to zero and things really start to go wrong
+there. This is where the silent failure comes from - only the first
+2**28 extents can be looked up directly due to the overflow, all the
+extents above this index wrap back to somewhere in the first 2**28
+extents. Hence with a regular pattern, trying to punch a hole in the
+range that didn't have holes mapped to a hole in the first 2**28
+extents and so "succeeded" without changing anything. Hence "silent
+failure"...
+
+Fix this by converting if_bytes to a int64_t and converting all the
+index variables and size calculations to use int64_t types to avoid
+overflows in future. Signed integers are still used to enable easy
+detection of extent count underflows. This enables scalability of
+extent counts to the limits of the on-disk format - MAXEXTNUM
+(2**31) extents.
+
+Current testing is at over 500M extents and still going:
+
+fsxattr.nextents = 517310478
+
+Reported-by: Zorro Lang <zlang@redhat.com>
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+

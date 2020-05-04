@@ -1,0 +1,118 @@
+netfilter: nf_conntrack_sip: fix expectation clash
+
+When conntracks change during a dialog, SDP messages may be sent from
+different conntracks to establish expects with identical tuples. In this
+case expects conflict may be detected for the 2nd SDP message and end up
+with a process failure.
+
+The fixing here is to reuse an existing expect who has the same tuple for a
+different conntrack if any.
+
+Here are two scenarios for the case.
+
+1)
+         SERVER                   CPE
+
+           |      INVITE SDP       |
+      5060 |<----------------------|5060
+           |      100 Trying       |
+      5060 |---------------------->|5060
+           |      183 SDP          |
+      5060 |---------------------->|5060    ===> Conntrack 1
+           |       PRACK           |
+     50601 |<----------------------|5060
+           |    200 OK (PRACK)     |
+     50601 |---------------------->|5060
+           |    200 OK (INVITE)    |
+      5060 |---------------------->|5060
+           |        ACK            |
+     50601 |<----------------------|5060
+           |                       |
+           |<--- RTP stream ------>|
+           |                       |
+           |    INVITE SDP (t38)   |
+     50601 |---------------------->|5060    ===> Conntrack 2
+
+With a certain configuration in the CPE, SIP messages "183 with SDP" and
+"re-INVITE with SDP t38" will go through the sip helper to create
+expects for RTP and RTCP.
+
+It is okay to create RTP and RTCP expects for "183", whose master
+connection source port is 5060, and destination port is 5060.
+
+In the "183" message, port in Contact header changes to 50601 (from the
+original 5060). So the following requests e.g. PRACK and ACK are sent to
+port 50601. It is a different conntrack (let call Conntrack 2) from the
+original INVITE (let call Conntrack 1) due to the port difference.
+
+In this example, after the call is established, there is RTP stream but no
+RTCP stream for Conntrack 1, so the RTP expect created upon "183" is
+cleared, and RTCP expect created for Conntrack 1 retains.
+
+When "re-INVITE with SDP t38" arrives to create RTP&RTCP expects, current
+ALG implementation will call nf_ct_expect_related() for RTP and RTCP. The
+expects tuples are identical to those for Conntrack 1. RTP expect for
+Conntrack 2 succeeds in creation as the one for Conntrack 1 has been
+removed. RTCP expect for Conntrack 2 fails in creation because it has
+idential tuples and 'conflict' with the one retained for Conntrack 1. And
+then result in a failure in processing of the re-INVITE.
+
+2)
+
+    SERVER A                 CPE
+
+       |      REGISTER     |
+  5060 |<------------------| 5060  ==> CT1
+       |       200         |
+  5060 |------------------>| 5060
+       |                   |
+       |   INVITE SDP(1)   |
+  5060 |<------------------| 5060
+       | 300(multi choice) |
+  5060 |------------------>| 5060                    SERVER B
+       |       ACK         |
+  5060 |<------------------| 5060
+                                  |    INVITE SDP(2)    |
+                             5060 |-------------------->| 5060  ==> CT2
+                                  |       100           |
+                             5060 |<--------------------| 5060
+                                  | 200(contact changes)|
+                             5060 |<--------------------| 5060
+                                  |       ACK           |
+                             5060 |-------------------->| 50601 ==> CT3
+                                  |                     |
+                                  |<--- RTP stream ---->|
+                                  |                     |
+                                  |       BYE           |
+                             5060 |<--------------------| 50601
+                                  |       200           |
+                             5060 |-------------------->| 50601
+       |   INVITE SDP(3)   |
+  5060 |<------------------| 5060  ==> CT1
+
+CPE sends an INVITE request(1) to Server A, and creates a RTP&RTCP expect
+pair for this Conntrack 1 (CT1). Server A responds 300 to redirect to
+Server B. The RTP&RTCP expect pairs created on CT1 are removed upon 300
+response.
+
+CPE sends the INVITE request(2) to Server B, and creates an expect pair
+for the new conntrack (due to destination address difference), let call
+CT2. Server B changes the port to 50601 in 200 OK response, and the
+following requests ACK and BYE from CPE are sent to 50601. The call is
+established. There is RTP stream and no RTCP stream. So RTP expect is
+removed and RTCP expect for CT2 retains.
+
+As BYE request is sent from port 50601, it is another conntrack, let call
+CT3, different from CT2 due to the port difference. So the BYE request will
+not remove the RTCP expect for CT2.
+
+Then another outgoing call is made, with the same RTP port being used (not
+definitely but possibly). CPE firstly sends the INVITE request(3) to Server
+A, and tries to create a RTP&RTCP expect pairs for this CT1. In current ALG
+implementation, the RTCP expect for CT1 fails in creation because it
+'conflicts' with the residual one for CT2. As a result the INVITE request
+fails to send.
+
+Signed-off-by: xiao ruizhu <katrina.xiaorz@gmail.com>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+

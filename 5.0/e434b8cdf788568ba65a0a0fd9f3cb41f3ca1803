@@ -1,0 +1,97 @@
+bpf: relax verifier restriction on BPF_MOV | BPF_ALU
+
+Currently, the destination register is marked as unknown for 32-bit
+sub-register move (BPF_MOV | BPF_ALU) whenever the source register type is
+SCALAR_VALUE.
+
+This is too conservative that some valid cases will be rejected.
+Especially, this may turn a constant scalar value into unknown value that
+could break some assumptions of verifier.
+
+For example, test_l4lb_noinline.c has the following C code:
+
+    struct real_definition *dst
+
+1:  if (!get_packet_dst(&dst, &pckt, vip_info, is_ipv6))
+2:    return TC_ACT_SHOT;
+3:
+4:  if (dst->flags & F_IPV6) {
+
+get_packet_dst is responsible for initializing "dst" into valid pointer and
+return true (1), otherwise return false (0). The compiled instruction
+sequence using alu32 will be:
+
+  412: (54) (u32) r7 &= (u32) 1
+  413: (bc) (u32) r0 = (u32) r7
+  414: (95) exit
+
+insn 413, a BPF_MOV | BPF_ALU, however will turn r0 into unknown value even
+r7 contains SCALAR_VALUE 1.
+
+This causes trouble when verifier is walking the code path that hasn't
+initialized "dst" inside get_packet_dst, for which case 0 is returned and
+we would then expect verifier concluding line 1 in the above C code pass
+the "if" check, therefore would skip fall through path starting at line 4.
+Now, because r0 returned from callee has became unknown value, so verifier
+won't skip analyzing path starting at line 4 and "dst->flags" requires
+dereferencing the pointer "dst" which actually hasn't be initialized for
+this path.
+
+This patch relaxed the code marking sub-register move destination. For a
+SCALAR_VALUE, it is safe to just copy the value from source then truncate
+it into 32-bit.
+
+A unit test also included to demonstrate this issue. This test will fail
+before this patch.
+
+This relaxation could let verifier skipping more paths for conditional
+comparison against immediate. It also let verifier recording a more
+accurate/strict value for one register at one state, if this state end up
+with going through exit without rejection and it is used for state
+comparison later, then it is possible an inaccurate/permissive value is
+better. So the real impact on verifier processed insn number is complex.
+But in all, without this fix, valid program could be rejected.
+
+>From real benchmarking on kernel selftests and Cilium bpf tests, there is
+no impact on processed instruction number when tests ares compiled with
+default compilation options. There is slightly improvements when they are
+compiled with -mattr=+alu32 after this patch.
+
+Also, test_xdp_noinline/-mattr=+alu32 now passed verification. It is
+rejected before this fix.
+
+Insn processed before/after this patch:
+
+                        default     -mattr=+alu32
+
+Kernel selftest
+
+===
+test_xdp.o              371/371      369/369
+test_l4lb.o             6345/6345    5623/5623
+test_xdp_noinline.o     2971/2971    rejected/2727
+test_tcp_estates.o      429/429      430/430
+
+Cilium bpf
+===
+bpf_lb-DLB_L3.o:        2085/2085     1685/1687
+bpf_lb-DLB_L4.o:        2287/2287     1986/1982
+bpf_lb-DUNKNOWN.o:      690/690       622/622
+bpf_lxc.o:              95033/95033   N/A
+bpf_netdev.o:           7245/7245     N/A
+bpf_overlay.o:          2898/2898     3085/2947
+
+NOTE:
+  - bpf_lxc.o and bpf_netdev.o compiled by -mattr=+alu32 are rejected by
+    verifier due to another issue inside verifier on supporting alu32
+    binary.
+  - Each cilium bpf program could generate several processed insn number,
+    above number is sum of them.
+
+v1->v2:
+ - Restrict the change on SCALAR_VALUE.
+ - Update benchmark numbers on Cilium bpf tests.
+
+Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

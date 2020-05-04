@@ -1,0 +1,60 @@
+dm snapshot: Don't sleep holding the snapshot lock
+
+When completing a pending exception, pending_complete() waits for all
+conflicting reads to drain, before inserting the final, completed
+exception. Conflicting reads are snapshot reads redirected to the
+origin, because the relevant chunk is not remapped to the COW device the
+moment we receive the read.
+
+The completed exception must be inserted into the exception table after
+all conflicting reads drain to ensure snapshot reads don't return
+corrupted data. This is required because inserting the completed
+exception into the exception table signals that the relevant chunk is
+remapped and both origin writes and snapshot merging will now overwrite
+the chunk in origin.
+
+This wait is done holding the snapshot lock to ensure that
+pending_complete() doesn't starve if new snapshot reads keep coming for
+this chunk.
+
+In preparation for the next commit, where we use a spinlock instead of a
+mutex to protect the exception tables, we remove the need for holding
+the lock while waiting for conflicting reads to drain.
+
+We achieve this in two steps:
+
+1. pending_complete() inserts the completed exception before waiting for
+   conflicting reads to drain and removes the pending exception after
+   all conflicting reads drain.
+
+   This ensures that new snapshot reads will be redirected to the COW
+   device, instead of the origin, and thus pending_complete() will not
+   starve. Moreover, we use the existence of both a completed and
+   a pending exception to signify that the COW is done but there are
+   conflicting reads in flight.
+
+2. In __origin_write() we check first if there is a pending exception
+   and then if there is a completed exception. If there is a pending
+   exception any submitted BIO is delayed on the pe->origin_bios list and
+   DM_MAPIO_SUBMITTED is returned. This ensures that neither writes to the
+   origin nor snapshot merging can overwrite the origin chunk, until all
+   conflicting reads drain, and thus snapshot reads will not return
+   corrupted data.
+
+Summarizing, we now have the following possible combinations of pending
+and completed exceptions for a chunk, along with their meaning:
+
+A. No exceptions exist: The chunk has not been remapped yet.
+B. Only a pending exception exists: The chunk is currently being copied
+   to the COW device.
+C. Both a pending and a completed exception exist: COW for this chunk
+   has completed but there are snapshot reads in flight which had been
+   redirected to the origin before the chunk was remapped.
+D. Only the completed exception exists: COW has been completed and there
+   are no conflicting reads in flight.
+
+Co-developed-by: Ilias Tsitsimpis <iliastsi@arrikto.com>
+Signed-off-by: Nikos Tsironis <ntsironis@arrikto.com>
+Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+

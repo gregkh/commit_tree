@@ -1,0 +1,61 @@
+KVM: nVMX: Stash L1's CR3 in vmcs01.GUEST_CR3 on nested entry w/o EPT
+
+KVM does not have 100% coverage of VMX consistency checks, i.e. some
+checks that cause VM-Fail may only be detected by hardware during a
+nested VM-Entry.  In such a case, KVM must restore L1's state to the
+pre-VM-Enter state as L2's state has already been loaded into KVM's
+software model.
+
+L1's CR3 and PDPTRs in particular are loaded from vmcs01.GUEST_*.  But
+when EPT is disabled, the associated fields hold KVM's shadow values,
+not L1's "real" values.  Fortunately, when EPT is disabled the PDPTRs
+come from memory, i.e. are not cached in the VMCS.  Which leaves CR3
+as the sole anomaly.
+
+A previously applied workaround to handle CR3 was to force nested early
+checks if EPT is disabled:
+
+  commit 2b27924bb1d48 ("KVM: nVMX: always use early vmcs check when EPT
+                         is disabled")
+
+Forcing nested early checks is undesirable as doing so adds hundreds of
+cycles to every nested VM-Entry.  Rather than take this performance hit,
+handle CR3 by overwriting vmcs01.GUEST_CR3 with L1's CR3 during nested
+VM-Entry when EPT is disabled *and* nested early checks are disabled.
+By stuffing vmcs01.GUEST_CR3, nested_vmx_restore_host_state() will
+naturally restore the correct vcpu->arch.cr3 from vmcs01.GUEST_CR3.
+
+These shenanigans work because nested_vmx_restore_host_state() does a
+full kvm_mmu_reset_context(), i.e. unloads the current MMU, which
+guarantees vmcs01.GUEST_CR3 will be rewritten with a new shadow CR3
+prior to re-entering L1.
+
+vcpu->arch.root_mmu.root_hpa is set to INVALID_PAGE via:
+
+    nested_vmx_restore_host_state() ->
+        kvm_mmu_reset_context() ->
+            kvm_mmu_unload() ->
+                kvm_mmu_free_roots()
+
+kvm_mmu_unload() has WARN_ON(root_hpa != INVALID_PAGE), i.e. we can bank
+on 'root_hpa == INVALID_PAGE' unless the implementation of
+kvm_mmu_reset_context() is changed.
+
+On the way into L1, VMCS.GUEST_CR3 is guaranteed to be written (on a
+successful entry) via:
+
+    vcpu_enter_guest() ->
+        kvm_mmu_reload() ->
+            kvm_mmu_load() ->
+                kvm_mmu_load_cr3() ->
+                    vmx_set_cr3()
+
+Stuff vmcs01.GUEST_CR3 if and only if nested early checks are disabled
+as a "late" VM-Fail should never happen win that case (KVM WARNs), and
+the conditional write avoids the need to restore the correct GUEST_CR3
+when nested_vmx_check_vmentry_hw() fails.
+
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20190607185534.24368-1-sean.j.christopherson@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+

@@ -1,0 +1,120 @@
+pipe: use exclusive waits when reading or writing
+
+This makes the pipe code use separate wait-queues and exclusive waiting
+for readers and writers, avoiding a nasty thundering herd problem when
+there are lots of readers waiting for data on a pipe (or, less commonly,
+lots of writers waiting for a pipe to have space).
+
+While this isn't a common occurrence in the traditional "use a pipe as a
+data transport" case, where you typically only have a single reader and
+a single writer process, there is one common special case: using a pipe
+as a source of "locking tokens" rather than for data communication.
+
+In particular, the GNU make jobserver code ends up using a pipe as a way
+to limit parallelism, where each job consumes a token by reading a byte
+from the jobserver pipe, and releases the token by writing a byte back
+to the pipe.
+
+This pattern is fairly traditional on Unix, and works very well, but
+will waste a lot of time waking up a lot of processes when only a single
+reader needs to be woken up when a writer releases a new token.
+
+A simplified test-case of just this pipe interaction is to create 64
+processes, and then pass a single token around between them (this
+test-case also intentionally passes another token that gets ignored to
+test the "wake up next" logic too, in case anybody wonders about it):
+
+    #include <unistd.h>
+
+    int main(int argc, char **argv)
+    {
+        int fd[2], counters[2];
+
+        pipe(fd);
+        counters[0] = 0;
+        counters[1] = -1;
+        write(fd[1], counters, sizeof(counters));
+
+        /* 64 processes */
+        fork(); fork(); fork(); fork(); fork(); fork();
+
+        do {
+                int i;
+                read(fd[0], &i, sizeof(i));
+                if (i < 0)
+                        continue;
+                counters[0] = i+1;
+                write(fd[1], counters, (1+(i & 1)) *sizeof(int));
+        } while (counters[0] < 1000000);
+        return 0;
+    }
+
+and in a perfect world, passing that token around should only cause one
+context switch per transfer, when the writer of a token causes a
+directed wakeup of just a single reader.
+
+But with the "writer wakes all readers" model we traditionally had, on
+my test box the above case causes more than an order of magnitude more
+scheduling: instead of the expected ~1M context switches, "perf stat"
+shows
+
+        231,852.37 msec task-clock                #   15.857 CPUs utilized
+        11,250,961      context-switches          #    0.049 M/sec
+           616,304      cpu-migrations            #    0.003 M/sec
+             1,648      page-faults               #    0.007 K/sec
+ 1,097,903,998,514      cycles                    #    4.735 GHz
+   120,781,778,352      instructions              #    0.11  insn per cycle
+    27,997,056,043      branches                  #  120.754 M/sec
+       283,581,233      branch-misses             #    1.01% of all branches
+
+      14.621273891 seconds time elapsed
+
+       0.018243000 seconds user
+       3.611468000 seconds sys
+
+before this commit.
+
+After this commit, I get
+
+          5,229.55 msec task-clock                #    3.072 CPUs utilized
+         1,212,233      context-switches          #    0.232 M/sec
+           103,951      cpu-migrations            #    0.020 M/sec
+             1,328      page-faults               #    0.254 K/sec
+    21,307,456,166      cycles                    #    4.074 GHz
+    12,947,819,999      instructions              #    0.61  insn per cycle
+     2,881,985,678      branches                  #  551.096 M/sec
+        64,267,015      branch-misses             #    2.23% of all branches
+
+       1.702148350 seconds time elapsed
+
+       0.004868000 seconds user
+       0.110786000 seconds sys
+
+instead. Much better.
+
+[ Note! This kernel improvement seems to be very good at triggering a
+  race condition in the make jobserver (in GNU make 4.2.1) for me. It's
+  a long known bug that was fixed back in June 2017 by GNU make commit
+  b552b0525198 ("[SV 51159] Use a non-blocking read with pselect to
+  avoid hangs.").
+
+  But there wasn't a new release of GNU make until 4.3 on Jan 19 2020,
+  so a number of distributions may still have the buggy version. Some
+  have backported the fix to their 4.2.1 release, though, and even
+  without the fix it's quite timing-dependent whether the bug actually
+  is hit. ]
+
+Josh Triplett says:
+ "I've been hammering on your pipe fix patch (switching to exclusive
+  wait queues) for a month or so, on several different systems, and I've
+  run into no issues with it. The patch *substantially* improves
+  parallel build times on large (~100 CPU) systems, both with parallel
+  make and with other things that use make's pipe-based jobserver.
+
+  All current distributions (including stable and long-term stable
+  distributions) have versions of GNU make that no longer have the
+  jobserver bug"
+
+Tested-by: Josh Triplett <josh@joshtriplett.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

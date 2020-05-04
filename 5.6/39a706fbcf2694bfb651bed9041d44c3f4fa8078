@@ -1,0 +1,56 @@
+selinux: fix sidtab string cache locking
+
+Avoiding taking a lock in an IRQ context is not enough to prevent
+deadlocks, as discovered by syzbot:
+
+===
+WARNING: SOFTIRQ-safe -> SOFTIRQ-unsafe lock order detected
+5.5.0-syzkaller #0 Not tainted
+-----------------------------------------------------
+syz-executor.0/8927 [HC0[0]:SC0[2]:HE1:SE0] is trying to acquire:
+ffff888027c94098 (&(&s->cache_lock)->rlock){+.+.}, at: spin_lock include/linux/spinlock.h:338 [inline]
+ffff888027c94098 (&(&s->cache_lock)->rlock){+.+.}, at: sidtab_sid2str_put.part.0+0x36/0x880 security/selinux/ss/sidtab.c:533
+
+and this task is already holding:
+ffffffff898639b0 (&(&nf_conntrack_locks[i])->rlock){+.-.}, at: spin_lock include/linux/spinlock.h:338 [inline]
+ffffffff898639b0 (&(&nf_conntrack_locks[i])->rlock){+.-.}, at: nf_conntrack_lock+0x17/0x70 net/netfilter/nf_conntrack_core.c:91
+which would create a new lock dependency:
+ (&(&nf_conntrack_locks[i])->rlock){+.-.} -> (&(&s->cache_lock)->rlock){+.+.}
+
+but this new dependency connects a SOFTIRQ-irq-safe lock:
+ (&(&nf_conntrack_locks[i])->rlock){+.-.}
+
+[...]
+
+other info that might help us debug this:
+
+ Possible interrupt unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&(&s->cache_lock)->rlock);
+                               local_irq_disable();
+                               lock(&(&nf_conntrack_locks[i])->rlock);
+                               lock(&(&s->cache_lock)->rlock);
+  <Interrupt>
+    lock(&(&nf_conntrack_locks[i])->rlock);
+
+ *** DEADLOCK ***
+[...]
+===
+
+Fix this by simply locking with irqsave/irqrestore and stop giving up on
+!in_task(). It makes the locking a bit slower, but it shouldn't make a
+big difference in real workloads. Under the scenario from [1] (only
+cache hits) it only increased the runtime overhead from the
+security_secid_to_secctx() function from ~2% to ~3% (it was ~5-65%
+before introducing the cache).
+
+[1] https://bugzilla.redhat.com/show_bug.cgi?id=1733259
+
+Fixes: d97bd23c2d7d ("selinux: cache the SID -> context string translation")
+Reported-by: syzbot+61cba5033e2072d61806@syzkaller.appspotmail.com
+Signed-off-by: Ondrej Mosnacek <omosnace@redhat.com>
+Acked-by: Stephen Smalley <sds@tycho.nsa.gov>
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+

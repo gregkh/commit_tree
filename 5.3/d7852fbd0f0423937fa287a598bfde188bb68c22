@@ -1,0 +1,58 @@
+access: avoid the RCU grace period for the temporary subjective credentials
+
+It turns out that 'access()' (and 'faccessat()') can cause a lot of RCU
+work because it installs a temporary credential that gets allocated and
+freed for each system call.
+
+The allocation and freeing overhead is mostly benign, but because
+credentials can be accessed under the RCU read lock, the freeing
+involves a RCU grace period.
+
+Which is not a huge deal normally, but if you have a lot of access()
+calls, this causes a fair amount of seconday damage: instead of having a
+nice alloc/free patterns that hits in hot per-CPU slab caches, you have
+all those delayed free's, and on big machines with hundreds of cores,
+the RCU overhead can end up being enormous.
+
+But it turns out that all of this is entirely unnecessary.  Exactly
+because access() only installs the credential as the thread-local
+subjective credential, the temporary cred pointer doesn't actually need
+to be RCU free'd at all.  Once we're done using it, we can just free it
+synchronously and avoid all the RCU overhead.
+
+So add a 'non_rcu' flag to 'struct cred', which can be set by users that
+know they only use it in non-RCU context (there are other potential
+users for this).  We can make it a union with the rcu freeing list head
+that we need for the RCU case, so this doesn't need any extra storage.
+
+Note that this also makes 'get_current_cred()' clear the new non_rcu
+flag, in case we have filesystems that take a long-term reference to the
+cred and then expect the RCU delayed freeing afterwards.  It's not
+entirely clear that this is required, but it makes for clear semantics:
+the subjective cred remains non-RCU as long as you only access it
+synchronously using the thread-local accessors, but you _can_ use it as
+a generic cred if you want to.
+
+It is possible that we should just remove the whole RCU markings for
+->cred entirely.  Only ->real_cred is really supposed to be accessed
+through RCU, and the long-term cred copies that nfs uses might want to
+explicitly re-enable RCU freeing if required, rather than have
+get_current_cred() do it implicitly.
+
+But this is a "minimal semantic changes" change for the immediate
+problem.
+
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Paul E. McKenney <paulmck@linux.ibm.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Jan Glauber <jglauber@marvell.com>
+Cc: Jiri Kosina <jikos@kernel.org>
+Cc: Jayachandran Chandrasekharan Nair <jnair@marvell.com>
+Cc: Greg KH <greg@kroah.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

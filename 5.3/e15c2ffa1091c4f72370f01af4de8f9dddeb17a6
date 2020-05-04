@@ -1,0 +1,57 @@
+block: fix O_DIRECT error handling for bio fragments
+
+0eb6ddfb865c tried to fix this up, but introduced a use-after-free
+of dio. Additionally, we still had an issue with error handling,
+as reported by Darrick:
+
+"I noticed a regression in xfs/747 (an unreleased xfstest for the
+xfs_scrub media scanning feature) on 5.3-rc3.  I'll condense that down
+to a simpler reproducer:
+
+error-test: 0 209 linear 8:48 0
+error-test: 209 1 error
+error-test: 210 6446894 linear 8:48 210
+
+Basically we have a ~3G /dev/sdd and we set up device mapper to fail IO
+for sector 209 and to pass the io to the scsi device everywhere else.
+
+On 5.3-rc3, performing a directio pread of this range with a < 1M buffer
+(in other words, a request for fewer than MAX_BIO_PAGES bytes) yields
+EIO like you'd expect:
+
+pread64(3, 0x7f880e1c7000, 1048576, 0)  = -1 EIO (Input/output error)
+pread: Input/output error
++++ exited with 0 +++
+
+But doing it with a larger buffer succeeds(!):
+
+pread64(3, "XFSB\0\0\20\0\0\0\0\0\0\fL\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 1146880, 0) = 1146880
+read 1146880/1146880 bytes at offset 0
+1 MiB, 1 ops; 0.0009 sec (1.124 GiB/sec and 1052.6316 ops/sec)
++++ exited with 0 +++
+
+(Note that the part of the buffer corresponding to the dm-error area is
+uninitialized)
+
+On 5.3-rc2, both commands would fail with EIO like you'd expect.  The
+only change between rc2 and rc3 is commit 0eb6ddfb865c ("block: Fix
+__blkdev_direct_IO() for bio fragments").
+
+AFAICT we end up in __blkdev_direct_IO with a 1120K buffer, which gets
+split into two bios: one for the first BIO_MAX_PAGES worth of data (1MB)
+and a second one for the 96k after that."
+
+Fix this by noting that it's always safe to dereference dio if we get
+BLK_QC_T_EAGAIN returned, as end_io hasn't been run for that case. So
+we can safely increment the dio size before calling submit_bio(), and
+then decrement it on failure (not that it really matters, as the bio
+and dio are going away).
+
+For error handling, return to the original method of just using 'ret'
+for tracking the error, and the size tracking in dio->size.
+
+Fixes: 0eb6ddfb865c ("block: Fix __blkdev_direct_IO() for bio fragments")
+Fixes: 6a43074e2f46 ("block: properly handle IOCB_NOWAIT for async O_DIRECT IO")
+Reported-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

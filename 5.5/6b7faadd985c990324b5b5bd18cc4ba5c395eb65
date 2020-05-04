@@ -1,0 +1,69 @@
+btrfs: Ensure we trim ranges across block group boundary
+
+[BUG]
+When deleting large files (which cross block group boundary) with
+discard mount option, we find some btrfs_discard_extent() calls only
+trimmed part of its space, not the whole range:
+
+  btrfs_discard_extent: type=0x1 start=19626196992 len=2144530432 trimmed=1073741824 ratio=50%
+
+type:		bbio->map_type, in above case, it's SINGLE DATA.
+start:		Logical address of this trim
+len:		Logical length of this trim
+trimmed:	Physically trimmed bytes
+ratio:		trimmed / len
+
+Thus leaving some unused space not discarded.
+
+[CAUSE]
+When discard mount option is specified, after a transaction is fully
+committed (super block written to disk), we begin to cleanup pinned
+extents in the following call chain:
+
+btrfs_commit_transaction()
+|- btrfs_finish_extent_commit()
+   |- find_first_extent_bit(unpin, 0, &start, &end, EXTENT_DIRTY);
+   |- btrfs_discard_extent()
+
+However, pinned extents are recorded in an extent_io_tree, which can
+merge adjacent extent states.
+
+When a large file gets deleted and it has adjacent file extents across
+block group boundary, we will get a large merged range like this:
+
+      |<---    BG1    --->|<---      BG2     --->|
+      |//////|<--   Range to discard   --->|/////|
+
+To discard that range, we have the following calls:
+
+  btrfs_discard_extent()
+  |- btrfs_map_block()
+  |  Returned bbio will end at BG1's end. As btrfs_map_block()
+  |  never returns result across block group boundary.
+  |- btrfs_issuse_discard()
+     Issue discard for each stripe.
+
+So we will only discard the range in BG1, not the remaining part in BG2.
+
+Furthermore, this bug is not that reliably observed, for above case, if
+there is no other extent in BG2, BG2 will be empty and btrfs will trim
+all space of BG2, covering up the bug.
+
+[FIX]
+- Allow __btrfs_map_block_for_discard() to modify @length parameter
+  btrfs_map_block() uses its @length paramter to notify the caller how
+  many bytes are mapped in current call.
+  With __btrfs_map_block_for_discard() also modifing the @length,
+  btrfs_discard_extent() now understands when to do extra trim.
+
+- Call btrfs_map_block() in a loop until we hit the range end Since we
+  now know how many bytes are mapped each time, we can iterate through
+  each block group boundary and issue correct trim for each range.
+
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: Nikolay Borisov <nborisov@suse.com>
+Tested-by: Nikolay Borisov <nborisov@suse.com>
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

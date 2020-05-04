@@ -1,0 +1,47 @@
+xfs: implement per-inode writeback completion queues
+
+When scheduling writeback of dirty file data in the page cache, XFS uses
+IO completion workqueue items to ensure that filesystem metadata only
+updates after the write completes successfully.  This is essential for
+converting unwritten extents to real extents at the right time and
+performing COW remappings.
+
+Unfortunately, XFS queues each IO completion work item to an unbounded
+workqueue, which means that the kernel can spawn dozens of threads to
+try to handle the items quickly.  These threads need to take the ILOCK
+to update file metadata, which results in heavy ILOCK contention if a
+large number of the work items target a single file, which is
+inefficient.
+
+Worse yet, the writeback completion threads get stuck waiting for the
+ILOCK while holding transaction reservations, which can use up all
+available log reservation space.  When that happens, metadata updates to
+other parts of the filesystem grind to a halt, even if the filesystem
+could otherwise have handled it.
+
+Even worse, if one of the things grinding to a halt happens to be a
+thread in the middle of a defer-ops finish holding the same ILOCK and
+trying to obtain more log reservation having exhausted the permanent
+reservation, we now have an ABBA deadlock - writeback completion has a
+transaction reserved and wants the ILOCK, and someone else has the ILOCK
+and wants a transaction reservation.
+
+Therefore, we create a per-inode writeback io completion queue + work
+item.  When writeback finishes, it can add the ioend to the per-inode
+queue and let the single worker item process that queue.  This
+dramatically cuts down on the number of kworkers and ILOCK contention in
+the system, and seems to have eliminated an occasional deadlock I was
+seeing while running generic/476.
+
+Testing with a program that simulates a heavy random-write workload to a
+single file demonstrates that the number of kworkers drops from
+approximately 120 threads per file to 1, without dramatically changing
+write bandwidth or pagecache access latency.
+
+Note that we leave the xfs-conv workqueue's max_active alone because we
+still want to be able to run ioend processing for as many inodes as the
+system can handle.
+
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+

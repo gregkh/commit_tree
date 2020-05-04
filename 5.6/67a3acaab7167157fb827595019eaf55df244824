@@ -1,0 +1,83 @@
+drm/i915: Use a ctor for TYPESAFE_BY_RCU i915_request
+
+As we start peeking into requests for longer and longer, e.g.
+incorporating use of spinlocks when only protected by an
+rcu_read_lock(), we need to be careful in how we reset the request when
+recycling and need to preserve any barriers that may still be in use as
+the request is reset for reuse.
+
+Quoting Linus Torvalds:
+
+> If there is refcounting going on then why use SLAB_TYPESAFE_BY_RCU?
+
+  .. because the object can be accessed (by RCU) after the refcount has
+  gone down to zero, and the thing has been released.
+
+  That's the whole and only point of SLAB_TYPESAFE_BY_RCU.
+
+  That flag basically says:
+
+  "I may end up accessing this object *after* it has been free'd,
+  because there may be RCU lookups in flight"
+
+  This has nothing to do with constructors. It's ok if the object gets
+  reused as an object of the same type and does *not* get
+  re-initialized, because we're perfectly fine seeing old stale data.
+
+  What it guarantees is that the slab isn't shared with any other kind
+  of object, _and_ that the underlying pages are free'd after an RCU
+  quiescent period (so the pages aren't shared with another kind of
+  object either during an RCU walk).
+
+  And it doesn't necessarily have to have a constructor, because the
+  thing that a RCU walk will care about is
+
+    (a) guaranteed to be an object that *has* been on some RCU list (so
+    it's not a "new" object)
+
+    (b) the RCU walk needs to have logic to verify that it's still the
+    *same* object and hasn't been re-used as something else.
+
+  In contrast, a SLAB_TYPESAFE_BY_RCU memory gets free'd and re-used
+  immediately, but because it gets reused as the same kind of object,
+  the RCU walker can "know" what parts have meaning for re-use, in a way
+  it couidn't if the re-use was random.
+
+  That said, it *is* subtle, and people should be careful.
+
+> So the re-use might initialize the fields lazily, not necessarily using a ctor.
+
+  If you have a well-defined refcount, and use "atomic_inc_not_zero()"
+  to guard the speculative RCU access section, and use
+  "atomic_dec_and_test()" in the freeing section, then you should be
+  safe wrt new allocations.
+
+  If you have a completely new allocation that has "random stale
+  content", you know that it cannot be on the RCU list, so there is no
+  speculative access that can ever see that random content.
+
+  So the only case you need to worry about is a re-use allocation, and
+  you know that the refcount will start out as zero even if you don't
+  have a constructor.
+
+  So you can think of the refcount itself as always having a zero
+  constructor, *BUT* you need to be careful with ordering.
+
+  In particular, whoever does the allocation needs to then set the
+  refcount to a non-zero value *after* it has initialized all the other
+  fields. And in particular, it needs to make sure that it uses the
+  proper memory ordering to do so.
+
+  NOTE! One thing to be very worried about is that re-initializing
+  whatever RCU lists means that now the RCU walker may be walking on the
+  wrong list so the walker may do the right thing for this particular
+  entry, but it may miss walking *other* entries. So then you can get
+  spurious lookup failures, because the RCU walker never walked all the
+  way to the end of the right list. That ends up being a much more
+  subtle bug.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20191122094924.629690-1-chris@chris-wilson.co.uk
+

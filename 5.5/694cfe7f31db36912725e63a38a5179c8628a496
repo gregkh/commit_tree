@@ -1,0 +1,72 @@
+dm thin: Flush data device before committing metadata
+
+The thin provisioning target maintains per thin device mappings that map
+virtual blocks to data blocks in the data device.
+
+When we write to a shared block, in case of internal snapshots, or
+provision a new block, in case of external snapshots, we copy the shared
+block to a new data block (COW), update the mapping for the relevant
+virtual block and then issue the write to the new data block.
+
+Suppose the data device has a volatile write-back cache and the
+following sequence of events occur:
+
+1. We write to a shared block
+2. A new data block is allocated
+3. We copy the shared block to the new data block using kcopyd (COW)
+4. We insert the new mapping for the virtual block in the btree for that
+   thin device.
+5. The commit timeout expires and we commit the metadata, that now
+   includes the new mapping from step (4).
+6. The system crashes and the data device's cache has not been flushed,
+   meaning that the COWed data are lost.
+
+The next time we read that virtual block of the thin device we read it
+from the data block allocated in step (2), since the metadata have been
+successfully committed. The data are lost due to the crash, so we read
+garbage instead of the old, shared data.
+
+This has the following implications:
+
+1. In case of writes to shared blocks, with size smaller than the pool's
+   block size (which means we first copy the whole block and then issue
+   the smaller write), we corrupt data that the user never touched.
+
+2. In case of writes to shared blocks, with size equal to the device's
+   logical block size, we fail to provide atomic sector writes. When the
+   system recovers the user will read garbage from that sector instead
+   of the old data or the new data.
+
+3. Even for writes to shared blocks, with size equal to the pool's block
+   size (overwrites), after the system recovers, the written sectors
+   will contain garbage instead of a random mix of sectors containing
+   either old data or new data, thus we fail again to provide atomic
+   sectors writes.
+
+4. Even when the user flushes the thin device, because we first commit
+   the metadata and then pass down the flush, the same risk for
+   corruption exists (if the system crashes after the metadata have been
+   committed but before the flush is passed down to the data device.)
+
+The only case which is unaffected is that of writes with size equal to
+the pool's block size and with the FUA flag set. But, because FUA writes
+trigger metadata commits, this case can trigger the corruption
+indirectly.
+
+Moreover, apart from internal and external snapshots, the same issue
+exists for newly provisioned blocks, when block zeroing is enabled.
+After the system recovers the provisioned blocks might contain garbage
+instead of zeroes.
+
+To solve this and avoid the potential data corruption we flush the
+pool's data device **before** committing its metadata.
+
+This ensures that the data blocks of any newly inserted mappings are
+properly written to non-volatile storage and won't be lost in case of a
+crash.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Nikos Tsironis <ntsironis@arrikto.com>
+Acked-by: Joe Thornber <ejt@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+

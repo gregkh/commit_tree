@@ -1,0 +1,93 @@
+bcache: avoid unnecessary btree nodes flushing in btree_flush_write()
+
+the commit 91be66e1318f ("bcache: performance improvement for
+btree_flush_write()") was an effort to flushing btree node with oldest
+btree node faster in following methods,
+- Only iterate dirty btree nodes in c->btree_cache, avoid scanning a lot
+  of clean btree nodes.
+- Take c->btree_cache as a LRU-like list, aggressively flushing all
+  dirty nodes from tail of c->btree_cache util the btree node with
+  oldest journal entry is flushed. This is to reduce the time of holding
+  c->bucket_lock.
+
+Guoju Fang and Shuang Li reported that they observe unexptected extra
+write I/Os on cache device after applying the above patch. Guoju Fang
+provideed more detailed diagnose information that the aggressive
+btree nodes flushing may cause 10x more btree nodes to flush in his
+workload. He points out when system memory is large enough to hold all
+btree nodes in memory, c->btree_cache is not a LRU-like list any more.
+Then the btree node with oldest journal entry is very probably not-
+close to the tail of c->btree_cache list. In such situation much more
+dirty btree nodes will be aggressively flushed before the target node
+is flushed. When slow SATA SSD is used as cache device, such over-
+aggressive flushing behavior will cause performance regression.
+
+After spending a lot of time on debug and diagnose, I find the real
+condition is more complicated, aggressive flushing dirty btree nodes
+from tail of c->btree_cache list is not a good solution.
+- When all btree nodes are cached in memory, c->btree_cache is not
+  a LRU-like list, the btree nodes with oldest journal entry won't
+  be close to the tail of the list.
+- There can be hundreds dirty btree nodes reference the oldest journal
+  entry, before flushing all the nodes the oldest journal entry cannot
+  be reclaimed.
+When the above two conditions mixed together, a simply flushing from
+tail of c->btree_cache list is really NOT a good idea.
+
+Fortunately there is still chance to make btree_flush_write() work
+better. Here is how this patch avoids unnecessary btree nodes flushing,
+- Only acquire c->journal.lock when getting oldest journal entry of
+  fifo c->journal.pin. In rested locations check the journal entries
+  locklessly, so their values can be changed on other cores
+  in parallel.
+- In loop list_for_each_entry_safe_reverse(), checking latest front
+  point of fifo c->journal.pin. If it is different from the original
+  point which we get with locking c->journal.lock, it means the oldest
+  journal entry is reclaim on other cores. At this moment, all selected
+  dirty nodes recorded in array btree_nodes[] are all flushed and clean
+  on other CPU cores, it is unncessary to iterate c->btree_cache any
+  longer. Just quit the list_for_each_entry_safe_reverse() loop and
+  the following for-loop will skip all the selected clean nodes.
+- Find a proper time to quit the list_for_each_entry_safe_reverse()
+  loop. Check the refcount value of orignial fifo front point, if the
+  value is larger than selected node number of btree_nodes[], it means
+  more matching btree nodes should be scanned. Otherwise it means no
+  more matching btee nodes in rest of c->btree_cache list, the loop
+  can be quit. If the original oldest journal entry is reclaimed and
+  fifo front point is updated, the refcount of original fifo front point
+  will be 0, then the loop will be quit too.
+- Not hold c->bucket_lock too long time. c->bucket_lock is also required
+  for space allocation for cached data, hold it for too long time will
+  block regular I/O requests. When iterating list c->btree_cache, even
+  there are a lot of maching btree nodes, in order to not holding
+  c->bucket_lock for too long time, only BTREE_FLUSH_NR nodes are
+  selected and to flush in following for-loop.
+With this patch, only btree nodes referencing oldest journal entry
+are flushed to cache device, no aggressive flushing for  unnecessary
+btree node any more. And in order to avoid blocking regluar I/O
+requests, each time when btree_flush_write() called, at most only
+BTREE_FLUSH_NR btree nodes are selected to flush, even there are more
+maching btree nodes in list c->btree_cache.
+
+At last, one more thing to explain: Why it is safe to read front point
+of c->journal.pin without holding c->journal.lock inside the
+list_for_each_entry_safe_reverse() loop ?
+
+Here is my answer: When reading the front point of fifo c->journal.pin,
+we don't need to know the exact value of front point, we just want to
+check whether the value is different from the original front point
+(which is accurate value because we get it while c->jouranl.lock is
+held). For such purpose, it works as expected without holding
+c->journal.lock. Even the front point is changed on other CPU core and
+not updated to local core, and current iterating btree node has
+identical journal entry local as original fetched fifo front point, it
+is still safe. Because after holding mutex b->write_lock (with memory
+barrier) this btree node can be found as clean and skipped, the loop
+will quite latter when iterate on next node of list c->btree_cache.
+
+Fixes: 91be66e1318f ("bcache: performance improvement for btree_flush_write()")
+Reported-by: Guoju Fang <fangguoju@gmail.com>
+Reported-by: Shuang Li <psymon@bonuscloud.io>
+Signed-off-by: Coly Li <colyli@suse.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

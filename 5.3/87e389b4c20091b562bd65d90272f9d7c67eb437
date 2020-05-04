@@ -1,0 +1,68 @@
+netfilter: conntrack: small conntrack lookup optimization
+
+____nf_conntrack_find() performs checks on the conntrack objects in
+this order:
+
+1. if (nf_ct_is_expired(ct))
+
+This fetches ct->timeout, in third cache line.
+
+The hnnode that is used to store the list pointers resides in the first
+(origin) or second (reply tuple) cache lines.
+
+This test rarely passes, but its necessary to reap obsolete entries.
+
+2. if (nf_ct_is_dying(ct))
+
+This fetches ct->status, also in third cache line.
+
+The test is useless, and can be removed:
+  Consider:
+     cpu0                                           cpu1
+    ct = ____nf_conntrack_find()
+    atomic_inc_not_zero(ct) -> ok
+    nf_ct_key_equal -> ok
+    is_dying -> DYING bit not set, ok
+                                                    set_bit(ct, DYING);
+						    ... unhash ... etc.
+    return ct
+    -> returning a ct with dying bit set, despite
+    having a test for it.
+
+This (unlikely) case is fine - refcount prevents ct from getting free'd.
+
+3. if (nf_ct_key_equal(h, tuple, zone, net))
+
+nf_ct_key_equal checks in following order:
+
+1. Tuple equal (first or second cacheline)
+2. Zone equal (third cacheline)
+3. confirmed bit set (->status, third cacheline)
+4. net namespace match (third cacheline).
+
+Swapping "timeout" and "cpu" places timeout in the first cacheline.
+This has two advantages:
+
+1. For a conntrack that won't even match the original tuple,
+   we will now only fetch the first and maybe the second cacheline
+   instead of always accessing the 3rd one as well.
+
+2.  in case of TCP ct->timeout changes frequently because we
+    reduce/increase it when there are packets outstanding in the network.
+
+The first cacheline contains both the reference count and the ct spinlock,
+i.e. moving timeout there avoids writes to 3rd cacheline.
+
+The restart sequence in __nf_conntrack_find() is removed, if we found a
+candidate, but then fail to increment the refcount or discover the tuple
+has changed (object recycling), just pretend we did not find an entry.
+
+A second lookup won't find anything until another CPU adds a new conntrack
+with identical tuple into the hash table, which is very unlikely.
+
+We have the confirmation-time checks (when we hold hash lock) that deal
+with identical entries and even perform clash resolution in some cases.
+
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+

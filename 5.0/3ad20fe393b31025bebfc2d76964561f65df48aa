@@ -1,0 +1,126 @@
+binder: implement binderfs
+
+As discussed at Linux Plumbers Conference 2018 in Vancouver [1] this is the
+implementation of binderfs.
+
+/* Abstract */
+binderfs is a backwards-compatible filesystem for Android's binder ipc
+mechanism. Each ipc namespace will mount a new binderfs instance. Mounting
+binderfs multiple times at different locations in the same ipc namespace
+will not cause a new super block to be allocated and hence it will be the
+same filesystem instance.
+Each new binderfs mount will have its own set of binder devices only
+visible in the ipc namespace it has been mounted in. All devices in a new
+binderfs mount will follow the scheme binder%d and numbering will always
+start at 0.
+
+/* Backwards compatibility */
+Devices requested in the Kconfig via CONFIG_ANDROID_BINDER_DEVICES for the
+initial ipc namespace will work as before. They will be registered via
+misc_register() and appear in the devtmpfs mount. Specifically, the
+standard devices binder, hwbinder, and vndbinder will all appear in their
+standard locations in /dev. Mounting or unmounting the binderfs mount in
+the initial ipc namespace will have no effect on these devices, i.e. they
+will neither show up in the binderfs mount nor will they disappear when the
+binderfs mount is gone.
+
+/* binder-control */
+Each new binderfs instance comes with a binder-control device. No other
+devices will be present at first. The binder-control device can be used to
+dynamically allocate binder devices. All requests operate on the binderfs
+mount the binder-control device resides in.
+Assuming a new instance of binderfs has been mounted at /dev/binderfs
+via mount -t binderfs binderfs /dev/binderfs. Then a request to create a
+new binder device can be made as illustrated in [2].
+Binderfs devices can simply be removed via unlink().
+
+/* Implementation details */
+- dynamic major number allocation:
+  When binderfs is registered as a new filesystem it will dynamically
+  allocate a new major number. The allocated major number will be returned
+  in struct binderfs_device when a new binder device is allocated.
+- global minor number tracking:
+  Minor are tracked in a global idr struct that is capped at
+  BINDERFS_MAX_MINOR. The minor number tracker is protected by a global
+  mutex. This is the only point of contention between binderfs mounts.
+- struct binderfs_info:
+  Each binderfs super block has its own struct binderfs_info that tracks
+  specific details about a binderfs instance:
+  - ipc namespace
+  - dentry of the binder-control device
+  - root uid and root gid of the user namespace the binderfs instance
+    was mounted in
+- mountable by user namespace root:
+  binderfs can be mounted by user namespace root in a non-initial user
+  namespace. The devices will be owned by user namespace root.
+- binderfs binder devices without misc infrastructure:
+  New binder devices associated with a binderfs mount do not use the
+  full misc_register() infrastructure.
+  The misc_register() infrastructure can only create new devices in the
+  host's devtmpfs mount. binderfs does however only make devices appear
+  under its own mountpoint and thus allocates new character device nodes
+  from the inode of the root dentry of the super block. This will have
+  the side-effect that binderfs specific device nodes do not appear in
+  sysfs. This behavior is similar to devpts allocated pts devices and
+  has no effect on the functionality of the ipc mechanism itself.
+
+[1]: https://goo.gl/JL2tfX
+[2]: program to allocate a new binderfs binder device:
+
+     #define _GNU_SOURCE
+     #include <errno.h>
+     #include <fcntl.h>
+     #include <stdio.h>
+     #include <stdlib.h>
+     #include <string.h>
+     #include <sys/ioctl.h>
+     #include <sys/stat.h>
+     #include <sys/types.h>
+     #include <unistd.h>
+     #include <linux/android/binder_ctl.h>
+
+     int main(int argc, char *argv[])
+     {
+             int fd, ret, saved_errno;
+             size_t len;
+             struct binderfs_device device = { 0 };
+
+             if (argc < 2)
+                     exit(EXIT_FAILURE);
+
+             len = strlen(argv[1]);
+             if (len > BINDERFS_MAX_NAME)
+                     exit(EXIT_FAILURE);
+
+             memcpy(device.name, argv[1], len);
+
+             fd = open("/dev/binderfs/binder-control", O_RDONLY | O_CLOEXEC);
+             if (fd < 0) {
+                     printf("%s - Failed to open binder-control device\n",
+                            strerror(errno));
+                     exit(EXIT_FAILURE);
+             }
+
+             ret = ioctl(fd, BINDER_CTL_ADD, &device);
+             saved_errno = errno;
+             close(fd);
+             errno = saved_errno;
+             if (ret < 0) {
+                     printf("%s - Failed to allocate new binder device\n",
+                            strerror(errno));
+                     exit(EXIT_FAILURE);
+             }
+
+             printf("Allocated new binder device with major %d, minor %d, and "
+                    "name %s\n", device.major, device.minor,
+                    device.name);
+
+             exit(EXIT_SUCCESS);
+     }
+
+Cc: Martijn Coenen <maco@android.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+Acked-by: Todd Kjos <tkjos@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

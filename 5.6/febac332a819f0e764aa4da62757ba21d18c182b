@@ -1,0 +1,64 @@
+clocksource: Prevent double add_timer_on() for watchdog_timer
+
+Kernel crashes inside QEMU/KVM are observed:
+
+  kernel BUG at kernel/time/timer.c:1154!
+  BUG_ON(timer_pending(timer) || !timer->function) in add_timer_on().
+
+At the same time another cpu got:
+
+  general protection fault: 0000 [#1] SMP PTI of poinson pointer 0xdead000000000200 in:
+
+  __hlist_del at include/linux/list.h:681
+  (inlined by) detach_timer at kernel/time/timer.c:818
+  (inlined by) expire_timers at kernel/time/timer.c:1355
+  (inlined by) __run_timers at kernel/time/timer.c:1686
+  (inlined by) run_timer_softirq at kernel/time/timer.c:1699
+
+Unfortunately kernel logs are badly scrambled, stacktraces are lost.
+
+Printing the timer->function before the BUG_ON() pointed to
+clocksource_watchdog().
+
+The execution of clocksource_watchdog() can race with a sequence of
+clocksource_stop_watchdog() .. clocksource_start_watchdog():
+
+expire_timers()
+ detach_timer(timer, true);
+  timer->entry.pprev = NULL;
+ raw_spin_unlock_irq(&base->lock);
+ call_timer_fn
+  clocksource_watchdog()
+
+					clocksource_watchdog_kthread() or
+					clocksource_unbind()
+
+					spin_lock_irqsave(&watchdog_lock, flags);
+					clocksource_stop_watchdog();
+					 del_timer(&watchdog_timer);
+					 watchdog_running = 0;
+					spin_unlock_irqrestore(&watchdog_lock, flags);
+
+					spin_lock_irqsave(&watchdog_lock, flags);
+					clocksource_start_watchdog();
+					 add_timer_on(&watchdog_timer, ...);
+					 watchdog_running = 1;
+					spin_unlock_irqrestore(&watchdog_lock, flags);
+
+  spin_lock(&watchdog_lock);
+  add_timer_on(&watchdog_timer, ...);
+   BUG_ON(timer_pending(timer) || !timer->function);
+    timer_pending() -> true
+    BUG()
+
+I.e. inside clocksource_watchdog() watchdog_timer could be already armed.
+
+Check timer_pending() before calling add_timer_on(). This is sufficient as
+all operations are synchronized by watchdog_lock.
+
+Fixes: 75c5158f70c0 ("timekeeping: Update clocksource with stop_machine")
+Signed-off-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/158048693917.4378.13823603769948933793.stgit@buzz
+

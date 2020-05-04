@@ -1,0 +1,105 @@
+afs: Fix in-progess ops to ignore server-level callback invalidation
+
+The in-kernel afs filesystem client counts the number of server-level
+callback invalidation events (CB.InitCallBackState* RPC operations) that it
+receives from the server.  This is stored in cb_s_break in various
+structures, including afs_server and afs_vnode.
+
+If an inode is examined by afs_validate(), say, the afs_server copy is
+compared, along with other break counters, to those in afs_vnode, and if
+one or more of the counters do not match, it is considered that the
+server's callback promise is broken.  At points where this happens,
+AFS_VNODE_CB_PROMISED is cleared to indicate that the status must be
+refetched from the server.
+
+afs_validate() issues an FS.FetchStatus operation to get updated metadata -
+and based on the updated data_version may invalidate the pagecache too.
+
+However, the break counters are also used to determine whether to note a
+new callback in the vnode (which would set the AFS_VNODE_CB_PROMISED flag)
+and whether to cache the permit data included in the YFSFetchStatus record
+by the server.
+
+
+The problem comes when the server sends us a CB.InitCallBackState op.  The
+first such instance doesn't cause cb_s_break to be incremented, but rather
+causes AFS_SERVER_FL_NEW to be cleared - but thereafter, say some hours
+after last use and all the volumes have been automatically unmounted and
+the server has forgotten about the client[*], this *will* likely cause an
+increment.
+
+ [*] There are other circumstances too, such as the server restarting or
+     needing to make space in its callback table.
+
+Note that the server won't send us a CB.InitCallBackState op until we talk
+to it again.
+
+So what happens is:
+
+ (1) A mount for a new volume is attempted, a inode is created for the root
+     vnode and vnode->cb_s_break and AFS_VNODE_CB_PROMISED aren't set
+     immediately, as we don't have a nominated server to talk to yet - and
+     we may iterate through a few to find one.
+
+ (2) Before the operation happens, afs_fetch_status(), say, notes in the
+     cursor (fc.cb_break) the break counter sum from the vnode, volume and
+     server counters, but the server->cb_s_break is currently 0.
+
+ (3) We send FS.FetchStatus to the server.  The server sends us back
+     CB.InitCallBackState.  We increment server->cb_s_break.
+
+ (4) Our FS.FetchStatus completes.  The reply includes a callback record.
+
+ (5) xdr_decode_AFSCallBack()/xdr_decode_YFSCallBack() check to see whether
+     the callback promise was broken by checking the break counter sum from
+     step (2) against the current sum.
+
+     This fails because of step (3), so we don't set the callback record
+     and, importantly, don't set AFS_VNODE_CB_PROMISED on the vnode.
+
+This does not preclude the syscall from progressing, and we don't loop here
+rechecking the status, but rather assume it's good enough for one round
+only and will need to be rechecked next time.
+
+ (6) afs_validate() it triggered on the vnode, probably called from
+     d_revalidate() checking the parent directory.
+
+ (7) afs_validate() notes that AFS_VNODE_CB_PROMISED isn't set, so doesn't
+     update vnode->cb_s_break and assumes the vnode to be invalid.
+
+ (8) afs_validate() needs to calls afs_fetch_status().  Go back to step (2)
+     and repeat, every time the vnode is validated.
+
+This primarily affects volume root dir vnodes.  Everything subsequent to
+those inherit an already incremented cb_s_break upon mounting.
+
+
+The issue is that we assume that the callback record and the cached permit
+information in a reply from the server can't be trusted after getting a
+server break - but this is wrong since the server makes sure things are
+done in the right order, holding up our ops if necessary[*].
+
+ [*] There is an extremely unlikely scenario where a reply from before the
+     CB.InitCallBackState could get its delivery deferred till after - at
+     which point we think we have a promise when we don't.  This, however,
+     requires unlucky mass packet loss to one call.
+
+AFS_SERVER_FL_NEW tries to paper over the cracks for the initial mount from
+a server we've never contacted before, but this should be unnecessary.
+It's also further insulated from the problem on an initial mount by
+querying the server first with FS.GetCapabilities, which triggers the
+CB.InitCallBackState.
+
+
+Fix this by
+
+ (1) Remove AFS_SERVER_FL_NEW.
+
+ (2) In afs_calc_vnode_cb_break(), don't include cb_s_break in the
+     calculation.
+
+ (3) In afs_cb_is_broken(), don't include cb_s_break in the check.
+
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+

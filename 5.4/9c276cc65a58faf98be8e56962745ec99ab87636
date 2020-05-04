@@ -1,0 +1,127 @@
+mm: introduce MADV_COLD
+
+Patch series "Introduce MADV_COLD and MADV_PAGEOUT", v7.
+
+- Background
+
+The Android terminology used for forking a new process and starting an app
+from scratch is a cold start, while resuming an existing app is a hot
+start.  While we continually try to improve the performance of cold
+starts, hot starts will always be significantly less power hungry as well
+as faster so we are trying to make hot start more likely than cold start.
+
+To increase hot start, Android userspace manages the order that apps
+should be killed in a process called ActivityManagerService.
+ActivityManagerService tracks every Android app or service that the user
+could be interacting with at any time and translates that into a ranked
+list for lmkd(low memory killer daemon).  They are likely to be killed by
+lmkd if the system has to reclaim memory.  In that sense they are similar
+to entries in any other cache.  Those apps are kept alive for
+opportunistic performance improvements but those performance improvements
+will vary based on the memory requirements of individual workloads.
+
+- Problem
+
+Naturally, cached apps were dominant consumers of memory on the system.
+However, they were not significant consumers of swap even though they are
+good candidate for swap.  Under investigation, swapping out only begins
+once the low zone watermark is hit and kswapd wakes up, but the overall
+allocation rate in the system might trip lmkd thresholds and cause a
+cached process to be killed(we measured performance swapping out vs.
+zapping the memory by killing a process.  Unsurprisingly, zapping is 10x
+times faster even though we use zram which is much faster than real
+storage) so kill from lmkd will often satisfy the high zone watermark,
+resulting in very few pages actually being moved to swap.
+
+- Approach
+
+The approach we chose was to use a new interface to allow userspace to
+proactively reclaim entire processes by leveraging platform information.
+This allowed us to bypass the inaccuracy of the kernel’s LRUs for pages
+that are known to be cold from userspace and to avoid races with lmkd by
+reclaiming apps as soon as they entered the cached state.  Additionally,
+it could provide many chances for platform to use much information to
+optimize memory efficiency.
+
+To achieve the goal, the patchset introduce two new options for madvise.
+One is MADV_COLD which will deactivate activated pages and the other is
+MADV_PAGEOUT which will reclaim private pages instantly.  These new
+options complement MADV_DONTNEED and MADV_FREE by adding non-destructive
+ways to gain some free memory space.  MADV_PAGEOUT is similar to
+MADV_DONTNEED in a way that it hints the kernel that memory region is not
+currently needed and should be reclaimed immediately; MADV_COLD is similar
+to MADV_FREE in a way that it hints the kernel that memory region is not
+currently needed and should be reclaimed when memory pressure rises.
+
+This patch (of 5):
+
+When a process expects no accesses to a certain memory range, it could
+give a hint to kernel that the pages can be reclaimed when memory pressure
+happens but data should be preserved for future use.  This could reduce
+workingset eviction so it ends up increasing performance.
+
+This patch introduces the new MADV_COLD hint to madvise(2) syscall.
+MADV_COLD can be used by a process to mark a memory range as not expected
+to be used in the near future.  The hint can help kernel in deciding which
+pages to evict early during memory pressure.
+
+It works for every LRU pages like MADV_[DONTNEED|FREE]. IOW, It moves
+
+	active file page -> inactive file LRU
+	active anon page -> inacdtive anon LRU
+
+Unlike MADV_FREE, it doesn't move active anonymous pages to inactive file
+LRU's head because MADV_COLD is a little bit different symantic.
+MADV_FREE means it's okay to discard when the memory pressure because the
+content of the page is *garbage* so freeing such pages is almost zero
+overhead since we don't need to swap out and access afterward causes just
+minor fault.  Thus, it would make sense to put those freeable pages in
+inactive file LRU to compete other used-once pages.  It makes sense for
+implmentaion point of view, too because it's not swapbacked memory any
+longer until it would be re-dirtied.  Even, it could give a bonus to make
+them be reclaimed on swapless system.  However, MADV_COLD doesn't mean
+garbage so reclaiming them requires swap-out/in in the end so it's bigger
+cost.  Since we have designed VM LRU aging based on cost-model, anonymous
+cold pages would be better to position inactive anon's LRU list, not file
+LRU.  Furthermore, it would help to avoid unnecessary scanning if system
+doesn't have a swap device.  Let's start simpler way without adding
+complexity at this moment.  However, keep in mind, too that it's a caveat
+that workloads with a lot of pages cache are likely to ignore MADV_COLD on
+anonymous memory because we rarely age anonymous LRU lists.
+
+* man-page material
+
+MADV_COLD (since Linux x.x)
+
+Pages in the specified regions will be treated as less-recently-accessed
+compared to pages in the system with similar access frequencies.  In
+contrast to MADV_FREE, the contents of the region are preserved regardless
+of subsequent writes to pages.
+
+MADV_COLD cannot be applied to locked pages, Huge TLB pages, or VM_PFNMAP
+pages.
+
+[akpm@linux-foundation.org: resolve conflicts with hmm.git]
+Link: http://lkml.kernel.org/r/20190726023435.214162-2-minchan@kernel.org
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Reported-by: kbuild test robot <lkp@intel.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: James E.J. Bottomley <James.Bottomley@HansenPartnership.com>
+Cc: Richard Henderson <rth@twiddle.net>
+Cc: Ralf Baechle <ralf@linux-mips.org>
+Cc: Chris Zankel <chris@zankel.net>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Daniel Colascione <dancol@google.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Joel Fernandes (Google) <joel@joelfernandes.org>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Oleksandr Natalenko <oleksandr@redhat.com>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Sonny Rao <sonnyrao@google.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Tim Murray <timmurray@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

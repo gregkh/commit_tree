@@ -1,0 +1,48 @@
+tipc: fix race condition causing hung sendto
+
+When sending multicast messages via blocking socket,
+if sending link is congested (tsk->cong_link_cnt is set to 1),
+the sending thread will be put into sleeping state. However,
+tipc_sk_filter_rcv() is called under socket spin lock but
+tipc_wait_for_cond() is not. So, there is no guarantee that
+the setting of tsk->cong_link_cnt to 0 in tipc_sk_proto_rcv() in
+CPU-1 will be perceived by CPU-0. If that is the case, the sending
+thread in CPU-0 after being waken up, will continue to see
+tsk->cong_link_cnt as 1 and put the sending thread into sleeping
+state again. The sending thread will sleep forever.
+
+CPU-0                                | CPU-1
+tipc_wait_for_cond()                 |
+{                                    |
+ // condition_ = !tsk->cong_link_cnt |
+ while ((rc_ = !(condition_))) {     |
+  ...                                |
+  release_sock(sk_);                 |
+  wait_woken();                      |
+                                     | if (!sock_owned_by_user(sk))
+                                     |  tipc_sk_filter_rcv()
+                                     |  {
+                                     |   ...
+                                     |   tipc_sk_proto_rcv()
+                                     |   {
+                                     |    ...
+                                     |    tsk->cong_link_cnt--;
+                                     |    ...
+                                     |    sk->sk_write_space(sk);
+                                     |    ...
+                                     |   }
+                                     |   ...
+                                     |  }
+  sched_annotate_sleep();            |
+  lock_sock(sk_);                    |
+  remove_wait_queue();               |
+ }                                   |
+}                                    |
+
+This commit fixes it by adding memory barrier to tipc_sk_proto_rcv()
+and tipc_wait_for_cond().
+
+Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: Tung Nguyen <tung.q.nguyen@dektech.com.au>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

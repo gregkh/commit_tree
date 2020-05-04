@@ -1,0 +1,47 @@
+missing barriers in some of unix_sock ->addr and ->path accesses
+
+Several u->addr and u->path users are not holding any locks in
+common with unix_bind().  unix_state_lock() is useless for those
+purposes.
+
+u->addr is assign-once and *(u->addr) is fully set up by the time
+we set u->addr (all under unix_table_lock).  u->path is also
+set in the same critical area, also before setting u->addr, and
+any unix_sock with ->path filled will have non-NULL ->addr.
+
+So setting ->addr with smp_store_release() is all we need for those
+"lockless" users - just have them fetch ->addr with smp_load_acquire()
+and don't even bother looking at ->path if they see NULL ->addr.
+
+Users of ->addr and ->path fall into several classes now:
+    1) ones that do smp_load_acquire(u->addr) and access *(u->addr)
+and u->path only if smp_load_acquire() has returned non-NULL.
+    2) places holding unix_table_lock.  These are guaranteed that
+*(u->addr) is seen fully initialized.  If unix_sock is in one of the
+"bound" chains, so's ->path.
+    3) unix_sock_destructor() using ->addr is safe.  All places
+that set u->addr are guaranteed to have seen all stores *(u->addr)
+while holding a reference to u and unix_sock_destructor() is called
+when (atomic) refcount hits zero.
+    4) unix_release_sock() using ->path is safe.  unix_bind()
+is serialized wrt unix_release() (normally - by struct file
+refcount), and for the instances that had ->path set by unix_bind()
+unix_release_sock() comes from unix_release(), so they are fine.
+Instances that had it set in unix_stream_connect() either end up
+attached to a socket (in unix_accept()), in which case the call
+chain to unix_release_sock() and serialization are the same as in
+the previous case, or they never get accept'ed and unix_release_sock()
+is called when the listener is shut down and its queue gets purged.
+In that case the listener's queue lock provides the barriers needed -
+unix_stream_connect() shoves our unix_sock into listener's queue
+under that lock right after having set ->path and eventual
+unix_release_sock() caller picks them from that queue under the
+same lock right before calling unix_release_sock().
+    5) unix_find_other() use of ->path is pointless, but safe -
+it happens with successful lookup by (abstract) name, so ->path.dentry
+is guaranteed to be NULL there.
+
+earlier-variant-reviewed-by: "Paul E. McKenney" <paulmck@linux.ibm.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

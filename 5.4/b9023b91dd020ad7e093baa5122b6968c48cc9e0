@@ -1,0 +1,81 @@
+tick: broadcast-hrtimer: Fix a race in bc_set_next
+
+When a cpu requests broadcasting, before starting the tick broadcast
+hrtimer, bc_set_next() checks if the timer callback (bc_handler) is active
+using hrtimer_try_to_cancel(). But hrtimer_try_to_cancel() does not provide
+the required synchronization when the callback is active on other core.
+
+The callback could have already executed tick_handle_oneshot_broadcast()
+and could have also returned. But still there is a small time window where
+the hrtimer_try_to_cancel() returns -1. In that case bc_set_next() returns
+without doing anything, but the next_event of the tick broadcast clock
+device is already set to a timeout value.
+
+In the race condition diagram below, CPU #1 is running the timer callback
+and CPU #2 is entering idle state and so calls bc_set_next().
+
+In the worst case, the next_event will contain an expiry time, but the
+hrtimer will not be started which happens when the racing callback returns
+HRTIMER_NORESTART. The hrtimer might never recover if all further requests
+from the CPUs to subscribe to tick broadcast have timeout greater than the
+next_event of tick broadcast clock device. This leads to cascading of
+failures and finally noticed as rcu stall warnings
+
+Here is a depiction of the race condition
+
+CPU #1 (Running timer callback)                   CPU #2 (Enter idle
+                                                  and subscribe to
+                                                  tick broadcast)
+---------------------                             ---------------------
+
+__run_hrtimer()                                   tick_broadcast_enter()
+
+  bc_handler()                                      __tick_broadcast_oneshot_control()
+
+    tick_handle_oneshot_broadcast()
+
+      raw_spin_lock(&tick_broadcast_lock);
+
+      dev->next_event = KTIME_MAX;                  //wait for tick_broadcast_lock
+      //next_event for tick broadcast clock
+      set to KTIME_MAX since no other cores
+      subscribed to tick broadcasting
+
+      raw_spin_unlock(&tick_broadcast_lock);
+
+    if (dev->next_event == KTIME_MAX)
+      return HRTIMER_NORESTART
+    // callback function exits without
+       restarting the hrtimer                      //tick_broadcast_lock acquired
+                                                   raw_spin_lock(&tick_broadcast_lock);
+
+                                                   tick_broadcast_set_event()
+
+                                                     clockevents_program_event()
+
+                                                       dev->next_event = expires;
+
+                                                       bc_set_next()
+
+                                                         hrtimer_try_to_cancel()
+                                                         //returns -1 since the timer
+                                                         callback is active. Exits without
+                                                         restarting the timer
+  cpu_base->running = NULL;
+
+The comment that hrtimer cannot be armed from within the callback is
+wrong. It is fine to start the hrtimer from within the callback. Also it is
+safe to start the hrtimer from the enter/exit idle code while the broadcast
+handler is active. The enter/exit idle code and the broadcast handler are
+synchronized using tick_broadcast_lock. So there is no need for the
+existing try to cancel logic. All this can be removed which will eliminate
+the race condition as well.
+
+Fixes: 5d1638acb9f6 ("tick: Introduce hrtimer based broadcast")
+Originally-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Balasubramani Vivekanandan <balasubramani_vivekanandan@mentor.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/20190926135101.12102-2-balasubramani_vivekanandan@mentor.com
+
+

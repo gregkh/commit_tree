@@ -1,0 +1,97 @@
+perf/x86/amd: Add support for Large Increment per Cycle Events
+
+Description of hardware operation
+---------------------------------
+
+The core AMD PMU has a 4-bit wide per-cycle increment for each
+performance monitor counter.  That works for most events, but
+now with AMD Family 17h and above processors, some events can
+occur more than 15 times in a cycle.  Those events are called
+"Large Increment per Cycle" events. In order to count these
+events, two adjacent h/w PMCs get their count signals merged
+to form 8 bits per cycle total.  In addition, the PERF_CTR count
+registers are merged to be able to count up to 64 bits.
+
+Normally, events like instructions retired, get programmed on a single
+counter like so:
+
+PERF_CTL0 (MSR 0xc0010200) 0x000000000053ff0c # event 0x0c, umask 0xff
+PERF_CTR0 (MSR 0xc0010201) 0x0000800000000001 # r/w 48-bit count
+
+The next counter at MSRs 0xc0010202-3 remains unused, or can be used
+independently to count something else.
+
+When counting Large Increment per Cycle events, such as FLOPs,
+however, we now have to reserve the next counter and program the
+PERF_CTL (config) register with the Merge event (0xFFF), like so:
+
+PERF_CTL0 (msr 0xc0010200) 0x000000000053ff03 # FLOPs event, umask 0xff
+PERF_CTR0 (msr 0xc0010201) 0x0000800000000001 # rd 64-bit cnt, wr lo 48b
+PERF_CTL1 (msr 0xc0010202) 0x0000000f004000ff # Merge event, enable bit
+PERF_CTR1 (msr 0xc0010203) 0x0000000000000000 # wr hi 16-bits count
+
+The count is widened from the normal 48-bits to 64 bits by having the
+second counter carry the higher 16 bits of the count in its lower 16
+bits of its counter register.
+
+The odd counter, e.g., PERF_CTL1, is programmed with the enabled Merge
+event before the even counter, PERF_CTL0.
+
+The Large Increment feature is available starting with Family 17h.
+For more details, search any Family 17h PPR for the "Large Increment
+per Cycle Events" section, e.g., section 2.1.15.3 on p. 173 in this
+version:
+
+https://www.amd.com/system/files/TechDocs/56176_ppr_Family_17h_Model_71h_B0_pub_Rev_3.06.zip
+
+Description of software operation
+---------------------------------
+
+The following steps are taken in order to support reserving and
+enabling the extra counter for Large Increment per Cycle events:
+
+1. In the main x86 scheduler, we reduce the number of available
+counters by the number of Large Increment per Cycle events being
+scheduled, tracked by a new cpuc variable 'n_pair' and a new
+amd_put_event_constraints_f17h().  This improves the counter
+scheduler success rate.
+
+2. In perf_assign_events(), if a counter is assigned to a Large
+Increment event, we increment the current counter variable, so the
+counter used for the Merge event is removed from assignment
+consideration by upcoming event assignments.
+
+3. In find_counter(), if a counter has been found for the Large
+Increment event, we set the next counter as used, to prevent other
+events from using it.
+
+4. We perform steps 2 & 3 also in the x86 scheduler fastpath, i.e.,
+we add Merge event accounting to the existing used_mask logic.
+
+5. Finally, we add on the programming of Merge event to the
+neighbouring PMC counters in the counter enable/disable{_all}
+code paths.
+
+Currently, software does not support a single PMU with mixed 48- and
+64-bit counting, so Large increment event counts are limited to 48
+bits.  In set_period, we zero-out the upper 16 bits of the count, so
+the hardware doesn't copy them to the even counter's higher bits.
+
+Simple invocation example showing counting 8 FLOPs per 256-bit/%ymm
+vaddps instruction executed in a loop 100 million times:
+
+perf stat -e cpu/fp_ret_sse_avx_ops.all/,cpu/instructions/ <workload>
+
+ Performance counter stats for '<workload>':
+
+       800,000,000      cpu/fp_ret_sse_avx_ops.all/u
+       300,042,101      cpu/instructions/u
+
+Prior to this patch, the reported SSE/AVX FLOPs retired count would
+be wrong.
+
+[peterz: lots of renames and edits to the code]
+
+Signed-off-by: Kim Phillips <kim.phillips@amd.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+

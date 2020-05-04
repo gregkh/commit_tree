@@ -1,0 +1,122 @@
+zram: fix lockdep warning of free block handling
+
+Patch series "zram idle page writeback", v3.
+
+Inherently, swap device has many idle pages which are rare touched since
+it was allocated.  It is never problem if we use storage device as swap.
+However, it's just waste for zram-swap.
+
+This patchset supports zram idle page writeback feature.
+
+* Admin can define what is idle page "no access since X time ago"
+* Admin can define when zram should writeback them
+* Admin can define when zram should stop writeback to prevent wearout
+
+Details are in each patch's description.
+
+This patch (of 7):
+
+  ================================
+  WARNING: inconsistent lock state
+  4.19.0+ #390 Not tainted
+  --------------------------------
+  inconsistent {SOFTIRQ-ON-W} -> {IN-SOFTIRQ-W} usage.
+  zram_verify/2095 [HC0[0]:SC1[1]:HE1:SE0] takes:
+  00000000b1828693 (&(&zram->bitmap_lock)->rlock){+.?.}, at: put_entry_bdev+0x1e/0x50
+  {SOFTIRQ-ON-W} state was registered at:
+    _raw_spin_lock+0x2c/0x40
+    zram_make_request+0x755/0xdc9
+    generic_make_request+0x373/0x6a0
+    submit_bio+0x6c/0x140
+    __swap_writepage+0x3a8/0x480
+    shrink_page_list+0x1102/0x1a60
+    shrink_inactive_list+0x21b/0x3f0
+    shrink_node_memcg.constprop.99+0x4f8/0x7e0
+    shrink_node+0x7d/0x2f0
+    do_try_to_free_pages+0xe0/0x300
+    try_to_free_pages+0x116/0x2b0
+    __alloc_pages_slowpath+0x3f4/0xf80
+    __alloc_pages_nodemask+0x2a2/0x2f0
+    __handle_mm_fault+0x42e/0xb50
+    handle_mm_fault+0x55/0xb0
+    __do_page_fault+0x235/0x4b0
+    page_fault+0x1e/0x30
+  irq event stamp: 228412
+  hardirqs last  enabled at (228412): [<ffffffff98245846>] __slab_free+0x3e6/0x600
+  hardirqs last disabled at (228411): [<ffffffff98245625>] __slab_free+0x1c5/0x600
+  softirqs last  enabled at (228396): [<ffffffff98e0031e>] __do_softirq+0x31e/0x427
+  softirqs last disabled at (228403): [<ffffffff98072051>] irq_exit+0xd1/0xe0
+
+  other info that might help us debug this:
+   Possible unsafe locking scenario:
+
+         CPU0
+         ----
+    lock(&(&zram->bitmap_lock)->rlock);
+    <Interrupt>
+      lock(&(&zram->bitmap_lock)->rlock);
+
+   *** DEADLOCK ***
+
+  no locks held by zram_verify/2095.
+
+  stack backtrace:
+  CPU: 5 PID: 2095 Comm: zram_verify Not tainted 4.19.0+ #390
+  Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1 04/01/2014
+  Call Trace:
+   <IRQ>
+   dump_stack+0x67/0x9b
+   print_usage_bug+0x1bd/0x1d3
+   mark_lock+0x4aa/0x540
+   __lock_acquire+0x51d/0x1300
+   lock_acquire+0x90/0x180
+   _raw_spin_lock+0x2c/0x40
+   put_entry_bdev+0x1e/0x50
+   zram_free_page+0xf6/0x110
+   zram_slot_free_notify+0x42/0xa0
+   end_swap_bio_read+0x5b/0x170
+   blk_update_request+0x8f/0x340
+   scsi_end_request+0x2c/0x1e0
+   scsi_io_completion+0x98/0x650
+   blk_done_softirq+0x9e/0xd0
+   __do_softirq+0xcc/0x427
+   irq_exit+0xd1/0xe0
+   do_IRQ+0x93/0x120
+   common_interrupt+0xf/0xf
+   </IRQ>
+
+With writeback feature, zram_slot_free_notify could be called in softirq
+context by end_swap_bio_read.  However, bitmap_lock is not aware of that
+so lockdep yell out:
+
+  get_entry_bdev
+  spin_lock(bitmap->lock);
+  irq
+  softirq
+  end_swap_bio_read
+  zram_slot_free_notify
+  zram_slot_lock <-- deadlock prone
+  zram_free_page
+  put_entry_bdev
+  spin_lock(bitmap->lock); <-- deadlock prone
+
+With akpm's suggestion (i.e.  bitmap operation is already atomic), we
+could remove bitmap lock.  It might fail to find a empty slot if serious
+contention happens.  However, it's not severe problem because huge page
+writeback has already possiblity to fail if there is severe memory
+pressure.  Worst case is just keeping the incompressible in memory, not
+storage.
+
+The other problem is zram_slot_lock in zram_slot_slot_free_notify.  To
+make it safe is this patch introduces zram_slot_trylock where
+zram_slot_free_notify uses it.  Although it's rare to be contented, this
+patch adds new debug stat "miss_free" to keep monitoring how often it
+happens.
+
+Link: http://lkml.kernel.org/r/20181127055429.251614-2-minchan@kernel.org
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Reviewed-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Reviewed-by: Joey Pabalinas <joeypabalinas@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

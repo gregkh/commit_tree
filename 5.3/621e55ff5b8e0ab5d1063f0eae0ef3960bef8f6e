@@ -1,0 +1,72 @@
+RDMA/devices: Do not deadlock during client removal
+
+lockdep reports:
+
+   WARNING: possible circular locking dependency detected
+
+   modprobe/302 is trying to acquire lock:
+   0000000007c8919c ((wq_completion)ib_cm){+.+.}, at: flush_workqueue+0xdf/0x990
+
+   but task is already holding lock:
+   000000002d3d2ca9 (&device->client_data_rwsem){++++}, at: remove_client_context+0x79/0xd0 [ib_core]
+
+   which lock already depends on the new lock.
+
+   the existing dependency chain (in reverse order) is:
+
+   -> #2 (&device->client_data_rwsem){++++}:
+          down_read+0x3f/0x160
+          ib_get_net_dev_by_params+0xd5/0x200 [ib_core]
+          cma_ib_req_handler+0x5f6/0x2090 [rdma_cm]
+          cm_process_work+0x29/0x110 [ib_cm]
+          cm_req_handler+0x10f5/0x1c00 [ib_cm]
+          cm_work_handler+0x54c/0x311d [ib_cm]
+          process_one_work+0x4aa/0xa30
+          worker_thread+0x62/0x5b0
+          kthread+0x1ca/0x1f0
+          ret_from_fork+0x24/0x30
+
+   -> #1 ((work_completion)(&(&work->work)->work)){+.+.}:
+          process_one_work+0x45f/0xa30
+          worker_thread+0x62/0x5b0
+          kthread+0x1ca/0x1f0
+          ret_from_fork+0x24/0x30
+
+   -> #0 ((wq_completion)ib_cm){+.+.}:
+          lock_acquire+0xc8/0x1d0
+          flush_workqueue+0x102/0x990
+          cm_remove_one+0x30e/0x3c0 [ib_cm]
+          remove_client_context+0x94/0xd0 [ib_core]
+          disable_device+0x10a/0x1f0 [ib_core]
+          __ib_unregister_device+0x5a/0xe0 [ib_core]
+          ib_unregister_device+0x21/0x30 [ib_core]
+          mlx5_ib_stage_ib_reg_cleanup+0x9/0x10 [mlx5_ib]
+          __mlx5_ib_remove+0x3d/0x70 [mlx5_ib]
+          mlx5_ib_remove+0x12e/0x140 [mlx5_ib]
+          mlx5_remove_device+0x144/0x150 [mlx5_core]
+          mlx5_unregister_interface+0x3f/0xf0 [mlx5_core]
+          mlx5_ib_cleanup+0x10/0x3a [mlx5_ib]
+          __x64_sys_delete_module+0x227/0x350
+          do_syscall_64+0xc3/0x6a4
+          entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+Which is due to the read side of the client_data_rwsem being obtained
+recursively through a work queue flush during cm client removal.
+
+The lock is being held across the remove in remove_client_context() so
+that the function is a fence, once it returns the client is removed. This
+is required so that the two callers do not proceed with destruction until
+the client completes removal.
+
+Instead of using client_data_rwsem use the existing device unregistration
+refcount and add a similar client unregistration (client->uses) refcount.
+
+This will fence the two unregistration paths without holding any locks.
+
+Cc: <stable@vger.kernel.org>
+Fixes: 921eab1143aa ("RDMA/devices: Re-organize device.c locking")
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Link: https://lore.kernel.org/r/20190731081841.32345-2-leon@kernel.org
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+

@@ -1,0 +1,89 @@
+fscrypt: add FS_IOC_ADD_ENCRYPTION_KEY ioctl
+
+Add a new fscrypt ioctl, FS_IOC_ADD_ENCRYPTION_KEY.  This ioctl adds an
+encryption key to the filesystem's fscrypt keyring ->s_master_keys,
+making any files encrypted with that key appear "unlocked".
+
+Why we need this
+~~~~~~~~~~~~~~~~
+
+The main problem is that the "locked/unlocked" (ciphertext/plaintext)
+status of encrypted files is global, but the fscrypt keys are not.
+fscrypt only looks for keys in the keyring(s) the process accessing the
+filesystem is subscribed to: the thread keyring, process keyring, and
+session keyring, where the session keyring may contain the user keyring.
+
+Therefore, userspace has to put fscrypt keys in the keyrings for
+individual users or sessions.  But this means that when a process with a
+different keyring tries to access encrypted files, whether they appear
+"unlocked" or not is nondeterministic.  This is because it depends on
+whether the files are currently present in the inode cache.
+
+Fixing this by consistently providing each process its own view of the
+filesystem depending on whether it has the key or not isn't feasible due
+to how the VFS caches work.  Furthermore, while sometimes users expect
+this behavior, it is misguided for two reasons.  First, it would be an
+OS-level access control mechanism largely redundant with existing access
+control mechanisms such as UNIX file permissions, ACLs, LSMs, etc.
+Encryption is actually for protecting the data at rest.
+
+Second, almost all users of fscrypt actually do need the keys to be
+global.  The largest users of fscrypt, Android and Chromium OS, achieve
+this by having PID 1 create a "session keyring" that is inherited by
+every process.  This works, but it isn't scalable because it prevents
+session keyrings from being used for any other purpose.
+
+On general-purpose Linux distros, the 'fscrypt' userspace tool [1] can't
+similarly abuse the session keyring, so to make 'sudo' work on all
+systems it has to link all the user keyrings into root's user keyring
+[2].  This is ugly and raises security concerns.  Moreover it can't make
+the keys available to system services, such as sshd trying to access the
+user's '~/.ssh' directory (see [3], [4]) or NetworkManager trying to
+read certificates from the user's home directory (see [5]); or to Docker
+containers (see [6], [7]).
+
+By having an API to add a key to the *filesystem* we'll be able to fix
+the above bugs, remove userspace workarounds, and clearly express the
+intended semantics: the locked/unlocked status of an encrypted directory
+is global, and encryption is orthogonal to OS-level access control.
+
+Why not use the add_key() syscall
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+We use an ioctl for this API rather than the existing add_key() system
+call because the ioctl gives us the flexibility needed to implement
+fscrypt-specific semantics that will be introduced in later patches:
+
+- Supporting key removal with the semantics such that the secret is
+  removed immediately and any unused inodes using the key are evicted;
+  also, the eviction of any in-use inodes can be retried.
+
+- Calculating a key-dependent cryptographic identifier and returning it
+  to userspace.
+
+- Allowing keys to be added and removed by non-root users, but only keys
+  for v2 encryption policies; and to prevent denial-of-service attacks,
+  users can only remove keys they themselves have added, and a key is
+  only really removed after all users who added it have removed it.
+
+Trying to shoehorn these semantics into the keyrings syscalls would be
+very difficult, whereas the ioctls make things much easier.
+
+However, to reuse code the implementation still uses the keyrings
+service internally.  Thus we get lockless RCU-mode key lookups without
+having to re-implement it, and the keys automatically show up in
+/proc/keys for debugging purposes.
+
+References:
+
+    [1] https://github.com/google/fscrypt
+    [2] https://goo.gl/55cCrI#heading=h.vf09isp98isb
+    [3] https://github.com/google/fscrypt/issues/111#issuecomment-444347939
+    [4] https://github.com/google/fscrypt/issues/116
+    [5] https://bugs.launchpad.net/ubuntu/+source/fscrypt/+bug/1770715
+    [6] https://github.com/google/fscrypt/issues/128
+    [7] https://askubuntu.com/questions/1130306/cannot-run-docker-on-an-encrypted-filesystem
+
+Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+

@@ -1,0 +1,122 @@
+xen/blkback: Squeeze page pools if a memory pressure is detected
+
+Each `blkif` has a free pages pool for the grant mapping.  The size of
+the pool starts from zero and is increased on demand while processing
+the I/O requests.  If current I/O requests handling is finished or 100
+milliseconds has passed since last I/O requests handling, it checks and
+shrinks the pool to not exceed the size limit, `max_buffer_pages`.
+
+Therefore, host administrators can cause memory pressure in blkback by
+attaching a large number of block devices and inducing I/O.  Such
+problematic situations can be avoided by limiting the maximum number of
+devices that can be attached, but finding the optimal limit is not so
+easy.  Improper set of the limit can results in memory pressure or a
+resource underutilization.  This commit avoids such problematic
+situations by squeezing the pools (returns every free page in the pool
+to the system) for a while (users can set this duration via a module
+parameter) if memory pressure is detected.
+
+Discussions
+===========
+
+The `blkback`'s original shrinking mechanism returns only pages in the
+pool which are not currently be used by `blkback` to the system.  In
+other words, the pages that are not mapped with granted pages.  Because
+this commit is changing only the shrink limit but still uses the same
+freeing mechanism it does not touch pages which are currently mapping
+grants.
+
+Once memory pressure is detected, this commit keeps the squeezing limit
+for a user-specified time duration.  The duration should be neither too
+long nor too short.  If it is too long, the squeezing incurring overhead
+can reduce the I/O performance.  If it is too short, `blkback` will not
+free enough pages to reduce the memory pressure.  This commit sets the
+value as `10 milliseconds` by default because it is a short time in
+terms of I/O while it is a long time in terms of memory operations.
+Also, as the original shrinking mechanism works for at least every 100
+milliseconds, this could be a somewhat reasonable choice.  I also tested
+other durations (refer to the below section for more details) and
+confirmed that 10 milliseconds is the one that works best with the test.
+That said, the proper duration depends on actual configurations and
+workloads.  That's why this commit allows users to set the duration as a
+module parameter.
+
+Memory Pressure Test
+====================
+
+To show how this commit fixes the memory pressure situation well, I
+configured a test environment on a xen-running virtualization system.
+On the `blkfront` running guest instances, I attach a large number of
+network-backed volume devices and induce I/O to those.  Meanwhile, I
+measure the number of pages that swapped in (pswpin) and out (pswpout)
+on the `blkback` running guest.  The test ran twice, once for the
+`blkback` before this commit and once for that after this commit.  As
+shown below, this commit has dramatically reduced the memory pressure:
+
+                pswpin  pswpout
+    before      76,672  185,799
+    after          867    3,967
+
+Optimal Aggressive Shrinking Duration
+-------------------------------------
+
+To find a best squeezing duration, I repeated the test with three
+different durations (1ms, 10ms, and 100ms).  The results are as below:
+
+    duration    pswpin  pswpout
+    1           707     5,095
+    10          867     3,967
+    100         362     3,348
+
+As expected, the memory pressure decreases as the duration increases,
+but the reduction become slow from the `10ms`.  Based on this results, I
+chose the default duration as 10ms.
+
+Performance Overhead Test
+=========================
+
+This commit could incur I/O performance degradation under severe memory
+pressure because the squeezing will require more page allocations per
+I/O.  To show the overhead, I artificially made a worst-case squeezing
+situation and measured the I/O performance of a `blkfront` running
+guest.
+
+For the artificial squeezing, I set the `blkback.max_buffer_pages` using
+the `/sys/module/xen_blkback/parameters/max_buffer_pages` file.  In this
+test, I set the value to `1024` and `0`.  The `1024` is the default
+value.  Setting the value as `0` is same to a situation doing the
+squeezing always (worst-case).
+
+If the underlying block device is slow enough, the squeezing overhead
+could be hidden.  For the reason, I use a fast block device, namely the
+rbd[1]:
+
+    # xl block-attach guest phy:/dev/ram0 xvdb w
+
+For the I/O performance measurement, I run a simple `dd` command 5 times
+directly to the device as below and collect the 'MB/s' results.
+
+    $ for i in {1..5}; do dd if=/dev/zero of=/dev/xvdb \
+                             bs=4k count=$((256*512)); sync; done
+
+The results are as below.  'max_pgs' represents the value of the
+`blkback.max_buffer_pages` parameter.
+
+    max_pgs   Min       Max       Median     Avg    Stddev
+    0         417       423       420        419.4  2.5099801
+    1024      414       425       416        417.8  4.4384682
+    No difference proven at 95.0% confidence
+
+In short, even worst case squeezing on ramdisk based fast block device
+makes no visible performance degradation.  Please note that this is just
+a very simple and minimal test.  On systems using super-fast block
+devices and a special I/O workload, the results might be different.  If
+you have any doubt, test on your machine with your workload to find the
+optimal squeezing duration for you.
+
+[1] https://www.kernel.org/doc/html/latest/admin-guide/blockdev/ramdisk.html
+
+Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+Signed-off-by: SeongJae Park <sjpark@amazon.de>
+Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+

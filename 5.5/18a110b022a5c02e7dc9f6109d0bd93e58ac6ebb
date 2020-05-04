@@ -1,0 +1,51 @@
+netfilter: ctnetlink: netns exit must wait for callbacks
+
+Curtis Taylor and Jon Maxwell reported and debugged a crash on 3.10
+based kernel.
+
+Crash occurs in ctnetlink_conntrack_events because net->nfnl socket is
+NULL.  The nfnl socket was set to NULL by netns destruction running on
+another cpu.
+
+The exiting network namespace calls the relevant destructors in the
+following order:
+
+1. ctnetlink_net_exit_batch
+
+This nulls out the event callback pointer in struct netns.
+
+2. nfnetlink_net_exit_batch
+
+This nulls net->nfnl socket and frees it.
+
+3. nf_conntrack_cleanup_net_list
+
+This removes all remaining conntrack entries.
+
+This is order is correct. The only explanation for the crash so ar is:
+
+cpu1: conntrack is dying, eviction occurs:
+ -> nf_ct_delete()
+   -> nf_conntrack_event_report \
+     -> nf_conntrack_eventmask_report
+       -> notify->fcn() (== ctnetlink_conntrack_events).
+
+cpu1: a. fetches rcu protected pointer to obtain ctnetlink event callback.
+      b. gets interrupted.
+ cpu2: runs netns exit handlers:
+     a runs ctnetlink destructor, event cb pointer set to NULL.
+     b runs nfnetlink destructor, nfnl socket is closed and set to NULL.
+cpu1: c. resumes and trips over NULL net->nfnl.
+
+Problem appears to be that ctnetlink_net_exit_batch only prevents future
+callers of nf_conntrack_eventmask_report() from obtaining the callback.
+It doesn't wait of other cpus that might have already obtained the
+callbacks address.
+
+I don't see anything in upstream kernels that would prevent similar
+crash: We need to wait for all cpus to have exited the event callback.
+
+Fixes: 9592a5c01e79dbc59eb56fa ("netfilter: ctnetlink: netns support")
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+

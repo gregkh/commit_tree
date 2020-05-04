@@ -1,0 +1,65 @@
+xfs: split up the xfs_reflink_end_cow work into smaller transactions
+
+In xfs_reflink_end_cow, we allocate a single transaction for the entire
+end_cow operation and then loop the CoW fork mappings to move them to
+the data fork.  This design fails on a heavily fragmented filesystem
+where an inode's data fork has exactly one more extent than would fit in
+an extents-format fork, because the unmap can collapse the data fork
+into extents format (freeing the bmbt block) but the remap can expand
+the data fork back into a (newly allocated) bmbt block.  If the number
+of extents we end up remapping is large, we can overflow the block
+reservation because we reserved blocks assuming that we were adding
+mappings into an already-cleared area of the data fork.
+
+Let's say we have 8 extents in the data fork, 8 extents in the CoW fork,
+and the data fork can hold at most 7 extents before needing to convert
+to btree format; and that blocks A-P are discontiguous single-block
+extents:
+
+   0......7
+D: ABCDEFGH
+C: IJKLMNOP
+
+When a write to file blocks 0-7 completes, we must remap I-P into the
+data fork.  We start by removing H from the btree-format data fork.  Now
+we have 7 extents, so we convert the fork to extents format, freeing the
+bmbt block.   We then move P into the data fork and it now has 8 extents
+again.  We must convert the data fork back to btree format, requiring a
+block allocation.  If we repeat this sequence for blocks 6-5-4-3-2-1-0,
+we'll need a total of 8 block allocations to remap all 8 blocks.  We
+reserved only enough blocks to handle one btree split (5 blocks on a 4k
+block filesystem), which means we overflow the block reservation.
+
+To fix this issue, create a separate helper function to remap a single
+extent, and change _reflink_end_cow to call it in a tight loop over the
+entire range we're completing.  As a side effect this also removes the
+size restrictions on how many extents we can end_cow at a time, though
+nobody ever hit that.  It is not reasonable to reserve N blocks to remap
+N blocks.
+
+Note that this can be reproduced after ~320 million fsx ops while
+running generic/938 (long soak directio fsx exerciser):
+
+XFS: Assertion failed: tp->t_blk_res >= tp->t_blk_res_used, file: fs/xfs/xfs_trans.c, line: 116
+<machine registers snipped>
+Call Trace:
+ xfs_trans_dup+0x211/0x250 [xfs]
+ xfs_trans_roll+0x6d/0x180 [xfs]
+ xfs_defer_trans_roll+0x10c/0x3b0 [xfs]
+ xfs_defer_finish_noroll+0xdf/0x740 [xfs]
+ xfs_defer_finish+0x13/0x70 [xfs]
+ xfs_reflink_end_cow+0x2c6/0x680 [xfs]
+ xfs_dio_write_end_io+0x115/0x220 [xfs]
+ iomap_dio_complete+0x3f/0x130
+ iomap_dio_rw+0x3c3/0x420
+ xfs_file_dio_aio_write+0x132/0x3c0 [xfs]
+ xfs_file_write_iter+0x8b/0xc0 [xfs]
+ __vfs_write+0x193/0x1f0
+ vfs_write+0xba/0x1c0
+ ksys_write+0x52/0xc0
+ do_syscall_64+0x50/0x160
+ entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+

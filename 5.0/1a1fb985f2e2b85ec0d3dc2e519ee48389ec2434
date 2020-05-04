@@ -1,0 +1,66 @@
+futex: Handle early deadlock return correctly
+
+commit 56222b212e8e ("futex: Drop hb->lock before enqueueing on the
+rtmutex") changed the locking rules in the futex code so that the hash
+bucket lock is not longer held while the waiter is enqueued into the
+rtmutex wait list. This made the lock and the unlock path symmetric, but
+unfortunately the possible early exit from __rt_mutex_proxy_start() due to
+a detected deadlock was not updated accordingly. That allows a concurrent
+unlocker to observe inconsitent state which triggers the warning in the
+unlock path.
+
+futex_lock_pi()                         futex_unlock_pi()
+  lock(hb->lock)
+  queue(hb_waiter)				lock(hb->lock)
+  lock(rtmutex->wait_lock)
+  unlock(hb->lock)
+                                        // acquired hb->lock
+                                        hb_waiter = futex_top_waiter()
+                                        lock(rtmutex->wait_lock)
+  __rt_mutex_proxy_start()
+     ---> fail
+          remove(rtmutex_waiter);
+     ---> returns -EDEADLOCK
+  unlock(rtmutex->wait_lock)
+                                        // acquired wait_lock
+                                        wake_futex_pi()
+                                        rt_mutex_next_owner()
+					  --> returns NULL
+                                          --> WARN
+
+  lock(hb->lock)
+  unqueue(hb_waiter)
+
+The problem is caused by the remove(rtmutex_waiter) in the failure case of
+__rt_mutex_proxy_start() as this lets the unlocker observe a waiter in the
+hash bucket but no waiter on the rtmutex, i.e. inconsistent state.
+
+The original commit handles this correctly for the other early return cases
+(timeout, signal) by delaying the removal of the rtmutex waiter until the
+returning task reacquired the hash bucket lock.
+
+Treat the failure case of __rt_mutex_proxy_start() in the same way and let
+the existing cleanup code handle the eventual handover of the rtmutex
+gracefully. The regular rt_mutex_proxy_start() gains the rtmutex waiter
+removal for the failure case, so that the other callsites are still
+operating correctly.
+
+Add proper comments to the code so all these details are fully documented.
+
+Thanks to Peter for helping with the analysis and writing the really
+valuable code comments.
+
+Fixes: 56222b212e8e ("futex: Drop hb->lock before enqueueing on the rtmutex")
+Reported-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+Co-developed-by: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Cc: linux-s390@vger.kernel.org
+Cc: Stefan Liebler <stli@linux.ibm.com>
+Cc: Sebastian Sewior <bigeasy@linutronix.de>
+Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/alpine.DEB.2.21.1901292311410.1950@nanos.tec.linutronix.de
+
+

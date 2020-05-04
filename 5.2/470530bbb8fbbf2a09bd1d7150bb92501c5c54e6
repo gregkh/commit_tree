@@ -1,0 +1,129 @@
+perf record: Implement --mmap-flush=<number> option
+
+Implement a --mmap-flush option that specifies minimal number of bytes
+that is extracted from mmaped kernel buffer to store into a trace. The
+default option value is 1 byte what means every time trace writing
+thread finds some new data in the mmaped buffer the data is extracted,
+possibly compressed and written to a trace.
+
+  $ tools/perf/perf record --mmap-flush 1024 -e cycles -- matrix.gcc
+  $ tools/perf/perf record --aio --mmap-flush 1K -e cycles -- matrix.gcc
+
+The option is independent from -z setting, doesn't vary with compression
+level and can serve two purposes.
+
+The first purpose is to increase the compression ratio of a trace data.
+Larger data chunks are compressed more effectively so the implemented
+option allows specifying data chunk size to compress. Also at some cases
+executing more write syscalls with smaller data size can take longer
+than executing less write syscalls with bigger data size due to syscall
+overhead so extracting bigger data chunks specified by the option value
+could additionally decrease runtime overhead.
+
+The second purpose is to avoid self monitoring live-lock issue in system
+wide (-a) profiling mode. Profiling in system wide mode with compression
+(-a -z) can additionally induce data into the kernel buffers along with
+the data from monitored processes. If performance data rate and volume
+from the monitored processes is high then trace streaming and
+compression activity in the tool is also high. High tool process
+activity can lead to subtle live-lock effect when compression of single
+new byte from some of mmaped kernel buffer leads to generation of the
+next single byte at some mmaped buffer. So perf tool process ends up in
+endless self monitoring.
+
+Implemented synch parameter is the mean to force data move independently
+from the specified flush threshold value. Despite the provided flush
+value the tool needs capability to unconditionally drain memory buffers,
+at least in the end of the collection.
+
+Committer testing:
+
+Running with the default value, i.e. as soon as there is something to
+read go on consuming, we first write the synthesized events, small
+chunks of about 128 bytes:
+
+  # perf trace -m 2048 --call-graph dwarf -e write -- perf record
+  <SNIP>
+     101.142 ( 0.004 ms): perf/25821 write(fd: 3</root/perf.data>, buf: 0x210db60, count: 120) = 120
+                                         __libc_write (/usr/lib64/libpthread-2.28.so)
+                                         ion (/home/acme/bin/perf)
+                                         record__write (inlined)
+                                         process_synthesized_event (/home/acme/bin/perf)
+                                         perf_tool__process_synth_event (inlined)
+                                         perf_event__synthesize_mmap_events (/home/acme/bin/perf)
+
+Then we move to reading the mmap buffers consuming the events put there
+by the kernel perf infrastructure:
+
+     107.561 ( 0.005 ms): perf/25821 write(fd: 3</root/perf.data>, buf: 0x7f1befc02000, count: 336) = 336
+                                         __libc_write (/usr/lib64/libpthread-2.28.so)
+                                         ion (/home/acme/bin/perf)
+                                         record__write (inlined)
+                                         record__pushfn (/home/acme/bin/perf)
+                                         perf_mmap__push (/home/acme/bin/perf)
+                                         record__mmap_read_evlist (inlined)
+                                         record__mmap_read_all (inlined)
+                                         __cmd_record (inlined)
+                                         cmd_record (/home/acme/bin/perf)
+     12919.953 ( 0.136 ms): perf/25821 write(fd: 3</root/perf.data>, buf: 0x7f1befc83150, count: 184984) = 184984
+  <SNIP same backtrace as in the 107.561 timestamp>
+     12920.094 ( 0.155 ms): perf/25821 write(fd: 3</root/perf.data>, buf: 0x7f1befc02150, count: 261816) = 261816
+  <SNIP same backtrace as in the 107.561 timestamp>
+     12920.253 ( 0.093 ms): perf/25821 write(fd: 3</root/perf.data>, buf: 0x7f1befb81120, count: 170832) = 170832
+  <SNIP same backtrace as in the 107.561 timestamp>
+
+If we limit it to write only when more than 16MB are available for
+reading, it throttles that to a quarter of the --mmap-pages set for
+'perf record', which by default get to 528384 bytes, found out using
+'record -v':
+
+  mmap flush: 132096
+  mmap size 528384B
+
+With that in place all the writes coming from
+record__mmap_read_evlist(), i.e. from the mmap buffers setup by the
+kernel perf infrastructure were at least 132096 bytes long.
+
+Trying with a bigger mmap size:
+
+   perf trace -e write perf record -v -m 2048 --mmap-flush 16M
+   74982.928 ( 2.471 ms): perf/26500 write(fd: 3</root/perf.data>, buf: 0x7ff94a6cc000, count: 3580888) = 3580888
+   74985.406 ( 2.353 ms): perf/26500 write(fd: 3</root/perf.data>, buf: 0x7ff949ecb000, count: 3453256) = 3453256
+   74987.764 ( 2.629 ms): perf/26500 write(fd: 3</root/perf.data>, buf: 0x7ff9496ca000, count: 3859232) = 3859232
+   74990.399 ( 2.341 ms): perf/26500 write(fd: 3</root/perf.data>, buf: 0x7ff948ec9000, count: 3769032) = 3769032
+   74992.744 ( 2.064 ms): perf/26500 write(fd: 3</root/perf.data>, buf: 0x7ff9486c8000, count: 3310520) = 3310520
+   74994.814 ( 2.619 ms): perf/26500 write(fd: 3</root/perf.data>, buf: 0x7ff947ec7000, count: 4194688) = 4194688
+   74997.439 ( 2.787 ms): perf/26500 write(fd: 3</root/perf.data>, buf: 0x7ff9476c6000, count: 4029760) = 4029760
+
+Was again limited to a quarter of the mmap size:
+
+  mmap flush: 2098176
+  mmap size 8392704B
+
+A warning about that would be good to have but can be added later,
+something like:
+
+  "max flush is a quarter of the mmap size, if wanting to bump the mmap
+   flush further, bump the mmap size as well using -m/--mmap-pages"
+
+Also rename the 'sync' parameters to 'synch' to keep tools/perf building
+with older glibcs:
+
+  cc1: warnings being treated as errors
+  builtin-record.c: In function 'record__mmap_read_evlist':
+  builtin-record.c:775: warning: declaration of 'sync' shadows a global declaration
+  /usr/include/unistd.h:933: warning: shadowed declaration is here
+  builtin-record.c: In function 'record__mmap_read_all':
+  builtin-record.c:856: warning: declaration of 'sync' shadows a global declaration
+  /usr/include/unistd.h:933: warning: shadowed declaration is here
+
+Signed-off-by: Alexey Budankov <alexey.budankov@linux.intel.com>
+Reviewed-by: Jiri Olsa <jolsa@kernel.org>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/f6600d72-ecfa-2eb7-7e51-f6954547d500@linux.intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

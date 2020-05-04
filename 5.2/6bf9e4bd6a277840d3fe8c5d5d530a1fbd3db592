@@ -1,0 +1,72 @@
+btrfs: inode: Verify inode mode to avoid NULL pointer dereference
+
+[BUG]
+When accessing a file on a crafted image, btrfs can crash in block layer:
+
+  BUG: unable to handle kernel NULL pointer dereference at 0000000000000008
+  PGD 136501067 P4D 136501067 PUD 124519067 PMD 0
+  CPU: 3 PID: 0 Comm: swapper/3 Not tainted 5.0.0-rc8-default #252
+  RIP: 0010:end_bio_extent_readpage+0x144/0x700
+  Call Trace:
+   <IRQ>
+   blk_update_request+0x8f/0x350
+   blk_mq_end_request+0x1a/0x120
+   blk_done_softirq+0x99/0xc0
+   __do_softirq+0xc7/0x467
+   irq_exit+0xd1/0xe0
+   call_function_single_interrupt+0xf/0x20
+   </IRQ>
+  RIP: 0010:default_idle+0x1e/0x170
+
+[CAUSE]
+The crafted image has a tricky corruption, the INODE_ITEM has a
+different type against its parent dir:
+
+        item 20 key (268 INODE_ITEM 0) itemoff 2808 itemsize 160
+                generation 13 transid 13 size 1048576 nbytes 1048576
+                block group 0 mode 121644 links 1 uid 0 gid 0 rdev 0
+                sequence 9 flags 0x0(none)
+
+This mode number 0120000 means it's a symlink.
+
+But the dir item think it's still a regular file:
+
+        item 8 key (264 DIR_INDEX 5) itemoff 3707 itemsize 32
+                location key (268 INODE_ITEM 0) type FILE
+                transid 13 data_len 0 name_len 2
+                name: f4
+        item 40 key (264 DIR_ITEM 51821248) itemoff 1573 itemsize 32
+                location key (268 INODE_ITEM 0) type FILE
+                transid 13 data_len 0 name_len 2
+                name: f4
+
+For symlink, we don't set BTRFS_I(inode)->io_tree.ops and leave it
+empty, as symlink is only designed to have inlined extent, all handled
+by tree block read.  Thus no need to trigger btrfs_submit_bio_hook() for
+inline file extent.
+
+However end_bio_extent_readpage() expects tree->ops populated, as it's
+reading regular data extent.  This causes NULL pointer dereference.
+
+[FIX]
+This patch fixes the problem in two ways:
+
+- Verify inode mode against its dir item when looking up inode
+  So in btrfs_lookup_dentry() if we find inode mode mismatch with dir
+  item, we error out so that corrupted inode will not be accessed.
+
+- Verify inode mode when getting extent mapping
+  Only regular file should have regular or preallocated extent.
+  If we found regular/preallocated file extent for symlink or
+  the rest, we error out before submitting the read bio.
+
+With this fix that crafted image can be rejected gracefully:
+
+  BTRFS critical (device loop0): inode mode mismatch with dir: inode mode=0121644 btrfs type=7 dir type=1
+
+Reported-by: Yoon Jungyeon <jungyeon@gatech.edu>
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=202763
+Reviewed-by: Nikolay Borisov <nborisov@suse.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

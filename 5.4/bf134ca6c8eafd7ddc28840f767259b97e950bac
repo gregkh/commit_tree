@@ -1,0 +1,90 @@
+perf augmented_raw_syscalls: Switch to using BPF_MAP_TYPE_PROG_ARRAY
+
+Trying to control what arguments to copy, which ones were strings, etc
+all from userspace via maps went nowhere, lots of difficulties to get
+the verifier satisfied, so use what the fine BPF guys designed for such
+a syscall handling mechanism: bpf_tail_call + BPF_MAP_TYPE_PROG_ARRAY.
+
+The series leading to this should have explained it thoroughly, but the
+end result, explained via gdb should help understand this:
+
+  Breakpoint 1, syscall_arg__scnprintf_filename (bf=0xc002b1 "", size=2031, arg=0x7fffffff7970) at builtin-trace.c:1268
+  1268	{
+  (gdb) n
+  1269		unsigned long ptr = arg->val;
+  (gdb) n
+  1271		if (arg->augmented.args)
+  (gdb) n
+  1272			return syscall_arg__scnprintf_augmented_string(arg, bf, size);
+  (gdb) s
+  syscall_arg__scnprintf_augmented_string (arg=0x7fffffff7970, bf=0xc002b1 "", size=2031) at builtin-trace.c:1251
+  1251	{
+  (gdb) n
+  1252		struct augmented_arg *augmented_arg = arg->augmented.args;
+  (gdb) n
+  1253		size_t printed = scnprintf(bf, size, "\"%.*s\"", augmented_arg->size, augmented_arg->value);
+  (gdb) n
+  1258		int consumed = sizeof(*augmented_arg) + augmented_arg->size;
+  (gdb) p bf
+  $1 = 0xc002b1 "\"/etc/ld.so.cache\""
+  (gdb) bt
+  #0  syscall_arg__scnprintf_augmented_string (arg=0x7fffffff7970, bf=0xc002b1 "\"/etc/ld.so.cache\"", size=2031) at builtin-trace.c:1258
+  #1  0x0000000000492634 in syscall_arg__scnprintf_filename (bf=0xc002b1 "\"/etc/ld.so.cache\"", size=2031, arg=0x7fffffff7970) at builtin-trace.c:1272
+  #2  0x0000000000493cd7 in syscall__scnprintf_val (sc=0xc0de68, bf=0xc002b1 "\"/etc/ld.so.cache\"", size=2031, arg=0x7fffffff7970, val=140737354091036) at builtin-trace.c:1689
+  #3  0x000000000049404f in syscall__scnprintf_args (sc=0xc0de68, bf=0xc002a7 "AT_FDCWD, \"/etc/ld.so.cache\"", size=2041, args=0x7ffff6cbf1ec "\234\377\377\377", augmented_args=0x7ffff6cbf21c, augmented_args_size=28, trace=0x7fffffffa170,
+      thread=0xbff940) at builtin-trace.c:1756
+  #4  0x0000000000494a97 in trace__sys_enter (trace=0x7fffffffa170, evsel=0xbe1900, event=0x7ffff6cbf1a0, sample=0x7fffffff7b00) at builtin-trace.c:1975
+  #5  0x0000000000496ff1 in trace__handle_event (trace=0x7fffffffa170, event=0x7ffff6cbf1a0, sample=0x7fffffff7b00) at builtin-trace.c:2685
+  #6  0x0000000000497edb in __trace__deliver_event (trace=0x7fffffffa170, event=0x7ffff6cbf1a0) at builtin-trace.c:3029
+  #7  0x000000000049801e in trace__deliver_event (trace=0x7fffffffa170, event=0x7ffff6cbf1a0) at builtin-trace.c:3056
+  #8  0x00000000004988de in trace__run (trace=0x7fffffffa170, argc=2, argv=0x7fffffffd660) at builtin-trace.c:3258
+  #9  0x000000000049c2d3 in cmd_trace (argc=2, argv=0x7fffffffd660) at builtin-trace.c:4220
+  #10 0x00000000004dcb6c in run_builtin (p=0xa18e00 <commands+576>, argc=5, argv=0x7fffffffd660) at perf.c:304
+  #11 0x00000000004dcdd9 in handle_internal_command (argc=5, argv=0x7fffffffd660) at perf.c:356
+  #12 0x00000000004dcf20 in run_argv (argcp=0x7fffffffd4bc, argv=0x7fffffffd4b0) at perf.c:400
+  #13 0x00000000004dd28c in main (argc=5, argv=0x7fffffffd660) at perf.c:522
+  (gdb)
+  (gdb) continue
+  Continuing.
+  openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+
+Now its a matter of automagically assigning the BPF programs copying
+syscall arg pointers to functions that are "open"-like (i.e. that need
+only the first syscall arg copied as a string), or "openat"-like (2nd
+arg, etc).
+
+End result in tool output:
+
+  # perf trace -e open* ls /tmp/notthere
+  LLVM: dumping /home/acme/git/perf/tools/perf/examples/bpf/augmented_raw_syscalls.o
+  openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+  openat(AT_FDCWD, "/lib64/libselinux.so.1", O_RDONLY|O_CLOEXEC) = 3
+  openat(AT_FDCWD, "/lib64/libcap.so.2", O_RDONLY|O_CLOEXEC) = 3
+  openat(AT_FDCWD, "/lib64/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+  openat(AT_FDCWD, "/lib64/libpcre2-8.so.0", O_RDONLY|O_CLOEXEC) = 3
+  openat(AT_FDCWD, "/lib64/libdl.so.2", O_RDONLY|O_CLOEXEC) = 3
+  openat(AT_FDCWD, "/lib64/libpthread.so.0", O_RDONLY|O_CLOEXEC) = 3
+  openat(AT_FDCWD, "", O_RDONLY|O_CLOEXEC) = 3
+  openat(AT_FDCWD, "/usr/share/locale/locale.alias", O_RDONLY|O_CLOEXEC) = 3
+  openat(AT_FDCWD, "/usr/share/locale/en_US.UTF-8/LC_MESSAGES/coreutils.mo", O_RDONLY) = ls: cannot access '/tmp/notthere'-1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en_US.utf8/LC_MESSAGES/coreutils.mo", O_RDONLY) = -1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en_US/LC_MESSAGES/coreutils.mo", O_RDONLY) = -1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en.UTF-8/LC_MESSAGES/coreutils.mo", O_RDONLY) = -1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en.utf8/LC_MESSAGES/coreutils.mo", O_RDONLY) = -1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en/LC_MESSAGES/coreutils.mo", O_RDONLY: No such file or directory) =
+  -1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en_US.UTF-8/LC_MESSAGES/libc.mo", O_RDONLY) = -1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en_US.utf8/LC_MESSAGES/libc.mo", O_RDONLY) = -1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en_US/LC_MESSAGES/libc.mo", O_RDONLY) = -1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en.UTF-8/LC_MESSAGES/libc.mo", O_RDONLY) = -1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en.utf8/LC_MESSAGES/libc.mo", O_RDONLY) = -1 ENOENT (No such file or directory)
+  openat(AT_FDCWD, "/usr/share/locale/en/LC_MESSAGES/libc.mo", O_RDONLY) = -1 ENOENT (No such file or directory)
+  #
+
+Cc: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Luis Cláudio Gonçalves <lclaudio@redhat.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/n/tip-snc7ry99cl6r0pqaspjim98x@git.kernel.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

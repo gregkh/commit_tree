@@ -1,0 +1,99 @@
+bpf: Fix precision tracking for unbounded scalars
+
+Anatoly has been fuzzing with kBdysch harness and reported a hang in one
+of the outcomes. Upon closer analysis, it turns out that precise scalar
+value tracking is missing a few precision markings for unknown scalars:
+
+  0: R1=ctx(id=0,off=0,imm=0) R10=fp0
+  0: (b7) r0 = 0
+  1: R0_w=invP0 R1=ctx(id=0,off=0,imm=0) R10=fp0
+  1: (35) if r0 >= 0xf72e goto pc+0
+  --> only follow fallthrough
+  2: R0_w=invP0 R1=ctx(id=0,off=0,imm=0) R10=fp0
+  2: (35) if r0 >= 0x80fe0000 goto pc+0
+  --> only follow fallthrough
+  3: R0_w=invP0 R1=ctx(id=0,off=0,imm=0) R10=fp0
+  3: (14) w0 -= -536870912
+  4: R0_w=invP536870912 R1=ctx(id=0,off=0,imm=0) R10=fp0
+  4: (0f) r1 += r0
+  5: R0_w=invP536870912 R1_w=inv(id=0) R10=fp0
+  5: (55) if r1 != 0x104c1500 goto pc+0
+  --> push other branch for later analysis
+  R0_w=invP536870912 R1_w=inv273421568 R10=fp0
+  6: R0_w=invP536870912 R1_w=inv273421568 R10=fp0
+  6: (b7) r0 = 0
+  7: R0=invP0 R1=inv273421568 R10=fp0
+  7: (76) if w1 s>= 0xffffff00 goto pc+3
+  --> only follow goto
+  11: R0=invP0 R1=inv273421568 R10=fp0
+  11: (95) exit
+  6: R0_w=invP536870912 R1_w=inv(id=0) R10=fp0
+  6: (b7) r0 = 0
+  propagating r0
+  7: safe
+  processed 11 insns [...]
+
+In the analysis of the second path coming after the successful exit above,
+the path is being pruned at line 7. Pruning analysis found that both r0 are
+precise P0 and both R1 are non-precise scalars and given prior path with
+R1 as non-precise scalar succeeded, this one is therefore safe as well.
+
+However, problem is that given condition at insn 7 in the first run, we only
+followed goto and didn't push the other branch for later analysis, we've
+never walked the few insns in there and therefore dead-code sanitation
+rewrites it as goto pc-1, causing the hang depending on the skb address
+hitting these conditions. The issue is that R1 should have been marked as
+precise as well such that pruning enforces range check and conluded that new
+R1 is not in range of old R1. In insn 4, we mark R1 (skb) as unknown scalar
+via __mark_reg_unbounded() but not mark_reg_unbounded() and therefore
+regs->precise remains as false.
+
+Back in b5dc0163d8fd ("bpf: precise scalar_value tracking"), this was not
+the case since marking out of __mark_reg_unbounded() had this covered as well.
+Once in both are set as precise in 4 as they should have been, we conclude
+that given R1 was in prior fall-through path 0x104c1500 and now is completely
+unknown, the check at insn 7 concludes that we need to continue walking.
+Analysis after the fix:
+
+  0: R1=ctx(id=0,off=0,imm=0) R10=fp0
+  0: (b7) r0 = 0
+  1: R0_w=invP0 R1=ctx(id=0,off=0,imm=0) R10=fp0
+  1: (35) if r0 >= 0xf72e goto pc+0
+  2: R0_w=invP0 R1=ctx(id=0,off=0,imm=0) R10=fp0
+  2: (35) if r0 >= 0x80fe0000 goto pc+0
+  3: R0_w=invP0 R1=ctx(id=0,off=0,imm=0) R10=fp0
+  3: (14) w0 -= -536870912
+  4: R0_w=invP536870912 R1=ctx(id=0,off=0,imm=0) R10=fp0
+  4: (0f) r1 += r0
+  5: R0_w=invP536870912 R1_w=invP(id=0) R10=fp0
+  5: (55) if r1 != 0x104c1500 goto pc+0
+  R0_w=invP536870912 R1_w=invP273421568 R10=fp0
+  6: R0_w=invP536870912 R1_w=invP273421568 R10=fp0
+  6: (b7) r0 = 0
+  7: R0=invP0 R1=invP273421568 R10=fp0
+  7: (76) if w1 s>= 0xffffff00 goto pc+3
+  11: R0=invP0 R1=invP273421568 R10=fp0
+  11: (95) exit
+  6: R0_w=invP536870912 R1_w=invP(id=0) R10=fp0
+  6: (b7) r0 = 0
+  7: R0_w=invP0 R1_w=invP(id=0) R10=fp0
+  7: (76) if w1 s>= 0xffffff00 goto pc+3
+  R0_w=invP0 R1_w=invP(id=0) R10=fp0
+  8: R0_w=invP0 R1_w=invP(id=0) R10=fp0
+  8: (a5) if r0 < 0x2007002a goto pc+0
+  9: R0_w=invP0 R1_w=invP(id=0) R10=fp0
+  9: (57) r0 &= -16316416
+  10: R0_w=invP0 R1_w=invP(id=0) R10=fp0
+  10: (a6) if w0 < 0x1201 goto pc+0
+  11: R0_w=invP0 R1_w=invP(id=0) R10=fp0
+  11: (95) exit
+  11: R0=invP0 R1=invP(id=0) R10=fp0
+  11: (95) exit
+  processed 16 insns [...]
+
+Fixes: 6754172c208d ("bpf: fix precision tracking in presence of bpf2bpf calls")
+Reported-by: Anatoly Trosinenko <anatoly.trosinenko@gmail.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20191222223740.25297-1-daniel@iogearbox.net
+

@@ -1,0 +1,134 @@
+Btrfs: fix missing data checksums after replaying a log tree
+
+When logging a file that has shared extents (reflinked with other files or
+with itself), we can end up logging multiple checksum items that cover
+overlapping ranges. This confuses the search for checksums at log replay
+time causing some checksums to never be added to the fs/subvolume tree.
+
+Consider the following example of a file that shares the same extent at
+offsets 0 and 256Kb:
+
+   [ bytenr 13893632, offset 64Kb, len 64Kb  ]
+   0                                         64Kb
+
+   [ bytenr 13631488, offset 64Kb, len 192Kb ]
+   64Kb                                      256Kb
+
+   [ bytenr 13893632, offset 0, len 256Kb    ]
+   256Kb                                     512Kb
+
+When logging the inode, at tree-log.c:copy_items(), when processing the
+file extent item at offset 0, we log a checksum item covering the range
+13959168 to 14024704, which corresponds to 13893632 + 64Kb and 13893632 +
+64Kb + 64Kb, respectively.
+
+Later when processing the extent item at offset 256K, we log the checksums
+for the range from 13893632 to 14155776 (which corresponds to 13893632 +
+256Kb). These checksums get merged with the checksum item for the range
+from 13631488 to 13893632 (13631488 + 256Kb), logged by a previous fsync.
+So after this we get the two following checksum items in the log tree:
+
+   (...)
+   item 6 key (EXTENT_CSUM EXTENT_CSUM 13631488) itemoff 3095 itemsize 512
+           range start 13631488 end 14155776 length 524288
+   item 7 key (EXTENT_CSUM EXTENT_CSUM 13959168) itemoff 3031 itemsize 64
+           range start 13959168 end 14024704 length 65536
+
+The first one covers the range from the second one, they overlap.
+
+So far this does not cause a problem after replaying the log, because
+when replaying the file extent item for offset 256K, we copy all the
+checksums for the extent 13893632 from the log tree to the fs/subvolume
+tree, since searching for an checksum item for bytenr 13893632 leaves us
+at the first checksum item, which covers the whole range of the extent.
+
+However if we write 64Kb to file offset 256Kb for example, we will
+not be able to find and copy the checksums for the last 128Kb of the
+extent at bytenr 13893632, referenced by the file range 384Kb to 512Kb.
+
+After writing 64Kb into file offset 256Kb we get the following extent
+layout for our file:
+
+   [ bytenr 13893632, offset 64K, len 64Kb   ]
+   0                                         64Kb
+
+   [ bytenr 13631488, offset 64Kb, len 192Kb ]
+   64Kb                                      256Kb
+
+   [ bytenr 14155776, offset 0, len 64Kb     ]
+   256Kb                                     320Kb
+
+   [ bytenr 13893632, offset 64Kb, len 192Kb ]
+   320Kb                                     512Kb
+
+After fsync'ing the file, if we have a power failure and then mount
+the filesystem to replay the log, the following happens:
+
+1) When replaying the file extent item for file offset 320Kb, we
+   lookup for the checksums for the extent range from 13959168
+   (13893632 + 64Kb) to 14155776 (13893632 + 256Kb), through a call
+   to btrfs_lookup_csums_range();
+
+2) btrfs_lookup_csums_range() finds the checksum item that starts
+   precisely at offset 13959168 (item 7 in the log tree, shown before);
+
+3) However that checksum item only covers 64Kb of data, and not 192Kb
+   of data;
+
+4) As a result only the checksums for the first 64Kb of data referenced
+   by the file extent item are found and copied to the fs/subvolume tree.
+   The remaining 128Kb of data, file range 384Kb to 512Kb, doesn't get
+   the corresponding data checksums found and copied to the fs/subvolume
+   tree.
+
+5) After replaying the log userspace will not be able to read the file
+   range from 384Kb to 512Kb, because the checksums are missing and
+   resulting in an -EIO error.
+
+The following steps reproduce this scenario:
+
+  $ mkfs.btrfs -f /dev/sdc
+  $ mount /dev/sdc /mnt/sdc
+
+  $ xfs_io -f -c "pwrite -S 0xa3 0 256K" /mnt/sdc/foobar
+  $ xfs_io -c "fsync" /mnt/sdc/foobar
+  $ xfs_io -c "pwrite -S 0xc7 256K 256K" /mnt/sdc/foobar
+
+  $ xfs_io -c "reflink /mnt/sdc/foobar 320K 0 64K" /mnt/sdc/foobar
+  $ xfs_io -c "fsync" /mnt/sdc/foobar
+
+  $ xfs_io -c "pwrite -S 0xe5 256K 64K" /mnt/sdc/foobar
+  $ xfs_io -c "fsync" /mnt/sdc/foobar
+
+  <power failure>
+
+  $ mount /dev/sdc /mnt/sdc
+  $ md5sum /mnt/sdc/foobar
+  md5sum: /mnt/sdc/foobar: Input/output error
+
+  $ dmesg | tail
+  [165305.003464] BTRFS info (device sdc): no csum found for inode 257 start 401408
+  [165305.004014] BTRFS info (device sdc): no csum found for inode 257 start 405504
+  [165305.004559] BTRFS info (device sdc): no csum found for inode 257 start 409600
+  [165305.005101] BTRFS info (device sdc): no csum found for inode 257 start 413696
+  [165305.005627] BTRFS info (device sdc): no csum found for inode 257 start 417792
+  [165305.006134] BTRFS info (device sdc): no csum found for inode 257 start 421888
+  [165305.006625] BTRFS info (device sdc): no csum found for inode 257 start 425984
+  [165305.007278] BTRFS info (device sdc): no csum found for inode 257 start 430080
+  [165305.008248] BTRFS warning (device sdc): csum failed root 5 ino 257 off 393216 csum 0x1337385e expected csum 0x00000000 mirror 1
+  [165305.009550] BTRFS warning (device sdc): csum failed root 5 ino 257 off 393216 csum 0x1337385e expected csum 0x00000000 mirror 1
+
+Fix this simply by deleting first any checksums, from the log tree, for the
+range of the extent we are logging at copy_items(). This ensures we do not
+get checksum items in the log tree that have overlapping ranges.
+
+This is a long time issue that has been present since we have the clone
+(and deduplication) ioctl, and can happen both when an extent is shared
+between different files and within the same file.
+
+A test case for fstests follows soon.
+
+CC: stable@vger.kernel.org # 4.4+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

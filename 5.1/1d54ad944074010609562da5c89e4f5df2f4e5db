@@ -1,0 +1,59 @@
+perf/core: Fix perf_event_disable_inatomic() race
+
+Thomas-Mich Richter reported he triggered a WARN()ing from event_function_local()
+on his s390. The problem boils down to:
+
+	CPU-A				CPU-B
+
+	perf_event_overflow()
+	  perf_event_disable_inatomic()
+	    @pending_disable = 1
+	    irq_work_queue();
+
+	sched-out
+	  event_sched_out()
+	    @pending_disable = 0
+
+					sched-in
+					perf_event_overflow()
+					  perf_event_disable_inatomic()
+					    @pending_disable = 1;
+					    irq_work_queue(); // FAILS
+
+	irq_work_run()
+	  perf_pending_event()
+	    if (@pending_disable)
+	      perf_event_disable_local(); // WHOOPS
+
+The problem exists in generic, but s390 is particularly sensitive
+because it doesn't implement arch_irq_work_raise(), nor does it call
+irq_work_run() from it's PMU interrupt handler (nor would that be
+sufficient in this case, because s390 also generates
+perf_event_overflow() from pmu::stop). Add to that the fact that s390
+is a virtual architecture and (virtual) CPU-A can stall long enough
+for the above race to happen, even if it would self-IPI.
+
+Adding a irq_work_sync() to event_sched_in() would work for all hardare
+PMUs that properly use irq_work_run() but fails for software PMUs.
+
+Instead encode the CPU number in @pending_disable, such that we can
+tell which CPU requested the disable. This then allows us to detect
+the above scenario and even redirect the IPI to make up for the failed
+queue.
+
+Reported-by: Thomas-Mich Richter <tmricht@linux.ibm.com>
+Tested-by: Thomas Richter <tmricht@linux.ibm.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Mark Rutland <mark.rutland@arm.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+Cc: Hendrik Brueckner <brueckner@linux.ibm.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

@@ -1,0 +1,132 @@
+nf_tables: Add set type for arbitrary concatenation of ranges
+
+This new set type allows for intervals in concatenated fields,
+which are expressed in the usual way, that is, simple byte
+concatenation with padding to 32 bits for single fields, and
+given as ranges by specifying start and end elements containing,
+each, the full concatenation of start and end values for the
+single fields.
+
+Ranges are expanded to composing netmasks, for each field: these
+are inserted as rules in per-field lookup tables. Bits to be
+classified are divided in 4-bit groups, and for each group, the
+lookup table contains 4^2 buckets, representing all the possible
+values of a bit group. This approach was inspired by the Grouper
+algorithm:
+	http://www.cse.usf.edu/~ligatti/projects/grouper/
+
+Matching is performed by a sequence of AND operations between
+bucket values, with buckets selected according to the value of
+packet bits, for each group. The result of this sequence tells
+us which rules matched for a given field.
+
+In order to concatenate several ranged fields, per-field rules
+are mapped using mapping arrays, one per field, that specify
+which rules should be considered while matching the next field.
+The mapping array for the last field contains a reference to
+the element originally inserted.
+
+The notes in nft_set_pipapo.c cover the algorithm in deeper
+detail.
+
+A pure hash-based approach is of no use here, as ranges need
+to be classified. An implementation based on "proxying" the
+existing red-black tree set type, creating a tree for each
+field, was considered, but deemed impractical due to the fact
+that elements would need to be shared between trees, at least
+as long as we want to keep UAPI changes to a minimum.
+
+A stand-alone implementation of this algorithm is available at:
+	https://pipapo.lameexcu.se
+together with notes about possible future optimisations
+(in pipapo.c).
+
+This algorithm was designed with data locality in mind, and can
+be highly optimised for SIMD instruction sets, as the bulk of
+the matching work is done with repetitive, simple bitwise
+operations.
+
+At this point, without further optimisations, nft_concat_range.sh
+reports, for one AMD Epyc 7351 thread (2.9GHz, 512 KiB L1D$, 8 MiB
+L2$):
+
+TEST: performance
+  net,port                                                      [ OK ]
+    baseline (drop from netdev hook):              10190076pps
+    baseline hash (non-ranged entries):             6179564pps
+    baseline rbtree (match on first field only):    2950341pps
+    set with  1000 full, ranged entries:            2304165pps
+  port,net                                                      [ OK ]
+    baseline (drop from netdev hook):              10143615pps
+    baseline hash (non-ranged entries):             6135776pps
+    baseline rbtree (match on first field only):    4311934pps
+    set with   100 full, ranged entries:            4131471pps
+  net6,port                                                     [ OK ]
+    baseline (drop from netdev hook):               9730404pps
+    baseline hash (non-ranged entries):             4809557pps
+    baseline rbtree (match on first field only):    1501699pps
+    set with  1000 full, ranged entries:            1092557pps
+  port,proto                                                    [ OK ]
+    baseline (drop from netdev hook):              10812426pps
+    baseline hash (non-ranged entries):             6929353pps
+    baseline rbtree (match on first field only):    3027105pps
+    set with 30000 full, ranged entries:             284147pps
+  net6,port,mac                                                 [ OK ]
+    baseline (drop from netdev hook):               9660114pps
+    baseline hash (non-ranged entries):             3778877pps
+    baseline rbtree (match on first field only):    3179379pps
+    set with    10 full, ranged entries:            2082880pps
+  net6,port,mac,proto                                           [ OK ]
+    baseline (drop from netdev hook):               9718324pps
+    baseline hash (non-ranged entries):             3799021pps
+    baseline rbtree (match on first field only):    1506689pps
+    set with  1000 full, ranged entries:             783810pps
+  net,mac                                                       [ OK ]
+    baseline (drop from netdev hook):              10190029pps
+    baseline hash (non-ranged entries):             5172218pps
+    baseline rbtree (match on first field only):    2946863pps
+    set with  1000 full, ranged entries:            1279122pps
+
+v4:
+ - fix build for 32-bit architectures: 64-bit division needs
+   div_u64() (kbuild test robot <lkp@intel.com>)
+v3:
+ - rework interface for field length specification,
+   NFT_SET_SUBKEY disappears and information is stored in
+   description
+ - remove scratch area to store closing element of ranges,
+   as elements now come with an actual attribute to specify
+   the upper range limit (Pablo Neira Ayuso)
+ - also remove pointer to 'start' element from mapping table,
+   closing key is now accessible via extension data
+ - use bytes right away instead of bits for field lengths,
+   this way we can also double the inner loop of the lookup
+   function to take care of upper and lower bits in a single
+   iteration (minor performance improvement)
+ - make it clearer that set operations are actually atomic
+   API-wise, but we can't e.g. implement flush() as one-shot
+   action
+ - fix type for 'dup' in nft_pipapo_insert(), check for
+   duplicates only in the next generation, and in general take
+   care of differentiating generation mask cases depending on
+   the operation (Pablo Neira Ayuso)
+ - report C implementation matching rate in commit message, so
+   that AVX2 implementation can be compared (Pablo Neira Ayuso)
+v2:
+ - protect access to scratch maps in nft_pipapo_lookup() with
+   local_bh_disable/enable() (Florian Westphal)
+ - drop rcu_read_lock/unlock() from nft_pipapo_lookup(), it's
+   already implied (Florian Westphal)
+ - explain why partial allocation failures don't need handling
+   in pipapo_realloc_scratch(), rename 'm' to clone and update
+   related kerneldoc to make it clear we're not operating on
+   the live copy (Florian Westphal)
+ - add expicit check for priv->start_elem in
+   nft_pipapo_insert() to avoid ending up in nft_pipapo_walk()
+   with a NULL start element, and also zero it out in every
+   operation that might make it invalid, so that insertion
+   doesn't proceed with an invalid element (Florian Westphal)
+
+Signed-off-by: Stefano Brivio <sbrivio@redhat.com>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+

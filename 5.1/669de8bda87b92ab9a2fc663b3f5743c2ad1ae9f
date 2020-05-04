@@ -1,0 +1,129 @@
+kernel/workqueue: Use dynamic lockdep keys for workqueues
+
+The following commit:
+
+  87915adc3f0a ("workqueue: re-add lockdep dependencies for flushing")
+
+improved deadlock checking in the workqueue implementation. Unfortunately
+that patch also introduced a few false positive lockdep complaints.
+
+This patch suppresses these false positives by allocating the workqueue mutex
+lockdep key dynamically.
+
+An example of a false positive lockdep complaint suppressed by this patch
+can be found below. The root cause of the lockdep complaint shown below
+is that the direct I/O code can call alloc_workqueue() from inside a work
+item created by another alloc_workqueue() call and that both workqueues
+share the same lockdep key. This patch avoids that that lockdep complaint
+is triggered by allocating the work queue lockdep keys dynamically.
+
+In other words, this patch guarantees that a unique lockdep key is
+associated with each work queue mutex.
+
+  ======================================================
+  WARNING: possible circular locking dependency detected
+  4.19.0-dbg+ #1 Not tainted
+  fio/4129 is trying to acquire lock:
+  00000000a01cfe1a ((wq_completion)"dio/%s"sb->s_id){+.+.}, at: flush_workqueue+0xd0/0x970
+
+  but task is already holding lock:
+  00000000a0acecf9 (&sb->s_type->i_mutex_key#14){+.+.}, at: ext4_file_write_iter+0x154/0x710
+
+  which lock already depends on the new lock.
+
+  the existing dependency chain (in reverse order) is:
+
+  -> #2 (&sb->s_type->i_mutex_key#14){+.+.}:
+         down_write+0x3d/0x80
+         __generic_file_fsync+0x77/0xf0
+         ext4_sync_file+0x3c9/0x780
+         vfs_fsync_range+0x66/0x100
+         dio_complete+0x2f5/0x360
+         dio_aio_complete_work+0x1c/0x20
+         process_one_work+0x481/0x9f0
+         worker_thread+0x63/0x5a0
+         kthread+0x1cf/0x1f0
+         ret_from_fork+0x24/0x30
+
+  -> #1 ((work_completion)(&dio->complete_work)){+.+.}:
+         process_one_work+0x447/0x9f0
+         worker_thread+0x63/0x5a0
+         kthread+0x1cf/0x1f0
+         ret_from_fork+0x24/0x30
+
+  -> #0 ((wq_completion)"dio/%s"sb->s_id){+.+.}:
+         lock_acquire+0xc5/0x200
+         flush_workqueue+0xf3/0x970
+         drain_workqueue+0xec/0x220
+         destroy_workqueue+0x23/0x350
+         sb_init_dio_done_wq+0x6a/0x80
+         do_blockdev_direct_IO+0x1f33/0x4be0
+         __blockdev_direct_IO+0x79/0x86
+         ext4_direct_IO+0x5df/0xbb0
+         generic_file_direct_write+0x119/0x220
+         __generic_file_write_iter+0x131/0x2d0
+         ext4_file_write_iter+0x3fa/0x710
+         aio_write+0x235/0x330
+         io_submit_one+0x510/0xeb0
+         __x64_sys_io_submit+0x122/0x340
+         do_syscall_64+0x71/0x220
+         entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+  other info that might help us debug this:
+
+  Chain exists of:
+    (wq_completion)"dio/%s"sb->s_id --> (work_completion)(&dio->complete_work) --> &sb->s_type->i_mutex_key#14
+
+   Possible unsafe locking scenario:
+
+         CPU0                    CPU1
+         ----                    ----
+    lock(&sb->s_type->i_mutex_key#14);
+                                 lock((work_completion)(&dio->complete_work));
+                                 lock(&sb->s_type->i_mutex_key#14);
+    lock((wq_completion)"dio/%s"sb->s_id);
+
+   *** DEADLOCK ***
+
+  1 lock held by fio/4129:
+   #0: 00000000a0acecf9 (&sb->s_type->i_mutex_key#14){+.+.}, at: ext4_file_write_iter+0x154/0x710
+
+  stack backtrace:
+  CPU: 3 PID: 4129 Comm: fio Not tainted 4.19.0-dbg+ #1
+  Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1 04/01/2014
+  Call Trace:
+   dump_stack+0x86/0xc5
+   print_circular_bug.isra.32+0x20a/0x218
+   __lock_acquire+0x1c68/0x1cf0
+   lock_acquire+0xc5/0x200
+   flush_workqueue+0xf3/0x970
+   drain_workqueue+0xec/0x220
+   destroy_workqueue+0x23/0x350
+   sb_init_dio_done_wq+0x6a/0x80
+   do_blockdev_direct_IO+0x1f33/0x4be0
+   __blockdev_direct_IO+0x79/0x86
+   ext4_direct_IO+0x5df/0xbb0
+   generic_file_direct_write+0x119/0x220
+   __generic_file_write_iter+0x131/0x2d0
+   ext4_file_write_iter+0x3fa/0x710
+   aio_write+0x235/0x330
+   io_submit_one+0x510/0xeb0
+   __x64_sys_io_submit+0x122/0x340
+   do_syscall_64+0x71/0x220
+   entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Johannes Berg <johannes.berg@intel.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Waiman Long <longman@redhat.com>
+Cc: Will Deacon <will.deacon@arm.com>
+Link: https://lkml.kernel.org/r/20190214230058.196511-20-bvanassche@acm.org
+[ Reworked the changelog a bit. ]
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

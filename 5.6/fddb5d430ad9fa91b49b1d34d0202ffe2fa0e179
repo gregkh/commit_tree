@@ -1,0 +1,128 @@
+open: introduce openat2(2) syscall
+
+/* Background. */
+For a very long time, extending openat(2) with new features has been
+incredibly frustrating. This stems from the fact that openat(2) is
+possibly the most famous counter-example to the mantra "don't silently
+accept garbage from userspace" -- it doesn't check whether unknown flags
+are present[1].
+
+This means that (generally) the addition of new flags to openat(2) has
+been fraught with backwards-compatibility issues (O_TMPFILE has to be
+defined as __O_TMPFILE|O_DIRECTORY|[O_RDWR or O_WRONLY] to ensure old
+kernels gave errors, since it's insecure to silently ignore the
+flag[2]). All new security-related flags therefore have a tough road to
+being added to openat(2).
+
+Userspace also has a hard time figuring out whether a particular flag is
+supported on a particular kernel. While it is now possible with
+contemporary kernels (thanks to [3]), older kernels will expose unknown
+flag bits through fcntl(F_GETFL). Giving a clear -EINVAL during
+openat(2) time matches modern syscall designs and is far more
+fool-proof.
+
+In addition, the newly-added path resolution restriction LOOKUP flags
+(which we would like to expose to user-space) don't feel related to the
+pre-existing O_* flag set -- they affect all components of path lookup.
+We'd therefore like to add a new flag argument.
+
+Adding a new syscall allows us to finally fix the flag-ignoring problem,
+and we can make it extensible enough so that we will hopefully never
+need an openat3(2).
+
+/* Syscall Prototype. */
+  /*
+   * open_how is an extensible structure (similar in interface to
+   * clone3(2) or sched_setattr(2)). The size parameter must be set to
+   * sizeof(struct open_how), to allow for future extensions. All future
+   * extensions will be appended to open_how, with their zero value
+   * acting as a no-op default.
+   */
+  struct open_how { /* ... */ };
+
+  int openat2(int dfd, const char *pathname,
+              struct open_how *how, size_t size);
+
+/* Description. */
+The initial version of 'struct open_how' contains the following fields:
+
+  flags
+    Used to specify openat(2)-style flags. However, any unknown flag
+    bits or otherwise incorrect flag combinations (like O_PATH|O_RDWR)
+    will result in -EINVAL. In addition, this field is 64-bits wide to
+    allow for more O_ flags than currently permitted with openat(2).
+
+  mode
+    The file mode for O_CREAT or O_TMPFILE.
+
+    Must be set to zero if flags does not contain O_CREAT or O_TMPFILE.
+
+  resolve
+    Restrict path resolution (in contrast to O_* flags they affect all
+    path components). The current set of flags are as follows (at the
+    moment, all of the RESOLVE_ flags are implemented as just passing
+    the corresponding LOOKUP_ flag).
+
+    RESOLVE_NO_XDEV       => LOOKUP_NO_XDEV
+    RESOLVE_NO_SYMLINKS   => LOOKUP_NO_SYMLINKS
+    RESOLVE_NO_MAGICLINKS => LOOKUP_NO_MAGICLINKS
+    RESOLVE_BENEATH       => LOOKUP_BENEATH
+    RESOLVE_IN_ROOT       => LOOKUP_IN_ROOT
+
+open_how does not contain an embedded size field, because it is of
+little benefit (userspace can figure out the kernel open_how size at
+runtime fairly easily without it). It also only contains u64s (even
+though ->mode arguably should be a u16) to avoid having padding fields
+which are never used in the future.
+
+Note that as a result of the new how->flags handling, O_PATH|O_TMPFILE
+is no longer permitted for openat(2). As far as I can tell, this has
+always been a bug and appears to not be used by userspace (and I've not
+seen any problems on my machines by disallowing it). If it turns out
+this breaks something, we can special-case it and only permit it for
+openat(2) but not openat2(2).
+
+After input from Florian Weimer, the new open_how and flag definitions
+are inside a separate header from uapi/linux/fcntl.h, to avoid problems
+that glibc has with importing that header.
+
+/* Testing. */
+In a follow-up patch there are over 200 selftests which ensure that this
+syscall has the correct semantics and will correctly handle several
+attack scenarios.
+
+In addition, I've written a userspace library[4] which provides
+convenient wrappers around openat2(RESOLVE_IN_ROOT) (this is necessary
+because no other syscalls support RESOLVE_IN_ROOT, and thus lots of care
+must be taken when using RESOLVE_IN_ROOT'd file descriptors with other
+syscalls). During the development of this patch, I've run numerous
+verification tests using libpathrs (showing that the API is reasonably
+usable by userspace).
+
+/* Future Work. */
+Additional RESOLVE_ flags have been suggested during the review period.
+These can be easily implemented separately (such as blocking auto-mount
+during resolution).
+
+Furthermore, there are some other proposed changes to the openat(2)
+interface (the most obvious example is magic-link hardening[5]) which
+would be a good opportunity to add a way for userspace to restrict how
+O_PATH file descriptors can be re-opened.
+
+Another possible avenue of future work would be some kind of
+CHECK_FIELDS[6] flag which causes the kernel to indicate to userspace
+which openat2(2) flags and fields are supported by the current kernel
+(to avoid userspace having to go through several guesses to figure it
+out).
+
+[1]: https://lwn.net/Articles/588444/
+[2]: https://lore.kernel.org/lkml/CA+55aFyyxJL1LyXZeBsf2ypriraj5ut1XkNDsunRBqgVjZU_6Q@mail.gmail.com
+[3]: commit 629e014bb834 ("fs: completely ignore unknown open flags")
+[4]: https://sourceware.org/bugzilla/show_bug.cgi?id=17523
+[5]: https://lore.kernel.org/lkml/20190930183316.10190-2-cyphar@cyphar.com/
+[6]: https://youtu.be/ggD-eb3yPVs
+
+Suggested-by: Christian Brauner <christian.brauner@ubuntu.com>
+Signed-off-by: Aleksa Sarai <cyphar@cyphar.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

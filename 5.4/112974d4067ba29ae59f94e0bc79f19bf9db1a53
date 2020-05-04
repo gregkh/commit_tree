@@ -1,0 +1,75 @@
+btrfs: volumes: Remove ENOSPC-prone btrfs_can_relocate()
+
+[BUG]
+Test case btrfs/156 fails since commit 302167c50b32 ("btrfs: don't end
+the transaction for delayed refs in throttle") with ENOSPC.
+
+[CAUSE]
+The ENOSPC is reported from btrfs_can_relocate().
+
+This function will check:
+- If this block group is empty, we can relocate
+- If we can enough free space, we can relocate
+
+Above checks are valid but the following check is vague due to its
+implementation:
+- If and only if we can allocated a new block group to contain all the
+  used space, we can relocate
+
+This design itself is OK, but the way to determine if we can allocate a
+new block group is problematic.
+
+btrfs_can_relocate() uses find_free_dev_extent() to find free space on a
+device.
+However find_free_dev_extent() only searches commit root and excludes
+dev extents allocated in current trans, this makes it unable to use dev
+extent just freed in current transaction.
+
+So for the following example, btrfs_can_relocate() will report ENOSPC:
+The example block group layout:
+1M      129M        257M       385M      513M       550M
+|///////|///////////|//////////|         |          |
+// = Used bg, consider all bg is 100% used for easy calculation.
+And all block groups are SINGLE, on-disk bytenr is the same as the
+logical bytenr.
+
+1) Bg in [129M, 257M) get relocated to [385M, 513M), transid=100
+1M      129M        257M       385M      513M       550M
+|///////|           |//////////|/////////|
+In transid 100, bg in [129M, 257M) get relocated to [385M, 513M)
+
+However transid 100 is not committed yet, so in dev commit tree, we
+still have the old dev extents layout:
+1M      129M        257M       385M      513M       550M
+|///////|///////////|//////////|         |          |
+
+2) Try to relocate bg [257M, 385M)
+We goes into btrfs_can_relocate(), no free space in current bgs, so we
+check if we can find large enough free dev extents.
+
+The first slot is [385M, 513M), but that is already used by new bg at
+[385M, 513M), so we continue search.
+
+The remaining slot is [512M, 550M), smaller than the bg's length 128M.
+So btrfs_can_relocate report ENOSPC.
+
+However this is over killed, in fact if we just skip btrfs_can_relocate()
+check, and go into regular relocation routine, at extent reservation time,
+if we can't find free extent, then we fallback to commit transaction,
+which will free up the dev extents and allow new block group to be created.
+
+[FIX]
+The fix here is to remove btrfs_can_relocate() completely.
+
+If we hit the false ENOSPC case just like btrfs/156, extent allocator
+will push harder by committing transaction and we will have space for
+new block group, avoiding the false ENOSPC.
+
+If we really ran out of space, we will hit ENOSPC at
+relocate_block_group(), and btrfs will just reports the ENOSPC error as
+usual.
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

@@ -1,0 +1,94 @@
+media: mceusb: fix out of bounds read in MCE receiver buffer
+
+Fix multiple cases of out of bounds (OOB) read associated with
+MCE device receive/input data handling.
+
+In reference for the OOB cases below, the incoming/read (byte) data
+format when the MCE device responds to a command is:
+    { cmd_prefix, subcmd, data0, data1, ... }
+where cmd_prefix are:
+    MCE_CMD_PORT_SYS
+    MCE_CMD_PORT_IR
+and subcmd examples are:
+    MCE_RSP_GETPORTSTATUS
+    MCE_RSP_EQIRNUMPORTS
+    ...
+Response size dynamically depends on cmd_prefix and subcmd.
+So data0, data1, ... may or may not be present on input.
+Multiple responses may return in a single receiver buffer.
+
+The trigger condition for OOB read is typically random or
+corrupt input data that fills the mceusb receiver buffer.
+
+Case 1:
+
+mceusb_handle_command() reads data0 (var hi) and data1 (var lo)
+regardless of whether the response includes such data.
+If { cmd_prefix, subcmd } is at the end of the receiver buffer,
+read past end of buffer occurs.
+
+This case was reported by
+KASAN: slab-out-of-bounds Read in mceusb_dev_recv
+https://syzkaller.appspot.com/bug?extid=c7fdb6cb36e65f2fe8c9
+
+Fix: In mceusb_handle_command(), change variable hi and lo to
+pointers, and dereference only when required.
+
+Case 2:
+
+If response with data is truncated at end of buffer after
+{ cmd_prefix, subcmd }, mceusb_handle_command() reads past
+end of buffer for data0, data1, ...
+
+Fix: In mceusb_process_ir_data(), check response size with
+remaining buffer size before invoking mceusb_handle_command().
++    if (i + ir->rem < buf_len)
+            mceusb_handle_command(ir, &ir->buf_in[i - 1]);
+
+Case 3:
+
+mceusb_handle_command() handles invalid/bad response such as
+{ 0x??, MCE_RSP_GETPORTSTATUS } of length 2 as a response
+{ MCE_CMD_PORT_SYS, MCE_RSP_GETPORTSTATUS, data0, ... }
+of length 7. Read OOB occurs for non-existent data0, data1, ...
+Cause is mceusb_handle_command() does not check cmd_prefix value.
+
+Fix: mceusb_handle_command() must test both cmd_prefix and subcmd.
+
+Case 4:
+
+mceusb_process_ir_data() receiver parser state SUBCMD is
+possible at start (i=0) of receiver buffer resulting in buffer
+offset=-1 passed to mceusb_dev_printdata().
+Bad offset results in OOB read before start of buffer.
+
+[1214218.580308] mceusb 1-1.3:1.0: rx data[0]: 00 80 (length=2)
+[1214218.580323] mceusb 1-1.3:1.0: Unknown command 0x00 0x80
+...
+[1214218.580406] mceusb 1-1.3:1.0: rx data[14]: 7f 7f (length=2)
+[1214218.679311] mceusb 1-1.3:1.0: rx data[-1]: 80 90 (length=2)
+[1214218.679325] mceusb 1-1.3:1.0: End of raw IR data
+[1214218.679340] mceusb 1-1.3:1.0: rx data[1]: 7f 7f (length=2)
+
+Fix: If parser_state is SUBCMD after processing receiver buffer,
+reset parser_state to CMD_HEADER.
+In effect, discard cmd_prefix at end of receiver buffer.
+In mceusb_dev_printdata(), abort if buffer offset is out of bounds.
+
+Case 5:
+
+If response with data is truncated at end of buffer after
+{ cmd_prefix, subcmd }, mceusb_dev_printdata() reads past
+end of buffer for data0, data1, ...
+while decoding the response to print out.
+
+Fix: In mceusb_dev_printdata(), remove unneeded buffer offset
+adjustments (var start and var skip) associated with MCE gen1 header.
+Test for truncated MCE cmd response (compare offset+len with buf_len)
+and skip decoding of incomplete response.
+Move IR data tracing to execute before the truncation test.
+
+Signed-off-by: A Sun <as1033x@comcast.net>
+Signed-off-by: Sean Young <sean@mess.org>
+Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+

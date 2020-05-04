@@ -1,0 +1,80 @@
+bpf: Introduce BPF trampoline
+
+Introduce BPF trampoline concept to allow kernel code to call into BPF programs
+with practically zero overhead.  The trampoline generation logic is
+architecture dependent.  It's converting native calling convention into BPF
+calling convention.  BPF ISA is 64-bit (even on 32-bit architectures). The
+registers R1 to R5 are used to pass arguments into BPF functions. The main BPF
+program accepts only single argument "ctx" in R1. Whereas CPU native calling
+convention is different. x86-64 is passing first 6 arguments in registers
+and the rest on the stack. x86-32 is passing first 3 arguments in registers.
+sparc64 is passing first 6 in registers. And so on.
+
+The trampolines between BPF and kernel already exist.  BPF_CALL_x macros in
+include/linux/filter.h statically compile trampolines from BPF into kernel
+helpers. They convert up to five u64 arguments into kernel C pointers and
+integers. On 64-bit architectures this BPF_to_kernel trampolines are nops. On
+32-bit architecture they're meaningful.
+
+The opposite job kernel_to_BPF trampolines is done by CAST_TO_U64 macros and
+__bpf_trace_##call() shim functions in include/trace/bpf_probe.h. They convert
+kernel function arguments into array of u64s that BPF program consumes via
+R1=ctx pointer.
+
+This patch set is doing the same job as __bpf_trace_##call() static
+trampolines, but dynamically for any kernel function. There are ~22k global
+kernel functions that are attachable via nop at function entry. The function
+arguments and types are described in BTF.  The job of btf_distill_func_proto()
+function is to extract useful information from BTF into "function model" that
+architecture dependent trampoline generators will use to generate assembly code
+to cast kernel function arguments into array of u64s.  For example the kernel
+function eth_type_trans has two pointers. They will be casted to u64 and stored
+into stack of generated trampoline. The pointer to that stack space will be
+passed into BPF program in R1. On x86-64 such generated trampoline will consume
+16 bytes of stack and two stores of %rdi and %rsi into stack. The verifier will
+make sure that only two u64 are accessed read-only by BPF program. The verifier
+will also recognize the precise type of the pointers being accessed and will
+not allow typecasting of the pointer to a different type within BPF program.
+
+The tracing use case in the datacenter demonstrated that certain key kernel
+functions have (like tcp_retransmit_skb) have 2 or more kprobes that are always
+active.  Other functions have both kprobe and kretprobe.  So it is essential to
+keep both kernel code and BPF programs executing at maximum speed. Hence
+generated BPF trampoline is re-generated every time new program is attached or
+detached to maintain maximum performance.
+
+To avoid the high cost of retpoline the attached BPF programs are called
+directly. __bpf_prog_enter/exit() are used to support per-program execution
+stats.  In the future this logic will be optimized further by adding support
+for bpf_stats_enabled_key inside generated assembly code. Introduction of
+preemptible and sleepable BPF programs will completely remove the need to call
+to __bpf_prog_enter/exit().
+
+Detach of a BPF program from the trampoline should not fail. To avoid memory
+allocation in detach path the half of the page is used as a reserve and flipped
+after each attach/detach. 2k bytes is enough to call 40+ BPF programs directly
+which is enough for BPF tracing use cases. This limit can be increased in the
+future.
+
+BPF_TRACE_FENTRY programs have access to raw kernel function arguments while
+BPF_TRACE_FEXIT programs have access to kernel return value as well. Often
+kprobe BPF program remembers function arguments in a map while kretprobe
+fetches arguments from a map and analyzes them together with return value.
+BPF_TRACE_FEXIT accelerates this typical use case.
+
+Recursion prevention for kprobe BPF programs is done via per-cpu
+bpf_prog_active counter. In practice that turned out to be a mistake. It
+caused programs to randomly skip execution. The tracing tools missed results
+they were looking for. Hence BPF trampoline doesn't provide builtin recursion
+prevention. It's a job of BPF program itself and will be addressed in the
+follow up patches.
+
+BPF trampoline is intended to be used beyond tracing and fentry/fexit use cases
+in the future. For example to remove retpoline cost from XDP programs.
+
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Andrii Nakryiko <andriin@fb.com>
+Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20191114185720.1641606-5-ast@kernel.org
+

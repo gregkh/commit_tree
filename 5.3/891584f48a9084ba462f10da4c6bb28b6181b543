@@ -1,0 +1,62 @@
+inet: frags: re-introduce skb coalescing for local delivery
+
+Before commit d4289fcc9b16 ("net: IP6 defrag: use rbtrees for IPv6
+defrag"), a netperf UDP_STREAM test[0] using big IPv6 datagrams (thus
+generating many fragments) and running over an IPsec tunnel, reported
+more than 6Gbps throughput. After that patch, the same test gets only
+9Mbps when receiving on a be2net nic (driver can make a big difference
+here, for example, ixgbe doesn't seem to be affected).
+
+By reusing the IPv4 defragmentation code, IPv6 lost fragment coalescing
+(IPv4 fragment coalescing was dropped by commit 14fe22e33462 ("Revert
+"ipv4: use skb coalescing in defragmentation"")).
+
+Without fragment coalescing, be2net runs out of Rx ring entries and
+starts to drop frames (ethtool reports rx_drops_no_frags errors). Since
+the netperf traffic is only composed of UDP fragments, any lost packet
+prevents reassembly of the full datagram. Therefore, fragments which
+have no possibility to ever get reassembled pile up in the reassembly
+queue, until the memory accounting exeeds the threshold. At that point
+no fragment is accepted anymore, which effectively discards all
+netperf traffic.
+
+When reassembly timeout expires, some stale fragments are removed from
+the reassembly queue, so a few packets can be received, reassembled
+and delivered to the netperf receiver. But the nic still drops frames
+and soon the reassembly queue gets filled again with stale fragments.
+These long time frames where no datagram can be received explain why
+the performance drop is so significant.
+
+Re-introducing fragment coalescing is enough to get the initial
+performances again (6.6Gbps with be2net): driver doesn't drop frames
+anymore (no more rx_drops_no_frags errors) and the reassembly engine
+works at full speed.
+
+This patch is quite conservative and only coalesces skbs for local
+IPv4 and IPv6 delivery (in order to avoid changing skb geometry when
+forwarding). Coalescing could be extended in the future if need be, as
+more scenarios would probably benefit from it.
+
+[0]: Test configuration
+Sender:
+ip xfrm policy flush
+ip xfrm state flush
+ip xfrm state add src fc00:1::1 dst fc00:2::1 proto esp spi 0x1000 aead 'rfc4106(gcm(aes))' 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b 96 mode transport sel src fc00:1::1 dst fc00:2::1
+ip xfrm policy add src fc00:1::1 dst fc00:2::1 dir in tmpl src fc00:1::1 dst fc00:2::1 proto esp mode transport action allow
+ip xfrm state add src fc00:2::1 dst fc00:1::1 proto esp spi 0x1001 aead 'rfc4106(gcm(aes))' 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b 96 mode transport sel src fc00:2::1 dst fc00:1::1
+ip xfrm policy add src fc00:2::1 dst fc00:1::1 dir out tmpl src fc00:2::1 dst fc00:1::1 proto esp mode transport action allow
+netserver -D -L fc00:2::1
+
+Receiver:
+ip xfrm policy flush
+ip xfrm state flush
+ip xfrm state add src fc00:2::1 dst fc00:1::1 proto esp spi 0x1001 aead 'rfc4106(gcm(aes))' 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b 96 mode transport sel src fc00:2::1 dst fc00:1::1
+ip xfrm policy add src fc00:2::1 dst fc00:1::1 dir in tmpl src fc00:2::1 dst fc00:1::1 proto esp mode transport action allow
+ip xfrm state add src fc00:1::1 dst fc00:2::1 proto esp spi 0x1000 aead 'rfc4106(gcm(aes))' 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b 96 mode transport sel src fc00:1::1 dst fc00:2::1
+ip xfrm policy add src fc00:1::1 dst fc00:2::1 dir out tmpl src fc00:1::1 dst fc00:2::1 proto esp mode transport action allow
+netperf -H fc00:2::1 -f k -P 0 -L fc00:1::1 -l 60 -t UDP_STREAM -I 99,5 -i 5,5 -T5,5 -6
+
+Signed-off-by: Guillaume Nault <gnault@redhat.com>
+Acked-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

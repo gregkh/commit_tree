@@ -1,0 +1,72 @@
+dmaengine: bcm2835: Fix abort of transactions
+
+There are multiple issues with bcm2835_dma_abort() (which is called on
+termination of a transaction):
+
+* The algorithm to abort the transaction first pauses the channel by
+  clearing the ACTIVE flag in the CS register, then waits for the PAUSED
+  flag to clear.  Page 49 of the spec documents the latter as follows:
+
+  "Indicates if the DMA is currently paused and not transferring data.
+   This will occur if the active bit has been cleared [...]"
+   https://www.raspberrypi.org/app/uploads/2012/02/BCM2835-ARM-Peripherals.pdf
+
+  So the function is entering an infinite loop because it is waiting for
+  PAUSED to clear which is always set due to the function having cleared
+  the ACTIVE flag.  The only thing that's saving it from itself is the
+  upper bound of 10000 loop iterations.
+
+  The code comment says that the intention is to "wait for any current
+  AXI transfer to complete", so the author probably wanted to check the
+  WAITING_FOR_OUTSTANDING_WRITES flag instead.  Amend the function
+  accordingly.
+
+* The CS register is only read at the beginning of the function.  It
+  needs to be read again after pausing the channel and before checking
+  for outstanding writes, otherwise writes which were issued between
+  the register read at the beginning of the function and pausing the
+  channel may not be waited for.
+
+* The function seeks to abort the transfer by writing 0 to the NEXTCONBK
+  register and setting the ABORT and ACTIVE flags.  Thereby, the 0 in
+  NEXTCONBK is sought to be loaded into the CONBLK_AD register.  However
+  experimentation has shown this approach to not work:  The CONBLK_AD
+  register remains the same as before and the CS register contains
+  0x00000030 (PAUSED | DREQ_STOPS_DMA).  In other words, the control
+  block is not aborted but merely paused and it will be resumed once the
+  next DMA transaction is started.  That is absolutely not the desired
+  behavior.
+
+  A simpler approach is to set the channel's RESET flag instead.  This
+  reliably zeroes the NEXTCONBK as well as the CS register.  It requires
+  less code and only a single MMIO write.  This is also what popular
+  user space DMA drivers do, e.g.:
+  https://github.com/metachris/RPIO/blob/master/source/c_pwm/pwm.c
+
+  Note that the spec is contradictory whether the NEXTCONBK register
+  is writeable at all.  On the one hand, page 41 claims:
+
+  "The value loaded into the NEXTCONBK register can be overwritten so
+  that the linked list of Control Block data structures can be
+  dynamically altered. However it is only safe to do this when the DMA
+  is paused."
+
+  On the other hand, page 40 specifies:
+
+  "Only three registers in each channel's register set are directly
+  writeable (CS, CONBLK_AD and DEBUG). The other registers (TI,
+  SOURCE_AD, DEST_AD, TXFR_LEN, STRIDE & NEXTCONBK), are automatically
+  loaded from a Control Block data structure held in external memory."
+
+Fixes: 96286b576690 ("dmaengine: Add support for BCM2835")
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Cc: stable@vger.kernel.org # v3.14+
+Cc: Frank Pavlic <f.pavlic@kunbus.de>
+Cc: Martin Sperl <kernel@martin.sperl.org>
+Cc: Florian Meier <florian.meier@koalo.de>
+Cc: Clive Messer <clive.m.messer@gmail.com>
+Cc: Matthias Reichl <hias@horus.com>
+Tested-by: Stefan Wahren <stefan.wahren@i2se.com>
+Acked-by: Florian Kauer <florian.kauer@koalo.de>
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+

@@ -1,0 +1,51 @@
+memcg: fix a crash in wb_workfn when a device disappears
+
+Without memcg, there is a one-to-one mapping between the bdi and
+bdi_writeback structures.  In this world, things are fairly
+straightforward; the first thing bdi_unregister() does is to shutdown
+the bdi_writeback structure (or wb), and part of that writeback ensures
+that no other work queued against the wb, and that the wb is fully
+drained.
+
+With memcg, however, there is a one-to-many relationship between the bdi
+and bdi_writeback structures; that is, there are multiple wb objects
+which can all point to a single bdi.  There is a refcount which prevents
+the bdi object from being released (and hence, unregistered).  So in
+theory, the bdi_unregister() *should* only get called once its refcount
+goes to zero (bdi_put will drop the refcount, and when it is zero,
+release_bdi gets called, which calls bdi_unregister).
+
+Unfortunately, del_gendisk() in block/gen_hd.c never got the memo about
+the Brave New memcg World, and calls bdi_unregister directly.  It does
+this without informing the file system, or the memcg code, or anything
+else.  This causes the root wb associated with the bdi to be
+unregistered, but none of the memcg-specific wb's are shutdown.  So when
+one of these wb's are woken up to do delayed work, they try to
+dereference their wb->bdi->dev to fetch the device name, but
+unfortunately bdi->dev is now NULL, thanks to the bdi_unregister()
+called by del_gendisk().  As a result, *boom*.
+
+Fortunately, it looks like the rest of the writeback path is perfectly
+happy with bdi->dev and bdi->owner being NULL, so the simplest fix is to
+create a bdi_dev_name() function which can handle bdi->dev being NULL.
+This also allows us to bulletproof the writeback tracepoints to prevent
+them from dereferencing a NULL pointer and crashing the kernel if one is
+tracing with memcg's enabled, and an iSCSI device dies or a USB storage
+stick is pulled.
+
+The most common way of triggering this will be hotremoval of a device
+while writeback with memcg enabled is going on.  It was triggering
+several times a day in a heavily loaded production environment.
+
+Google Bug Id: 145475544
+
+Link: https://lore.kernel.org/r/20191227194829.150110-1-tytso@mit.edu
+Link: http://lkml.kernel.org/r/20191228005211.163952-1-tytso@mit.edu
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: Chris Mason <clm@fb.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

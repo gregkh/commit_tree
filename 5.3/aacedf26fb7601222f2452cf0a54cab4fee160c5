@@ -1,0 +1,64 @@
+sched/core: Optimize try_to_wake_up() for local wakeups
+
+Jens reported that significant performance can be had on some block
+workloads by special casing local wakeups. That is, wakeups on the
+current task before it schedules out.
+
+Given something like the normal wait pattern:
+
+	for (;;) {
+		set_current_state(TASK_UNINTERRUPTIBLE);
+
+		if (cond)
+			break;
+
+		schedule();
+	}
+	__set_current_state(TASK_RUNNING);
+
+Any wakeup (on this CPU) after set_current_state() and before
+schedule() would benefit from this.
+
+Normal wakeups take p->pi_lock, which serializes wakeups to the same
+task. By eliding that we gain concurrency on:
+
+ - ttwu_stat(); we already had concurrency on rq stats, this now also
+   brings it to task stats. -ENOCARE
+
+ - tracepoints; it is now possible to get multiple instances of
+   trace_sched_waking() (and possibly trace_sched_wakeup()) for the
+   same task. Tracers will have to learn to cope.
+
+Furthermore, p->pi_lock is used by set_special_state(), to order
+against TASK_RUNNING stores from other CPUs. But since this is
+strictly CPU local, we don't need the lock, and set_special_state()'s
+disabling of IRQs is sufficient.
+
+After the normal wakeup takes p->pi_lock it issues
+smp_mb__after_spinlock(), in order to ensure the woken task must
+observe prior stores before we observe the p->state. If this is CPU
+local, this will be satisfied with a compiler barrier, and we rely on
+try_to_wake_up() being a funcation call, which implies such.
+
+Since, when 'p == current', 'p->on_rq' must be true, the normal wakeup
+would continue into the ttwu_remote() branch, which normally is
+concerned with exactly this wakeup scenario, except from a remote CPU.
+IOW we're waking a task that is still running. In this case, we can
+trivially avoid taking rq->lock, all that's left from this is to set
+p->state.
+
+This then yields an extremely simple and fast path for 'p == current'.
+
+Reported-by: Jens Axboe <axboe@kernel.dk>
+Tested-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qian Cai <cai@lca.pw>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: akpm@linux-foundation.org
+Cc: gkohli@codeaurora.org
+Cc: hch@lst.de
+Cc: oleg@redhat.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

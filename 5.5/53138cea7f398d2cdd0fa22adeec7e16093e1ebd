@@ -1,0 +1,105 @@
+mm: vmscan: move file exhaustion detection to the node level
+
+Patch series "mm: fix page aging across multiple cgroups".
+
+When applications are put into unconfigured cgroups for memory accounting
+purposes, the cgrouping itself should not change the behavior of the page
+reclaim code.  We expect the VM to reclaim the coldest pages in the
+system.  But right now the VM can reclaim hot pages in one cgroup while
+there is eligible cold cache in others.
+
+This is because one part of the reclaim algorithm isn't truly cgroup
+hierarchy aware: the inactive/active list balancing.  That is the part
+that is supposed to protect hot cache data from one-off streaming IO.
+
+The recursive cgroup reclaim scheme will scan and rotate the physical LRU
+lists of each eligible cgroup at the same rate in a round-robin fashion,
+thereby establishing a relative order among the pages of all those
+cgroups.  However, the inactive/active balancing decisions are made
+locally within each cgroup, so when a cgroup is running low on cold pages,
+its hot pages will get reclaimed - even when sibling cgroups have plenty
+of cold cache eligible in the same reclaim run.
+
+For example:
+
+   [root@ham ~]# head -n1 /proc/meminfo
+   MemTotal:        1016336 kB
+
+   [root@ham ~]# ./reclaimtest2.sh
+   Establishing 50M active files in cgroup A...
+   Hot pages cached: 12800/12800 workingset-a
+   Linearly scanning through 18G of file data in cgroup B:
+   real    0m4.269s
+   user    0m0.051s
+   sys     0m4.182s
+   Hot pages cached: 134/12800 workingset-a
+
+The streaming IO in B, which doesn't benefit from caching at all, pushes
+out most of the workingset in A.
+
+Solution
+
+This series fixes the problem by elevating inactive/active balancing
+decisions to the toplevel of the reclaim run.  This is either a cgroup
+that hit its limit, or straight-up global reclaim if there is physical
+memory pressure.  From there, it takes a recursive view of the cgroup
+subtree to decide whether page deactivation is necessary.
+
+In the test above, the VM will then recognize that cgroup B has plenty of
+eligible cold cache, and that the hot pages in A can be spared:
+
+   [root@ham ~]# ./reclaimtest2.sh
+   Establishing 50M active files in cgroup A...
+   Hot pages cached: 12800/12800 workingset-a
+   Linearly scanning through 18G of file data in cgroup B:
+   real    0m4.244s
+   user    0m0.064s
+   sys     0m4.177s
+   Hot pages cached: 12800/12800 workingset-a
+
+Implementation
+
+Whether active pages can be deactivated or not is influenced by two
+factors: the inactive list dropping below a minimum size relative to the
+active list, and the occurence of refaults.
+
+This patch series first moves refault detection to the reclaim root, then
+enforces the minimum inactive size based on a recursive view of the cgroup
+tree's LRUs.
+
+History
+
+Note that this actually never worked correctly in Linux cgroups.  In the
+past it worked for global reclaim and leaf limit reclaim only (we used to
+have two physical LRU linkages per page), but it never worked for
+intermediate limit reclaim over multiple leaf cgroups.
+
+We're noticing this now because 1) we're putting everything into cgroups
+for accounting, not just the things we want to control and 2) we're moving
+away from leaf limits that invoke reclaim on individual cgroups, toward
+large tree reclaim, triggered by high-level limits, or physical memory
+pressure that is influenced by local protections such as memory.low and
+memory.min instead.
+
+This patch (of 3):
+
+When file pages are lower than the watermark on a node, we try to force
+scan anonymous pages to counter-act the balancing algorithms preference
+for new file pages when they are likely thrashing.  This is a node-level
+decision, but it's currently made each time we look at an lruvec.  This is
+unnecessarily expensive and also a layering violation that makes the code
+harder to understand.
+
+Clean this up by making the check once per node and setting a flag in the
+scan_control.
+
+Link: http://lkml.kernel.org/r/20191107205334.158354-2-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Reviewed-by: Suren Baghdasaryan <surenb@google.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Rik van Riel <riel@surriel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

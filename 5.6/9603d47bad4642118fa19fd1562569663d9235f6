@@ -1,0 +1,73 @@
+tcp: Reduce SYN resend delay if a suspicous ACK is received
+
+When closing a connection, the two acks that required to change closing
+socket's status to FIN_WAIT_2 and then TIME_WAIT could be processed in
+reverse order.  This is possible in RSS disabled environments such as a
+connection inside a host.
+
+For example, expected state transitions and required packets for the
+disconnection will be similar to below flow.
+
+	 00 (Process A)				(Process B)
+	 01 ESTABLISHED				ESTABLISHED
+	 02 close()
+	 03 FIN_WAIT_1
+	 04 		---FIN-->
+	 05 					CLOSE_WAIT
+	 06 		<--ACK---
+	 07 FIN_WAIT_2
+	 08 		<--FIN/ACK---
+	 09 TIME_WAIT
+	 10 		---ACK-->
+	 11 					LAST_ACK
+	 12 CLOSED				CLOSED
+
+In some cases such as LINGER option applied socket, the FIN and FIN/ACK
+will be substituted to RST and RST/ACK, but there is no difference in
+the main logic.
+
+The acks in lines 6 and 8 are the acks.  If the line 8 packet is
+processed before the line 6 packet, it will be just ignored as it is not
+a expected packet, and the later process of the line 6 packet will
+change the status of Process A to FIN_WAIT_2, but as it has already
+handled line 8 packet, it will not go to TIME_WAIT and thus will not
+send the line 10 packet to Process B.  Thus, Process B will left in
+CLOSE_WAIT status, as below.
+
+	 00 (Process A)				(Process B)
+	 01 ESTABLISHED				ESTABLISHED
+	 02 close()
+	 03 FIN_WAIT_1
+	 04 		---FIN-->
+	 05 					CLOSE_WAIT
+	 06 				(<--ACK---)
+	 07	  			(<--FIN/ACK---)
+	 08 				(fired in right order)
+	 09 		<--FIN/ACK---
+	 10 		<--ACK---
+	 11 		(processed in reverse order)
+	 12 FIN_WAIT_2
+
+Later, if the Process B sends SYN to Process A for reconnection using
+the same port, Process A will responds with an ACK for the last flow,
+which has no increased sequence number.  Thus, Process A will send RST,
+wait for TIMEOUT_INIT (one second in default), and then try
+reconnection.  If reconnections are frequent, the one second latency
+spikes can be a big problem.  Below is a tcpdump results of the problem:
+
+    14.436259 IP 127.0.0.1.45150 > 127.0.0.1.4242: Flags [S], seq 2560603644
+    14.436266 IP 127.0.0.1.4242 > 127.0.0.1.45150: Flags [.], ack 5, win 512
+    14.436271 IP 127.0.0.1.45150 > 127.0.0.1.4242: Flags [R], seq 2541101298
+    /* ONE SECOND DELAY */
+    15.464613 IP 127.0.0.1.45150 > 127.0.0.1.4242: Flags [S], seq 2560603644
+
+This commit mitigates the problem by reducing the delay for the next SYN
+if the suspicous ACK is received while in SYN_SENT state.
+
+Following commit will add a selftest, which can be also helpful for
+understanding of this issue.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: SeongJae Park <sjpark@amazon.de>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+

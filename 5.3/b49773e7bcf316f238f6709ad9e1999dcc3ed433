@@ -1,0 +1,54 @@
+block: Disable write plugging for zoned block devices
+
+Simultaneously writing to a sequential zone of a zoned block device
+from multiple contexts requires mutual exclusion for BIO issuing to
+ensure that writes happen sequentially. However, even for a well
+behaved user correctly implementing such synchronization, BIO plugging
+may interfere and result in BIOs from the different contextx to be
+reordered if plugging is done outside of the mutual exclusion section,
+e.g. the plug was started by a function higher in the call chain than
+the function issuing BIOs.
+
+         Context A                     Context B
+
+   | blk_start_plug()
+   | ...
+   | seq_write_zone()
+     | mutex_lock(zone)
+     | bio-0->bi_iter.bi_sector = zone->wp
+     | zone->wp += bio_sectors(bio-0)
+     | submit_bio(bio-0)
+     | bio-1->bi_iter.bi_sector = zone->wp
+     | zone->wp += bio_sectors(bio-1)
+     | submit_bio(bio-1)
+     | mutex_unlock(zone)
+     | return
+   | -----------------------> | seq_write_zone()
+  				| mutex_lock(zone)
+     				| bio-2->bi_iter.bi_sector = zone->wp
+     				| zone->wp += bio_sectors(bio-2)
+				| submit_bio(bio-2)
+				| mutex_unlock(zone)
+   | <------------------------- |
+   | blk_finish_plug()
+
+In the above example, despite the mutex synchronization ensuring the
+correct BIO issuing order 0, 1, 2, context A BIOs 0 and 1 end up being
+issued after BIO 2 of context B, when the plug is released with
+blk_finish_plug().
+
+While this problem can be addressed using the blk_flush_plug_list()
+function (in the above example, the call must be inserted before the
+zone mutex lock is released), a simple generic solution in the block
+layer avoid this additional code in all zoned block device user code.
+The simple generic solution implemented with this patch is to introduce
+the internal helper function blk_mq_plug() to access the current
+context plug on BIO submission. This helper returns the current plug
+only if the target device is not a zoned block device or if the BIO to
+be plugged is not a write operation. Otherwise, the caller context plug
+is ignored and NULL returned, resulting is all writes to zoned block
+device to never be plugged.
+
+Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

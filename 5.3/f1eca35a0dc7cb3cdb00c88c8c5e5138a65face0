@@ -1,0 +1,146 @@
+mm/sparsemem: introduce struct mem_section_usage
+
+Patch series "mm: Sub-section memory hotplug support", v10.
+
+The memory hotplug section is an arbitrary / convenient unit for memory
+hotplug.  'Section-size' units have bled into the user interface
+('memblock' sysfs) and can not be changed without breaking existing
+userspace.  The section-size constraint, while mostly benign for typical
+memory hotplug, has and continues to wreak havoc with 'device-memory'
+use cases, persistent memory (pmem) in particular.  Recall that pmem
+uses devm_memremap_pages(), and subsequently arch_add_memory(), to
+allocate a 'struct page' memmap for pmem.  However, it does not use the
+'bottom half' of memory hotplug, i.e.  never marks pmem pages online and
+never exposes the userspace memblock interface for pmem.  This leaves an
+opening to redress the section-size constraint.
+
+To date, the libnvdimm subsystem has attempted to inject padding to
+satisfy the internal constraints of arch_add_memory().  Beyond
+complicating the code, leading to bugs [2], wasting memory, and limiting
+configuration flexibility, the padding hack is broken when the platform
+changes this physical memory alignment of pmem from one boot to the
+next.  Device failure (intermittent or permanent) and physical
+reconfiguration are events that can cause the platform firmware to
+change the physical placement of pmem on a subsequent boot, and device
+failure is an everyday event in a data-center.
+
+It turns out that sections are only a hard requirement of the
+user-facing interface for memory hotplug and with a bit more
+infrastructure sub-section arch_add_memory() support can be added for
+kernel internal usages like devm_memremap_pages().  Here is an analysis
+of the current design assumptions in the current code and how they are
+addressed in the new implementation:
+
+Current design assumptions:
+
+ - Sections that describe boot memory (early sections) are never
+   unplugged / removed.
+
+ - pfn_valid(), in the CONFIG_SPARSEMEM_VMEMMAP=y, case devolves to a
+   valid_section() check
+
+ - __add_pages() and helper routines assume all operations occur in
+   PAGES_PER_SECTION units.
+
+ - The memblock sysfs interface only comprehends full sections
+
+New design assumptions:
+
+ - Sections are instrumented with a sub-section bitmask to track (on
+   x86) individual 2MB sub-divisions of a 128MB section.
+
+ - Partially populated early sections can be extended with additional
+   sub-sections, and those sub-sections can be removed with
+   arch_remove_memory(). With this in place we no longer lose usable
+   memory capacity to padding.
+
+ - pfn_valid() is updated to look deeper than valid_section() to also
+   check the active-sub-section mask. This indication is in the same
+   cacheline as the valid_section() so the performance impact is
+   expected to be negligible. So far the lkp robot has not reported any
+   regressions.
+
+ - Outside of the core vmemmap population routines which are replaced,
+   other helper routines like shrink_{zone,pgdat}_span() are updated to
+   handle the smaller granularity. Core memory hotplug routines that
+   deal with online memory are not touched.
+
+ - The existing memblock sysfs user api guarantees / assumptions are not
+   touched since this capability is limited to !online
+   !memblock-sysfs-accessible sections.
+
+Meanwhile the issue reports continue to roll in from users that do not
+understand when and how the 128MB constraint will bite them.  The current
+implementation relied on being able to support at least one misaligned
+namespace, but that immediately falls over on any moderately complex
+namespace creation attempt.  Beyond the initial problem of 'System RAM'
+colliding with pmem, and the unsolvable problem of physical alignment
+changes, Linux is now being exposed to platforms that collide pmem ranges
+with other pmem ranges by default [3].  In short, devm_memremap_pages()
+has pushed the venerable section-size constraint past the breaking point,
+and the simplicity of section-aligned arch_add_memory() is no longer
+tenable.
+
+These patches are exposed to the kbuild robot on a subsection-v10 branch
+[4], and a preview of the unit test for this functionality is available
+on the 'subsection-pending' branch of ndctl [5].
+
+[2]: https://lore.kernel.org/r/155000671719.348031.2347363160141119237.stgit@dwillia2-desk3.amr.corp.intel.com
+[3]: https://github.com/pmem/ndctl/issues/76
+[4]: https://git.kernel.org/pub/scm/linux/kernel/git/djbw/nvdimm.git/log/?h=subsection-v10
+[5]: https://github.com/pmem/ndctl/commit/7c59b4867e1c
+
+This patch (of 13):
+
+Towards enabling memory hotplug to track partial population of a section,
+introduce 'struct mem_section_usage'.
+
+A pointer to a 'struct mem_section_usage' instance replaces the existing
+pointer to a 'pageblock_flags' bitmap.  Effectively it adds one more
+'unsigned long' beyond the 'pageblock_flags' (usemap) allocation to house
+a new 'subsection_map' bitmap.  The new bitmap enables the memory
+hot{plug,remove} implementation to act on incremental sub-divisions of a
+section.
+
+SUBSECTION_SHIFT is defined as global constant instead of per-architecture
+value like SECTION_SIZE_BITS in order to allow cross-arch compatibility of
+subsection users.  Specifically a common subsection size allows for the
+possibility that persistent memory namespace configurations be made
+compatible across architectures.
+
+The primary motivation for this functionality is to support platforms that
+mix "System RAM" and "Persistent Memory" within a single section, or
+multiple PMEM ranges with different mapping lifetimes within a single
+section.  The section restriction for hotplug has caused an ongoing saga
+of hacks and bugs for devm_memremap_pages() users.
+
+Beyond the fixups to teach existing paths how to retrieve the 'usemap'
+from a section, and updates to usemap allocation path, there are no
+expected behavior changes.
+
+Link: http://lkml.kernel.org/r/156092349845.979959.73333291612799019.stgit@dwillia2-desk3.amr.corp.intel.com
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Reviewed-by: Wei Yang <richardw.yang@linux.intel.com>
+Tested-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>	[ppc64]
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Logan Gunthorpe <logang@deltatee.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Jérôme Glisse <jglisse@redhat.com>
+Cc: Mike Rapoport <rppt@linux.ibm.com>
+Cc: Jane Chu <jane.chu@oracle.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Qian Cai <cai@lca.pw>
+Cc: Logan Gunthorpe <logang@deltatee.com>
+Cc: Toshi Kani <toshi.kani@hpe.com>
+Cc: Jeff Moyer <jmoyer@redhat.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Jason Gunthorpe <jgg@mellanox.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

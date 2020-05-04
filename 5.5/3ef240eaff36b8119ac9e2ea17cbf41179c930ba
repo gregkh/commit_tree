@@ -1,0 +1,88 @@
+futex: Prevent exit livelock
+
+Oleg provided the following test case:
+
+int main(void)
+{
+	struct sched_param sp = {};
+
+	sp.sched_priority = 2;
+	assert(sched_setscheduler(0, SCHED_FIFO, &sp) == 0);
+
+	int lock = vfork();
+	if (!lock) {
+		sp.sched_priority = 1;
+		assert(sched_setscheduler(0, SCHED_FIFO, &sp) == 0);
+		_exit(0);
+	}
+
+	syscall(__NR_futex, &lock, FUTEX_LOCK_PI, 0,0,0);
+	return 0;
+}
+
+This creates an unkillable RT process spinning in futex_lock_pi() on a UP
+machine or if the process is affine to a single CPU. The reason is:
+
+ parent	    	    			child
+
+  set FIFO prio 2
+
+  vfork()			->	set FIFO prio 1
+   implies wait_for_child()	 	sched_setscheduler(...)
+ 			   		exit()
+					do_exit()
+ 					....
+					mm_release()
+					  tsk->futex_state = FUTEX_STATE_EXITING;
+					  exit_futex(); (NOOP in this case)
+					  complete() --> wakes parent
+  sys_futex()
+    loop infinite because
+    tsk->futex_state == FUTEX_STATE_EXITING
+
+The same problem can happen just by regular preemption as well:
+
+  task holds futex
+  ...
+  do_exit()
+    tsk->futex_state = FUTEX_STATE_EXITING;
+
+  --> preemption (unrelated wakeup of some other higher prio task, e.g. timer)
+
+  switch_to(other_task)
+
+  return to user
+  sys_futex()
+	loop infinite as above
+
+Just for the fun of it the futex exit cleanup could trigger the wakeup
+itself before the task sets its futex state to DEAD.
+
+To cure this, the handling of the exiting owner is changed so:
+
+   - A refcount is held on the task
+
+   - The task pointer is stored in a caller visible location
+
+   - The caller drops all locks (hash bucket, mmap_sem) and blocks
+     on task::futex_exit_mutex. When the mutex is acquired then
+     the exiting task has completed the cleanup and the state
+     is consistent and can be reevaluated.
+
+This is not a pretty solution, but there is no choice other than returning
+an error code to user space, which would break the state consistency
+guarantee and open another can of problems including regressions.
+
+For stable backports the preparatory commits ac31c7ff8624 .. ba31c1a48538
+are required as well, but for anything older than 5.3.y the backports are
+going to be provided when this hits mainline as the other dependencies for
+those kernels are definitely not stable material.
+
+Fixes: 778e9a9c3e71 ("pi-futex: fix exit races and locking problems")
+Reported-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Stable Team <stable@vger.kernel.org>
+Link: https://lkml.kernel.org/r/20191106224557.041676471@linutronix.de
+

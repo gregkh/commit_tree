@@ -1,0 +1,203 @@
+bpf: Introduce bpf sk local storage
+
+After allowing a bpf prog to
+- directly read the skb->sk ptr
+- get the fullsock bpf_sock by "bpf_sk_fullsock()"
+- get the bpf_tcp_sock by "bpf_tcp_sock()"
+- get the listener sock by "bpf_get_listener_sock()"
+- avoid duplicating the fields of "(bpf_)sock" and "(bpf_)tcp_sock"
+  into different bpf running context.
+
+this patch is another effort to make bpf's network programming
+more intuitive to do (together with memory and performance benefit).
+
+When bpf prog needs to store data for a sk, the current practice is to
+define a map with the usual 4-tuples (src/dst ip/port) as the key.
+If multiple bpf progs require to store different sk data, multiple maps
+have to be defined.  Hence, wasting memory to store the duplicated
+keys (i.e. 4 tuples here) in each of the bpf map.
+[ The smallest key could be the sk pointer itself which requires
+  some enhancement in the verifier and it is a separate topic. ]
+
+Also, the bpf prog needs to clean up the elem when sk is freed.
+Otherwise, the bpf map will become full and un-usable quickly.
+The sk-free tracking currently could be done during sk state
+transition (e.g. BPF_SOCK_OPS_STATE_CB).
+
+The size of the map needs to be predefined which then usually ended-up
+with an over-provisioned map in production.  Even the map was re-sizable,
+while the sk naturally come and go away already, this potential re-size
+operation is arguably redundant if the data can be directly connected
+to the sk itself instead of proxy-ing through a bpf map.
+
+This patch introduces sk->sk_bpf_storage to provide local storage space
+at sk for bpf prog to use.  The space will be allocated when the first bpf
+prog has created data for this particular sk.
+
+The design optimizes the bpf prog's lookup (and then optionally followed by
+an inline update).  bpf_spin_lock should be used if the inline update needs
+to be protected.
+
+BPF_MAP_TYPE_SK_STORAGE:
+-----------------------
+To define a bpf "sk-local-storage", a BPF_MAP_TYPE_SK_STORAGE map (new in
+this patch) needs to be created.  Multiple BPF_MAP_TYPE_SK_STORAGE maps can
+be created to fit different bpf progs' needs.  The map enforces
+BTF to allow printing the sk-local-storage during a system-wise
+sk dump (e.g. "ss -ta") in the future.
+
+The purpose of a BPF_MAP_TYPE_SK_STORAGE map is not for lookup/update/delete
+a "sk-local-storage" data from a particular sk.
+Think of the map as a meta-data (or "type") of a "sk-local-storage".  This
+particular "type" of "sk-local-storage" data can then be stored in any sk.
+
+The main purposes of this map are mostly:
+1. Define the size of a "sk-local-storage" type.
+2. Provide a similar syscall userspace API as the map (e.g. lookup/update,
+   map-id, map-btf...etc.)
+3. Keep track of all sk's storages of this "type" and clean them up
+   when the map is freed.
+
+sk->sk_bpf_storage:
+------------------
+The main lookup/update/delete is done on sk->sk_bpf_storage (which
+is a "struct bpf_sk_storage").  When doing a lookup,
+the "map" pointer is now used as the "key" to search on the
+sk_storage->list.  The "map" pointer is actually serving
+as the "type" of the "sk-local-storage" that is being
+requested.
+
+To allow very fast lookup, it should be as fast as looking up an
+array at a stable-offset.  At the same time, it is not ideal to
+set a hard limit on the number of sk-local-storage "type" that the
+system can have.  Hence, this patch takes a cache approach.
+The last search result from sk_storage->list is cached in
+sk_storage->cache[] which is a stable sized array.  Each
+"sk-local-storage" type has a stable offset to the cache[] array.
+In the future, a map's flag could be introduced to do cache
+opt-out/enforcement if it became necessary.
+
+The cache size is 16 (i.e. 16 types of "sk-local-storage").
+Programs can share map.  On the program side, having a few bpf_progs
+running in the networking hotpath is already a lot.  The bpf_prog
+should have already consolidated the existing sock-key-ed map usage
+to minimize the map lookup penalty.  16 has enough runway to grow.
+
+All sk-local-storage data will be removed from sk->sk_bpf_storage
+during sk destruction.
+
+bpf_sk_storage_get() and bpf_sk_storage_delete():
+------------------------------------------------
+Instead of using bpf_map_(lookup|update|delete)_elem(),
+the bpf prog needs to use the new helper bpf_sk_storage_get() and
+bpf_sk_storage_delete().  The verifier can then enforce the
+ARG_PTR_TO_SOCKET argument.  The bpf_sk_storage_get() also allows to
+"create" new elem if one does not exist in the sk.  It is done by
+the new BPF_SK_STORAGE_GET_F_CREATE flag.  An optional value can also be
+provided as the initial value during BPF_SK_STORAGE_GET_F_CREATE.
+The BPF_MAP_TYPE_SK_STORAGE also supports bpf_spin_lock.  Together,
+it has eliminated the potential use cases for an equivalent
+bpf_map_update_elem() API (for bpf_prog) in this patch.
+
+Misc notes:
+----------
+1. map_get_next_key is not supported.  From the userspace syscall
+   perspective,  the map has the socket fd as the key while the map
+   can be shared by pinned-file or map-id.
+
+   Since btf is enforced, the existing "ss" could be enhanced to pretty
+   print the local-storage.
+
+   Supporting a kernel defined btf with 4 tuples as the return key could
+   be explored later also.
+
+2. The sk->sk_lock cannot be acquired.  Atomic operations is used instead.
+   e.g. cmpxchg is done on the sk->sk_bpf_storage ptr.
+   Please refer to the source code comments for the details in
+   synchronization cases and considerations.
+
+3. The mem is charged to the sk->sk_omem_alloc as the sk filter does.
+
+Benchmark:
+---------
+Here is the benchmark data collected by turning on
+the "kernel.bpf_stats_enabled" sysctl.
+Two bpf progs are tested:
+
+One bpf prog with the usual bpf hashmap (max_entries = 8192) with the
+sk ptr as the key. (verifier is modified to support sk ptr as the key
+That should have shortened the key lookup time.)
+
+Another bpf prog is with the new BPF_MAP_TYPE_SK_STORAGE.
+
+Both are storing a "u32 cnt", do a lookup on "egress_skb/cgroup" for
+each egress skb and then bump the cnt.  netperf is used to drive
+data with 4096 connected UDP sockets.
+
+BPF_MAP_TYPE_HASH with a modifier verifier (152ns per bpf run)
+27: cgroup_skb  name egress_sk_map  tag 74f56e832918070b run_time_ns 58280107540 run_cnt 381347633
+    loaded_at 2019-04-15T13:46:39-0700  uid 0
+    xlated 344B  jited 258B  memlock 4096B  map_ids 16
+    btf_id 5
+
+BPF_MAP_TYPE_SK_STORAGE in this patch (66ns per bpf run)
+30: cgroup_skb  name egress_sk_stora  tag d4aa70984cc7bbf6 run_time_ns 25617093319 run_cnt 390989739
+    loaded_at 2019-04-15T13:47:54-0700  uid 0
+    xlated 168B  jited 156B  memlock 4096B  map_ids 17
+    btf_id 6
+
+Here is a high-level picture on how are the objects organized:
+
+       sk
+    ┌──────┐
+    │      │
+    │      │
+    │      │
+    │*sk_bpf_storage─────▶ bpf_sk_storage
+    └──────┘                 ┌───────┐
+                 ┌───────────┤ list  │
+                 │           │       │
+                 │           │       │
+                 │           │       │
+                 │           └───────┘
+                 │
+                 │     elem
+                 │  ┌────────┐
+                 ├─▶│ snode  │
+                 │  ├────────┤
+                 │  │  data  │          bpf_map
+                 │  ├────────┤        ┌─────────┐
+                 │  │map_node│◀─┬─────┤  list   │
+                 │  └────────┘  │     │         │
+                 │              │     │         │
+                 │     elem     │     │         │
+                 │  ┌────────┐  │     └─────────┘
+                 └─▶│ snode  │  │
+                    ├────────┤  │
+   bpf_map          │  data  │  │
+ ┌─────────┐        ├────────┤  │
+ │  list   ├───────▶│map_node│  │
+ │         │        └────────┘  │
+ │         │                    │
+ │         │           elem     │
+ └─────────┘        ┌────────┐  │
+                 ┌─▶│ snode  │  │
+                 │  ├────────┤  │
+                 │  │  data  │  │
+                 │  ├────────┤  │
+                 │  │map_node│◀─┘
+                 │  └────────┘
+                 │
+                 │
+                 │          ┌───────┐
+     sk          └──────────│ list  │
+  ┌──────┐                  │       │
+  │      │                  │       │
+  │      │                  │       │
+  │      │                  └───────┘
+  │*sk_bpf_storage───────▶bpf_sk_storage
+  └──────┘
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

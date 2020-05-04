@@ -1,0 +1,62 @@
+powerpc/mm/64s/hash: Reallocate context ids on fork
+
+When using the Hash Page Table (HPT) MMU, userspace memory mappings
+are managed at two levels. Firstly in the Linux page tables, much like
+other architectures, and secondly in the SLB (Segment Lookaside
+Buffer) and HPT. It's the SLB and HPT that are actually used by the
+hardware to do translations.
+
+As part of the series adding support for 4PB user virtual address
+space using the hash MMU, we added support for allocating multiple
+"context ids" per process, one for each 512TB chunk of address space.
+These are tracked in an array called extended_id in the mm_context_t
+of a process that has done a mapping above 512TB.
+
+If such a process forks (ie. clone(2) without CLONE_VM set) it's mm is
+copied, including the mm_context_t, and then init_new_context() is
+called to reinitialise parts of the mm_context_t as appropriate to
+separate the address spaces of the two processes.
+
+The key step in ensuring the two processes have separate address
+spaces is to allocate a new context id for the process, this is done
+at the beginning of hash__init_new_context(). If we didn't allocate a
+new context id then the two processes would share mappings as far as
+the SLB and HPT are concerned, even though their Linux page tables
+would be separate.
+
+For mappings above 512TB, which use the extended_id array, we
+neglected to allocate new context ids on fork, meaning the parent and
+child use the same ids and therefore share those mappings even though
+they're supposed to be separate. This can lead to the parent seeing
+writes done by the child, which is essentially memory corruption.
+
+There is an additional exposure which is that if the child process
+exits, all its context ids are freed, including the context ids that
+are still in use by the parent for mappings above 512TB. One or more
+of those ids can then be reallocated to a third process, that process
+can then read/write to the parent's mappings above 512TB. Additionally
+if the freed id is used for the third process's primary context id,
+then the parent is able to read/write to the third process's mappings
+*below* 512TB.
+
+All of these are fundamental failures to enforce separation between
+processes. The only mitigating factor is that the bug only occurs if a
+process creates mappings above 512TB, and most applications still do
+not create such mappings.
+
+Only machines using the hash page table MMU are affected, eg. PowerPC
+970 (G5), PA6T, Power5/6/7/8/9. By default Power9 bare metal machines
+(powernv) use the Radix MMU and are not affected, unless the machine
+has been explicitly booted in HPT mode (using disable_radix on the
+kernel command line). KVM guests on Power9 may be affected if the host
+or guest is configured to use the HPT MMU. LPARs under PowerVM on
+Power9 are affected as they always use the HPT MMU. Kernels built with
+PAGE_SIZE=4K are not affected.
+
+The fix is relatively simple, we need to reallocate context ids for
+all extended mappings on fork.
+
+Fixes: f384796c40dc ("powerpc/mm: Add support for handling > 512TB address in SLB miss")
+Cc: stable@vger.kernel.org # v4.17+
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+

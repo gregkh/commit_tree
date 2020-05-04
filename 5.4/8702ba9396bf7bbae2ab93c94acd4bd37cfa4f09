@@ -1,0 +1,91 @@
+btrfs: qgroup: Always free PREALLOC META reserve in btrfs_delalloc_release_extents()
+
+[Background]
+Btrfs qgroup uses two types of reserved space for METADATA space,
+PERTRANS and PREALLOC.
+
+PERTRANS is metadata space reserved for each transaction started by
+btrfs_start_transaction().
+While PREALLOC is for delalloc, where we reserve space before joining a
+transaction, and finally it will be converted to PERTRANS after the
+writeback is done.
+
+[Inconsistency]
+However there is inconsistency in how we handle PREALLOC metadata space.
+
+The most obvious one is:
+In btrfs_buffered_write():
+	btrfs_delalloc_release_extents(BTRFS_I(inode), reserve_bytes, true);
+
+We always free qgroup PREALLOC meta space.
+
+While in btrfs_truncate_block():
+	btrfs_delalloc_release_extents(BTRFS_I(inode), blocksize, (ret != 0));
+
+We only free qgroup PREALLOC meta space when something went wrong.
+
+[The Correct Behavior]
+The correct behavior should be the one in btrfs_buffered_write(), we
+should always free PREALLOC metadata space.
+
+The reason is, the btrfs_delalloc_* mechanism works by:
+- Reserve metadata first, even it's not necessary
+  In btrfs_delalloc_reserve_metadata()
+
+- Free the unused metadata space
+  Normally in:
+  btrfs_delalloc_release_extents()
+  |- btrfs_inode_rsv_release()
+     Here we do calculation on whether we should release or not.
+
+E.g. for 64K buffered write, the metadata rsv works like:
+
+/* The first page */
+reserve_meta:	num_bytes=calc_inode_reservations()
+free_meta:	num_bytes=0
+total:		num_bytes=calc_inode_reservations()
+/* The first page caused one outstanding extent, thus needs metadata
+   rsv */
+
+/* The 2nd page */
+reserve_meta:	num_bytes=calc_inode_reservations()
+free_meta:	num_bytes=calc_inode_reservations()
+total:		not changed
+/* The 2nd page doesn't cause new outstanding extent, needs no new meta
+   rsv, so we free what we have reserved */
+
+/* The 3rd~16th pages */
+reserve_meta:	num_bytes=calc_inode_reservations()
+free_meta:	num_bytes=calc_inode_reservations()
+total:		not changed (still space for one outstanding extent)
+
+This means, if btrfs_delalloc_release_extents() determines to free some
+space, then those space should be freed NOW.
+So for qgroup, we should call btrfs_qgroup_free_meta_prealloc() other
+than btrfs_qgroup_convert_reserved_meta().
+
+The good news is:
+- The callers are not that hot
+  The hottest caller is in btrfs_buffered_write(), which is already
+  fixed by commit 336a8bb8e36a ("btrfs: Fix wrong
+  btrfs_delalloc_release_extents parameter"). Thus it's not that
+  easy to cause false EDQUOT.
+
+- The trans commit in advance for qgroup would hide the bug
+  Since commit f5fef4593653 ("btrfs: qgroup: Make qgroup async transaction
+  commit more aggressive"), when btrfs qgroup metadata free space is slow,
+  it will try to commit transaction and free the wrongly converted
+  PERTRANS space, so it's not that easy to hit such bug.
+
+[FIX]
+So to fix the problem, remove the @qgroup_free parameter for
+btrfs_delalloc_release_extents(), and always pass true to
+btrfs_inode_rsv_release().
+
+Reported-by: Filipe Manana <fdmanana@suse.com>
+Fixes: 43b18595d660 ("btrfs: qgroup: Use separate meta reservation type for delalloc")
+CC: stable@vger.kernel.org # 4.19+
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

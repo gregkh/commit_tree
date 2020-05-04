@@ -1,0 +1,58 @@
+xfs: properly serialise fallocate against AIO+DIO
+
+AIO+DIO can extend the file size on IO completion, and it holds
+no inode locks while the IO is in flight. Therefore, a race
+condition exists in file size updates if we do something like this:
+
+aio-thread			fallocate-thread
+
+lock inode
+submit IO beyond inode->i_size
+unlock inode
+.....
+				lock inode
+				break layouts
+				if (off + len > inode->i_size)
+					new_size = off + len
+				.....
+				inode_dio_wait()
+				<blocks>
+.....
+completes
+inode->i_size updated
+inode_dio_done()
+....
+				<wakes>
+				<does stuff no long beyond EOF>
+				if (new_size)
+					xfs_vn_setattr(inode, new_size)
+
+
+Yup, that attempt to extend the file size in the fallocate code
+turns into a truncate - it removes the whatever the aio write
+allocated and put to disk, and reduced the inode size back down to
+where the fallocate operation ends.
+
+Fundamentally, xfs_file_fallocate()  not compatible with racing
+AIO+DIO completions, so we need to move the inode_dio_wait() call
+up to where the lock the inode and break the layouts.
+
+Secondly, storing the inode size and then using it unchecked without
+holding the ILOCK is not safe; we can only do such a thing if we've
+locked out and drained all IO and other modification operations,
+which we don't do initially in xfs_file_fallocate.
+
+It should be noted that some of the fallocate operations are
+compound operations - they are made up of multiple manipulations
+that may zero data, and so we may need to flush and invalidate the
+file multiple times during an operation. However, we only need to
+lock out IO and other space manipulation operations once, as that
+lockout is maintained until the entire fallocate operation has been
+completed.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+

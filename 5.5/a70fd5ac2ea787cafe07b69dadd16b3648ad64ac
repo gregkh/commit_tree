@@ -1,0 +1,83 @@
+ext4: reserve revoke credits in __ext4_new_inode
+
+It's possible that __ext4_new_inode will release the xattr block, so
+it will trigger a warning since there is revoke credits will be 0 if
+the handle == NULL. The below scripts can reproduce it easily.
+
+------------[ cut here ]------------
+WARNING: CPU: 0 PID: 3861 at fs/jbd2/revoke.c:374 jbd2_journal_revoke+0x30e/0x540 fs/jbd2/revoke.c:374
+...
+__ext4_forget+0x1d7/0x800 fs/ext4/ext4_jbd2.c:248
+ext4_free_blocks+0x213/0x1d60 fs/ext4/mballoc.c:4743
+ext4_xattr_release_block+0x55b/0x780 fs/ext4/xattr.c:1254
+ext4_xattr_block_set+0x1c2c/0x2c40 fs/ext4/xattr.c:2112
+ext4_xattr_set_handle+0xa7e/0x1090 fs/ext4/xattr.c:2384
+__ext4_set_acl+0x54d/0x6c0 fs/ext4/acl.c:214
+ext4_init_acl+0x218/0x2e0 fs/ext4/acl.c:293
+__ext4_new_inode+0x352a/0x42b0 fs/ext4/ialloc.c:1151
+ext4_mkdir+0x2e9/0xbd0 fs/ext4/namei.c:2774
+vfs_mkdir+0x386/0x5f0 fs/namei.c:3811
+do_mkdirat+0x11c/0x210 fs/namei.c:3834
+do_syscall_64+0xa1/0x530 arch/x86/entry/common.c:294
+...
+-------------------------------------
+
+scripts:
+mkfs.ext4 /dev/vdb
+mount /dev/vdb /mnt
+cd /mnt && mkdir dir && for i in {1..8}; do setfacl -dm "u:user_"$i":rx" dir; done
+mkdir dir/dir1 && mv dir/dir1 ./
+sh repro.sh && add some user
+
+[root@localhost ~]# cat repro.sh
+while [ 1 -eq 1 ]; do
+    rm -rf dir
+    rm -rf dir1/dir1
+    mkdir dir
+    for i in {1..8}; do  setfacl -dm "u:test"$i":rx" dir; done
+    setfacl -m "u:user_9:rx" dir &
+    mkdir dir1/dir1 &
+done
+
+Before exec repro.sh, dir1 has inherit the default acl from dir, and
+xattr block of dir1 dir is not the same, so the h_refcount of these
+two dir's xattr block will be 1. Then repro.sh can trigger the warning
+with the situation show as below. The last h_refcount can be clear
+with mkdir, and __ext4_new_inode has not reserved revoke credits, so
+the warning will happened, fix it by reserve revoke credits in
+__ext4_new_inode.
+
+Thread 1                        Thread 2
+mkdir dir
+set default acl(will create
+a xattr block blk1 and the
+refcount of ext4_xattr_header
+will be 1)
+				...
+                                mkdir dir1/dir1
+				->....->ext4_init_acl
+				->__ext4_set_acl(set default acl,
+			          will reuse blk1, and h_refcount
+				  will be 2)
+
+setfacl->ext4_set_acl->...
+->ext4_xattr_block_set(will create
+new block blk2 to store xattr)
+
+				->__ext4_set_acl(set access acl, since
+				  h_refcount of blk1 is 2, will create
+				  blk3 to store xattr)
+
+  ->ext4_xattr_release_block(dec
+  h_refcount of blk1 to 1)
+				  ->ext4_xattr_release_block(dec
+				    h_refcount and since it is 0,
+				    will release the block and trigger
+				    the warning)
+
+Link: https://lore.kernel.org/r/20191213014900.47228-1-yangerkun@huawei.com
+Reported-by: Hulk Robot <hulkci@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+

@@ -1,0 +1,78 @@
+mm, swap: fix race between swapoff and some swap operations
+
+When swapin is performed, after getting the swap entry information from
+the page table, system will swap in the swap entry, without any lock held
+to prevent the swap device from being swapoff.  This may cause the race
+like below,
+
+CPU 1				CPU 2
+-----				-----
+				do_swap_page
+				  swapin_readahead
+				    __read_swap_cache_async
+swapoff				      swapcache_prepare
+  p->swap_map = NULL		        __swap_duplicate
+					  p->swap_map[?] /* !!! NULL pointer access */
+
+Because swapoff is usually done when system shutdown only, the race may
+not hit many people in practice.  But it is still a race need to be fixed.
+
+To fix the race, get_swap_device() is added to check whether the specified
+swap entry is valid in its swap device.  If so, it will keep the swap
+entry valid via preventing the swap device from being swapoff, until
+put_swap_device() is called.
+
+Because swapoff() is very rare code path, to make the normal path runs as
+fast as possible, rcu_read_lock/unlock() and synchronize_rcu() instead of
+reference count is used to implement get/put_swap_device().  >From
+get_swap_device() to put_swap_device(), RCU reader side is locked, so
+synchronize_rcu() in swapoff() will wait until put_swap_device() is
+called.
+
+In addition to swap_map, cluster_info, etc.  data structure in the struct
+swap_info_struct, the swap cache radix tree will be freed after swapoff,
+so this patch fixes the race between swap cache looking up and swapoff
+too.
+
+Races between some other swap cache usages and swapoff are fixed too via
+calling synchronize_rcu() between clearing PageSwapCache() and freeing
+swap cache data structure.
+
+Another possible method to fix this is to use preempt_off() +
+stop_machine() to prevent the swap device from being swapoff when its data
+structure is being accessed.  The overhead in hot-path of both methods is
+similar.  The advantages of RCU based method are,
+
+1. stop_machine() may disturb the normal execution code path on other
+   CPUs.
+
+2. File cache uses RCU to protect its radix tree.  If the similar
+   mechanism is used for swap cache too, it is easier to share code
+   between them.
+
+3. RCU is used to protect swap cache in total_swapcache_pages() and
+   exit_swap_address_space() already.  The two mechanisms can be
+   merged to simplify the logic.
+
+Link: http://lkml.kernel.org/r/20190522015423.14418-1-ying.huang@intel.com
+Fixes: 235b62176712 ("mm/swap: add cluster lock")
+Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+Reviewed-by: Andrea Parri <andrea.parri@amarulasolutions.com>
+Not-nacked-by: Hugh Dickins <hughd@google.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Jérôme Glisse <jglisse@redhat.com>
+Cc: Yang Shi <yang.shi@linux.alibaba.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Dave Jiang <dave.jiang@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

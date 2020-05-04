@@ -1,0 +1,55 @@
+KVM: VMX: Leave preemption timer running when it's disabled
+
+VMWRITEs to the major VMCS controls, pin controls included, are
+deceptively expensive.  CPUs with VMCS caching (Westmere and later) also
+optimize away consistency checks on VM-Entry, i.e. skip consistency
+checks if the relevant fields have not changed since the last successful
+VM-Entry (of the cached VMCS).  Because uops are a precious commodity,
+uCode's dirty VMCS field tracking isn't as precise as software would
+prefer.  Notably, writing any of the major VMCS fields effectively marks
+the entire VMCS dirty, i.e. causes the next VM-Entry to perform all
+consistency checks, which consumes several hundred cycles.
+
+As it pertains to KVM, toggling PIN_BASED_VMX_PREEMPTION_TIMER more than
+doubles the latency of the next VM-Entry (and again when/if the flag is
+toggled back).  In a non-nested scenario, running a "standard" guest
+with the preemption timer enabled, toggling the timer flag is uncommon
+but not rare, e.g. roughly 1 in 10 entries.  Disabling the preemption
+timer can change these numbers due to its use for "immediate exits",
+even when explicitly disabled by userspace.
+
+Nested virtualization in particular is painful, as the timer flag is set
+for the majority of VM-Enters, but prepare_vmcs02() initializes vmcs02's
+pin controls to *clear* the flag since its the timer's final state isn't
+known until vmx_vcpu_run().  I.e. the majority of nested VM-Enters end
+up unnecessarily writing pin controls *twice*.
+
+Rather than toggle the timer flag in pin controls, set the timer value
+itself to the largest allowed value to put it into a "soft disabled"
+state, and ignore any spurious preemption timer exits.
+
+Sadly, the timer is a 32-bit value and so theoretically it can fire
+before the head death of the universe, i.e. spurious exits are possible.
+But because KVM does *not* save the timer value on VM-Exit and because
+the timer runs at a slower rate than the TSC, the maximuma timer value
+is still sufficiently large for KVM's purposes.  E.g. on a modern CPU
+with a timer that runs at 1/32 the frequency of a 2.4ghz constant-rate
+TSC, the timer will fire after ~55 seconds of *uninterrupted* guest
+execution.  In other words, spurious VM-Exits are effectively only
+possible if the host is completely tickless on the logical CPU, the
+guest is not using the preemption timer, and the guest is not generating
+VM-Exits for any other reason.
+
+To be safe from bad/weird hardware, disable the preemption timer if its
+maximum delay is less than ten seconds.  Ten seconds is mostly arbitrary
+and was selected in no small part because it's a nice round number.
+For simplicity and paranoia, fall back to __kvm_request_immediate_exit()
+if the preemption timer is disabled by KVM or userspace.  Previously
+KVM continued to use the preemption timer to force immediate exits even
+when the timer was disabled by userspace.  Now that KVM leaves the timer
+running instead of truly disabling it, allow userspace to kill it
+entirely in the unlikely event the timer (or KVM) malfunctions.
+
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+

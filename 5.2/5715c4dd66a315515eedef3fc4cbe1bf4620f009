@@ -1,0 +1,76 @@
+vfio/mdev: Synchronize device create/remove with parent removal
+
+In following sequences, child devices created while removing mdev parent
+device can be left out, or it may lead to race of removing half
+initialized child mdev devices.
+
+issue-1:
+--------
+       cpu-0                         cpu-1
+       -----                         -----
+                                  mdev_unregister_device()
+                                    device_for_each_child()
+                                      mdev_device_remove_cb()
+                                        mdev_device_remove()
+create_store()
+  mdev_device_create()                   [...]
+    device_add()
+                                  parent_remove_sysfs_files()
+
+/* BUG: device added by cpu-0
+ * whose parent is getting removed
+ * and it won't process this mdev.
+ */
+
+issue-2:
+--------
+Below crash is observed when user initiated remove is in progress
+and mdev_unregister_driver() completes parent unregistration.
+
+       cpu-0                         cpu-1
+       -----                         -----
+remove_store()
+   mdev_device_remove()
+   active = false;
+                                  mdev_unregister_device()
+                                  parent device removed.
+   [...]
+   parents->ops->remove()
+ /*
+  * BUG: Accessing invalid parent.
+  */
+
+This is similar race like create() racing with mdev_unregister_device().
+
+BUG: unable to handle kernel paging request at ffffffffc0585668
+PGD e8f618067 P4D e8f618067 PUD e8f61a067 PMD 85adca067 PTE 0
+Oops: 0000 [#1] SMP PTI
+CPU: 41 PID: 37403 Comm: bash Kdump: loaded Not tainted 5.1.0-rc6-vdevbus+ #6
+Hardware name: Supermicro SYS-6028U-TR4+/X10DRU-i+, BIOS 2.0b 08/09/2016
+RIP: 0010:mdev_device_remove+0xfa/0x140 [mdev]
+Call Trace:
+ remove_store+0x71/0x90 [mdev]
+ kernfs_fop_write+0x113/0x1a0
+ vfs_write+0xad/0x1b0
+ ksys_write+0x5a/0xe0
+ do_syscall_64+0x5a/0x210
+ entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+Therefore, mdev core is improved as below to overcome above issues.
+
+Wait for any ongoing mdev create() and remove() to finish before
+unregistering parent device.
+This continues to allow multiple create and remove to progress in
+parallel for different mdev devices as most common case.
+At the same time guard parent removal while parent is being accessed by
+create() and remove() callbacks.
+create()/remove() and unregister_device() are synchronized by the rwsem.
+
+Refactor device removal code to mdev_device_remove_common() to avoid
+acquiring unreg_sem of the parent.
+
+Fixes: 7b96953bc640 ("vfio: Mediated device Core driver")
+Signed-off-by: Parav Pandit <parav@mellanox.com>
+Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+

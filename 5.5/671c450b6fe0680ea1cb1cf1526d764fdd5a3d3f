@@ -1,0 +1,59 @@
+xprtrdma: Fix oops in Receive handler after device removal
+
+Since v5.4, a device removal occasionally triggered this oops:
+
+Dec  2 17:13:53 manet kernel: BUG: unable to handle page fault for address: 0000000c00000219
+Dec  2 17:13:53 manet kernel: #PF: supervisor read access in kernel mode
+Dec  2 17:13:53 manet kernel: #PF: error_code(0x0000) - not-present page
+Dec  2 17:13:53 manet kernel: PGD 0 P4D 0
+Dec  2 17:13:53 manet kernel: Oops: 0000 [#1] SMP
+Dec  2 17:13:53 manet kernel: CPU: 2 PID: 468 Comm: kworker/2:1H Tainted: G        W         5.4.0-00050-g53717e43af61 #883
+Dec  2 17:13:53 manet kernel: Hardware name: Supermicro SYS-6028R-T/X10DRi, BIOS 1.1a 10/16/2015
+Dec  2 17:13:53 manet kernel: Workqueue: ib-comp-wq ib_cq_poll_work [ib_core]
+Dec  2 17:13:53 manet kernel: RIP: 0010:rpcrdma_wc_receive+0x7c/0xf6 [rpcrdma]
+Dec  2 17:13:53 manet kernel: Code: 6d 8b 43 14 89 c1 89 45 78 48 89 4d 40 8b 43 2c 89 45 14 8b 43 20 89 45 18 48 8b 45 20 8b 53 14 48 8b 30 48 8b 40 10 48 8b 38 <48> 8b 87 18 02 00 00 48 85 c0 75 18 48 8b 05 1e 24 c4 e1 48 85 c0
+Dec  2 17:13:53 manet kernel: RSP: 0018:ffffc900035dfe00 EFLAGS: 00010246
+Dec  2 17:13:53 manet kernel: RAX: ffff888467290000 RBX: ffff88846c638400 RCX: 0000000000000048
+Dec  2 17:13:53 manet kernel: RDX: 0000000000000048 RSI: 00000000f942e000 RDI: 0000000c00000001
+Dec  2 17:13:53 manet kernel: RBP: ffff888467611b00 R08: ffff888464e4a3c4 R09: 0000000000000000
+Dec  2 17:13:53 manet kernel: R10: ffffc900035dfc88 R11: fefefefefefefeff R12: ffff888865af4428
+Dec  2 17:13:53 manet kernel: R13: ffff888466023000 R14: ffff88846c63f000 R15: 0000000000000010
+Dec  2 17:13:53 manet kernel: FS:  0000000000000000(0000) GS:ffff88846fa80000(0000) knlGS:0000000000000000
+Dec  2 17:13:53 manet kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+Dec  2 17:13:53 manet kernel: CR2: 0000000c00000219 CR3: 0000000002009002 CR4: 00000000001606e0
+Dec  2 17:13:53 manet kernel: Call Trace:
+Dec  2 17:13:53 manet kernel: __ib_process_cq+0x5c/0x14e [ib_core]
+Dec  2 17:13:53 manet kernel: ib_cq_poll_work+0x26/0x70 [ib_core]
+Dec  2 17:13:53 manet kernel: process_one_work+0x19d/0x2cd
+Dec  2 17:13:53 manet kernel: ? cancel_delayed_work_sync+0xf/0xf
+Dec  2 17:13:53 manet kernel: worker_thread+0x1a6/0x25a
+Dec  2 17:13:53 manet kernel: ? cancel_delayed_work_sync+0xf/0xf
+Dec  2 17:13:53 manet kernel: kthread+0xf4/0xf9
+Dec  2 17:13:53 manet kernel: ? kthread_queue_delayed_work+0x74/0x74
+Dec  2 17:13:53 manet kernel: ret_from_fork+0x24/0x30
+
+The proximal cause is that this rpcrdma_rep has a rr_rdmabuf that
+is still pointing to the old ib_device, which has been freed. The
+only way that is possible is if this rpcrdma_rep was not destroyed
+by rpcrdma_ia_remove.
+
+Debugging showed that was indeed the case: this rpcrdma_rep was
+still in use by a completing RPC at the time of the device removal,
+and thus wasn't on the rep free list. So, it was not found by
+rpcrdma_reps_destroy().
+
+The fix is to introduce a list of all rpcrdma_reps so that they all
+can be found when a device is removed. That list is used to perform
+only regbuf DMA unmapping, replacing that call to
+rpcrdma_reps_destroy().
+
+Meanwhile, to prevent corruption of this list, I've moved the
+destruction of temp rpcrdma_rep objects to rpcrdma_post_recvs().
+rpcrdma_xprt_drain() ensures that post_recvs (and thus rep_destroy) is
+not invoked while rpcrdma_reps_unmap is walking rb_all_reps, thus
+protecting the rb_all_reps list.
+
+Fixes: b0b227f071a0 ("xprtrdma: Use an llist to manage free rpcrdma_reps")
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+

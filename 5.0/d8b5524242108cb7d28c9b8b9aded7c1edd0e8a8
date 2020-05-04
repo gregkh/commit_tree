@@ -1,0 +1,144 @@
+Btrfs: fix race between reflink/dedupe and relocation
+
+The recent rework that makes btrfs' remap_file_range operation use the
+generic helper generic_remap_file_range_prep() introduced a race between
+relocation and reflinking (for both cloning and deduplication) the file
+extents between the source and destination inodes.
+
+This happens because we no longer lock the source range anymore, and we do
+not lock it anymore because we wait for direct IO writes and writeback to
+complete early on the code path right after locking the inodes, which
+guarantees no other file operations interfere with the reflinking. However
+there is one exception which is relocation, since it replaces the byte
+number of file extents items in the fs tree after locking the range the
+file extent items represent. This is a problem because after finding each
+file extent to clone in the fs tree, the reflink process copies the file
+extent item into a local buffer, releases the search path, inserts new
+file extent items in the destination range and then increments the
+reference count for the extent mentioned in the file extent item that it
+previously copied to the buffer. If right after copying the file extent
+item into the buffer and releasing the path the relocation process
+updates the file extent item to point to the new extent, the reflink
+process ends up creating a delayed reference to increment the reference
+count of the old extent, for which the relocation process already created
+a delayed reference to drop it. This results in failure to run delayed
+references because we will attempt to increment the count of a reference
+that was already dropped. This is illustrated by the following diagram:
+
+        CPU 1                                       CPU 2
+
+                                        relocation is running
+
+  btrfs_clone_files()
+
+    btrfs_clone()
+      --> finds extent item
+          in source range
+          point to extent
+          at bytenr X
+      --> copies it into a
+          local buffer
+      --> releases path
+
+                                        replace_file_extents()
+                                          --> successfully locks the
+                                              range represented by
+                                              the file extent item
+                                          --> replaces disk_bytenr
+                                              field in the file
+                                              extent item with some
+                                              other value Y
+                                          --> creates delayed reference
+                                              to increment reference
+                                              count for extent at
+                                              bytenr Y
+                                          --> creates delayed reference
+                                              to drop the extent at
+                                              bytenr X
+
+      --> starts transaction
+      --> creates delayed
+          reference to
+          increment extent
+          at bytenr X
+
+                    <delayed references are run, due to a transaction
+                     commit for example, and the transaction is aborted
+                     with -EIO because we attempt to increment reference
+                     count for the extent at bytenr X after we freed it>
+
+When this race is hit the running transaction ends up getting aborted with
+an -EIO error and a trace like the following is produced:
+
+[ 4382.553858] WARNING: CPU: 2 PID: 3648 at fs/btrfs/extent-tree.c:1552 lookup_inline_extent_backref+0x4f4/0x650 [btrfs]
+(...)
+[ 4382.556293] CPU: 2 PID: 3648 Comm: btrfs Tainted: G        W         4.20.0-rc6-btrfs-next-41 #1
+[ 4382.556294] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.11.2-0-gf9626ccb91-prebuilt.qemu-project.org 04/01/2014
+[ 4382.556308] RIP: 0010:lookup_inline_extent_backref+0x4f4/0x650 [btrfs]
+(...)
+[ 4382.556310] RSP: 0018:ffffac784408f738 EFLAGS: 00010202
+[ 4382.556311] RAX: 0000000000000001 RBX: ffff8980673c3a48 RCX: 0000000000000001
+[ 4382.556312] RDX: 0000000000000008 RSI: 0000000000000000 RDI: 0000000000000000
+[ 4382.556312] RBP: 0000000000000000 R08: 0000000000000000 R09: 0000000000000001
+[ 4382.556313] R10: 0000000000000001 R11: ffff897f40000000 R12: 0000000000001000
+[ 4382.556313] R13: 00000000c224f000 R14: ffff89805de9bd40 R15: ffff8980453f4548
+[ 4382.556315] FS:  00007f5e759178c0(0000) GS:ffff89807b300000(0000) knlGS:0000000000000000
+[ 4382.563130] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[ 4382.563562] CR2: 00007f2e9789fcbc CR3: 0000000120512001 CR4: 00000000003606e0
+[ 4382.564005] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[ 4382.564451] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+[ 4382.564887] Call Trace:
+[ 4382.565343]  insert_inline_extent_backref+0x55/0xe0 [btrfs]
+[ 4382.565796]  __btrfs_inc_extent_ref.isra.60+0x88/0x260 [btrfs]
+[ 4382.566249]  ? __btrfs_run_delayed_refs+0x93/0x1650 [btrfs]
+[ 4382.566702]  __btrfs_run_delayed_refs+0xa22/0x1650 [btrfs]
+[ 4382.567162]  btrfs_run_delayed_refs+0x7e/0x1d0 [btrfs]
+[ 4382.567623]  btrfs_commit_transaction+0x50/0x9c0 [btrfs]
+[ 4382.568112]  ? _raw_spin_unlock+0x24/0x30
+[ 4382.568557]  ? block_rsv_release_bytes+0x14e/0x410 [btrfs]
+[ 4382.569006]  create_subvol+0x3c8/0x830 [btrfs]
+[ 4382.569461]  ? btrfs_mksubvol+0x317/0x600 [btrfs]
+[ 4382.569906]  btrfs_mksubvol+0x317/0x600 [btrfs]
+[ 4382.570383]  ? rcu_sync_lockdep_assert+0xe/0x60
+[ 4382.570822]  ? __sb_start_write+0xd4/0x1c0
+[ 4382.571262]  ? mnt_want_write_file+0x24/0x50
+[ 4382.571712]  btrfs_ioctl_snap_create_transid+0x117/0x1a0 [btrfs]
+[ 4382.572155]  ? _copy_from_user+0x66/0x90
+[ 4382.572602]  btrfs_ioctl_snap_create+0x66/0x80 [btrfs]
+[ 4382.573052]  btrfs_ioctl+0x7c1/0x30e0 [btrfs]
+[ 4382.573502]  ? mem_cgroup_commit_charge+0x8b/0x570
+[ 4382.573946]  ? do_raw_spin_unlock+0x49/0xc0
+[ 4382.574379]  ? _raw_spin_unlock+0x24/0x30
+[ 4382.574803]  ? __handle_mm_fault+0xf29/0x12d0
+[ 4382.575215]  ? do_vfs_ioctl+0xa2/0x6f0
+[ 4382.575622]  ? btrfs_ioctl_get_supported_features+0x30/0x30 [btrfs]
+[ 4382.576020]  do_vfs_ioctl+0xa2/0x6f0
+[ 4382.576405]  ksys_ioctl+0x70/0x80
+[ 4382.576776]  __x64_sys_ioctl+0x16/0x20
+[ 4382.577137]  do_syscall_64+0x60/0x1b0
+[ 4382.577488]  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+(...)
+[ 4382.578837] RSP: 002b:00007ffe04bf64c8 EFLAGS: 00000202 ORIG_RAX: 0000000000000010
+[ 4382.579174] RAX: ffffffffffffffda RBX: 00005564136f3050 RCX: 00007f5e74724dd7
+[ 4382.579505] RDX: 00007ffe04bf64d0 RSI: 000000005000940e RDI: 0000000000000003
+[ 4382.579848] RBP: 0000000000000000 R08: 0000000000000000 R09: 0000000000000044
+[ 4382.580164] R10: 0000000000000541 R11: 0000000000000202 R12: 00005564136f3010
+[ 4382.580477] R13: 0000000000000003 R14: 00005564136f3035 R15: 00005564136f3050
+[ 4382.580792] irq event stamp: 0
+[ 4382.581106] hardirqs last  enabled at (0): [<0000000000000000>]           (null)
+[ 4382.581441] hardirqs last disabled at (0): [<ffffffff8d085842>] copy_process.part.32+0x6e2/0x2320
+[ 4382.581772] softirqs last  enabled at (0): [<ffffffff8d085842>] copy_process.part.32+0x6e2/0x2320
+[ 4382.582095] softirqs last disabled at (0): [<0000000000000000>]           (null)
+[ 4382.582413] ---[ end trace d3c188e3e9367382 ]---
+[ 4382.623855] BTRFS: error (device sdc) in btrfs_run_delayed_refs:2981: errno=-5 IO failure
+[ 4382.624295] BTRFS info (device sdc): forced readonly
+
+Fix this by locking the source range before searching for the file extent
+items in the fs tree, since the relocation process will try to lock the
+range a file extent item represents before updating it with the new extent
+location.
+
+Fixes: 34a28e3d7753 ("Btrfs: use generic_remap_file_range_prep() for cloning and deduplication")
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

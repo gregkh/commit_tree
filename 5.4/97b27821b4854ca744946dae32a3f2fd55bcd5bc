@@ -1,0 +1,155 @@
+writeback, memcg: Implement foreign dirty flushing
+
+There's an inherent mismatch between memcg and writeback.  The former
+trackes ownership per-page while the latter per-inode.  This was a
+deliberate design decision because honoring per-page ownership in the
+writeback path is complicated, may lead to higher CPU and IO overheads
+and deemed unnecessary given that write-sharing an inode across
+different cgroups isn't a common use-case.
+
+Combined with inode majority-writer ownership switching, this works
+well enough in most cases but there are some pathological cases.  For
+example, let's say there are two cgroups A and B which keep writing to
+different but confined parts of the same inode.  B owns the inode and
+A's memory is limited far below B's.  A's dirty ratio can rise enough
+to trigger balance_dirty_pages() sleeps but B's can be low enough to
+avoid triggering background writeback.  A will be slowed down without
+a way to make writeback of the dirty pages happen.
+
+This patch implements foreign dirty recording and foreign mechanism so
+that when a memcg encounters a condition as above it can trigger
+flushes on bdi_writebacks which can clean its pages.  Please see the
+comment on top of mem_cgroup_track_foreign_dirty_slowpath() for
+details.
+
+A reproducer follows.
+
+write-range.c::
+
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <unistd.h>
+  #include <fcntl.h>
+  #include <sys/types.h>
+
+  static const char *usage = "write-range FILE START SIZE\n";
+
+  int main(int argc, char **argv)
+  {
+	  int fd;
+	  unsigned long start, size, end, pos;
+	  char *endp;
+	  char buf[4096];
+
+	  if (argc < 4) {
+		  fprintf(stderr, usage);
+		  return 1;
+	  }
+
+	  fd = open(argv[1], O_WRONLY);
+	  if (fd < 0) {
+		  perror("open");
+		  return 1;
+	  }
+
+	  start = strtoul(argv[2], &endp, 0);
+	  if (*endp != '\0') {
+		  fprintf(stderr, usage);
+		  return 1;
+	  }
+
+	  size = strtoul(argv[3], &endp, 0);
+	  if (*endp != '\0') {
+		  fprintf(stderr, usage);
+		  return 1;
+	  }
+
+	  end = start + size;
+
+	  while (1) {
+		  for (pos = start; pos < end; ) {
+			  long bread, bwritten = 0;
+
+			  if (lseek(fd, pos, SEEK_SET) < 0) {
+				  perror("lseek");
+				  return 1;
+			  }
+
+			  bread = read(0, buf, sizeof(buf) < end - pos ?
+					       sizeof(buf) : end - pos);
+			  if (bread < 0) {
+				  perror("read");
+				  return 1;
+			  }
+			  if (bread == 0)
+				  return 0;
+
+			  while (bwritten < bread) {
+				  long this;
+
+				  this = write(fd, buf + bwritten,
+					       bread - bwritten);
+				  if (this < 0) {
+					  perror("write");
+					  return 1;
+				  }
+
+				  bwritten += this;
+				  pos += bwritten;
+			  }
+		  }
+	  }
+  }
+
+repro.sh::
+
+  #!/bin/bash
+
+  set -e
+  set -x
+
+  sysctl -w vm.dirty_expire_centisecs=300000
+  sysctl -w vm.dirty_writeback_centisecs=300000
+  sysctl -w vm.dirtytime_expire_seconds=300000
+  echo 3 > /proc/sys/vm/drop_caches
+
+  TEST=/sys/fs/cgroup/test
+  A=$TEST/A
+  B=$TEST/B
+
+  mkdir -p $A $B
+  echo "+memory +io" > $TEST/cgroup.subtree_control
+  echo $((1<<30)) > $A/memory.high
+  echo $((32<<30)) > $B/memory.high
+
+  rm -f testfile
+  touch testfile
+  fallocate -l 4G testfile
+
+  echo "Starting B"
+
+  (echo $BASHPID > $B/cgroup.procs
+   pv -q --rate-limit 70M < /dev/urandom | ./write-range testfile $((2<<30)) $((2<<30))) &
+
+  echo "Waiting 10s to ensure B claims the testfile inode"
+  sleep 5
+  sync
+  sleep 5
+  sync
+  echo "Starting A"
+
+  (echo $BASHPID > $A/cgroup.procs
+   pv < /dev/urandom | ./write-range testfile 0 $((2<<30)))
+
+v2: Added comments explaining why the specific intervals are being used.
+
+v3: Use 0 @nr when calling cgroup_writeback_by_id() to use best-effort
+    flushing while avoding possible livelocks.
+
+v4: Use get_jiffies_64() and time_before/after64() instead of raw
+    jiffies_64 and arthimetic comparisons as suggested by Jan.
+
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

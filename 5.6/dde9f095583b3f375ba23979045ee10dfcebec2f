@@ -1,0 +1,52 @@
+afs: Fix handling of an abort from a service handler
+
+When an AFS service handler function aborts a call, AF_RXRPC marks the call
+as complete - which means that it's not going to get any more packets from
+the receiver.  This is a problem because reception of the final ACK is what
+triggers afs_deliver_to_call() to drop the final ref on the afs_call
+object.
+
+Instead, aborted AFS service calls may then just sit around waiting for
+ever or until they're displaced by a new call on the same connection
+channel or a connection-level abort.
+
+Fix this by calling afs_set_call_complete() to finalise the afs_call struct
+representing the call.
+
+However, we then need to drop the ref that stops the call from being
+deallocated.  We can do this in afs_set_call_complete(), as the work queue
+is holding a separate ref of its own, but then we shouldn't do it in
+afs_process_async_call() and afs_delete_async_call().
+
+call->drop_ref is set to indicate that a ref needs dropping for a call and
+this is dealt with when we transition a call to AFS_CALL_COMPLETE.
+
+But then we also need to get rid of the ref that pins an asynchronous
+client call.  We can do this by the same mechanism, setting call->drop_ref
+for an async client call too.
+
+We can also get rid of call->incoming since nothing ever sets it and only
+one thing ever checks it (futilely).
+
+
+A trace of the rxrpc_call and afs_call struct ref counting looks like:
+
+          <idle>-0     [001] ..s5   164.764892: rxrpc_call: c=00000002 SEE u=3 sp=rxrpc_new_incoming_call+0x473/0xb34 a=00000000442095b5
+          <idle>-0     [001] .Ns5   164.766001: rxrpc_call: c=00000002 QUE u=4 sp=rxrpc_propose_ACK+0xbe/0x551 a=00000000442095b5
+          <idle>-0     [001] .Ns4   164.766005: rxrpc_call: c=00000002 PUT u=3 sp=rxrpc_new_incoming_call+0xa3f/0xb34 a=00000000442095b5
+          <idle>-0     [001] .Ns7   164.766433: afs_call: c=00000002 WAKE  u=2 o=11 sp=rxrpc_notify_socket+0x196/0x33c
+     kworker/1:2-1810  [001] ...1   164.768409: rxrpc_call: c=00000002 SEE u=3 sp=rxrpc_process_call+0x25/0x7ae a=00000000442095b5
+     kworker/1:2-1810  [001] ...1   164.769439: rxrpc_tx_packet: c=00000002 e9f1a7a8:95786a88:00000008:09c5 00000001 00000000 02 22 ACK CallAck
+     kworker/1:2-1810  [001] ...1   164.769459: rxrpc_call: c=00000002 PUT u=2 sp=rxrpc_process_call+0x74f/0x7ae a=00000000442095b5
+     kworker/1:2-1810  [001] ...1   164.770794: afs_call: c=00000002 QUEUE u=3 o=12 sp=afs_deliver_to_call+0x449/0x72c
+     kworker/1:2-1810  [001] ...1   164.770829: afs_call: c=00000002 PUT   u=2 o=12 sp=afs_process_async_call+0xdb/0x11e
+     kworker/1:2-1810  [001] ...2   164.771084: rxrpc_abort: c=00000002 95786a88:00000008 s=0 a=1 e=1 K-1
+     kworker/1:2-1810  [001] ...1   164.771461: rxrpc_tx_packet: c=00000002 e9f1a7a8:95786a88:00000008:09c5 00000002 00000000 04 00 ABORT CallAbort
+     kworker/1:2-1810  [001] ...1   164.771466: afs_call: c=00000002 PUT   u=1 o=12 sp=SRXAFSCB_ProbeUuid+0xc1/0x106
+
+The abort generated in SRXAFSCB_ProbeUuid(), labelled "K-1", indicates that
+the local filesystem/cache manager didn't recognise the UUID as its own.
+
+Fixes: 2067b2b3f484 ("afs: Fix the CB.ProbeUuid service handler to reply correctly")
+Signed-off-by: David Howells <dhowells@redhat.com>
+

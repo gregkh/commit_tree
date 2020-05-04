@@ -1,0 +1,66 @@
+IB/core: Avoid deadlock during netlink message handling
+
+When rdmacm module is not loaded, and when netlink message is received to
+get char device info, it results into a deadlock due to recursive locking
+of rdma_nl_mutex with the below call sequence.
+
+[..]
+  rdma_nl_rcv()
+  mutex_lock()
+   [..]
+   rdma_nl_rcv_msg()
+      ib_get_client_nl_info()
+         request_module()
+           iw_cm_init()
+             rdma_nl_register()
+               mutex_lock(); <- Deadlock, acquiring mutex again
+
+Due to above call sequence, following call trace and deadlock is observed.
+
+  kernel: __mutex_lock+0x35e/0x860
+  kernel: ? __mutex_lock+0x129/0x860
+  kernel: ? rdma_nl_register+0x1a/0x90 [ib_core]
+  kernel: rdma_nl_register+0x1a/0x90 [ib_core]
+  kernel: ? 0xffffffffc029b000
+  kernel: iw_cm_init+0x34/0x1000 [iw_cm]
+  kernel: do_one_initcall+0x67/0x2d4
+  kernel: ? kmem_cache_alloc_trace+0x1ec/0x2a0
+  kernel: do_init_module+0x5a/0x223
+  kernel: load_module+0x1998/0x1e10
+  kernel: ? __symbol_put+0x60/0x60
+  kernel: __do_sys_finit_module+0x94/0xe0
+  kernel: do_syscall_64+0x5a/0x270
+  kernel: entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+  process stack trace:
+  [<0>] __request_module+0x1c9/0x460
+  [<0>] ib_get_client_nl_info+0x5e/0xb0 [ib_core]
+  [<0>] nldev_get_chardev+0x1ac/0x320 [ib_core]
+  [<0>] rdma_nl_rcv_msg+0xeb/0x1d0 [ib_core]
+  [<0>] rdma_nl_rcv+0xcd/0x120 [ib_core]
+  [<0>] netlink_unicast+0x179/0x220
+  [<0>] netlink_sendmsg+0x2f6/0x3f0
+  [<0>] sock_sendmsg+0x30/0x40
+  [<0>] ___sys_sendmsg+0x27a/0x290
+  [<0>] __sys_sendmsg+0x58/0xa0
+  [<0>] do_syscall_64+0x5a/0x270
+  [<0>] entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+To overcome this deadlock and to allow multiple netlink messages to
+progress in parallel, following scheme is implemented.
+
+1. Split the lock protecting the cb_table into a per-index lock, and make
+   it a rwlock. This lock is used to ensure no callbacks are running after
+   unregistration returns. Since a module will not be registered once it
+   is already running callbacks, this avoids the deadlock.
+
+2. Use smp_store_release() to update the cb_table during registration so
+   that no lock is required. This avoids lockdep problems with thinking
+   all the rwsems are the same lock class.
+
+Fixes: 0e2d00eb6fd45 ("RDMA: Add NLDEV_GET_CHARDEV to allow char dev discovery and autoload")
+Link: https://lore.kernel.org/r/20191015080733.18625-1-leon@kernel.org
+Signed-off-by: Parav Pandit <parav@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+

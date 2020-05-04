@@ -1,0 +1,56 @@
+Fix aio_poll() races
+
+aio_poll() has to cope with several unpleasant problems:
+	* requests that might stay around indefinitely need to
+be made visible for io_cancel(2); that must not be done to
+a request already completed, though.
+	* in cases when ->poll() has placed us on a waitqueue,
+wakeup might have happened (and request completed) before ->poll()
+returns.
+	* worse, in some early wakeup cases request might end
+up re-added into the queue later - we can't treat "woken up and
+currently not in the queue" as "it's not going to stick around
+indefinitely"
+	* ... moreover, ->poll() might have decided not to
+put it on any queues to start with, and that needs to be distinguished
+from the previous case
+	* ->poll() might have tried to put us on more than one queue.
+Only the first will succeed for aio poll, so we might end up missing
+wakeups.  OTOH, we might very well notice that only after the
+wakeup hits and request gets completed (all before ->poll() gets
+around to the second poll_wait()).  In that case it's too late to
+decide that we have an error.
+
+req->woken was an attempt to deal with that.  Unfortunately, it was
+broken.  What we need to keep track of is not that wakeup has happened -
+the thing might come back after that.  It's that async reference is
+already gone and won't come back, so we can't (and needn't) put the
+request on the list of cancellables.
+
+The easiest case is "request hadn't been put on any waitqueues"; we
+can tell by seeing NULL apt.head, and in that case there won't be
+anything async.  We should either complete the request ourselves
+(if vfs_poll() reports anything of interest) or return an error.
+
+In all other cases we get exclusion with wakeups by grabbing the
+queue lock.
+
+If request is currently on queue and we have something interesting
+from vfs_poll(), we can steal it and complete the request ourselves.
+
+If it's on queue and vfs_poll() has not reported anything interesting,
+we either put it on the cancellable list, or, if we know that it
+hadn't been put on all queues ->poll() wanted it on, we steal it and
+return an error.
+
+If it's _not_ on queue, it's either been already dealt with (in which
+case we do nothing), or there's aio_poll_complete_work() about to be
+executed.  In that case we either put it on the cancellable list,
+or, if we know it hadn't been put on all queues ->poll() wanted it on,
+simulate what cancel would've done.
+
+It's a lot more convoluted than I'd like it to be.  Single-consumer APIs
+suck, and unfortunately aio is not an exception...
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

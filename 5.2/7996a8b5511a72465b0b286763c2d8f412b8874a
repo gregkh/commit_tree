@@ -1,0 +1,73 @@
+blk-mq: fix hang caused by freeze/unfreeze sequence
+
+The following is a description of a hang in blk_mq_freeze_queue_wait().
+The hang happens on attempt to freeze a queue while another task does
+queue unfreeze.
+
+The root cause is an incorrect sequence of percpu_ref_resurrect() and
+percpu_ref_kill() and as a result those two can be swapped:
+
+ CPU#0                         CPU#1
+ ----------------              -----------------
+ q1 = blk_mq_init_queue(shared_tags)
+
+                                q2 = blk_mq_init_queue(shared_tags):
+                                  blk_mq_add_queue_tag_set(shared_tags):
+                                    blk_mq_update_tag_set_depth(shared_tags):
+				     list_for_each_entry()
+                                      blk_mq_freeze_queue(q1)
+                                       > percpu_ref_kill()
+                                       > blk_mq_freeze_queue_wait()
+
+ blk_cleanup_queue(q1)
+  blk_mq_freeze_queue(q1)
+   > percpu_ref_kill()
+                 ^^^^^^ freeze_depth can't guarantee the order
+
+                                      blk_mq_unfreeze_queue()
+                                        > percpu_ref_resurrect()
+
+   > blk_mq_freeze_queue_wait()
+                 ^^^^^^ Hang here!!!!
+
+This wrong sequence raises kernel warning:
+percpu_ref_kill_and_confirm called more than once on blk_queue_usage_counter_release!
+WARNING: CPU: 0 PID: 11854 at lib/percpu-refcount.c:336 percpu_ref_kill_and_confirm+0x99/0xb0
+
+But the most unpleasant effect is a hang of a blk_mq_freeze_queue_wait(),
+which waits for a zero of a q_usage_counter, which never happens
+because percpu-ref was reinited (instead of being killed) and stays in
+PERCPU state forever.
+
+How to reproduce:
+ - "insmod null_blk.ko shared_tags=1 nr_devices=0 queue_mode=2"
+ - cpu0: python Script.py 0; taskset the corresponding process running on cpu0
+ - cpu1: python Script.py 1; taskset the corresponding process running on cpu1
+
+ Script.py:
+ ------
+ #!/usr/bin/python3
+
+import os
+import sys
+
+while True:
+    on = "echo 1 > /sys/kernel/config/nullb/%s/power" % sys.argv[1]
+    off = "echo 0 > /sys/kernel/config/nullb/%s/power" % sys.argv[1]
+    os.system(on)
+    os.system(off)
+------
+
+This bug was first reported and fixed by Roman, previous discussion:
+[1] Message id: 1443287365-4244-7-git-send-email-akinobu.mita@gmail.com
+[2] Message id: 1443563240-29306-6-git-send-email-tj@kernel.org
+[3] https://patchwork.kernel.org/patch/9268199/
+
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Roman Pen <roman.penyaev@profitbricks.com>
+Signed-off-by: Bob Liu <bob.liu@oracle.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

@@ -1,0 +1,95 @@
+btrfs: Check the first key and level for cached extent buffer
+
+[BUG]
+When reading a file from a fuzzed image, kernel can panic like:
+
+  BTRFS warning (device loop0): csum failed root 5 ino 270 off 0 csum 0x98f94189 expected csum 0x00000000 mirror 1
+  assertion failed: !memcmp_extent_buffer(b, &disk_key, offsetof(struct btrfs_leaf, items[0].key), sizeof(disk_key)), file: fs/btrfs/ctree.c, line: 2544
+  ------------[ cut here ]------------
+  kernel BUG at fs/btrfs/ctree.h:3500!
+  invalid opcode: 0000 [#1] PREEMPT SMP NOPTI
+  RIP: 0010:btrfs_search_slot.cold.24+0x61/0x63 [btrfs]
+  Call Trace:
+   btrfs_lookup_csum+0x52/0x150 [btrfs]
+   __btrfs_lookup_bio_sums+0x209/0x640 [btrfs]
+   btrfs_submit_bio_hook+0x103/0x170 [btrfs]
+   submit_one_bio+0x59/0x80 [btrfs]
+   extent_read_full_page+0x58/0x80 [btrfs]
+   generic_file_read_iter+0x2f6/0x9d0
+   __vfs_read+0x14d/0x1a0
+   vfs_read+0x8d/0x140
+   ksys_read+0x52/0xc0
+   do_syscall_64+0x60/0x210
+   entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+[CAUSE]
+The fuzzed image has a corrupted leaf whose first key doesn't match its
+parent:
+
+  checksum tree key (CSUM_TREE ROOT_ITEM 0)
+  node 29741056 level 1 items 14 free 107 generation 19 owner CSUM_TREE
+  fs uuid 3381d111-94a3-4ac7-8f39-611bbbdab7e6
+  chunk uuid 9af1c3c7-2af5-488b-8553-530bd515f14c
+  	...
+          key (EXTENT_CSUM EXTENT_CSUM 79691776) block 29761536 gen 19
+
+  leaf 29761536 items 1 free space 1726 generation 19 owner CSUM_TREE
+  leaf 29761536 flags 0x1(WRITTEN) backref revision 1
+  fs uuid 3381d111-94a3-4ac7-8f39-611bbbdab7e6
+  chunk uuid 9af1c3c7-2af5-488b-8553-530bd515f14c
+          item 0 key (EXTENT_CSUM EXTENT_CSUM 8798638964736) itemoff 1751 itemsize 2244
+                  range start 8798638964736 end 8798641262592 length 2297856
+
+When reading the above tree block, we have extent_buffer->refs = 2 in
+the context:
+
+- initial one from __alloc_extent_buffer()
+  alloc_extent_buffer()
+  |- __alloc_extent_buffer()
+     |- atomic_set(&eb->refs, 1)
+
+- one being added to fs_info->buffer_radix
+  alloc_extent_buffer()
+  |- check_buffer_tree_ref()
+     |- atomic_inc(&eb->refs)
+
+So if even we call free_extent_buffer() in read_tree_block or other
+similar situation, we only decrease the refs by 1, it doesn't reach 0
+and won't be freed right now.
+
+The staled eb and its corrupted content will still be kept cached.
+
+Furthermore, we have several extra cases where we either don't do first
+key check or the check is not proper for all callers:
+
+- scrub
+  We just don't have first key in this context.
+
+- shared tree block
+  One tree block can be shared by several snapshot/subvolume trees.
+  In that case, the first key check for one subvolume doesn't apply to
+  another.
+
+So for the above reasons, a corrupted extent buffer can sneak into the
+buffer cache.
+
+[FIX]
+Call verify_level_key in read_block_for_search to do another
+verification. For that purpose the function is exported.
+
+Due to above reasons, although we can free corrupted extent buffer from
+cache, we still need the check in read_block_for_search(), for scrub and
+shared tree blocks.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=202755
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=202757
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=202759
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=202761
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=202767
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=202769
+Reported-by: Yoon Jungyeon <jungyeon@gatech.edu>
+CC: stable@vger.kernel.org # 4.19+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

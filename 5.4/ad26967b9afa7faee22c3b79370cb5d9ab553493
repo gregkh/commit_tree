@@ -1,0 +1,65 @@
+gfs2: Use async glocks for rename
+
+Because s_vfs_rename_mutex is not cluster-wide, multiple nodes can
+reverse the roles of which directories are "old" and which are "new" for
+the purposes of rename. This can cause deadlocks where two nodes end up
+waiting for each other.
+
+There can be several layers of directory dependencies across many nodes.
+
+This patch fixes the problem by acquiring all gfs2_rename's inode glocks
+asychronously and waiting for all glocks to be acquired.  That way all
+inodes are locked regardless of the order.
+
+The timeout value for multiple asynchronous glocks is calculated to be
+the total of the individual wait times for each glock times two.
+
+Since gfs2_exchange is very similar to gfs2_rename, both functions are
+patched in the same way.
+
+A new async glock wait queue, sd_async_glock_wait, keeps a list of
+waiters for these events. If gfs2's holder_wake function detects an
+async holder, it wakes up any waiters for the event. The waiter only
+tests whether any of its requests are still pending.
+
+Since the glocks are sent to dlm asychronously, the wait function needs
+to check to see which glocks, if any, were granted.
+
+If a glock is granted by dlm (and therefore held), its minimum hold time
+is checked and adjusted as necessary, as other glock grants do.
+
+If the event times out, all glocks held thus far must be dequeued to
+resolve any existing deadlocks.  Then, if there are any outstanding
+locking requests, we need to loop around and wait for dlm to respond to
+those requests too.  After we release all requests, we return -ESTALE to
+the caller (vfs rename) which loops around and retries the request.
+
+    Node1           Node2
+    ---------       ---------
+1.  Enqueue A       Enqueue B
+2.  Enqueue B       Enqueue A
+3.  A granted
+6.                  B granted
+7.  Wait for B
+8.                  Wait for A
+9.                  A times out (since Node 1 holds A)
+10.                 Dequeue B (since it was granted)
+11.                 Wait for all requests from DLM
+12. B Granted (since Node2 released it in step 10)
+13. Rename
+14. Dequeue A
+15.                 DLM Grants A
+16.                 Dequeue A (due to the timeout and since we
+                    no longer have B held for our task).
+17. Dequeue B
+18.                 Return -ESTALE to vfs
+19.                 VFS retries the operation, goto step 1.
+
+This release-all-locks / acquire-all-locks may slow rename / exchange
+down as both nodes struggle in the same way and do the same thing.
+However, this will only happen when there is contention for the same
+inodes, which ought to be rare.
+
+Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+

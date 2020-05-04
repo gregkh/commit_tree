@@ -1,0 +1,84 @@
+bpf: precise scalar_value tracking
+
+Introduce precision tracking logic that
+helps cilium programs the most:
+                  old clang  old clang    new clang  new clang
+                          with all patches         with all patches
+bpf_lb-DLB_L3.o      1838     2283         1923       1863
+bpf_lb-DLB_L4.o      3218     2657         3077       2468
+bpf_lb-DUNKNOWN.o    1064     545          1062       544
+bpf_lxc-DDROP_ALL.o  26935    23045        166729     22629
+bpf_lxc-DUNKNOWN.o   34439    35240        174607     28805
+bpf_netdev.o         9721     8753         8407       6801
+bpf_overlay.o        6184     7901         5420       4754
+bpf_lxc_jit.o        39389    50925        39389      50925
+
+Consider code:
+654: (85) call bpf_get_hash_recalc#34
+655: (bf) r7 = r0
+656: (15) if r8 == 0x0 goto pc+29
+657: (bf) r2 = r10
+658: (07) r2 += -48
+659: (18) r1 = 0xffff8881e41e1b00
+661: (85) call bpf_map_lookup_elem#1
+662: (15) if r0 == 0x0 goto pc+23
+663: (69) r1 = *(u16 *)(r0 +0)
+664: (15) if r1 == 0x0 goto pc+21
+665: (bf) r8 = r7
+666: (57) r8 &= 65535
+667: (bf) r2 = r8
+668: (3f) r2 /= r1
+669: (2f) r2 *= r1
+670: (bf) r1 = r8
+671: (1f) r1 -= r2
+672: (57) r1 &= 255
+673: (25) if r1 > 0x1e goto pc+12
+ R0=map_value(id=0,off=0,ks=20,vs=64,imm=0) R1_w=inv(id=0,umax_value=30,var_off=(0x0; 0x1f))
+674: (67) r1 <<= 1
+675: (0f) r0 += r1
+
+At this point the verifier will notice that scalar R1 is used in map pointer adjustment.
+R1 has to be precise for later operations on R0 to be validated properly.
+
+The verifier will backtrack the above code in the following way:
+last_idx 675 first_idx 664
+regs=2 stack=0 before 675: (0f) r0 += r1         // started backtracking R1 regs=2 is a bitmask
+regs=2 stack=0 before 674: (67) r1 <<= 1
+regs=2 stack=0 before 673: (25) if r1 > 0x1e goto pc+12
+regs=2 stack=0 before 672: (57) r1 &= 255
+regs=2 stack=0 before 671: (1f) r1 -= r2         // now both R1 and R2 has to be precise -> regs=6 mask
+regs=6 stack=0 before 670: (bf) r1 = r8          // after this insn R8 and R2 has to be precise
+regs=104 stack=0 before 669: (2f) r2 *= r1       // after this one R8, R2, and R1
+regs=106 stack=0 before 668: (3f) r2 /= r1
+regs=106 stack=0 before 667: (bf) r2 = r8
+regs=102 stack=0 before 666: (57) r8 &= 65535
+regs=102 stack=0 before 665: (bf) r8 = r7
+regs=82 stack=0 before 664: (15) if r1 == 0x0 goto pc+21
+ // this is the end of verifier state. The following regs will be marked precised:
+ R1_rw=invP(id=0,umax_value=65535,var_off=(0x0; 0xffff)) R7_rw=invP(id=0)
+parent didn't have regs=82 stack=0 marks         // so backtracking continues into parent state
+last_idx 663 first_idx 655
+regs=82 stack=0 before 663: (69) r1 = *(u16 *)(r0 +0)   // R1 was assigned no need to track it further
+regs=80 stack=0 before 662: (15) if r0 == 0x0 goto pc+23    // keep tracking R7
+regs=80 stack=0 before 661: (85) call bpf_map_lookup_elem#1  // keep tracking R7
+regs=80 stack=0 before 659: (18) r1 = 0xffff8881e41e1b00
+regs=80 stack=0 before 658: (07) r2 += -48
+regs=80 stack=0 before 657: (bf) r2 = r10
+regs=80 stack=0 before 656: (15) if r8 == 0x0 goto pc+29
+regs=80 stack=0 before 655: (bf) r7 = r0                // here the assignment into R7
+ // mark R0 to be precise:
+ R0_rw=invP(id=0)
+parent didn't have regs=1 stack=0 marks                 // regs=1 -> tracking R0
+last_idx 654 first_idx 644
+regs=1 stack=0 before 654: (85) call bpf_get_hash_recalc#34 // and in the parent frame it was a return value
+  // nothing further to backtrack
+
+Two scalar registers not marked precise are equivalent from state pruning point of view.
+More details in the patch comments.
+
+It doesn't support bpf2bpf calls yet and enabled for root only.
+
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Andrii Nakryiko <andriin@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+

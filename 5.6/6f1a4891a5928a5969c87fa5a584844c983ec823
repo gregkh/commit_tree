@@ -1,0 +1,95 @@
+x86/apic/msi: Plug non-maskable MSI affinity race
+
+Evan tracked down a subtle race between the update of the MSI message and
+the device raising an interrupt internally on PCI devices which do not
+support MSI masking. The update of the MSI message is non-atomic and
+consists of either 2 or 3 sequential 32bit wide writes to the PCI config
+space.
+
+   - Write address low 32bits
+   - Write address high 32bits (If supported by device)
+   - Write data
+
+When an interrupt is migrated then both address and data might change, so
+the kernel attempts to mask the MSI interrupt first. But for MSI masking is
+optional, so there exist devices which do not provide it. That means that
+if the device raises an interrupt internally between the writes then a MSI
+message is sent built from half updated state.
+
+On x86 this can lead to spurious interrupts on the wrong interrupt
+vector when the affinity setting changes both address and data. As a
+consequence the device interrupt can be lost causing the device to
+become stuck or malfunctioning.
+
+Evan tried to handle that by disabling MSI accross an MSI message
+update. That's not feasible because disabling MSI has issues on its own:
+
+ If MSI is disabled the PCI device is routing an interrupt to the legacy
+ INTx mechanism. The INTx delivery can be disabled, but the disablement is
+ not working on all devices.
+
+ Some devices lose interrupts when both MSI and INTx delivery are disabled.
+
+Another way to solve this would be to enforce the allocation of the same
+vector on all CPUs in the system for this kind of screwed devices. That
+could be done, but it would bring back the vector space exhaustion problems
+which got solved a few years ago.
+
+Fortunately the high address (if supported by the device) is only relevant
+when X2APIC is enabled which implies interrupt remapping. In the interrupt
+remapping case the affinity setting is happening at the interrupt remapping
+unit and the PCI MSI message is programmed only once when the PCI device is
+initialized.
+
+That makes it possible to solve it with a two step update:
+
+  1) Target the MSI msg to the new vector on the current target CPU
+
+  2) Target the MSI msg to the new vector on the new target CPU
+
+In both cases writing the MSI message is only changing a single 32bit word
+which prevents the issue of inconsistency.
+
+After writing the final destination it is necessary to check whether the
+device issued an interrupt while the intermediate state #1 (new vector,
+current CPU) was in effect.
+
+This is possible because the affinity change is always happening on the
+current target CPU. The code runs with interrupts disabled, so the
+interrupt can be detected by checking the IRR of the local APIC. If the
+vector is pending in the IRR then the interrupt is retriggered on the new
+target CPU by sending an IPI for the associated vector on the target CPU.
+
+This can cause spurious interrupts on both the local and the new target
+CPU.
+
+ 1) If the new vector is not in use on the local CPU and the device
+    affected by the affinity change raised an interrupt during the
+    transitional state (step #1 above) then interrupt entry code will
+    ignore that spurious interrupt. The vector is marked so that the
+    'No irq handler for vector' warning is supressed once.
+
+ 2) If the new vector is in use already on the local CPU then the IRR check
+    might see an pending interrupt from the device which is using this
+    vector. The IPI to the new target CPU will then invoke the handler of
+    the device, which got the affinity change, even if that device did not
+    issue an interrupt
+
+ 3) If the new vector is in use already on the local CPU and the device
+    affected by the affinity change raised an interrupt during the
+    transitional state (step #1 above) then the handler of the device which
+    uses that vector on the local CPU will be invoked.
+
+expose issues in device driver interrupt handlers which are not prepared to
+handle a spurious interrupt correctly. This not a regression, it's just
+exposing something which was already broken as spurious interrupts can
+happen for a lot of reasons and all driver handlers need to be able to deal
+with them.
+
+Reported-by: Evan Green <evgreen@chromium.org>
+Debugged-by: Evan Green <evgreen@chromium.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Evan Green <evgreen@chromium.org>
+Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/87imkr4s7n.fsf@nanos.tec.linutronix.de
+

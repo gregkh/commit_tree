@@ -1,0 +1,112 @@
+Revert "mm, thp: restore node-local hugepage allocations"
+
+This reverts commit 2f0799a0ffc033b ("mm, thp: restore node-local
+hugepage allocations").
+
+commit 2f0799a0ffc033b was rightfully applied to avoid the risk of a
+severe regression that was reported by the kernel test robot at the end
+of the merge window.  Now we understood the regression was a false
+positive and was caused by a significant increase in fairness during a
+swap trashing benchmark.  So it's safe to re-apply the fix and continue
+improving the code from there.  The benchmark that reported the
+regression is very useful, but it provides a meaningful result only when
+there is no significant alteration in fairness during the workload.  The
+removal of __GFP_THISNODE increased fairness.
+
+__GFP_THISNODE cannot be used in the generic page faults path for new
+memory allocations under the MPOL_DEFAULT mempolicy, or the allocation
+behavior significantly deviates from what the MPOL_DEFAULT semantics are
+supposed to be for THP and 4k allocations alike.
+
+Setting THP defrag to "always" or using MADV_HUGEPAGE (with THP defrag
+set to "madvise") has never meant to provide an implicit MPOL_BIND on
+the "current" node the task is running on, causing swap storms and
+providing a much more aggressive behavior than even zone_reclaim_node =
+3.
+
+Any workload who could have benefited from __GFP_THISNODE has now to
+enable zone_reclaim_mode=1||2||3.  __GFP_THISNODE implicitly provided
+the zone_reclaim_mode behavior, but it only did so if THP was enabled:
+if THP was disabled, there would have been no chance to get any 4k page
+from the current node if the current node was full of pagecache, which
+further shows how this __GFP_THISNODE was misplaced in MADV_HUGEPAGE.
+MADV_HUGEPAGE has never been intended to provide any zone_reclaim_mode
+semantics, in fact the two are orthogonal, zone_reclaim_mode = 1|2|3
+must work exactly the same with MADV_HUGEPAGE set or not.
+
+The performance characteristic of memory depends on the hardware
+details.  The numbers below are obtained on Naples/EPYC architecture and
+the N/A projection extends them to show what we should aim for in the
+future as a good THP NUMA locality default.  The benchmark used
+exercises random memory seeks (note: the cost of the page faults is not
+part of the measurement).
+
+  D0 THP | D0 4k | D1 THP | D1 4k | D2 THP | D2 4k | D3 THP | D3 4k | ...
+  0%     | +43%  | +45%   | +106% | +131%  | +224% | N/A    | N/A
+
+D0 means distance zero (i.e.  local memory), D1 means distance one (i.e.
+intra socket memory), D2 means distance two (i.e.  inter socket memory),
+etc...
+
+For the guest physical memory allocated by qemu and for guest mode
+kernel the performance characteristic of RAM is more complex and an
+ideal default could be:
+
+  D0 THP | D1 THP | D0 4k | D2 THP | D1 4k | D3 THP | D2 4k | D3 4k | ...
+  0%     | +58%   | +101% | N/A    | +222% | N/A    | N/A   | N/A
+
+NOTE: the N/A are projections and haven't been measured yet, the
+measurement in this case is done on a 1950x with only two NUMA nodes.
+The THP case here means THP was used both in the host and in the guest.
+
+After applying this commit the THP NUMA locality order that we'll get
+out of MADV_HUGEPAGE is this:
+
+  D0 THP | D1 THP | D2 THP | D3 THP | ... | D0 4k | D1 4k | D2 4k | D3 4k | ...
+
+Before this commit it was:
+
+  D0 THP | D0 4k | D1 4k | D2 4k | D3 4k | ...
+
+Even if we ignore the breakage of large workloads that can't fit in a
+single node that the __GFP_THISNODE implicit "current node" mbind
+caused, the THP NUMA locality order provided by __GFP_THISNODE was still
+not the one we shall aim for in the long term (i.e.  the first one at
+the top).
+
+After this commit is applied, we can introduce a new allocator multi
+order API and to replace those two alloc_pages_vmas calls in the page
+fault path, with a single multi order call:
+
+        unsigned int order = (1 << HPAGE_PMD_ORDER) | (1 << 0);
+        page = alloc_pages_multi_order(..., &order);
+        if (!page)
+        	goto out;
+        if (!(order & (1 << 0))) {
+        	VM_WARN_ON(order != 1 << HPAGE_PMD_ORDER);
+        	/* THP fault */
+        } else {
+        	VM_WARN_ON(order != 1 << 0);
+        	/* 4k fallback */
+        }
+
+The page allocator logic has to be altered so that when it fails on any
+zone with order 9, it has to try again with a order 0 before falling
+back to the next zone in the zonelist.
+
+After that we need to do more measurements and evaluate if adding an
+opt-in feature for guest mode is worth it, to swap "DN 4k | DN+1 THP"
+with "DN+1 THP | DN 4k" at every NUMA distance crossing.
+
+Link: http://lkml.kernel.org/r/20190503223146.2312-3-aarcange@redhat.com
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Mel Gorman <mgorman@suse.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Zi Yan <zi.yan@cs.rutgers.edu>
+Cc: Stefan Priebe - Profihost AG <s.priebe@profihost.ag>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

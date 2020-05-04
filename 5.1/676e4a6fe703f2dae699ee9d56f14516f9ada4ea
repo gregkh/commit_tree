@@ -1,0 +1,42 @@
+xdp: fix cpumap redirect SKB creation bug
+
+We want to avoid leaking pointer info from xdp_frame (that is placed in
+top of frame) like commit 6dfb970d3dbd ("xdp: avoid leaking info stored in
+frame data on page reuse"), and followup commit 97e19cce05e5 ("bpf:
+reserve xdp_frame size in xdp headroom") that reserve this headroom.
+
+These changes also affected how cpumap constructed SKBs, as xdpf->headroom
+size changed, the skb data starting point were in-effect shifted with 32
+bytes (sizeof xdp_frame). This was still okay, as the cpumap frame_size
+calculation also included xdpf->headroom which were reduced by same amount.
+
+A bug was introduced in commit 77ea5f4cbe20 ("bpf/cpumap: make sure
+frame_size for build_skb is aligned if headroom isn't"), where the
+xdpf->headroom became part of the SKB_DATA_ALIGN rounding up. This
+round-up to find the frame_size is in principle still correct as it does
+not exceed the 2048 bytes frame_size (which is max for ixgbe and i40e),
+but the 32 bytes offset of pkt_data_start puts this over the 2048 bytes
+limit. This cause skb_shared_info to spill into next frame. It is a little
+hard to trigger, as the SKB need to use above 15 skb_shinfo->frags[] as
+far as I calculate. This does happen in practise for TCP streams when
+skb_try_coalesce() kicks in.
+
+KASAN can be used to detect these wrong memory accesses, I've seen:
+ BUG: KASAN: use-after-free in skb_try_coalesce+0x3cb/0x760
+ BUG: KASAN: wild-memory-access in skb_release_data+0xe2/0x250
+
+Driver veth also construct a SKB from xdp_frame in this way, but is not
+affected, as it doesn't reserve/deduct the room (used by xdp_frame) from
+the SKB headroom. Instead is clears the pointers via xdp_scrub_frame(),
+and allows SKB to use this area.
+
+The fix in this patch is to do like veth and instead allow SKB to (re)use
+the area occupied by xdp_frame, by clearing via xdp_scrub_frame().  (This
+does kill the idea of the SKB being able to access (mem) info from this
+area, but I guess it was a bad idea anyhow, and it was already killed by
+the veth changes.)
+
+Fixes: 77ea5f4cbe20 ("bpf/cpumap: make sure frame_size for build_skb is aligned if headroom isn't")
+Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

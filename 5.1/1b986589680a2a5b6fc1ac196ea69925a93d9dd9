@@ -1,0 +1,120 @@
+bpf: Fix bpf_tcp_sock and bpf_sk_fullsock issue related to bpf_sk_release
+
+Lorenz Bauer [thanks!] reported that a ptr returned by bpf_tcp_sock(sk)
+can still be accessed after bpf_sk_release(sk).
+Both bpf_tcp_sock() and bpf_sk_fullsock() have the same issue.
+This patch addresses them together.
+
+A simple reproducer looks like this:
+
+	sk = bpf_sk_lookup_tcp();
+	/* if (!sk) ... */
+	tp = bpf_tcp_sock(sk);
+	/* if (!tp) ... */
+	bpf_sk_release(sk);
+	snd_cwnd = tp->snd_cwnd; /* oops! The verifier does not complain. */
+
+The problem is the verifier did not scrub the register's states of
+the tcp_sock ptr (tp) after bpf_sk_release(sk).
+
+[ Note that when calling bpf_tcp_sock(sk), the sk is not always
+  refcount-acquired. e.g. bpf_tcp_sock(skb->sk). The verifier works
+  fine for this case. ]
+
+Currently, the verifier does not track if a helper's return ptr (in REG_0)
+is "carry"-ing one of its argument's refcount status. To carry this info,
+the reg1->id needs to be stored in reg0.
+
+One approach was tried, like "reg0->id = reg1->id", when calling
+"bpf_tcp_sock()".  The main idea was to avoid adding another "ref_obj_id"
+for the same reg.  However, overlapping the NULL marking and ref
+tracking purpose in one "id" does not work well:
+
+	ref_sk = bpf_sk_lookup_tcp();
+	fullsock = bpf_sk_fullsock(ref_sk);
+	tp = bpf_tcp_sock(ref_sk);
+	if (!fullsock) {
+	     bpf_sk_release(ref_sk);
+	     return 0;
+	}
+	/* fullsock_reg->id is marked for NOT-NULL.
+	 * Same for tp_reg->id because they have the same id.
+	 */
+
+	/* oops. verifier did not complain about the missing !tp check */
+	snd_cwnd = tp->snd_cwnd;
+
+Hence, a new "ref_obj_id" is needed in "struct bpf_reg_state".
+With a new ref_obj_id, when bpf_sk_release(sk) is called, the verifier can
+scrub all reg states which has a ref_obj_id match.  It is done with the
+changes in release_reg_references() in this patch.
+
+While fixing it, sk_to_full_sk() is removed from bpf_tcp_sock() and
+bpf_sk_fullsock() to avoid these helpers from returning
+another ptr. It will make bpf_sk_release(tp) possible:
+
+	sk = bpf_sk_lookup_tcp();
+	/* if (!sk) ... */
+	tp = bpf_tcp_sock(sk);
+	/* if (!tp) ... */
+	bpf_sk_release(tp);
+
+A separate helper "bpf_get_listener_sock()" will be added in a later
+patch to do sk_to_full_sk().
+
+Misc change notes:
+- To allow bpf_sk_release(tp), the arg of bpf_sk_release() is changed
+  from ARG_PTR_TO_SOCKET to ARG_PTR_TO_SOCK_COMMON.  ARG_PTR_TO_SOCKET
+  is removed from bpf.h since no helper is using it.
+
+- arg_type_is_refcounted() is renamed to arg_type_may_be_refcounted()
+  because ARG_PTR_TO_SOCK_COMMON is the only one and skb->sk is not
+  refcounted.  All bpf_sk_release(), bpf_sk_fullsock() and bpf_tcp_sock()
+  take ARG_PTR_TO_SOCK_COMMON.
+
+- check_refcount_ok() ensures is_acquire_function() cannot take
+  arg_type_may_be_refcounted() as its argument.
+
+- The check_func_arg() can only allow one refcount-ed arg.  It is
+  guaranteed by check_refcount_ok() which ensures at most one arg can be
+  refcounted.  Hence, it is a verifier internal error if >1 refcount arg
+  found in check_func_arg().
+
+- In release_reference(), release_reference_state() is called
+  first to ensure a match on "reg->ref_obj_id" can be found before
+  scrubbing the reg states with release_reg_references().
+
+- reg_is_refcounted() is no longer needed.
+  1. In mark_ptr_or_null_regs(), its usage is replaced by
+     "ref_obj_id && ref_obj_id == id" because,
+     when is_null == true, release_reference_state() should only be
+     called on the ref_obj_id obtained by a acquire helper (i.e.
+     is_acquire_function() == true).  Otherwise, the following
+     would happen:
+
+	sk = bpf_sk_lookup_tcp();
+	/* if (!sk) { ... } */
+	fullsock = bpf_sk_fullsock(sk);
+	if (!fullsock) {
+		/*
+		 * release_reference_state(fullsock_reg->ref_obj_id)
+		 * where fullsock_reg->ref_obj_id == sk_reg->ref_obj_id.
+		 *
+		 * Hence, the following bpf_sk_release(sk) will fail
+		 * because the ref state has already been released in the
+		 * earlier release_reference_state(fullsock_reg->ref_obj_id).
+		 */
+		bpf_sk_release(sk);
+	}
+
+  2. In release_reg_references(), the current reg_is_refcounted() call
+     is unnecessary because the id check is enough.
+
+- The type_is_refcounted() and type_is_refcounted_or_null()
+  are no longer needed also because reg_is_refcounted() is removed.
+
+Fixes: 655a51e536c0 ("bpf: Add struct bpf_tcp_sock and BPF_FUNC_tcp_sock")
+Reported-by: Lorenz Bauer <lmb@cloudflare.com>
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

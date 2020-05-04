@@ -1,0 +1,65 @@
+mm: memcontrol: don't batch updates of local VM stats and events
+
+The kernel test robot noticed a 26% will-it-scale pagefault regression
+from commit 42a300353577 ("mm: memcontrol: fix recursive statistics
+correctness & scalabilty").  This appears to be caused by bouncing the
+additional cachelines from the new hierarchical statistics counters.
+
+We can fix this by getting rid of the batched local counters instead.
+
+Originally, there were *only* group-local counters, and they were fully
+maintained per cpu.  A reader of a stats file high up in the cgroup tree
+would have to walk the entire subtree and collect each level's per-cpu
+counters to get the recursive view.  This was prohibitively expensive,
+and so we switched to per-cpu batched updates of the local counters
+during a983b5ebee57 ("mm: memcontrol: fix excessive complexity in
+memory.stat reporting"), reducing the complexity from nr_subgroups *
+nr_cpus to nr_subgroups.
+
+With growing machines and cgroup trees, the tree walk itself became too
+expensive for monitoring top-level groups, and this is when the culprit
+patch added hierarchy counters on each cgroup level.  When the per-cpu
+batch size would be reached, both the local and the hierarchy counters
+would get batch-updated from the per-cpu delta simultaneously.
+
+This makes local and hierarchical counter reads blazingly fast, but it
+unfortunately makes the write-side too cache line intense.
+
+Since local counter reads were never a problem - we only centralized
+them to accelerate the hierarchy walk - and use of the local counters
+are becoming rarer due to replacement with hierarchical views (ongoing
+rework in the page reclaim and workingset code), we can make those local
+counters unbatched per-cpu counters again.
+
+The scheme will then be as such:
+
+   when a memcg statistic changes, the writer will:
+   - update the local counter (per-cpu)
+   - update the batch counter (per-cpu). If the batch is full:
+   - spill the batch into the group's atomic_t
+   - spill the batch into all ancestors' atomic_ts
+   - empty out the batch counter (per-cpu)
+
+   when a local memcg counter is read, the reader will:
+   - collect the local counter from all cpus
+
+   when a hiearchy memcg counter is read, the reader will:
+   - read the atomic_t
+
+We might be able to simplify this further and make the recursive
+counters unbatched per-cpu counters as well (batch upward propagation,
+but leave per-cpu collection to the readers), but that will require a
+more in-depth analysis and testing of all the callsites.  Deal with the
+immediate regression for now.
+
+Link: http://lkml.kernel.org/r/20190521151647.GB2870@cmpxchg.org
+Fixes: 42a300353577 ("mm: memcontrol: fix recursive statistics correctness & scalabilty")
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reported-by: kernel test robot <rong.a.chen@intel.com>
+Tested-by: kernel test robot <rong.a.chen@intel.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Roman Gushchin <guro@fb.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

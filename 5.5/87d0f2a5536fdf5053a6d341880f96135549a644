@@ -1,0 +1,88 @@
+PCI: pciehp: Prevent deadlock on disconnect
+
+This addresses deadlocks in these common cases in hierarchies containing
+two switches:
+
+  - All involved ports are runtime suspended and they are unplugged. This
+    can happen easily if the drivers involved automatically enable runtime
+    PM (xHCI for example does that).
+
+  - System is suspended (e.g., closing the lid on a laptop) with a dock +
+    something else connected, and the dock is unplugged while suspended.
+
+These cases lead to the following deadlock:
+
+  INFO: task irq/126-pciehp:198 blocked for more than 120 seconds.
+  irq/126-pciehp  D    0   198      2 0x80000000
+  Call Trace:
+   schedule+0x2c/0x80
+   schedule_timeout+0x246/0x350
+   wait_for_completion+0xb7/0x140
+   kthread_stop+0x49/0x110
+   free_irq+0x32/0x70
+   pcie_shutdown_notification+0x2f/0x50
+   pciehp_remove+0x27/0x50
+   pcie_port_remove_service+0x36/0x50
+   device_release_driver+0x12/0x20
+   bus_remove_device+0xec/0x160
+   device_del+0x13b/0x350
+   device_unregister+0x1a/0x60
+   remove_iter+0x1e/0x30
+   device_for_each_child+0x56/0x90
+   pcie_port_device_remove+0x22/0x40
+   pcie_portdrv_remove+0x20/0x60
+   pci_device_remove+0x3e/0xc0
+   device_release_driver_internal+0x18c/0x250
+   device_release_driver+0x12/0x20
+   pci_stop_bus_device+0x6f/0x90
+   pci_stop_bus_device+0x31/0x90
+   pci_stop_and_remove_bus_device+0x12/0x20
+   pciehp_unconfigure_device+0x88/0x140
+   pciehp_disable_slot+0x6a/0x110
+   pciehp_handle_presence_or_link_change+0x263/0x400
+   pciehp_ist+0x1c9/0x1d0
+   irq_thread_fn+0x24/0x60
+   irq_thread+0xeb/0x190
+   kthread+0x120/0x140
+
+  INFO: task irq/190-pciehp:2288 blocked for more than 120 seconds.
+  irq/190-pciehp  D    0  2288      2 0x80000000
+  Call Trace:
+   __schedule+0x2a2/0x880
+   schedule+0x2c/0x80
+   schedule_preempt_disabled+0xe/0x10
+   mutex_lock+0x2c/0x30
+   pci_lock_rescan_remove+0x15/0x20
+   pciehp_unconfigure_device+0x4d/0x140
+   pciehp_disable_slot+0x6a/0x110
+   pciehp_handle_presence_or_link_change+0x263/0x400
+   pciehp_ist+0x1c9/0x1d0
+   irq_thread_fn+0x24/0x60
+   irq_thread+0xeb/0x190
+   kthread+0x120/0x140
+
+What happens here is that the whole hierarchy is runtime resumed and the
+parent PCIe downstream port, which got the hot-remove event, starts
+removing devices below it, taking pci_lock_rescan_remove() lock. When the
+child PCIe port is runtime resumed it calls pciehp_check_presence() which
+ends up calling pciehp_card_present() and pciehp_check_link_active().  Both
+of these use pcie_capability_read_word(), which notices that the underlying
+device is already gone and returns PCIBIOS_DEVICE_NOT_FOUND with the
+capability value set to 0. When pciehp gets this value it thinks that its
+child device is also hot-removed and schedules its IRQ thread to handle the
+event.
+
+The deadlock happens when the child's IRQ thread runs and tries to acquire
+pci_lock_rescan_remove() which is already taken by the parent and the
+parent waits for the child's IRQ thread to finish.
+
+Prevent this from happening by checking the return value of
+pcie_capability_read_word() and if it is PCIBIOS_DEVICE_NOT_FOUND stop
+performing any hot-removal activities.
+
+[bhelgaas: add common scenarios to commit log]
+Link: https://lore.kernel.org/r/20191029170022.57528-2-mika.westerberg@linux.intel.com
+Tested-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+

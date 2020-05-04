@@ -1,0 +1,87 @@
+f2fs: fix to avoid deadloop if data_flush is on
+
+As Hagbard Celine reported:
+
+[  615.697824] INFO: task kworker/u16:5:344 blocked for more than 120 seconds.
+[  615.697825]       Not tainted 5.0.15-gentoo-f2fslog #4
+[  615.697826] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs"
+disables this message.
+[  615.697827] kworker/u16:5   D    0   344      2 0x80000000
+[  615.697831] Workqueue: writeback wb_workfn (flush-259:0)
+[  615.697832] Call Trace:
+[  615.697836]  ? __schedule+0x2c5/0x8b0
+[  615.697839]  schedule+0x32/0x80
+[  615.697841]  schedule_preempt_disabled+0x14/0x20
+[  615.697842]  __mutex_lock.isra.8+0x2ba/0x4d0
+[  615.697845]  ? log_store+0xf5/0x260
+[  615.697848]  f2fs_write_data_pages+0x133/0x320
+[  615.697851]  ? trace_hardirqs_on+0x2c/0xe0
+[  615.697854]  do_writepages+0x41/0xd0
+[  615.697857]  __filemap_fdatawrite_range+0x81/0xb0
+[  615.697859]  f2fs_sync_dirty_inodes+0x1dd/0x200
+[  615.697861]  f2fs_balance_fs_bg+0x2a7/0x2c0
+[  615.697863]  ? up_read+0x5/0x20
+[  615.697865]  ? f2fs_do_write_data_page+0x2cb/0x940
+[  615.697867]  f2fs_balance_fs+0xe5/0x2c0
+[  615.697869]  __write_data_page+0x1c8/0x6e0
+[  615.697873]  f2fs_write_cache_pages+0x1e0/0x450
+[  615.697878]  f2fs_write_data_pages+0x14b/0x320
+[  615.697880]  ? trace_hardirqs_on+0x2c/0xe0
+[  615.697883]  do_writepages+0x41/0xd0
+[  615.697885]  __filemap_fdatawrite_range+0x81/0xb0
+[  615.697887]  f2fs_sync_dirty_inodes+0x1dd/0x200
+[  615.697889]  f2fs_balance_fs_bg+0x2a7/0x2c0
+[  615.697891]  f2fs_write_node_pages+0x51/0x220
+[  615.697894]  do_writepages+0x41/0xd0
+[  615.697897]  __writeback_single_inode+0x3d/0x3d0
+[  615.697899]  writeback_sb_inodes+0x1e8/0x410
+[  615.697902]  __writeback_inodes_wb+0x5d/0xb0
+[  615.697904]  wb_writeback+0x28f/0x340
+[  615.697906]  ? cpumask_next+0x16/0x20
+[  615.697908]  wb_workfn+0x33e/0x420
+[  615.697911]  process_one_work+0x1a1/0x3d0
+[  615.697913]  worker_thread+0x30/0x380
+[  615.697915]  ? process_one_work+0x3d0/0x3d0
+[  615.697916]  kthread+0x116/0x130
+[  615.697918]  ? kthread_create_worker_on_cpu+0x70/0x70
+[  615.697921]  ret_from_fork+0x3a/0x50
+
+There is still deadloop in below condition:
+
+d A
+- do_writepages
+ - f2fs_write_node_pages
+  - f2fs_balance_fs_bg
+   - f2fs_sync_dirty_inodes
+    - f2fs_write_cache_pages
+     - mutex_lock(&sbi->writepages)	-- lock once
+     - __write_data_page
+      - f2fs_balance_fs_bg
+       - f2fs_sync_dirty_inodes
+        - f2fs_write_data_pages
+         - mutex_lock(&sbi->writepages)	-- lock again
+
+Thread A			Thread B
+- do_writepages
+ - f2fs_write_node_pages
+  - f2fs_balance_fs_bg
+   - f2fs_sync_dirty_inodes
+    - .cp_task = current
+				- f2fs_sync_dirty_inodes
+				 - .cp_task = current
+				 - filemap_fdatawrite
+				 - .cp_task = NULL
+    - filemap_fdatawrite
+     - f2fs_write_cache_pages
+      - enter f2fs_balance_fs_bg since .cp_task is NULL
+    - .cp_task = NULL
+
+Change as below to avoid this:
+- add condition to avoid holding .writepages mutex lock in path
+of data flush
+- introduce mutex lock sbi.flush_lock to exclude concurrent data
+flush in background.
+
+Signed-off-by: Chao Yu <yuchao0@huawei.com>
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+

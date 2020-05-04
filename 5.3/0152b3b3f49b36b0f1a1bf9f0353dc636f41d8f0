@@ -1,0 +1,45 @@
+drm/i915: Seal races between async GPU cancellation, retirement and signaling
+
+Currently there is an underlying assumption that i915_request_unsubmit()
+is synchronous wrt the GPU -- that is the request is no longer in flight
+as we remove it. In the near future that may change, and this may upset
+our signaling as we can process an interrupt for that request while it
+is no longer in flight.
+
+CPU0					CPU1
+intel_engine_breadcrumbs_irq
+(queue request completion)
+					i915_request_cancel_signaling
+...					...
+					i915_request_enable_signaling
+dma_fence_signal
+
+Hence in the time it took us to drop the lock to signal the request, a
+preemption event may have occurred and re-queued the request. In the
+process, that request would have seen I915_FENCE_FLAG_SIGNAL clear and
+so reused the rq->signal_link that was in use on CPU0, leading to bad
+pointer chasing in intel_engine_breadcrumbs_irq.
+
+A related issue was that if someone started listening for a signal on a
+completed but no longer in-flight request, we missed the opportunity to
+immediately signal that request.
+
+Furthermore, as intel_contexts may be immediately released during
+request retirement, in order to be entirely sure that
+intel_engine_breadcrumbs_irq may no longer dereference the intel_context
+(ce->signals and ce->signal_link), we must wait for irq spinlock.
+
+In order to prevent the race, we use a bit in the fence.flags to signal
+the transfer onto the signal list inside intel_engine_breadcrumbs_irq.
+For simplicity, we use the DMA_FENCE_FLAG_SIGNALED_BIT as it then
+quickly signals to any outside observer that the fence is indeed signaled.
+
+v2: Sketch out potential dma-fence API for manual signaling
+v3: And the test_and_set_bit()
+
+Fixes: 52c0fdb25c7c ("drm/i915: Replace global breadcrumbs with per-context interrupt tracking")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190508112452.18942-1-chris@chris-wilson.co.uk
+

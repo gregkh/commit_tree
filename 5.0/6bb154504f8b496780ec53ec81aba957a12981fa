@@ -1,0 +1,279 @@
+mm, page_alloc: spread allocations across zones before introducing fragmentation
+
+Patch series "Fragmentation avoidance improvements", v5.
+
+It has been noted before that fragmentation avoidance (aka
+anti-fragmentation) is not perfect. Given sufficient time or an adverse
+workload, memory gets fragmented and the long-term success of high-order
+allocations degrades. This series defines an adverse workload, a definition
+of external fragmentation events (including serious) ones and a series
+that reduces the level of those fragmentation events.
+
+The details of the workload and the consequences are described in more
+detail in the changelogs. However, from patch 1, this is a high-level
+summary of the adverse workload. The exact details are found in the
+mmtests implementation.
+
+The broad details of the workload are as follows;
+
+1. Create an XFS filesystem (not specified in the configuration but done
+   as part of the testing for this patch)
+2. Start 4 fio threads that write a number of 64K files inefficiently.
+   Inefficiently means that files are created on first access and not
+   created in advance (fio parameterr create_on_open=1) and fallocate
+   is not used (fallocate=none). With multiple IO issuers this creates
+   a mix of slab and page cache allocations over time. The total size
+   of the files is 150% physical memory so that the slabs and page cache
+   pages get mixed
+3. Warm up a number of fio read-only threads accessing the same files
+   created in step 2. This part runs for the same length of time it
+   took to create the files. It'll fault back in old data and further
+   interleave slab and page cache allocations. As it's now low on
+   memory due to step 2, fragmentation occurs as pageblocks get
+   stolen.
+4. While step 3 is still running, start a process that tries to allocate
+   75% of memory as huge pages with a number of threads. The number of
+   threads is based on a (NR_CPUS_SOCKET - NR_FIO_THREADS)/4 to avoid THP
+   threads contending with fio, any other threads or forcing cross-NUMA
+   scheduling. Note that the test has not been used on a machine with less
+   than 8 cores. The benchmark records whether huge pages were allocated
+   and what the fault latency was in microseconds
+5. Measure the number of events potentially causing external fragmentation,
+   the fault latency and the huge page allocation success rate.
+6. Cleanup
+
+Overall the series reduces external fragmentation causing events by over 94%
+on 1 and 2 socket machines, which in turn impacts high-order allocation
+success rates over the long term. There are differences in latencies and
+high-order allocation success rates. Latencies are a mixed bag as they
+are vulnerable to exact system state and whether allocations succeeded
+so they are treated as a secondary metric.
+
+Patch 1 uses lower zones if they are populated and have free memory
+	instead of fragmenting a higher zone. It's special cased to
+	handle a Normal->DMA32 fallback with the reasons explained
+	in the changelog.
+
+Patch 2-4 boosts watermarks temporarily when an external fragmentation
+	event occurs. kswapd wakes to reclaim a small amount of old memory
+	and then wakes kcompactd on completion to recover the system
+	slightly. This introduces some overhead in the slowpath. The level
+	of boosting can be tuned or disabled depending on the tolerance
+	for fragmentation vs allocation latency.
+
+Patch 5 stalls some movable allocation requests to let kswapd from patch 4
+	make some progress. The duration of the stalls is very low but it
+	is possible to tune the system to avoid fragmentation events if
+	larger stalls can be tolerated.
+
+The bulk of the improvement in fragmentation avoidance is from patches
+1-4 but patch 5 can deal with a rare corner case and provides the option
+of tuning a system for THP allocation success rates in exchange for
+some stalls to control fragmentation.
+
+This patch (of 5):
+
+The page allocator zone lists are iterated based on the watermarks of each
+zone which does not take anti-fragmentation into account.  On x86, node 0
+may have multiple zones while other nodes have one zone.  A consequence is
+that tasks running on node 0 may fragment ZONE_NORMAL even though
+ZONE_DMA32 has plenty of free memory.  This patch special cases the
+allocator fast path such that it'll try an allocation from a lower local
+zone before fragmenting a higher zone.  In this case, stealing of
+pageblocks or orders larger than a pageblock are still allowed in the fast
+path as they are uninteresting from a fragmentation point of view.
+
+This was evaluated using a benchmark designed to fragment memory before
+attempting THP allocations.  It's implemented in mmtests as the following
+configurations
+
+configs/config-global-dhp__workload_thpfioscale
+configs/config-global-dhp__workload_thpfioscale-defrag
+configs/config-global-dhp__workload_thpfioscale-madvhugepage
+
+e.g. from mmtests
+./run-mmtests.sh --run-monitor --config configs/config-global-dhp__workload_thpfioscale test-run-1
+
+The broad details of the workload are as follows;
+
+1. Create an XFS filesystem (not specified in the configuration but done
+   as part of the testing for this patch).
+2. Start 4 fio threads that write a number of 64K files inefficiently.
+   Inefficiently means that files are created on first access and not
+   created in advance (fio parameter create_on_open=1) and fallocate
+   is not used (fallocate=none). With multiple IO issuers this creates
+   a mix of slab and page cache allocations over time. The total size
+   of the files is 150% physical memory so that the slabs and page cache
+   pages get mixed.
+3. Warm up a number of fio read-only processes accessing the same files
+   created in step 2. This part runs for the same length of time it
+   took to create the files. It'll refault old data and further
+   interleave slab and page cache allocations. As it's now low on
+   memory due to step 2, fragmentation occurs as pageblocks get
+   stolen.
+4. While step 3 is still running, start a process that tries to allocate
+   75% of memory as huge pages with a number of threads. The number of
+   threads is based on a (NR_CPUS_SOCKET - NR_FIO_THREADS)/4 to avoid THP
+   threads contending with fio, any other threads or forcing cross-NUMA
+   scheduling. Note that the test has not been used on a machine with less
+   than 8 cores. The benchmark records whether huge pages were allocated
+   and what the fault latency was in microseconds.
+5. Measure the number of events potentially causing external fragmentation,
+   the fault latency and the huge page allocation success rate.
+6. Cleanup the test files.
+
+Note that due to the use of IO and page cache that this benchmark is not
+suitable for running on large machines where the time to fragment memory
+may be excessive.  Also note that while this is one mix that generates
+fragmentation that it's not the only mix that generates fragmentation.
+Differences in workload that are more slab-intensive or whether SLUB is
+used with high-order pages may yield different results.
+
+When the page allocator fragments memory, it records the event using the
+mm_page_alloc_extfrag ftrace event.  If the fallback_order is smaller than
+a pageblock order (order-9 on 64-bit x86) then it's considered to be an
+"external fragmentation event" that may cause issues in the future.
+Hence, the primary metric here is the number of external fragmentation
+events that occur with order < 9.  The secondary metric is allocation
+latency and huge page allocation success rates but note that differences
+in latencies and what the success rate also can affect the number of
+external fragmentation event which is why it's a secondary metric.
+
+1-socket Skylake machine
+config-global-dhp__workload_thpfioscale XFS (no special madvise)
+4 fio threads, 1 THP allocating thread
+--------------------------------------
+
+4.20-rc3 extfrag events < order 9:   804694
+4.20-rc3+patch:                      408912 (49% reduction)
+
+thpfioscale Fault Latencies
+                                   4.20.0-rc3             4.20.0-rc3
+                                      vanilla           lowzone-v5r8
+Amean     fault-base-1      662.92 (   0.00%)      653.58 *   1.41%*
+Amean     fault-huge-1        0.00 (   0.00%)        0.00 (   0.00%)
+
+                              4.20.0-rc3             4.20.0-rc3
+                                 vanilla           lowzone-v5r8
+Percentage huge-1        0.00 (   0.00%)        0.00 (   0.00%)
+
+Fault latencies are slightly reduced while allocation success rates remain
+at zero as this configuration does not make any special effort to allocate
+THP and fio is heavily active at the time and either filling memory or
+keeping pages resident.  However, a 49% reduction of serious fragmentation
+events reduces the changes of external fragmentation being a problem in
+the future.
+
+Vlastimil asked during review for a breakdown of the allocation types
+that are falling back.
+
+vanilla
+   3816 MIGRATE_UNMOVABLE
+ 800845 MIGRATE_MOVABLE
+     33 MIGRATE_UNRECLAIMABLE
+
+patch
+    735 MIGRATE_UNMOVABLE
+ 408135 MIGRATE_MOVABLE
+     42 MIGRATE_UNRECLAIMABLE
+
+The majority of the fallbacks are due to movable allocations and this is
+consistent for the workload throughout the series so will not be presented
+again as the primary source of fallbacks are movable allocations.
+
+Movable fallbacks are sometimes considered "ok" to fallback because they
+can be migrated.  The problem is that they can fill an
+unmovable/reclaimable pageblock causing those allocations to fallback
+later and polluting pageblocks with pages that cannot move.  If there is a
+movable fallback, it is pretty much guaranteed to affect an
+unmovable/reclaimable pageblock and while it might not be enough to
+actually cause a unmovable/reclaimable fallback in the future, we cannot
+know that in advance so the patch takes the only option available to it.
+Hence, it's important to control them.  This point is also consistent
+throughout the series and will not be repeated.
+
+1-socket Skylake machine
+global-dhp__workload_thpfioscale-madvhugepage-xfs (MADV_HUGEPAGE)
+-----------------------------------------------------------------
+
+4.20-rc3 extfrag events < order 9:  291392
+4.20-rc3+patch:                     191187 (34% reduction)
+
+thpfioscale Fault Latencies
+                                   4.20.0-rc3             4.20.0-rc3
+                                      vanilla           lowzone-v5r8
+Amean     fault-base-1     1495.14 (   0.00%)     1467.55 (   1.85%)
+Amean     fault-huge-1     1098.48 (   0.00%)     1127.11 (  -2.61%)
+
+thpfioscale Percentage Faults Huge
+                              4.20.0-rc3             4.20.0-rc3
+                                 vanilla           lowzone-v5r8
+Percentage huge-1       78.57 (   0.00%)       77.64 (  -1.18%)
+
+Fragmentation events were reduced quite a bit although this is known
+to be a little variable. The latencies and allocation success rates
+are similar but they were already quite high.
+
+2-socket Haswell machine
+config-global-dhp__workload_thpfioscale XFS (no special madvise)
+4 fio threads, 5 THP allocating threads
+----------------------------------------------------------------
+
+4.20-rc3 extfrag events < order 9:  215698
+4.20-rc3+patch:                     200210 (7% reduction)
+
+thpfioscale Fault Latencies
+                                   4.20.0-rc3             4.20.0-rc3
+                                      vanilla           lowzone-v5r8
+Amean     fault-base-5     1350.05 (   0.00%)     1346.45 (   0.27%)
+Amean     fault-huge-5     4181.01 (   0.00%)     3418.60 (  18.24%)
+
+                              4.20.0-rc3             4.20.0-rc3
+                                 vanilla           lowzone-v5r8
+Percentage huge-5        1.15 (   0.00%)        0.78 ( -31.88%)
+
+The reduction of external fragmentation events is slight and this is
+partially due to the removal of __GFP_THISNODE in commit ac5b2c18911f
+("mm: thp: relax __GFP_THISNODE for MADV_HUGEPAGE mappings") as THP
+allocations can now spill over to remote nodes instead of fragmenting
+local memory.
+
+2-socket Haswell machine
+global-dhp__workload_thpfioscale-madvhugepage-xfs (MADV_HUGEPAGE)
+-----------------------------------------------------------------
+
+4.20-rc3 extfrag events < order 9: 166352
+4.20-rc3+patch:                    147463 (11% reduction)
+
+thpfioscale Fault Latencies
+                                   4.20.0-rc3             4.20.0-rc3
+                                      vanilla           lowzone-v5r8
+Amean     fault-base-5     6138.97 (   0.00%)     6217.43 (  -1.28%)
+Amean     fault-huge-5     2294.28 (   0.00%)     3163.33 * -37.88%*
+
+thpfioscale Percentage Faults Huge
+                              4.20.0-rc3             4.20.0-rc3
+                                 vanilla           lowzone-v5r8
+Percentage huge-5       96.82 (   0.00%)       95.14 (  -1.74%)
+
+There was a slight reduction in external fragmentation events although the
+latencies were higher.  The allocation success rate is high enough that
+the system is struggling and there is quite a lot of parallel reclaim and
+compaction activity.  There is also a certain degree of luck on whether
+processes start on node 0 or not for this patch but the relevance is
+reduced later in the series.
+
+Overall, the patch reduces the number of external fragmentation causing
+events so the success of THP over long periods of time would be improved
+for this adverse workload.
+
+Link: http://lkml.kernel.org/r/20181123114528.28802-2-mgorman@techsingularity.net
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Zi Yan <zi.yan@cs.rutgers.edu>
+Cc: Michal Hocko <mhocko@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

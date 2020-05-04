@@ -1,0 +1,59 @@
+filemap: drop the mmap_sem for all blocking operations
+
+Currently we only drop the mmap_sem if there is contention on the page
+lock.  The idea is that we issue readahead and then go to lock the page
+while it is under IO and we want to not hold the mmap_sem during the IO.
+
+The problem with this is the assumption that the readahead does anything.
+In the case that the box is under extreme memory or IO pressure we may end
+up not reading anything at all for readahead, which means we will end up
+reading in the page under the mmap_sem.
+
+Even if the readahead does something, it could get throttled because of io
+pressure on the system and the process is in a lower priority cgroup.
+
+Holding the mmap_sem while doing IO is problematic because it can cause
+system-wide priority inversions.  Consider some large company that does a
+lot of web traffic.  This large company has load balancing logic in it's
+core web server, cause some engineer thought this was a brilliant plan.
+This load balancing logic gets statistics from /proc about the system,
+which trip over processes mmap_sem for various reasons.  Now the web
+server application is in a protected cgroup, but these other processes may
+not be, and if they are being throttled while their mmap_sem is held we'll
+stall, and cause this nice death spiral.
+
+Instead rework filemap fault path to drop the mmap sem at any point that
+we may do IO or block for an extended period of time.  This includes while
+issuing readahead, locking the page, or needing to call ->readpage because
+readahead did not occur.  Then once we have a fully uptodate page we can
+return with VM_FAULT_RETRY and come back again to find our nicely in-cache
+page that was gotten outside of the mmap_sem.
+
+This patch also adds a new helper for locking the page with the mmap_sem
+dropped.  This doesn't make sense currently as generally speaking if the
+page is already locked it'll have been read in (unless there was an error)
+before it was unlocked.  However a forthcoming patchset will change this
+with the ability to abort read-ahead bio's if necessary, making it more
+likely that we could contend for a page lock and still have a not uptodate
+page.  This allows us to deal with this case by grabbing the lock and
+issuing the IO without the mmap_sem held, and then returning
+VM_FAULT_RETRY to come back around.
+
+[josef@toxicpanda.com: v6]
+  Link: http://lkml.kernel.org/r/20181212152757.10017-1-josef@toxicpanda.com
+[kirill@shutemov.name: fix race in filemap_fault()]
+  Link: http://lkml.kernel.org/r/20181228235106.okk3oastsnpxusxs@kshutemo-mobl1
+[akpm@linux-foundation.org: coding style fixes]
+Link: http://lkml.kernel.org/r/20181211173801.29535-4-josef@toxicpanda.com
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Tested-by: syzbot+b437b5a429d680cf2217@syzkaller.appspotmail.com
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

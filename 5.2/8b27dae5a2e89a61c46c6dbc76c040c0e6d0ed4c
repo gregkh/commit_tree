@@ -1,0 +1,52 @@
+tcp: add one skb cache for rx
+
+Often times, recvmsg() system calls and BH handling for a particular
+TCP socket are done on different cpus.
+
+This means the incoming skb had to be allocated on a cpu,
+but freed on another.
+
+This incurs a high spinlock contention in slab layer for small rpc,
+but also a high number of cache line ping pongs for larger packets.
+
+A full size GRO packet might use 45 page fragments, meaning
+that up to 45 put_page() can be involved.
+
+More over performing the __kfree_skb() in the recvmsg() context
+adds a latency for user applications, and increase probability
+of trapping them in backlog processing, since the BH handler
+might found the socket owned by the user.
+
+This patch, combined with the prior one increases the rpc
+performance by about 10 % on servers with large number of cores.
+
+(tcp_rr workload with 10,000 flows and 112 threads reach 9 Mpps
+ instead of 8 Mpps)
+
+This also increases single bulk flow performance on 40Gbit+ links,
+since in this case there are often two cpus working in tandem :
+
+ - CPU handling the NIC rx interrupts, feeding the receive queue,
+  and (after this patch) freeing the skbs that were consumed.
+
+ - CPU in recvmsg() system call, essentially 100 % busy copying out
+  data to user space.
+
+Having at most one skb in a per-socket cache has very little risk
+of memory exhaustion, and since it is protected by socket lock,
+its management is essentially free.
+
+Note that if rps/rfs is used, we do not enable this feature, because
+there is high chance that the same cpu is handling both the recvmsg()
+system call and the TCP rx path, but that another cpu did the skb
+allocations in the device driver right before the RPS/RFS logic.
+
+To properly handle this case, it seems we would need to record
+on which cpu skb was allocated, and use a different channel
+to give skbs back to this cpu.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+Acked-by: Willem de Bruijn <willemb@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

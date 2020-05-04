@@ -1,0 +1,66 @@
+arm64: mm: Ignore spurious translation faults taken from the kernel
+
+Thanks to address translation being performed out of order with respect to
+loads and stores, it is possible for a CPU to take a translation fault when
+accessing a page that was mapped by a different CPU.
+
+For example, in the case that one CPU maps a page and then sets a flag to
+tell another CPU:
+
+	CPU 0
+	-----
+
+	MOV	X0, <valid pte>
+	STR	X0, [Xptep]	// Store new PTE to page table
+	DSB	ISHST
+	ISB
+	MOV	X1, #1
+	STR	X1, [Xflag]	// Set the flag
+
+	CPU 1
+	-----
+
+loop:	LDAR	X0, [Xflag]	// Poll flag with Acquire semantics
+	CBZ	X0, loop
+	LDR	X1, [X2]	// Translates using the new PTE
+
+then the final load on CPU 1 can raise a translation fault because the
+translation can be performed speculatively before the read of the flag and
+marked as "faulting" by the CPU. This isn't quite as bad as it sounds
+since, in reality, code such as:
+
+	CPU 0				CPU 1
+	-----				-----
+	spin_lock(&lock);		spin_lock(&lock);
+	*ptr = vmalloc(size);		if (*ptr)
+	spin_unlock(&lock);			foo = **ptr;
+					spin_unlock(&lock);
+
+will not trigger the fault because there is an address dependency on CPU 1
+which prevents the speculative translation. However, more exotic code where
+the virtual address is known ahead of time, such as:
+
+	CPU 0				CPU 1
+	-----				-----
+	spin_lock(&lock);		spin_lock(&lock);
+	set_fixmap(0, paddr, prot);	if (mapped)
+	mapped = true;				foo = *fix_to_virt(0);
+	spin_unlock(&lock);		spin_unlock(&lock);
+
+could fault. This can be avoided by any of:
+
+	* Introducing broadcast TLB maintenance on the map path
+	* Adding a DSB;ISB sequence after checking a flag which indicates
+	  that a virtual address is now mapped
+	* Handling the spurious fault
+
+Given that we have never observed a problem due to this under Linux and
+future revisions of the architecture are being tightened so that
+translation table walks are effectively ordered in the same way as explicit
+memory accesses, we no longer treat spurious kernel faults as fatal if an
+AT instruction indicates that the access does not trigger a translation
+fault.
+
+Reviewed-by: Mark Rutland <mark.rutland@arm.com>
+Signed-off-by: Will Deacon <will@kernel.org>
+

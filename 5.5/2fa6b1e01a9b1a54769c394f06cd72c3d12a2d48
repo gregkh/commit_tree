@@ -1,0 +1,62 @@
+fs/namei.c: fix missing barriers when checking positivity
+
+Pinned negative dentries can, generally, be made positive
+by another thread.  Conditions that prevent that are
+	* ->d_lock on dentry in question
+	* parent directory held at least shared
+	* nobody else could have observed the address of dentry
+Most of the places working with those fall into one of those
+categories; however, d_lookup() and friends need to be used
+with some care.  Fortunately, there's not a lot of call sites,
+and with few exceptions all of those fall under one of the
+cases above.
+
+Exceptions are all in fs/namei.c - in lookup_fast(), lookup_dcache()
+and mountpoint_last().  Another one is lookup_slow() - there
+dcache lookup is done with parent held shared, but the result
+is used after we'd drop the lock.  The same happens in do_last() -
+the lookup (in lookup_one()) is done with parent locked, but
+result is used after unlocking.
+
+lookup_fast(), do_last() and mountpoint_last() flat-out reject
+negatives.
+
+Most of lookup_dcache() calls are made with parent locked at least
+shared; the only exception is lookup_one_len_unlocked().  It might
+return pinned negative, needs serious care from callers.  Fortunately,
+almost nobody calls it directly anymore; all but two callers have
+converted to lookup_positive_unlocked(), which rejects negatives.
+
+lookup_slow() is called by the same lookup_one_len_unlocked() (see
+above), mountpoint_last() and walk_component().  In those two negatives
+are rejected.
+
+In other words, there is a small set of places where we need to
+check carefully if a pinned potentially negative dentry is, in
+fact, positive.  After that check we want to be sure that both
+->d_inode and type bits in ->d_flags are stable and observed.
+The set consists of follow_managed() (where the rejection happens
+for lookup_fast(), walk_component() and do_last()), last_mountpoint()
+and lookup_positive_unlocked().
+
+Solution:
+	1) transition from negative to positive (in __d_set_inode_and_type())
+stores ->d_inode, then uses smp_store_release() to set ->d_flags type bits.
+	2) aforementioned 3 places in fs/namei.c fetch ->d_flags with
+smp_load_acquire() and bugger off if it type bits say "negative".
+That way anyone downstream of those checks has dentry know positive pinned,
+with ->d_inode and type bits of ->d_flags stable and observed.
+
+I considered splitting off d_lookup_positive(), so that the checks could
+be done right there, under ->d_lock.  However, that leads to massive
+duplication of rather subtle code in fs/namei.c and fs/dcache.c.  It's
+worse than it might seem, thanks to autofs ->d_manage() getting involved ;-/
+No matter what, autofs_d_manage()/autofs_d_automount() must live with
+the possibility of pinned negative dentry passed their way, becoming
+positive under them - that's the intended behaviour when lookup comes
+in the middle of automount in progress, so we can't keep them out of
+the area that has to deal with those, more's the pity...
+
+Reported-by: Ritesh Harjani <riteshh@linux.ibm.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

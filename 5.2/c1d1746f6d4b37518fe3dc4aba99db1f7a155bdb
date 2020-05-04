@@ -1,0 +1,103 @@
+drm/i915: Avoid reset lock in writing fence registers
+
+The idea of taking the reset lock around writing the fence register was
+to serialise the mmio write we also perform during the reset where those
+registers get clobbered. However, the lock is overkill as write tearing
+between reset and fence_update() is harmless; the final value of the
+fence register is the same. A race between revoke_fences() and
+fence_update() is also harmless at this point as on the fault path where
+this is necessary, we acquire the reset lock to coordinate ourselves in
+the upper layer.
+
+The danger of acquiring the reset lock again in fence_update() is that
+we may recurse from the shrinker along the i915_gem_fault() path.
+
+<4> [125.739646] ============================================
+<4> [125.739652] WARNING: possible recursive locking detected
+<4> [125.739659] 5.0.0-rc6-ga6e4cbf00557-drmtip_223+ #1 Tainted: G     U
+<4> [125.739666] --------------------------------------------
+<4> [125.739672] gem_mmap_gtt/1017 is trying to acquire lock:
+<4> [125.739679] 00000000a730190a (&dev_priv->gpu_error.reset_backoff_srcu){+.+.}, at: i915_reset_trylock+0x0/0x310 [i915]
+<4> [125.739848]
+but task is already holding lock:
+<4> [125.739854] 00000000a730190a (&dev_priv->gpu_error.reset_backoff_srcu){+.+.}, at: i915_reset_trylock+0x192/0x310 [i915]
+<4> [125.739918]
+other info that might help us debug this:
+<4> [125.739925]  Possible unsafe locking scenario:
+
+<4> [125.739930]        CPU0
+<4> [125.739934]        ----
+<4> [125.739937]   lock(&dev_priv->gpu_error.reset_backoff_srcu);
+<4> [125.739944]   lock(&dev_priv->gpu_error.reset_backoff_srcu);
+<4> [125.739950]
+ *** DEADLOCK ***
+
+<4> [125.739958]  May be due to missing lock nesting notation
+
+<4> [125.739966] 5 locks held by gem_mmap_gtt/1017:
+<4> [125.739972]  #0: 00000000471f682c (&mm->mmap_sem){++++}, at: __do_page_fault+0x133/0x500
+<4> [125.739987]  #1: 0000000026542685 (&dev->struct_mutex){+.+.}, at: i915_gem_fault+0x1f6/0x860 [i915]
+<4> [125.740061]  #2: 00000000a730190a (&dev_priv->gpu_error.reset_backoff_srcu){+.+.}, at: i915_reset_trylock+0x192/0x310 [i915]
+<4> [125.740126]  #3: 00000000c828eb4f (fs_reclaim){+.+.}, at: fs_reclaim_acquire.part.25+0x0/0x30
+<4> [125.740140]  #4: 000000002d360d65 (shrinker_rwsem){++++}, at: shrink_slab+0x1cb/0x2c0
+<4> [125.740151]
+stack backtrace:
+<4> [125.740159] CPU: 1 PID: 1017 Comm: gem_mmap_gtt Tainted: G     U            5.0.0-rc6-ga6e4cbf00557-drmtip_223+ #1
+<4> [125.740170] Hardware name: Dell Inc.                 OptiPlex 745                 /0GW726, BIOS 2.3.1  05/21/2007
+<4> [125.740180] Call Trace:
+<4> [125.740189]  dump_stack+0x67/0x9b
+<4> [125.740199]  __lock_acquire+0xc75/0x1b00
+<4> [125.740209]  ? arch_tlb_finish_mmu+0x2a/0xa0
+<4> [125.740216]  ? tlb_finish_mmu+0x1a/0x30
+<4> [125.740222]  ? zap_page_range_single+0xe2/0x130
+<4> [125.740230]  ? lock_acquire+0xa6/0x1c0
+<4> [125.740237]  lock_acquire+0xa6/0x1c0
+<4> [125.740296]  ? i915_clear_error_registers+0x280/0x280 [i915]
+<4> [125.740357]  i915_reset_trylock+0x44/0x310 [i915]
+<4> [125.740417]  ? i915_clear_error_registers+0x280/0x280 [i915]
+<4> [125.740426]  ? lockdep_hardirqs_on+0xe0/0x1b0
+<4> [125.740434]  ? _raw_spin_unlock_irqrestore+0x39/0x60
+<4> [125.740499]  fence_update+0x218/0x470 [i915]
+<4> [125.740571]  i915_vma_unbind+0xa6/0x550 [i915]
+<4> [125.740640]  i915_gem_object_unbind+0xfa/0x190 [i915]
+<4> [125.740711]  i915_gem_shrink+0x2dc/0x590 [i915]
+<4> [125.740722]  ? ___preempt_schedule+0x16/0x18
+<4> [125.740792]  ? i915_gem_shrinker_scan+0xc9/0x130 [i915]
+<4> [125.740861]  i915_gem_shrinker_scan+0xc9/0x130 [i915]
+<4> [125.740870]  do_shrink_slab+0x143/0x3f0
+<4> [125.740878]  shrink_slab+0x228/0x2c0
+<4> [125.740886]  shrink_node+0x167/0x450
+<4> [125.740894]  do_try_to_free_pages+0xc4/0x340
+<4> [125.740902]  try_to_free_pages+0xdc/0x2e0
+<4> [125.740911]  __alloc_pages_nodemask+0x662/0x1110
+<4> [125.740921]  ? reacquire_held_locks+0xb5/0x1b0
+<4> [125.740928]  ? reacquire_held_locks+0xb5/0x1b0
+<4> [125.740986]  ? i915_reset_trylock+0x192/0x310 [i915]
+<4> [125.741045]  ? i915_memcpy_init_early+0x30/0x30 [i915]
+<4> [125.741054]  pte_alloc_one+0x12/0x70
+<4> [125.741060]  __pte_alloc+0x11/0xf0
+<4> [125.741067]  apply_to_page_range+0x37e/0x440
+<4> [125.741127]  remap_io_mapping+0x6c/0x100 [i915]
+<4> [125.741196]  i915_gem_fault+0x5a9/0x860 [i915]
+<4> [125.741204]  ? ptlock_alloc+0x15/0x30
+<4> [125.741212]  __do_fault+0x2c/0xb0
+<4> [125.741218]  __handle_mm_fault+0x8ee/0xfa0
+<4> [125.741227]  handle_mm_fault+0x196/0x3a0
+<4> [125.741235]  __do_page_fault+0x246/0x500
+<4> [125.741243]  ? page_fault+0x8/0x30
+<4> [125.741250]  page_fault+0x1e/0x30
+<4> [125.741256] RIP: 0033:0x55d0cc456e12
+<4> [125.741264] Code: b0 df ff ff 89 c2 8b 85 70 df ff ff 01 c2 8b 85 70 df ff ff 48 98 48 8d 0c 85 00 00 00 00 48 8b 85 e0 df ff ff 48 01 c8 f7 d2 <89> 10 83 85 70 df ff ff 01 81 bd 70 df ff ff ff 03 00 00 7e be 48
+<4> [125.741280] RSP: 002b:00007ffc1bab7ab0 EFLAGS: 00010206
+<4> [125.741287] RAX: 00007fc787cb6000 RBX: 0000000000000000 RCX: 0000000000000000
+<4> [125.741295] RDX: 00000000ffffffff RSI: 0000000000005401 RDI: 0000000000000002
+<4> [125.741303] RBP: 00007ffc1bab9b70 R08: 00007ffc1bab7920 R09: 000000000000001b
+<4> [125.741310] R10: 7165722074736554 R11: 0000000000000246 R12: 000055d0cc454a80
+<4> [125.741318] R13: 00007ffc1bab9f60 R14: 0000000000000000 R15: 0000000000000000
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=109665
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190219122215.8941-4-chris@chris-wilson.co.uk
+

@@ -1,0 +1,70 @@
+Btrfs: fix fsync not persisting dentry deletions due to inode evictions
+
+In order to avoid searches on a log tree when unlinking an inode, we check
+if the inode being unlinked was logged in the current transaction, as well
+as the inode of its parent directory. When any of the inodes are logged,
+we proceed to delete directory items and inode reference items from the
+log, to ensure that if a subsequent fsync of only the inode being unlinked
+or only of the parent directory when the other is not fsync'ed as well,
+does not result in the entry still existing after a power failure.
+
+That check however is not reliable when one of the inodes involved (the
+one being unlinked or its parent directory's inode) is evicted, since the
+logged_trans field is transient, that is, it is not stored on disk, so it
+is lost when the inode is evicted and loaded into memory again (which is
+set to zero on load). As a consequence the checks currently being done by
+btrfs_del_dir_entries_in_log() and btrfs_del_inode_ref_in_log() always
+return true if the inode was evicted before, regardless of the inode
+having been logged or not before (and in the current transaction), this
+results in the dentry being unlinked still existing after a log replay
+if after the unlink operation only one of the inodes involved is fsync'ed.
+
+Example:
+
+  $ mkfs.btrfs -f /dev/sdb
+  $ mount /dev/sdb /mnt
+
+  $ mkdir /mnt/dir
+  $ touch /mnt/dir/foo
+  $ xfs_io -c fsync /mnt/dir/foo
+
+  # Keep an open file descriptor on our directory while we evict inodes.
+  # We just want to evict the file's inode, the directory's inode must not
+  # be evicted.
+  $ ( cd /mnt/dir; while true; do :; done ) &
+  $ pid=$!
+
+  # Wait a bit to give time to background process to chdir to our test
+  # directory.
+  $ sleep 0.5
+
+  # Trigger eviction of the file's inode.
+  $ echo 2 > /proc/sys/vm/drop_caches
+
+  # Unlink our file and fsync the parent directory. After a power failure
+  # we don't expect to see the file anymore, since we fsync'ed the parent
+  # directory.
+  $ rm -f $SCRATCH_MNT/dir/foo
+  $ xfs_io -c fsync /mnt/dir
+
+  <power failure>
+
+  $ mount /dev/sdb /mnt
+  $ ls /mnt/dir
+  foo
+  $
+   --> file still there, unlink not persisted despite explicit fsync on dir
+
+Fix this by checking if the inode has the full_sync bit set in its runtime
+flags as well, since that bit is set everytime an inode is loaded from
+disk, or for other less common cases such as after a shrinking truncate
+or failure to allocate extent maps for holes, and gets cleared after the
+first fsync. Also consider the inode as possibly logged only if it was
+last modified in the current transaction (besides having the full_fsync
+flag set).
+
+Fixes: 3a5f1d458ad161 ("Btrfs: Optimize btree walking while logging inodes")
+CC: stable@vger.kernel.org # 4.4+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

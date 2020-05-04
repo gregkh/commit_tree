@@ -1,0 +1,56 @@
+drm/i915: Revoke mmaps and prevent access to fence registers across reset
+
+Previously, we were able to rely on the recursive properties of
+struct_mutex to allow us to serialise revoking mmaps and reacquiring the
+FENCE registers with them being clobbered over a global device reset.
+I then proceeded to throw out the baby with the bath water in order to
+pursue a struct_mutex-less reset.
+
+Perusing LWN for alternative strategies, the dilemma on how to serialise
+access to a global resource on one side was answered by
+https://lwn.net/Articles/202847/ -- Sleepable RCU:
+
+    1  int readside(void) {
+    2      int idx;
+    3      rcu_read_lock();
+    4	   if (nomoresrcu) {
+    5          rcu_read_unlock();
+    6	       return -EINVAL;
+    7      }
+    8	   idx = srcu_read_lock(&ss);
+    9	   rcu_read_unlock();
+    10	   /* SRCU read-side critical section. */
+    11	   srcu_read_unlock(&ss, idx);
+    12	   return 0;
+    13 }
+    14
+    15 void cleanup(void)
+    16 {
+    17     nomoresrcu = 1;
+    18     synchronize_rcu();
+    19     synchronize_srcu(&ss);
+    20     cleanup_srcu_struct(&ss);
+    21 }
+
+No more worrying about stop_machine, just an uber-complex mutex,
+optimised for reads, with the overhead pushed to the rare reset path.
+
+However, we do run the risk of a deadlock as we allocate underneath the
+SRCU read lock, and the allocation may require a GPU reset, causing a
+dependency cycle via the in-flight requests. We resolve that by declaring
+the driver wedged and cancelling all in-flight rendering.
+
+v2: Use expedited rcu barriers to match our earlier timing
+characteristics.
+v3: Try to annotate locking contexts for sparse
+v4: Reduce selftest lock duration to avoid a reset deadlock with fences
+v5: s/srcu/reset_backoff_srcu/
+v6: Remove more stale comments
+
+Testcase: igt/gem_mmap_gtt/hang
+Fixes: eb8d0f5af4ec ("drm/i915: Remove GPU reset dependence on struct_mutex")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190208153708.20023-2-chris@chris-wilson.co.uk
+

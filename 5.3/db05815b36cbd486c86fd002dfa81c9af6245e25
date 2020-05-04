@@ -1,0 +1,97 @@
+net/mlx5e: Add XSK zero-copy support
+
+This commit adds support for AF_XDP zero-copy RX and TX.
+
+We create a dedicated XSK RQ inside the channel, it means that two
+RQs are running simultaneously: one for non-XSK traffic and the other
+for XSK traffic. The regular and XSK RQs use a single ID namespace split
+into two halves: the lower half is regular RQs, and the upper half is
+XSK RQs. When any zero-copy AF_XDP socket is active, changing the number
+of channels is not allowed, because it would break to mapping between
+XSK RQ IDs and channels.
+
+XSK requires different page allocation and release routines. Such
+functions as mlx5e_{alloc,free}_rx_mpwqe and mlx5e_{get,put}_rx_frag are
+generic enough to be used for both regular and XSK RQs, and they use the
+mlx5e_page_{alloc,release} wrappers around the real allocation
+functions. Function pointers are not used to avoid losing the
+performance with retpolines. Wherever it's certain that the regular
+(non-XSK) page release function should be used, it's called directly.
+
+Only the stats that could be meaningful for XSK are exposed to the
+userspace. Those that don't take part in the XSK flow are not
+considered.
+
+Note that we don't wait for WQEs on the XSK RQ (unlike the regular RQ),
+because the newer xdpsock sample doesn't provide any Fill Ring entries
+at the setup stage.
+
+We create a dedicated XSK SQ in the channel. This separation has its
+advantages:
+
+1. When the UMEM is closed, the XSK SQ can also be closed and stop
+receiving completions. If an existing SQ was used for XSK, it would
+continue receiving completions for the packets of the closed socket. If
+a new UMEM was opened at that point, it would start getting completions
+that don't belong to it.
+
+2. Calculating statistics separately.
+
+When the userspace kicks the TX, the driver triggers a hardware
+interrupt by posting a NOP to a dedicated XSK ICO (internal control
+operations) SQ, in order to trigger NAPI on the right CPU core. This XSK
+ICO SQ is protected by a spinlock, as the userspace application may kick
+the TX from any core.
+
+Store the pointers to the UMEMs in the net device private context,
+independently from the kernel. This way the driver can distinguish
+between the zero-copy and non-zero-copy UMEMs. The kernel function
+xdp_get_umem_from_qid does not care about this difference, but the
+driver is only interested in zero-copy UMEMs, particularly, on the
+cleanup it determines whether to close the XSK RQ and SQ or not by
+looking at the presence of the UMEM. Use state_lock to protect the
+access to this area of UMEM pointers.
+
+LRO isn't compatible with XDP, but there may be active UMEMs while
+XDP is off. If this is the case, don't allow LRO to ensure XDP can
+be reenabled at any time.
+
+The validation of XSK parameters typically happens when XSK queues
+open. However, when the interface is down or the XDP program isn't
+set, it's still possible to have active AF_XDP sockets and even to
+open new, but the XSK queues will be closed. To cover these cases,
+perform the validation also in these flows:
+
+1. A new UMEM is registered, but the XSK queues aren't going to be
+created due to missing XDP program or interface being down.
+
+2. MTU changes while there are UMEMs registered.
+
+Having this early check prevents mlx5e_open_channels from failing
+at a later stage, where recovery is impossible and the application
+has no chance to handle the error, because it got the successful
+return value for an MTU change or XSK open operation.
+
+The performance testing was performed on a machine with the following
+configuration:
+
+- 24 cores of Intel Xeon E5-2620 v3 @ 2.40 GHz
+- Mellanox ConnectX-5 Ex with 100 Gbit/s link
+
+The results with retpoline disabled, single stream:
+
+txonly: 33.3 Mpps (21.5 Mpps with queue and app pinned to the same CPU)
+rxdrop: 12.2 Mpps
+l2fwd: 9.4 Mpps
+
+The results with retpoline enabled, single stream:
+
+txonly: 21.3 Mpps (14.1 Mpps with queue and app pinned to the same CPU)
+rxdrop: 9.9 Mpps
+l2fwd: 6.8 Mpps
+
+Signed-off-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+Acked-by: Saeed Mahameed <saeedm@mellanox.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+

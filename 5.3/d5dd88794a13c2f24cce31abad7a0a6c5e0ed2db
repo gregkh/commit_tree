@@ -1,0 +1,151 @@
+inet: fix various use-after-free in defrags units
+
+syzbot reported another issue caused by my recent patches. [1]
+
+The issue here is that fqdir_exit() is initiating a work queue
+and immediately returns. A bit later cleanup_net() was able
+to free the MIB (percpu data) and the whole struct net was freed,
+but we had active frag timers that fired and triggered use-after-free.
+
+We need to make sure that timers can catch fqdir->dead being set,
+to bailout.
+
+Since RCU is used for the reader side, this means
+we want to respect an RCU grace period between these operations :
+
+1) qfdir->dead = 1;
+
+2) netns dismantle (freeing of various data structure)
+
+This patch uses new new (struct pernet_operations)->pre_exit
+infrastructure to ensures a full RCU grace period
+happens between fqdir_pre_exit() and fqdir_exit()
+
+This also means we can use a regular work queue, we no
+longer need rcu_work.
+
+Tested:
+
+$ time for i in {1..1000}; do unshare -n /bin/false;done
+
+real	0m2.585s
+user	0m0.160s
+sys	0m2.214s
+
+[1]
+
+BUG: KASAN: use-after-free in ip_expire+0x73e/0x800 net/ipv4/ip_fragment.c:152
+Read of size 8 at addr ffff88808b9fe330 by task syz-executor.4/11860
+
+CPU: 1 PID: 11860 Comm: syz-executor.4 Not tainted 5.2.0-rc2+ #22
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+Call Trace:
+ <IRQ>
+ __dump_stack lib/dump_stack.c:77 [inline]
+ dump_stack+0x172/0x1f0 lib/dump_stack.c:113
+ print_address_description.cold+0x7c/0x20d mm/kasan/report.c:188
+ __kasan_report.cold+0x1b/0x40 mm/kasan/report.c:317
+ kasan_report+0x12/0x20 mm/kasan/common.c:614
+ __asan_report_load8_noabort+0x14/0x20 mm/kasan/generic_report.c:132
+ ip_expire+0x73e/0x800 net/ipv4/ip_fragment.c:152
+ call_timer_fn+0x193/0x720 kernel/time/timer.c:1322
+ expire_timers kernel/time/timer.c:1366 [inline]
+ __run_timers kernel/time/timer.c:1685 [inline]
+ __run_timers kernel/time/timer.c:1653 [inline]
+ run_timer_softirq+0x66f/0x1740 kernel/time/timer.c:1698
+ __do_softirq+0x25c/0x94c kernel/softirq.c:293
+ invoke_softirq kernel/softirq.c:374 [inline]
+ irq_exit+0x180/0x1d0 kernel/softirq.c:414
+ exiting_irq arch/x86/include/asm/apic.h:536 [inline]
+ smp_apic_timer_interrupt+0x13b/0x550 arch/x86/kernel/apic/apic.c:1068
+ apic_timer_interrupt+0xf/0x20 arch/x86/entry/entry_64.S:806
+ </IRQ>
+RIP: 0010:tomoyo_domain_quota_is_ok+0x131/0x540 security/tomoyo/util.c:1035
+Code: 24 4c 3b 65 d0 0f 84 9c 00 00 00 e8 19 1d 73 fe 49 8d 7c 24 18 48 ba 00 00 00 00 00 fc ff df 48 89 f8 48 c1 e8 03 0f b6 04 10 <48> 89 fa 83 e2 07 38 d0 7f 08 84 c0 0f 85 69 03 00 00 41 0f b6 5c
+RSP: 0018:ffff88806ae079c0 EFLAGS: 00000a02 ORIG_RAX: ffffffffffffff13
+RAX: 0000000000000000 RBX: 0000000000000010 RCX: ffffc9000e655000
+RDX: dffffc0000000000 RSI: ffffffff82fd88a7 RDI: ffff888086202398
+RBP: ffff88806ae07a00 R08: ffff88808b6c8700 R09: ffffed100d5c0f4d
+R10: ffffed100d5c0f4c R11: 0000000000000000 R12: ffff888086202380
+R13: 0000000000000030 R14: 00000000000000d3 R15: 0000000000000000
+ tomoyo_supervisor+0x2e8/0xef0 security/tomoyo/common.c:2087
+ tomoyo_audit_path_number_log security/tomoyo/file.c:235 [inline]
+ tomoyo_path_number_perm+0x42f/0x520 security/tomoyo/file.c:734
+ tomoyo_file_ioctl+0x23/0x30 security/tomoyo/tomoyo.c:335
+ security_file_ioctl+0x77/0xc0 security/security.c:1370
+ ksys_ioctl+0x57/0xd0 fs/ioctl.c:711
+ __do_sys_ioctl fs/ioctl.c:720 [inline]
+ __se_sys_ioctl fs/ioctl.c:718 [inline]
+ __x64_sys_ioctl+0x73/0xb0 fs/ioctl.c:718
+ do_syscall_64+0xfd/0x680 arch/x86/entry/common.c:301
+ entry_SYSCALL_64_after_hwframe+0x49/0xbe
+RIP: 0033:0x4592c9
+Code: fd b7 fb ff c3 66 2e 0f 1f 84 00 00 00 00 00 66 90 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff ff 0f 83 cb b7 fb ff c3 66 2e 0f 1f 84 00 00 00 00
+RSP: 002b:00007f8db5e44c78 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+RAX: ffffffffffffffda RBX: 0000000000000003 RCX: 00000000004592c9
+RDX: 0000000020000080 RSI: 00000000000089f1 RDI: 0000000000000006
+RBP: 000000000075bf20 R08: 0000000000000000 R09: 0000000000000000
+R10: 0000000000000000 R11: 0000000000000246 R12: 00007f8db5e456d4
+R13: 00000000004cc770 R14: 00000000004d5cd8 R15: 00000000ffffffff
+
+Allocated by task 9047:
+ save_stack+0x23/0x90 mm/kasan/common.c:71
+ set_track mm/kasan/common.c:79 [inline]
+ __kasan_kmalloc mm/kasan/common.c:489 [inline]
+ __kasan_kmalloc.constprop.0+0xcf/0xe0 mm/kasan/common.c:462
+ kasan_slab_alloc+0xf/0x20 mm/kasan/common.c:497
+ slab_post_alloc_hook mm/slab.h:437 [inline]
+ slab_alloc mm/slab.c:3326 [inline]
+ kmem_cache_alloc+0x11a/0x6f0 mm/slab.c:3488
+ kmem_cache_zalloc include/linux/slab.h:732 [inline]
+ net_alloc net/core/net_namespace.c:386 [inline]
+ copy_net_ns+0xed/0x340 net/core/net_namespace.c:426
+ create_new_namespaces+0x400/0x7b0 kernel/nsproxy.c:107
+ unshare_nsproxy_namespaces+0xc2/0x200 kernel/nsproxy.c:206
+ ksys_unshare+0x440/0x980 kernel/fork.c:2692
+ __do_sys_unshare kernel/fork.c:2760 [inline]
+ __se_sys_unshare kernel/fork.c:2758 [inline]
+ __x64_sys_unshare+0x31/0x40 kernel/fork.c:2758
+ do_syscall_64+0xfd/0x680 arch/x86/entry/common.c:301
+ entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+Freed by task 2541:
+ save_stack+0x23/0x90 mm/kasan/common.c:71
+ set_track mm/kasan/common.c:79 [inline]
+ __kasan_slab_free+0x102/0x150 mm/kasan/common.c:451
+ kasan_slab_free+0xe/0x10 mm/kasan/common.c:459
+ __cache_free mm/slab.c:3432 [inline]
+ kmem_cache_free+0x86/0x260 mm/slab.c:3698
+ net_free net/core/net_namespace.c:402 [inline]
+ net_drop_ns.part.0+0x70/0x90 net/core/net_namespace.c:409
+ net_drop_ns net/core/net_namespace.c:408 [inline]
+ cleanup_net+0x538/0x960 net/core/net_namespace.c:571
+ process_one_work+0x989/0x1790 kernel/workqueue.c:2269
+ worker_thread+0x98/0xe40 kernel/workqueue.c:2415
+ kthread+0x354/0x420 kernel/kthread.c:255
+ ret_from_fork+0x24/0x30 arch/x86/entry/entry_64.S:352
+
+The buggy address belongs to the object at ffff88808b9fe100
+ which belongs to the cache net_namespace of size 6784
+The buggy address is located 560 bytes inside of
+ 6784-byte region [ffff88808b9fe100, ffff88808b9ffb80)
+The buggy address belongs to the page:
+page:ffffea00022e7f80 refcount:1 mapcount:0 mapping:ffff88821b6f60c0 index:0x0 compound_mapcount: 0
+flags: 0x1fffc0000010200(slab|head)
+raw: 01fffc0000010200 ffffea000256f288 ffffea0001bbef08 ffff88821b6f60c0
+raw: 0000000000000000 ffff88808b9fe100 0000000100000001 0000000000000000
+page dumped because: kasan: bad access detected
+
+Memory state around the buggy address:
+ ffff88808b9fe200: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+ ffff88808b9fe280: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+>ffff88808b9fe300: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+                                     ^
+ ffff88808b9fe380: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+ ffff88808b9fe400: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+
+Fixes: 3c8fc8782044 ("inet: frags: rework rhashtable dismantle")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: syzbot <syzkaller@googlegroups.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

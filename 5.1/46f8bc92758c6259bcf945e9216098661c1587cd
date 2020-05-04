@@ -1,0 +1,96 @@
+bpf: Add a bpf_sock pointer to __sk_buff and a bpf_sk_fullsock helper
+
+In kernel, it is common to check "skb->sk && sk_fullsock(skb->sk)"
+before accessing the fields in sock.  For example, in __netdev_pick_tx:
+
+static u16 __netdev_pick_tx(struct net_device *dev, struct sk_buff *skb,
+			    struct net_device *sb_dev)
+{
+	/* ... */
+
+	struct sock *sk = skb->sk;
+
+		if (queue_index != new_index && sk &&
+		    sk_fullsock(sk) &&
+		    rcu_access_pointer(sk->sk_dst_cache))
+			sk_tx_queue_set(sk, new_index);
+
+	/* ... */
+
+	return queue_index;
+}
+
+This patch adds a "struct bpf_sock *sk" pointer to the "struct __sk_buff"
+where a few of the convert_ctx_access() in filter.c has already been
+accessing the skb->sk sock_common's fields,
+e.g. sock_ops_convert_ctx_access().
+
+"__sk_buff->sk" is a PTR_TO_SOCK_COMMON_OR_NULL in the verifier.
+Some of the fileds in "bpf_sock" will not be directly
+accessible through the "__sk_buff->sk" pointer.  It is limited
+by the new "bpf_sock_common_is_valid_access()".
+e.g. The existing "type", "protocol", "mark" and "priority" in bpf_sock
+     are not allowed.
+
+The newly added "struct bpf_sock *bpf_sk_fullsock(struct bpf_sock *sk)"
+can be used to get a sk with all accessible fields in "bpf_sock".
+This helper is added to both cg_skb and sched_(cls|act).
+
+int cg_skb_foo(struct __sk_buff *skb) {
+	struct bpf_sock *sk;
+
+	sk = skb->sk;
+	if (!sk)
+		return 1;
+
+	sk = bpf_sk_fullsock(sk);
+	if (!sk)
+		return 1;
+
+	if (sk->family != AF_INET6 || sk->protocol != IPPROTO_TCP)
+		return 1;
+
+	/* some_traffic_shaping(); */
+
+	return 1;
+}
+
+(1) The sk is read only
+
+(2) There is no new "struct bpf_sock_common" introduced.
+
+(3) Future kernel sock's members could be added to bpf_sock only
+    instead of repeatedly adding at multiple places like currently
+    in bpf_sock_ops_md, bpf_sock_addr_md, sk_reuseport_md...etc.
+
+(4) After "sk = skb->sk", the reg holding sk is in type
+    PTR_TO_SOCK_COMMON_OR_NULL.
+
+(5) After bpf_sk_fullsock(), the return type will be in type
+    PTR_TO_SOCKET_OR_NULL which is the same as the return type of
+    bpf_sk_lookup_xxx().
+
+    However, bpf_sk_fullsock() does not take refcnt.  The
+    acquire_reference_state() is only depending on the return type now.
+    To avoid it, a new is_acquire_function() is checked before calling
+    acquire_reference_state().
+
+(6) The WARN_ON in "release_reference_state()" is no longer an
+    internal verifier bug.
+
+    When reg->id is not found in state->refs[], it means the
+    bpf_prog does something wrong like
+    "bpf_sk_release(bpf_sk_fullsock(skb->sk))" where reference has
+    never been acquired by calling "bpf_sk_fullsock(skb->sk)".
+
+    A -EINVAL and a verbose are done instead of WARN_ON.  A test is
+    added to the test_verifier in a later patch.
+
+    Since the WARN_ON in "release_reference_state()" is no longer
+    needed, "__release_reference_state()" is folded into
+    "release_reference_state()" also.
+
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
