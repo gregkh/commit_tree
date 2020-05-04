@@ -1,0 +1,63 @@
+btrfs: make full fsyncs always operate on the entire file again
+
+This is a revert of commit 0a8068a3dd4294 ("btrfs: make ranged full
+fsyncs more efficient"), with updated comment in btrfs_sync_file.
+
+Commit 0a8068a3dd4294 ("btrfs: make ranged full fsyncs more efficient")
+made full fsyncs operate on the given range only as it assumed it was safe
+when using the NO_HOLES feature, since the hole detection was simplified
+some time ago and no longer was a source for races with ordered extent
+completion of adjacent file ranges.
+
+However it's still not safe to have a full fsync only operate on the given
+range, because extent maps for new extents might not be present in memory
+due to inode eviction or extent cloning. Consider the following example:
+
+1) We are currently at transaction N;
+
+2) We write to the file range [0, 1MiB);
+
+3) Writeback finishes for the whole range and ordered extents complete,
+   while we are still at transaction N;
+
+4) The inode is evicted;
+
+5) We open the file for writing, causing the inode to be loaded to
+   memory again, which sets the 'full sync' bit on its flags. At this
+   point the inode's list of modified extent maps is empty (figuring
+   out which extents were created in the current transaction and were
+   not yet logged by an fsync is expensive, that's why we set the
+   'full sync' bit when loading an inode);
+
+6) We write to the file range [512KiB, 768KiB);
+
+7) We do a ranged fsync (such as msync()) for file range [512KiB, 768KiB).
+   This correctly flushes this range and logs its extent into the log
+   tree. When the writeback started an extent map for range [512KiB, 768KiB)
+   was added to the inode's list of modified extents, and when the fsync()
+   finishes logging it removes that extent map from the list of modified
+   extent maps. This fsync also clears the 'full sync' bit;
+
+8) We do a regular fsync() (full ranged). This fsync() ends up doing
+   nothing because the inode's list of modified extents is empty and
+   no other changes happened since the previous ranged fsync(), so
+   it just returns success (0) and we end up never logging extents for
+   the file ranges [0, 512KiB) and [768KiB, 1MiB).
+
+Another scenario where this can happen is if we replace steps 2 to 4 with
+cloning from another file into our test file, as that sets the 'full sync'
+bit in our inode's flags and does not populate its list of modified extent
+maps.
+
+This was causing test case generic/457 to fail sporadically when using the
+NO_HOLES feature, as it exercised this later case where the inode has the
+'full sync' bit set and has no extent maps in memory to represent the new
+extents due to extent cloning.
+
+Fix this by reverting commit 0a8068a3dd4294 ("btrfs: make ranged full fsyncs
+more efficient") since there is no easy way to work around it.
+
+Fixes: 0a8068a3dd4294 ("btrfs: make ranged full fsyncs more efficient")
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

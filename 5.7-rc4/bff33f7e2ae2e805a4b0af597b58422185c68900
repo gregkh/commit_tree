@@ -1,0 +1,72 @@
+net: dsa: implement auto-normalization of MTU for bridge hardware datapath
+
+Many switches don't have an explicit knob for configuring the MTU
+(maximum transmission unit per interface).  Instead, they do the
+length-based packet admission checks on the ingress interface, for
+reasons that are easy to understand (why would you accept a packet in
+the queuing subsystem if you know you're going to drop it anyway).
+
+So it is actually the MRU that these switches permit configuring.
+
+In Linux there only exists the IFLA_MTU netlink attribute and the
+associated dev_set_mtu function. The comments like to play blind and say
+that it's changing the "maximum transfer unit", which is to say that
+there isn't any directionality in the meaning of the MTU word. So that
+is the interpretation that this patch is giving to things: MTU == MRU.
+
+When 2 interfaces having different MTUs are bridged, the bridge driver
+MTU auto-adjustment logic kicks in: what br_mtu_auto_adjust() does is it
+adjusts the MTU of the bridge net device itself (and not that of the
+slave net devices) to the minimum value of all slave interfaces, in
+order for forwarded packets to not exceed the MTU regardless of the
+interface they are received and send on.
+
+The idea behind this behavior, and why the slave MTUs are not adjusted,
+is that normal termination from Linux over the L2 forwarding domain
+should happen over the bridge net device, which _is_ properly limited by
+the minimum MTU. And termination over individual slave devices is
+possible even if those are bridged. But that is not "forwarding", so
+there's no reason to do normalization there, since only a single
+interface sees that packet.
+
+The problem with those switches that can only control the MRU is with
+the offloaded data path, where a packet received on an interface with
+MRU 9000 would still be forwarded to an interface with MRU 1500. And the
+br_mtu_auto_adjust() function does not really help, since the MTU
+configured on the bridge net device is ignored.
+
+In order to enforce the de-facto MTU == MRU rule for these switches, we
+need to do MTU normalization, which means: in order for no packet larger
+than the MTU configured on this port to be sent, then we need to limit
+the MRU on all ports that this packet could possibly come from. AKA
+since we are configuring the MRU via MTU, it means that all ports within
+a bridge forwarding domain should have the same MTU.
+
+And that is exactly what this patch is trying to do.
+
+>From an implementation perspective, we try to follow the intent of the
+user, otherwise there is a risk that we might livelock them (they try to
+change the MTU on an already-bridged interface, but we just keep
+changing it back in an attempt to keep the MTU normalized). So the MTU
+that the bridge is normalized to is either:
+
+ - The most recently changed one:
+
+   ip link set dev swp0 master br0
+   ip link set dev swp1 master br0
+   ip link set dev swp0 mtu 1400
+
+   This sequence will make swp1 inherit MTU 1400 from swp0.
+
+ - The one of the most recently added interface to the bridge:
+
+   ip link set dev swp0 master br0
+   ip link set dev swp1 mtu 1400
+   ip link set dev swp1 master br0
+
+   The above sequence will make swp0 inherit MTU 1400 as well.
+
+Suggested-by: Florian Fainelli <f.fainelli@gmail.com>
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

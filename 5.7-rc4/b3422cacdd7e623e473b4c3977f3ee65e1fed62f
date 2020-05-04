@@ -1,0 +1,72 @@
+gfs2: Rework how rgrp buffer_heads are managed
+
+Before this patch, the rgrp code had a serious problem related to
+how it managed buffer_heads for resource groups. The problem caused
+file system corruption, especially in cases of journal replay.
+
+When an rgrp glock was demoted to transfer ownership to a
+different cluster node, do_xmote() first calls rgrp_go_sync and then
+rgrp_go_inval, as expected. When it calls rgrp_go_sync, that called
+gfs2_rgrp_brelse() that dropped the buffer_head reference count.
+In most cases, the reference count went to zero, which is right.
+However, there were other places where the buffers are handled
+differently.
+
+After rgrp_go_sync, do_xmote called rgrp_go_inval which called
+gfs2_rgrp_brelse a second time, then rgrp_go_inval's call to
+truncate_inode_pages_range would get rid of the pages in memory,
+but only if the reference count drops to 0.
+
+Unfortunately, gfs2_rgrp_brelse was setting bi->bi_bh = NULL.
+So when rgrp_go_sync called gfs2_rgrp_brelse, it lost the pointer
+to the buffer_heads in cases where the reference count was still 1.
+Therefore, when rgrp_go_inval called gfs2_rgrp_brelse a second time,
+it failed the check for "if (bi->bi_bh)" and thus failed to call
+brelse a second time. Because of that, the reference count on those
+buffers sometimes failed to drop from 1 to 0. And that caused
+function truncate_inode_pages_range to keep the pages in page cache
+rather than freeing them.
+
+The next time the rgrp glock was acquired, the metadata read of
+the rgrp buffers re-used the pages in memory, which were now
+wrong because they were likely modified by the other node who
+acquired the glock in EX (which is why we demoted the glock).
+This re-use of the page cache caused corruption because changes
+made by the other nodes were never seen, so the bitmaps were
+inaccurate.
+
+For some reason, the problem became most apparent when journal
+replay forced the replay of rgrps in memory, which caused newer
+rgrp data to be overwritten by the older in-core pages.
+
+A big part of the problem was that the rgrp buffer were released
+in multiple places: The go_unlock function would release them when
+the glock was released rather than when the glock is demoted,
+which is clearly wrong because our intent was to cache them until
+the glock is demoted from SH or EX.
+
+This patch attempts to clean up the mess and make one consistent
+and centralized mechanism for managing the rgrp buffer_heads by
+implementing several changes:
+
+1. It eliminates the call to gfs2_rgrp_brelse() from rgrp_go_sync.
+   We don't want to release the buffers or zero the pointers when
+   syncing for the reasons stated above. It only makes sense to
+   release them when the glock is actually invalidated (go_inval).
+   And when we do, then we set the bh pointers to NULL.
+2. The go_unlock function (which was only used for rgrps) is
+   eliminated, as we've talked about doing many times before.
+   The go_unlock function was called too early in the glock dq
+   process, and should not happen until the glock is invalidated.
+3. It also eliminates the call to rgrp_brelse in gfs2_clear_rgrpd.
+   That will now happen automatically when the rgrp glocks are
+   demoted, and shouldn't happen any sooner or later than that.
+   Instead, function gfs2_clear_rgrpd has been modified to demote
+   the rgrp glocks, and therefore, free those pages, before the
+   remaining glocks are culled by gfs2_gl_hash_clear. This
+   prevents the gl_object from hanging around when the glocks are
+   culled.
+
+Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+

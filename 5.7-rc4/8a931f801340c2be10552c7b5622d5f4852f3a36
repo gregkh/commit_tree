@@ -1,0 +1,97 @@
+mm: memcontrol: recursive memory.low protection
+
+Right now, the effective protection of any given cgroup is capped by its
+own explicit memory.low setting, regardless of what the parent says.  The
+reasons for this are mostly historical and ease of implementation: to make
+delegation of memory.low safe, effective protection is the min() of all
+memory.low up the tree.
+
+Unfortunately, this limitation makes it impossible to protect an entire
+subtree from another without forcing the user to make explicit protection
+allocations all the way to the leaf cgroups - something that is highly
+undesirable in real life scenarios.
+
+Consider memory in a data center host.  At the cgroup top level, we have a
+distinction between system management software and the actual workload the
+system is executing.  Both branches are further subdivided into individual
+services, job components etc.
+
+We want to protect the workload as a whole from the system management
+software, but that doesn't mean we want to protect and prioritize
+individual workload wrt each other.  Their memory demand can vary over
+time, and we'd want the VM to simply cache the hottest data within the
+workload subtree.  Yet, the current memory.low limitations force us to
+allocate a fixed amount of protection to each workload component in order
+to get protection from system management software in general.  This
+results in very inefficient resource distribution.
+
+Another concern with mandating downward allocation is that, as the
+complexity of the cgroup tree grows, it gets harder for the lower levels
+to be informed about decisions made at the host-level.  Consider a
+container inside a namespace that in turn creates its own nested tree of
+cgroups to run multiple workloads.  It'd be extremely difficult to
+configure memory.low parameters in those leaf cgroups that on one hand
+balance pressure among siblings as the container desires, while also
+reflecting the host-level protection from e.g.  rpm upgrades, that lie
+beyond one or more delegation and namespacing points in the tree.
+
+It's highly unusual from a cgroup interface POV that nested levels have to
+be aware of and reflect decisions made at higher levels for them to be
+effective.
+
+To enable such use cases and scale configurability for complex trees, this
+patch implements a resource inheritance model for memory that is similar
+to how the CPU and the IO controller implement work-conserving resource
+allocations: a share of a resource allocated to a subree always applies to
+the entire subtree recursively, while allowing, but not mandating,
+children to further specify distribution rules.
+
+That means that if protection is explicitly allocated among siblings,
+those configured shares are being followed during page reclaim just like
+they are now.  However, if the memory.low set at a higher level is not
+fully claimed by the children in that subtree, the "floating" remainder is
+applied to each cgroup in the tree in proportion to its size.  Since
+reclaim pressure is applied in proportion to size as well, each child in
+that tree gets the same boost, and the effect is neutral among siblings -
+with respect to each other, they behave as if no memory control was
+enabled at all, and the VM simply balances the memory demands optimally
+within the subtree.  But collectively those cgroups enjoy a boost over the
+cgroups in neighboring trees.
+
+E.g.  a leaf cgroup with a memory.low setting of 0 no longer means that
+it's not getting a share of the hierarchically assigned resource, just
+that it doesn't claim a fixed amount of it to protect from its siblings.
+
+This allows us to recursively protect one subtree (workload) from another
+(system management), while letting subgroups compete freely among each
+other - without having to assign fixed shares to each leaf, and without
+nested groups having to echo higher-level settings.
+
+The floating protection composes naturally with fixed protection.
+Consider the following example tree:
+
+		A            A: low = 2G
+               / \          A1: low = 1G
+              A1 A2         A2: low = 0G
+
+As outside pressure is applied to this tree, A1 will enjoy a fixed
+protection from A2 of 1G, but the remaining, unclaimed 1G from A is split
+evenly among A1 and A2, coming out to 1.5G and 0.5G.
+
+There is a slight risk of regressing theoretical setups where the
+top-level cgroups don't know about the true budgeting and set bogusly high
+"bypass" values that are meaningfully allocated down the tree.  Such
+setups would rely on unclaimed protection to be discarded, and
+distributing it would change the intended behavior.  Be safe and hide the
+new behavior behind a mount option, 'memory_recursiveprot'.
+
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Tejun Heo <tj@kernel.org>
+Acked-by: Roman Gushchin <guro@fb.com>
+Acked-by: Chris Down <chris@chrisdown.name>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Michal Koutný <mkoutny@suse.com>
+Link: http://lkml.kernel.org/r/20200227195606.46212-4-hannes@cmpxchg.org
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

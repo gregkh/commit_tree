@@ -1,0 +1,65 @@
+spi: spi-fsl-dspi: Protect against races on dspi->words_in_flight
+
+dspi->words_in_flight is a variable populated in the *_write functions
+and used in the dspi_fifo_read function. It is also used in
+dspi_fifo_write, immediately after transmission, to update the
+message->actual_length variable used by higher layers such as spi-mem
+for integrity checking.
+
+But it may happen that the IRQ which calls dspi_fifo_read to be
+triggered before the updating of message->actual_length takes place. In
+that case, dspi_fifo_read will decrement dspi->words_in_flight to -1,
+and that will cause an invalid modification of message->actual_length.
+
+For that, we make the simplest fix possible: to not decrement the actual
+shared variable in dspi->words_in_flight from dspi_fifo_read, but
+actually a copy of it which is on stack.
+
+But even if dspi_fifo_read from the next IRQ does not interfere with the
+dspi_fifo_write of the current chunk, the *next* dspi_fifo_write still
+can. So we must assume that everything after the last write to the TX
+FIFO can be preempted by the "TX complete" IRQ, and the dspi_fifo_write
+function must be safe against that. This means refactoring the 2
+flavours of FIFO writes (for EOQ and XSPI) such that the calculation of
+the number of words to be written is common and happens a priori. This
+way, the code for updating the message->actual_length variable works
+with a copy and not with the volatile dspi->words_in_flight.
+
+After some interior debate, the dspi->progress variable used for
+software timestamping was *not* backed up against preemption in a copy
+on stack. Because if preemption does occur between
+spi_take_timestamp_pre and spi_take_timestamp_post, there's really no
+point in trying to save anything. The first-in-time
+spi_take_timestamp_post call with a dspi->progress higher than the
+requested xfer->ptp_sts_word_post will trigger xfer->timestamped = true
+anyway and will close the deal.
+
+To understand the above a bit better, consider a transfer with
+xfer->ptp_sts_word_pre = xfer->ptp_sts_word_post = 3, and
+xfer->bits_per_words = 8 (so byte 3 needs to be timestamped). The DSPI
+controller timestamps in chunks of 4 bytes at a time, and preemption
+occurs in the middle of timestamping the first chunk:
+
+  spi_take_timestamp_pre(0)
+    .
+    . (preemption)
+    .
+    . spi_take_timestamp_pre(4)
+    .
+    . spi_take_timestamp_post(7)
+    .
+  spi_take_timestamp_post(3)
+
+So the reason I'm not bothering to back up dspi->progress for that
+spi_take_timestamp_post(3) is that spi_take_timestamp_post(7) is going
+to (a) be more honest, (b) provide better accuracy and (c) already
+render the spi_take_timestamp_post(3) into a noop by setting
+xfer->timestamped = true anyway.
+
+Fixes: d59c90a2400f ("spi: spi-fsl-dspi: Convert TCFQ users to XSPI FIFO mode")
+Reported-by: Michael Walle <michael@walle.cc>
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Tested-by: Michael Walle <michael@walle.cc>
+Link: https://lore.kernel.org/r/20200318001603.9650-6-olteanv@gmail.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+

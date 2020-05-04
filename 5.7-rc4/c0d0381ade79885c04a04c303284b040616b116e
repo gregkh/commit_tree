@@ -1,0 +1,101 @@
+hugetlbfs: use i_mmap_rwsem for more pmd sharing synchronization
+
+Patch series "hugetlbfs: use i_mmap_rwsem for more synchronization", v2.
+
+While discussing the issue with huge_pte_offset [1], I remembered that
+there were more outstanding hugetlb races.  These issues are:
+
+1) For shared pmds, huge PTE pointers returned by huge_pte_alloc can become
+   invalid via a call to huge_pmd_unshare by another thread.
+2) hugetlbfs page faults can race with truncation causing invalid global
+   reserve counts and state.
+
+A previous attempt was made to use i_mmap_rwsem in this manner as
+described at [2].  However, those patches were reverted starting with [3]
+due to locking issues.
+
+To effectively use i_mmap_rwsem to address the above issues it needs to be
+held (in read mode) during page fault processing.  However, during fault
+processing we need to lock the page we will be adding.  Lock ordering
+requires we take page lock before i_mmap_rwsem.  Waiting until after
+taking the page lock is too late in the fault process for the
+synchronization we want to do.
+
+To address this lock ordering issue, the following patches change the lock
+ordering for hugetlb pages.  This is not too invasive as hugetlbfs
+processing is done separate from core mm in many places.  However, I don't
+really like this idea.  Much ugliness is contained in the new routine
+hugetlb_page_mapping_lock_write() of patch 1.
+
+The only other way I can think of to address these issues is by catching
+all the races.  After catching a race, cleanup, backout, retry ...  etc,
+as needed.  This can get really ugly, especially for huge page
+reservations.  At one time, I started writing some of the reservation
+backout code for page faults and it got so ugly and complicated I went
+down the path of adding synchronization to avoid the races.  Any other
+suggestions would be welcome.
+
+[1] https://lore.kernel.org/linux-mm/1582342427-230392-1-git-send-email-longpeng2@huawei.com/
+[2] https://lore.kernel.org/linux-mm/20181222223013.22193-1-mike.kravetz@oracle.com/
+[3] https://lore.kernel.org/linux-mm/20190103235452.29335-1-mike.kravetz@oracle.com
+[4] https://lore.kernel.org/linux-mm/1584028670.7365.182.camel@lca.pw/
+[5] https://lore.kernel.org/lkml/20200312183142.108df9ac@canb.auug.org.au/
+
+This patch (of 2):
+
+While looking at BUGs associated with invalid huge page map counts, it was
+discovered and observed that a huge pte pointer could become 'invalid' and
+point to another task's page table.  Consider the following:
+
+A task takes a page fault on a shared hugetlbfs file and calls
+huge_pte_alloc to get a ptep.  Suppose the returned ptep points to a
+shared pmd.
+
+Now, another task truncates the hugetlbfs file.  As part of truncation, it
+unmaps everyone who has the file mapped.  If the range being truncated is
+covered by a shared pmd, huge_pmd_unshare will be called.  For all but the
+last user of the shared pmd, huge_pmd_unshare will clear the pud pointing
+to the pmd.  If the task in the middle of the page fault is not the last
+user, the ptep returned by huge_pte_alloc now points to another task's
+page table or worse.  This leads to bad things such as incorrect page
+map/reference counts or invalid memory references.
+
+To fix, expand the use of i_mmap_rwsem as follows:
+- i_mmap_rwsem is held in read mode whenever huge_pmd_share is called.
+  huge_pmd_share is only called via huge_pte_alloc, so callers of
+  huge_pte_alloc take i_mmap_rwsem before calling.  In addition, callers
+  of huge_pte_alloc continue to hold the semaphore until finished with
+  the ptep.
+- i_mmap_rwsem is held in write mode whenever huge_pmd_unshare is called.
+
+One problem with this scheme is that it requires taking i_mmap_rwsem
+before taking the page lock during page faults.  This is not the order
+specified in the rest of mm code.  Handling of hugetlbfs pages is mostly
+isolated today.  Therefore, we use this alternative locking order for
+PageHuge() pages.
+
+         mapping->i_mmap_rwsem
+           hugetlb_fault_mutex (hugetlbfs specific page fault mutex)
+             page->flags PG_locked (lock_page)
+
+To help with lock ordering issues, hugetlb_page_mapping_lock_write() is
+introduced to write lock the i_mmap_rwsem associated with a page.
+
+In most cases it is easy to get address_space via vma->vm_file->f_mapping.
+However, in the case of migration or memory errors for anon pages we do
+not have an associated vma.  A new routine _get_hugetlb_page_mapping()
+will use anon_vma to get address_space in these cases.
+
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.vnet.ibm.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: "Kirill A . Shutemov" <kirill.shutemov@linux.intel.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Prakash Sangappa <prakash.sangappa@oracle.com>
+Link: http://lkml.kernel.org/r/20200316205756.146666-2-mike.kravetz@oracle.com
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

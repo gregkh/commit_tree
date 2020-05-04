@@ -1,0 +1,51 @@
+Bluetooth: Fix refcount use-after-free issue
+
+There is no lock preventing both l2cap_sock_release() and
+chan->ops->close() from running at the same time.
+
+If we consider Thread A running l2cap_chan_timeout() and Thread B running
+l2cap_sock_release(), expected behavior is:
+  A::l2cap_chan_timeout()->l2cap_chan_close()->l2cap_sock_teardown_cb()
+  A::l2cap_chan_timeout()->l2cap_sock_close_cb()->l2cap_sock_kill()
+  B::l2cap_sock_release()->sock_orphan()
+  B::l2cap_sock_release()->l2cap_sock_kill()
+
+where,
+sock_orphan() clears "sk->sk_socket" and l2cap_sock_teardown_cb() marks
+socket as SOCK_ZAPPED.
+
+In l2cap_sock_kill(), there is an "if-statement" that checks if both
+sock_orphan() and sock_teardown() has been run i.e. sk->sk_socket is NULL
+and socket is marked as SOCK_ZAPPED. Socket is killed if the condition is
+satisfied.
+
+In the race condition, following occurs:
+  A::l2cap_chan_timeout()->l2cap_chan_close()->l2cap_sock_teardown_cb()
+  B::l2cap_sock_release()->sock_orphan()
+  B::l2cap_sock_release()->l2cap_sock_kill()
+  A::l2cap_chan_timeout()->l2cap_sock_close_cb()->l2cap_sock_kill()
+
+In this scenario, "if-statement" is true in both B::l2cap_sock_kill() and
+A::l2cap_sock_kill() and we hit "refcount: underflow; use-after-free" bug.
+
+Similar condition occurs at other places where teardown/sock_kill is
+happening:
+  l2cap_disconnect_rsp()->l2cap_chan_del()->l2cap_sock_teardown_cb()
+  l2cap_disconnect_rsp()->l2cap_sock_close_cb()->l2cap_sock_kill()
+
+  l2cap_conn_del()->l2cap_chan_del()->l2cap_sock_teardown_cb()
+  l2cap_conn_del()->l2cap_sock_close_cb()->l2cap_sock_kill()
+
+  l2cap_disconnect_req()->l2cap_chan_del()->l2cap_sock_teardown_cb()
+  l2cap_disconnect_req()->l2cap_sock_close_cb()->l2cap_sock_kill()
+
+  l2cap_sock_cleanup_listen()->l2cap_chan_close()->l2cap_sock_teardown_cb()
+  l2cap_sock_cleanup_listen()->l2cap_sock_kill()
+
+Protect teardown/sock_kill and orphan/sock_kill by adding hold_lock on
+l2cap channel to ensure that the socket is killed only after marked as
+zapped and orphan.
+
+Signed-off-by: Manish Mandlik <mmandlik@google.com>
+Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+

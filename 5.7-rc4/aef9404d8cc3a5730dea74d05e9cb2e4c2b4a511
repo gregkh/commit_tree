@@ -1,0 +1,48 @@
+pick_link(): more straightforward handling of allocation failures
+
+pick_link() needs to push onto stack; we start with using two-element
+array embedded into struct nameidata and the first time we need
+more than that we switch to separately allocated array.
+
+Allocation can fail, of course, and handling of that would be simple
+enough - we need to drop 'link' and bugger off.  However, the things
+get more complicated in RCU mode.  There we must do GFP_ATOMIC
+allocation.  If that fails, we try to switch to non-RCU mode and
+repeat the allocation.
+
+To switch to non-RCU mode we need to grab references to 'link' and
+to everything in nameidata.  The latter done by unlazy_walk();
+the former - legitimize_path().  'link' must go first - after
+unlazy_walk() we are out of RCU-critical period and it's too
+late to call legitimize_path() since the references in link->mnt
+and link->dentry might be pointing to freed and reused memory.
+
+So we do legitimize_path(), then unlazy_walk().  And that's where
+it gets too subtle: what to do if the former fails?  We MUST
+do path_put(link) to avoid leaks.  And we can't do that under
+rcu_read_lock().  Solution in mainline was to empty then nameidata
+manually, drop out of RCU mode and then do put_path().
+
+In effect, we open-code the things eventual terminate_walk()
+would've done on error in RCU mode.  That looks badly out of place
+and confusing.  We could add a comment along the lines of the
+explanation above, but... there's a simpler solution.  Call
+unlazy_walk() even if legitimaze_path() fails.  It will take
+us out of RCU mode, so we'll be able to do path_put(link).
+
+Yes, it will do unnecessary work - attempt to grab references
+on the stuff in nameidata, only to have them dropped as soon
+as we return the error to upper layer and get terminate_walk()
+called there.  So what?  We are thoroughly off the fast path
+by that point - we had GFP_ATOMIC allocation fail, we had
+->d_seq or mount_lock mismatch and we are about to try walking
+the same path from scratch in non-RCU mode.  Which will need
+to do the same allocation, this time with GFP_KERNEL, so it will
+be able to apply memory pressure for blocking stuff.
+
+Compared to that the cost of several lockref_get_not_dead()
+is noise.  And the logics become much easier to understand
+that way.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

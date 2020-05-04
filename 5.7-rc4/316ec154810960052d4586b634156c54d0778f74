@@ -1,0 +1,67 @@
+s390/mm: fix page table upgrade vs 2ndary address mode accesses
+
+A page table upgrade in a kernel section that uses secondary address
+mode will mess up the kernel instructions as follows:
+
+Consider the following scenario: two threads are sharing memory.
+On CPU1 thread 1 does e.g. strnlen_user().  That gets to
+        old_fs = enable_sacf_uaccess();
+        len = strnlen_user_srst(src, size);
+and
+                "   la    %2,0(%1)\n"
+                "   la    %3,0(%0,%1)\n"
+                "   slgr  %0,%0\n"
+                "   sacf  256\n"
+                "0: srst  %3,%2\n"
+in strnlen_user_srst().  At that point we are in secondary space mode,
+control register 1 points to kernel page table and instruction fetching
+happens via c1, rather than usual c13.  Interrupts are not disabled, for
+obvious reasons.
+
+On CPU2 thread 2 does MAP_FIXED mmap(), forcing the upgrade of page table
+from 3-level to e.g. 4-level one.  We'd allocated new top-level table,
+set it up and now we hit this:
+                notify = 1;
+                spin_unlock_bh(&mm->page_table_lock);
+        }
+        if (notify)
+                on_each_cpu(__crst_table_upgrade, mm, 0);
+OK, we need to actually change over to use of new page table and we
+need that to happen in all threads that are currently running.  Which
+happens to include the thread 1.  IPI is delivered and we have
+static void __crst_table_upgrade(void *arg)
+{
+        struct mm_struct *mm = arg;
+
+        if (current->active_mm == mm)
+                set_user_asce(mm);
+        __tlb_flush_local();
+}
+run on CPU1.  That does
+static inline void set_user_asce(struct mm_struct *mm)
+{
+        S390_lowcore.user_asce = mm->context.asce;
+OK, user page table address updated...
+        __ctl_load(S390_lowcore.user_asce, 1, 1);
+... and control register 1 set to it.
+        clear_cpu_flag(CIF_ASCE_PRIMARY);
+}
+
+IPI is run in home space mode, so it's fine - insns are fetched
+using c13, which always points to kernel page table.  But as soon
+as we return from the interrupt, previous PSW is restored, putting
+CPU1 back into secondary space mode, at which point we no longer
+get the kernel instructions from the kernel mapping.
+
+The fix is to only fixup the control registers that are currently in use
+for user processes during the page table update.  We must also disable
+interrupts in enable_sacf_uaccess to synchronize the cr and
+thread.mm_segment updates against the on_each-cpu.
+
+Fixes: 0aaba41b58bc ("s390: remove all code using the access register mode")
+Cc: stable@vger.kernel.org # 4.15+
+Reported-by: Al Viro <viro@zeniv.linux.org.uk>
+Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+References: CVE-2020-11884
+Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+

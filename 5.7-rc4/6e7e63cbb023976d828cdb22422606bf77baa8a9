@@ -1,0 +1,65 @@
+bpf: Forbid XADD on spilled pointers for unprivileged users
+
+When check_xadd() verifies an XADD operation on a pointer to a stack slot
+containing a spilled pointer, check_stack_read() verifies that the read,
+which is part of XADD, is valid. However, since the placeholder value -1 is
+passed as `value_regno`, check_stack_read() can only return a binary
+decision and can't return the type of the value that was read. The intent
+here is to verify whether the value read from the stack slot may be used as
+a SCALAR_VALUE; but since check_stack_read() doesn't check the type, and
+the type information is lost when check_stack_read() returns, this is not
+enforced, and a malicious user can abuse XADD to leak spilled kernel
+pointers.
+
+Fix it by letting check_stack_read() verify that the value is usable as a
+SCALAR_VALUE if no type information is passed to the caller.
+
+To be able to use __is_pointer_value() in check_stack_read(), move it up.
+
+Fix up the expected unprivileged error message for a BPF selftest that,
+until now, assumed that unprivileged users can use XADD on stack-spilled
+pointers. This also gives us a test for the behavior introduced in this
+patch for free.
+
+In theory, this could also be fixed by forbidding XADD on stack spills
+entirely, since XADD is a locked operation (for operations on memory with
+concurrency) and there can't be any concurrency on the BPF stack; but
+Alexei has said that he wants to keep XADD on stack slots working to avoid
+changes to the test suite [1].
+
+The following BPF program demonstrates how to leak a BPF map pointer as an
+unprivileged user using this bug:
+
+    // r7 = map_pointer
+    BPF_LD_MAP_FD(BPF_REG_7, small_map),
+    // r8 = launder(map_pointer)
+    BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_7, -8),
+    BPF_MOV64_IMM(BPF_REG_1, 0),
+    ((struct bpf_insn) {
+      .code  = BPF_STX | BPF_DW | BPF_XADD,
+      .dst_reg = BPF_REG_FP,
+      .src_reg = BPF_REG_1,
+      .off = -8
+    }),
+    BPF_LDX_MEM(BPF_DW, BPF_REG_8, BPF_REG_FP, -8),
+
+    // store r8 into map
+    BPF_MOV64_REG(BPF_REG_ARG1, BPF_REG_7),
+    BPF_MOV64_REG(BPF_REG_ARG2, BPF_REG_FP),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_ARG2, -4),
+    BPF_ST_MEM(BPF_W, BPF_REG_ARG2, 0, 0),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),
+    BPF_EXIT_INSN(),
+    BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_8, 0),
+
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN()
+
+[1] https://lore.kernel.org/bpf/20200416211116.qxqcza5vo2ddnkdq@ast-mbp.dhcp.thefacebook.com/
+
+Fixes: 17a5267067f3 ("bpf: verifier (add verifier core)")
+Signed-off-by: Jann Horn <jannh@google.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200417000007.10734-1-jannh@google.com
+

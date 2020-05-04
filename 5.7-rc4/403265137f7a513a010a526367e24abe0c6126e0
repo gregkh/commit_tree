@@ -1,0 +1,135 @@
+media: vimc: use-after-free fix - release vimc in the v4l_device release
+
+A use-after-free bug occures when unbinding the device while it streams.
+The 'struct vimc_ent_device' allocated for the 'Sensor A' is freed
+when calling the sensor's 'rm' callback but the freed pointer is
+later accessed in the function 'vimc_streamer_pipeline_terminate'.
+To fix this bug, move the release callback of the vimc entities
+and vimc_device to the release callback of v4l2_device.
+The .rm callback of vimc_ent_config is replaced by two callbacks:
+
+.unregister - this is called upon removing the device and
+it unregisters the entity. This is an optional callback since
+subdevices don't need to implement it because they are already
+unregistered in v4l2_device_unregister.
+
+.release - this is called from the release callback of v4l2_device
+and it frees the entity.
+
+This ensures that the entities will be released when the last fh
+of any of the devices is closed.
+
+The commands that cause the crash and the KASAN report:
+
+media-ctl -d platform:vimc -V '"Sensor A":0[fmt:SBGGR8_1X8/640x480]'
+media-ctl -d platform:vimc -V '"Debayer A":0[fmt:SBGGR8_1X8/640x480]'
+v4l2-ctl -z platform:vimc -d "RGB/YUV Capture" -v width=1920,height=1440
+v4l2-ctl -z platform:vimc -d "Raw Capture 0" -v pixelformat=BA81
+v4l2-ctl --stream-mmap --stream-count=1000 -d /dev/video2 &
+sleep 1
+echo -n vimc.0 >/sys/bus/platform/drivers/vimc/unbind
+
+[  188.417934] BUG: KASAN: use-after-free in vimc_streamer_pipeline_terminate+0x75/0x140 [vimc]
+[  188.420182] Read of size 8 at addr ffff8881e9c26008 by task bash/185
+[  188.421800]
+[  188.422223] CPU: 0 PID: 185 Comm: bash Not tainted 5.5.0-rc1+ #1
+[  188.423681] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.12.0-1 04/01/2014
+[  188.425938] Call Trace:
+[  188.426610]  dump_stack+0x75/0xa0
+[  188.427519]  ? vimc_streamer_pipeline_terminate+0x75/0x140 [vimc]
+[  188.429057]  print_address_description.constprop.6+0x16/0x220
+[  188.430462]  ? vimc_streamer_pipeline_terminate+0x75/0x140 [vimc]
+[  188.431979]  ? vimc_streamer_pipeline_terminate+0x75/0x140 [vimc]
+[  188.433455]  __kasan_report.cold.9+0x1a/0x40
+[  188.434518]  ? vimc_streamer_pipeline_terminate+0x75/0x140 [vimc]
+[  188.436010]  kasan_report+0xe/0x20
+[  188.436859]  vimc_streamer_pipeline_terminate+0x75/0x140 [vimc]
+[  188.438339]  vimc_streamer_s_stream+0x8b/0x3c0 [vimc]
+[  188.439576]  vimc_cap_stop_streaming+0x22/0x40 [vimc]
+[  188.440863]  __vb2_queue_cancel+0x65/0x560 [videobuf2_common]
+[  188.442391]  vb2_core_queue_release+0x19/0x50 [videobuf2_common]
+[  188.443974]  vimc_cap_rm+0x10/0x20 [vimc]
+[  188.444986]  vimc_rm_subdevs+0x9e/0xe0 [vimc]
+[  188.446179]  vimc_remove+0x19/0x70 [vimc]
+[  188.447301]  platform_drv_remove+0x2f/0x50
+[  188.448468]  device_release_driver_internal+0x133/0x260
+[  188.449814]  unbind_store+0x121/0x150
+[  188.450726]  kernfs_fop_write+0x142/0x230
+[  188.451724]  ? sysfs_kf_bin_read+0x100/0x100
+[  188.452826]  vfs_write+0xdc/0x230
+[  188.453760]  ksys_write+0xaf/0x140
+[  188.454702]  ? __ia32_sys_read+0x40/0x40
+[  188.455773]  ? __do_page_fault+0x473/0x620
+[  188.456780]  do_syscall_64+0x5e/0x1a0
+[  188.457711]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+[  188.459079] RIP: 0033:0x7f80f1f13504
+[  188.459969] Code: 00 f7 d8 64 89 02 48 c7 c0 ff ff ff ff eb b3 0f 1f 80 00 00 00 00 48 8d 05 f9 61 0d 00 8b 00 85 c0 75 13 b8 01 00 00 00 0f 05 <48> 3d 00 f0 ff ff 77 54 c3 0f 1f 00 41 54 49 89 d4 55 48 89 f5 53
+[  188.464445] RSP: 002b:00007ffd7e843b58 EFLAGS: 00000246 ORIG_RAX: 0000000000000001
+[  188.466276] RAX: ffffffffffffffda RBX: 0000000000000006 RCX: 00007f80f1f13504
+[  188.467999] RDX: 0000000000000006 RSI: 000055ef2eb21b10 RDI: 0000000000000001
+[  188.469708] RBP: 000055ef2eb21b10 R08: 00007f80f1fe68c0 R09: 00007f80f1e26740
+[  188.471407] R10: 000055ef2eade010 R11: 0000000000000246 R12: 00007f80f1fe5760
+[  188.473381] R13: 0000000000000006 R14: 00007f80f1fe0760 R15: 0000000000000006
+[  188.475107]
+[  188.475500] Allocated by task 473:
+[  188.476351]  save_stack+0x19/0x80
+[  188.477201]  __kasan_kmalloc.constprop.6+0xc1/0xd0
+[  188.478507]  vimc_sen_add+0x36/0x309 [vimc]
+[  188.479649]  vimc_probe+0x1e2/0x530 [vimc]
+[  188.480776]  platform_drv_probe+0x46/0xa0
+[  188.481829]  really_probe+0x16c/0x520
+[  188.482732]  driver_probe_device+0x114/0x170
+[  188.483783]  device_driver_attach+0x85/0x90
+[  188.484800]  __driver_attach+0xa8/0x190
+[  188.485734]  bus_for_each_dev+0xe4/0x140
+[  188.486702]  bus_add_driver+0x223/0x2d0
+[  188.487715]  driver_register+0xca/0x140
+[  188.488767]  0xffffffffc037003d
+[  188.489635]  do_one_initcall+0x86/0x28f
+[  188.490702]  do_init_module+0xf8/0x340
+[  188.491773]  load_module+0x3766/0x3a10
+[  188.492811]  __do_sys_finit_module+0x11a/0x1b0
+[  188.494059]  do_syscall_64+0x5e/0x1a0
+[  188.495079]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+[  188.496481]
+[  188.496893] Freed by task 185:
+[  188.497670]  save_stack+0x19/0x80
+[  188.498493]  __kasan_slab_free+0x125/0x170
+[  188.499486]  kfree+0x8c/0x230
+[  188.500254]  v4l2_subdev_release+0x64/0x70 [videodev]
+[  188.501498]  v4l2_device_release_subdev_node+0x1c/0x30 [videodev]
+[  188.502976]  device_release+0x3c/0xd0
+[  188.503867]  kobject_put+0xf4/0x240
+[  188.507802]  vimc_rm_subdevs+0x9e/0xe0 [vimc]
+[  188.508846]  vimc_remove+0x19/0x70 [vimc]
+[  188.509792]  platform_drv_remove+0x2f/0x50
+[  188.510752]  device_release_driver_internal+0x133/0x260
+[  188.512006]  unbind_store+0x121/0x150
+[  188.512899]  kernfs_fop_write+0x142/0x230
+[  188.513874]  vfs_write+0xdc/0x230
+[  188.514698]  ksys_write+0xaf/0x140
+[  188.515523]  do_syscall_64+0x5e/0x1a0
+[  188.516543]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+[  188.517710]
+[  188.518034] The buggy address belongs to the object at ffff8881e9c26000
+[  188.518034]  which belongs to the cache kmalloc-4k of size 4096
+[  188.520528] The buggy address is located 8 bytes inside of
+[  188.520528]  4096-byte region [ffff8881e9c26000, ffff8881e9c27000)
+[  188.523015] The buggy address belongs to the page:
+[  188.524357] page:ffffea0007a70800 refcount:1 mapcount:0 mapping:ffff8881f6402140 index:0x0 compound_mapcount: 0
+[  188.527058] raw: 0200000000010200 dead000000000100 dead000000000122 ffff8881f6402140
+[  188.528983] raw: 0000000000000000 0000000000040004 00000001ffffffff 0000000000000000
+[  188.530883] page dumped because: kasan: bad access detected
+[  188.532336]
+[  188.532720] Memory state around the buggy address:
+[  188.533871]  ffff8881e9c25f00: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[  188.535631]  ffff8881e9c25f80: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[  188.537370] >ffff8881e9c26000: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[  188.538996]                       ^
+[  188.539812]  ffff8881e9c26080: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[  188.541549]  ffff8881e9c26100: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+
+Signed-off-by: Dafna Hirschfeld <dafna.hirschfeld@collabora.com>
+Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+Signed-off-by: Mauro Carvalho Chehab <mchehab+huawei@kernel.org>
+

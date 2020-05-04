@@ -1,0 +1,91 @@
+bpf: Verifier, do explicit ALU32 bounds tracking
+
+It is not possible for the current verifier to track ALU32 and JMP ops
+correctly. This can result in the verifier aborting with errors even though
+the program should be verifiable. BPF codes that hit this can work around
+it by changin int variables to 64-bit types, marking variables volatile,
+etc. But this is all very ugly so it would be better to avoid these tricks.
+
+But, the main reason to address this now is do_refine_retval_range() was
+assuming return values could not be negative. Once we fixed this code that
+was previously working will no longer work. See do_refine_retval_range()
+patch for details. And we don't want to suddenly cause programs that used
+to work to fail.
+
+The simplest example code snippet that illustrates the problem is likely
+this,
+
+ 53: w8 = w0                    // r8 <- [0, S32_MAX],
+                                // w8 <- [-S32_MIN, X]
+ 54: w8 <s 0                    // r8 <- [0, U32_MAX]
+                                // w8 <- [0, X]
+
+The expected 64-bit and 32-bit bounds after each line are shown on the
+right. The current issue is without the w* bounds we are forced to use
+the worst case bound of [0, U32_MAX]. To resolve this type of case,
+jmp32 creating divergent 32-bit bounds from 64-bit bounds, we add explicit
+32-bit register bounds s32_{min|max}_value and u32_{min|max}_value. Then
+from branch_taken logic creating new bounds we can track 32-bit bounds
+explicitly.
+
+The next case we observed is ALU ops after the jmp32,
+
+ 53: w8 = w0                    // r8 <- [0, S32_MAX],
+                                // w8 <- [-S32_MIN, X]
+ 54: w8 <s 0                    // r8 <- [0, U32_MAX]
+                                // w8 <- [0, X]
+ 55: w8 += 1                    // r8 <- [0, U32_MAX+1]
+                                // w8 <- [0, X+1]
+
+In order to keep the bounds accurate at this point we also need to track
+ALU32 ops. To do this we add explicit ALU32 logic for each of the ALU
+ops, mov, add, sub, etc.
+
+Finally there is a question of how and when to merge bounds. The cases
+enumerate here,
+
+1. MOV ALU32   - zext 32-bit -> 64-bit
+2. MOV ALU64   - copy 64-bit -> 32-bit
+3. op  ALU32   - zext 32-bit -> 64-bit
+4. op  ALU64   - n/a
+5. jmp ALU32   - 64-bit: var32_off | upper_32_bits(var64_off)
+6. jmp ALU64   - 32-bit: (>> (<< var64_off))
+
+Details for each case,
+
+For "MOV ALU32" BPF arch zero extends so we simply copy the bounds
+from 32-bit into 64-bit ensuring we truncate var_off and 64-bit
+bounds correctly. See zext_32_to_64.
+
+For "MOV ALU64" copy all bounds including 32-bit into new register. If
+the src register had 32-bit bounds the dst register will as well.
+
+For "op ALU32" zero extend 32-bit into 64-bit the same as move,
+see zext_32_to_64.
+
+For "op ALU64" calculate both 32-bit and 64-bit bounds no merging
+is done here. Except we have a special case. When RSH or ARSH is
+done we can't simply ignore shifting bits from 64-bit reg into the
+32-bit subreg. So currently just push bounds from 64-bit into 32-bit.
+This will be correct in the sense that they will represent a valid
+state of the register. However we could lose some accuracy if an
+ARSH is following a jmp32 operation. We can handle this special
+case in a follow up series.
+
+For "jmp ALU32" mark 64-bit reg unknown and recalculate 64-bit bounds
+from tnum by setting var_off to ((<<(>>var_off)) | var32_off). We
+special case if 64-bit bounds has zero'd upper 32bits at which point
+we can simply copy 32-bit bounds into 64-bit register. This catches
+a common compiler trick where upper 32-bits are zeroed and then
+32-bit ops are used followed by a 64-bit compare or 64-bit op on
+a pointer. See __reg_combine_64_into_32().
+
+For "jmp ALU64" cast the bounds of the 64bit to their 32-bit
+counterpart. For example s32_min_value = (s32)reg->smin_value. For
+tnum use only the lower 32bits via, (>>(<<var_off)). See
+__reg_combine_64_into_32().
+
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/158560419880.10843.11448220440809118343.stgit@john-Precision-5820-Tower
+

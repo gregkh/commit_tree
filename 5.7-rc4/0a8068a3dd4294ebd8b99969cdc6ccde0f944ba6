@@ -1,0 +1,63 @@
+btrfs: make ranged full fsyncs more efficient
+
+Commit 0c713cbab6200b ("Btrfs: fix race between ranged fsync and writeback
+of adjacent ranges") fixed a bug where we could end up with file extent
+items in a log tree that represent file ranges that overlap due to a race
+between the hole detection of a ranged full fsync and writeback for a
+different file range.
+
+The problem was solved by forcing any ranged full fsync to become a
+non-ranged full fsync - setting the range start to 0 and the end offset to
+LLONG_MAX. This was a simple solution because the code that detected and
+marked holes was very complex, it used to be done at copy_items() and
+implied several searches on the fs/subvolume tree. The drawback of that
+solution was that we started to flush delalloc for the entire file and
+wait for all the ordered extents to complete for ranged full fsyncs
+(including ordered extents covering ranges completely outside the given
+range). Fortunatelly ranged full fsyncs are not the most common case
+(hopefully for most workloads).
+
+However a later fix for detecting and marking holes was made by commit
+0e56315ca147b3 ("Btrfs: fix missing hole after hole punching and fsync
+when using NO_HOLES") and it simplified a lot the detection of holes,
+and now copy_items() no longer does it and we do it in a much more simple
+way at btrfs_log_holes().
+
+This makes it now possible to simply make the code that detects holes to
+operate only on the initial range and no longer need to operate on the
+whole file, while also avoiding the need to flush delalloc for the entire
+file and wait for ordered extents that cover ranges that don't overlap the
+given range.
+
+Another special care is that we must skip file extent items that fall
+entirely outside the fsync range when copying inode items from the
+fs/subvolume tree into the log tree - this is to avoid races with ordered
+extent completion for extents falling outside the fsync range, which could
+cause us to end up with file extent items in the log tree that have
+overlapping ranges - for example if the fsync range is [1Mb, 2Mb], when
+we copy inode items we could copy an extent item for the range [0, 512K],
+then release the search path and before moving to the next leaf, an
+ordered extent for a range of [256Kb, 512Kb] completes - this would
+cause us to copy the new extent item for range [256Kb, 512Kb] into the
+log tree after we have copied one for the range [0, 512Kb] - the extents
+overlap, resulting in a corruption.
+
+So this change just does these steps:
+
+1) When the NO_HOLES feature is enabled it leaves the initial range
+   intact - no longer sets it to [0, LLONG_MAX] when the full sync bit
+   is set in the inode. If NO_HOLES is not enabled, always set the range
+   to a full, just like before this change, to avoid missing file extent
+   items representing holes after replaying the log (for both full and
+   fast fsyncs);
+
+2) Make the hole detection code to operate only on the fsync range;
+
+3) Make the code that copies items from the fs/subvolume tree to skip
+   copying file extent items that cover a range completely outside the
+   range of the fsync.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

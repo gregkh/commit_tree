@@ -1,0 +1,70 @@
+gfs2: Force withdraw to replay journals and wait for it to finish
+
+When a node withdraws from a file system, it often leaves its journal
+in an incomplete state. This is especially true when the withdraw is
+caused by io errors writing to the journal. Before this patch, a
+withdraw would try to write a "shutdown" record to the journal, tell
+dlm it's done with the file system, and none of the other nodes
+know about the problem. Later, when the problem is fixed and the
+withdrawn node is rebooted, it would then discover that its own
+journal was incomplete, and replay it. However, replaying it at this
+point is almost guaranteed to introduce corruption because the other
+nodes are likely to have used affected resource groups that appeared
+in the journal since the time of the withdraw. Replaying the journal
+later will overwrite any changes made, and not through any fault of
+dlm, which was instructed during the withdraw to release those
+resources.
+
+This patch makes file system withdraws seen by the entire cluster.
+Withdrawing nodes dequeue their journal glock to allow recovery.
+
+The remaining nodes check all the journals to see if they are
+clean or in need of replay. They try to replay dirty journals, but
+only the journals of withdrawn nodes will be "not busy" and
+therefore available for replay.
+
+Until the journal replay is complete, no i/o related glocks may be
+given out, to ensure that the replay does not cause the
+aforementioned corruption: We cannot allow any journal replay to
+overwrite blocks associated with a glock once it is held.
+
+The "live" glock which is now used to signal when a withdraw
+occurs. When a withdraw occurs, the node signals its withdraw by
+dequeueing the "live" glock and trying to enqueue it in EX mode,
+thus forcing the other nodes to all see a demote request, by way
+of a "1CB" (one callback) try lock. The "live" glock is not
+granted in EX; the callback is only just used to indicate a
+withdraw has occurred.
+
+Note that all nodes in the cluster must wait for the recovering
+node to finish replaying the withdrawing node's journal before
+continuing. To this end, it checks that the journals are clean
+multiple times in a retry loop.
+
+Also note that the withdraw function may be called from a wide
+variety of situations, and therefore, we need to take extra
+precautions to make sure pointers are valid before using them in
+many circumstances.
+
+We also need to take care when glocks decide to withdraw, since
+the withdraw code now uses glocks.
+
+Also, before this patch, if a process encountered an error and
+decided to withdraw, if another process was already withdrawing,
+the second withdraw would be silently ignored, which set it free
+to unlock its glocks. That's correct behavior if the original
+withdrawer encounters further errors down the road. But if
+secondary waiters don't wait for the journal replay, unlocking
+glocks will allow other nodes to use them, despite the fact that
+the journal containing those blocks is being replayed. The
+replay needs to finish before our glocks are released to other
+nodes. IOW, secondary withdraws need to wait for the first
+withdraw to finish.
+
+For example, if an rgrp glock is unlocked by a process that didn't
+wait for the first withdraw, a journal replay could introduce file
+system corruption by replaying a rgrp block that has already been
+granted to a different cluster node.
+
+Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+

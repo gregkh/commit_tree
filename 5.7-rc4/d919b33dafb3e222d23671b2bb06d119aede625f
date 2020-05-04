@@ -1,0 +1,131 @@
+proc: faster open/read/close with "permanent" files
+
+Now that "struct proc_ops" exist we can start putting there stuff which
+could not fly with VFS "struct file_operations"...
+
+Most of fs/proc/inode.c file is dedicated to make open/read/.../close
+reliable in the event of disappearing /proc entries which usually happens
+if module is getting removed.  Files like /proc/cpuinfo which never
+disappear simply do not need such protection.
+
+Save 2 atomic ops, 1 allocation, 1 free per open/read/close sequence for such
+"permanent" files.
+
+Enable "permanent" flag for
+
+	/proc/cpuinfo
+	/proc/kmsg
+	/proc/modules
+	/proc/slabinfo
+	/proc/stat
+	/proc/sysvipc/*
+	/proc/swaps
+
+More will come once I figure out foolproof way to prevent out module
+authors from marking their stuff "permanent" for performance reasons
+when it is not.
+
+This should help with scalability: benchmark is "read /proc/cpuinfo R times
+by N threads scattered over the system".
+
+	N	R	t, s (before)	t, s (after)
+	-----------------------------------------------------
+	64	4096	1.582458	1.530502	-3.2%
+	256	4096	6.371926	6.125168	-3.9%
+	1024	4096	25.64888	24.47528	-4.6%
+
+Benchmark source:
+
+#include <chrono>
+#include <iostream>
+#include <thread>
+#include <vector>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+const int NR_CPUS = sysconf(_SC_NPROCESSORS_ONLN);
+int N;
+const char *filename;
+int R;
+
+int xxx = 0;
+
+int glue(int n)
+{
+	cpu_set_t m;
+	CPU_ZERO(&m);
+	CPU_SET(n, &m);
+	return sched_setaffinity(0, sizeof(cpu_set_t), &m);
+}
+
+void f(int n)
+{
+	glue(n % NR_CPUS);
+
+	while (*(volatile int *)&xxx == 0) {
+	}
+
+	for (int i = 0; i < R; i++) {
+		int fd = open(filename, O_RDONLY);
+		char buf[4096];
+		ssize_t rv = read(fd, buf, sizeof(buf));
+		asm volatile ("" :: "g" (rv));
+		close(fd);
+	}
+}
+
+int main(int argc, char *argv[])
+{
+	if (argc < 4) {
+		std::cerr << "usage: " << argv[0] << ' ' << "N /proc/filename R
+";
+		return 1;
+	}
+
+	N = atoi(argv[1]);
+	filename = argv[2];
+	R = atoi(argv[3]);
+
+	for (int i = 0; i < NR_CPUS; i++) {
+		if (glue(i) == 0)
+			break;
+	}
+
+	std::vector<std::thread> T;
+	T.reserve(N);
+	for (int i = 0; i < N; i++) {
+		T.emplace_back(f, i);
+	}
+
+	auto t0 = std::chrono::system_clock::now();
+	{
+		*(volatile int *)&xxx = 1;
+		for (auto& t: T) {
+			t.join();
+		}
+	}
+	auto t1 = std::chrono::system_clock::now();
+	std::chrono::duration<double> dt = t1 - t0;
+	std::cout << dt.count() << '
+';
+
+	return 0;
+}
+
+P.S.:
+Explicit randomization marker is added because adding non-function pointer
+will silently disable structure layout randomization.
+
+[akpm@linux-foundation.org: coding style fixes]
+Reported-by: kbuild test robot <lkp@intel.com>
+Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+Signed-off-by: Alexey Dobriyan <adobriyan@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Joe Perches <joe@perches.com>
+Link: http://lkml.kernel.org/r/20200222201539.GA22576@avx2
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

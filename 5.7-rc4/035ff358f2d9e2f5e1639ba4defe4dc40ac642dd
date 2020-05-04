@@ -1,0 +1,58 @@
+net: Generate reuseport group ID on group creation
+
+Commit 736b46027eb4 ("net: Add ID (if needed) to sock_reuseport and expose
+reuseport_lock") has introduced lazy generation of reuseport group IDs that
+survive group resize.
+
+By comparing the identifier we check if BPF reuseport program is not trying
+to select a socket from a BPF map that belongs to a different reuseport
+group than the one the packet is for.
+
+Because SOCKARRAY used to be the only BPF map type that can be used with
+reuseport BPF, it was possible to delay the generation of reuseport group
+ID until a socket from the group was inserted into BPF map for the first
+time.
+
+Now that SOCK{MAP,HASH} can be used with reuseport BPF we have two options,
+either generate the reuseport ID on map update, like SOCKARRAY does, or
+allocate an ID from the start when reuseport group gets created.
+
+This patch takes the latter approach to keep sockmap free of calls into
+reuseport code. This streamlines the reuseport_id access as its lifetime
+now matches the longevity of reuseport object.
+
+The cost of this simplification, however, is that we allocate reuseport IDs
+for all SO_REUSEPORT users. Even those that don't use SOCKARRAY in their
+setups. With the way identifiers are currently generated, we can have at
+most S32_MAX reuseport groups, which hopefully is sufficient. If we ever
+get close to the limit, we can switch an u64 counter like sk_cookie.
+
+Another change is that we now always call into SOCKARRAY logic to unlink
+the socket from the map when unhashing or closing the socket. Previously we
+did it only when at least one socket from the group was in a BPF map.
+
+It is worth noting that this doesn't conflict with sockmap tear-down in
+case a socket is in a SOCK{MAP,HASH} and belongs to a reuseport
+group. sockmap tear-down happens first:
+
+  prot->unhash
+  `- tcp_bpf_unhash
+     |- tcp_bpf_remove
+     |  `- while (sk_psock_link_pop(psock))
+     |     `- sk_psock_unlink
+     |        `- sock_map_delete_from_link
+     |           `- __sock_map_delete
+     |              `- sock_map_unref
+     |                 `- sk_psock_put
+     |                    `- sk_psock_drop
+     |                       `- rcu_assign_sk_user_data(sk, NULL)
+     `- inet_unhash
+        `- reuseport_detach_sock
+           `- bpf_sk_reuseport_detach
+              `- WRITE_ONCE(sk->sk_user_data, NULL)
+
+Suggested-by: Martin Lau <kafai@fb.com>
+Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20200218171023.844439-10-jakub@cloudflare.com
+
