@@ -1,0 +1,68 @@
+packet: use percpu mmap tx frame pending refcount
+
+In PF_PACKET's packet mmap(), we can avoid using one atomic_inc()
+and one atomic_dec() call in skb destructor and use a percpu
+reference count instead in order to determine if packets are
+still pending to be sent out. Micro-benchmark with [1] that has
+been slightly modified (that is, protcol = 0 in socket(2) and
+bind(2)), example on a rather crappy testing machine; I expect
+it to scale and have even better results on bigger machines:
+
+./packet_mm_tx -s7000 -m7200 -z700000 em1, avg over 2500 runs:
+
+With patch:    4,022,015 cyc
+Without patch: 4,812,994 cyc
+
+time ./packet_mm_tx -s64 -c10000000 em1 > /dev/null, stable:
+
+With patch:
+  real         1m32.241s
+  user         0m0.287s
+  sys          1m29.316s
+
+Without patch:
+  real         1m38.386s
+  user         0m0.265s
+  sys          1m35.572s
+
+In function tpacket_snd(), it is okay to use packet_read_pending()
+since in fast-path we short-circuit the condition already with
+ph != NULL, since we have next frames to process. In case we have
+MSG_DONTWAIT, we also do not execute this path as need_wait is
+false here anyway, and in case of _no_ MSG_DONTWAIT flag, it is
+okay to call a packet_read_pending(), because when we ever reach
+that path, we're done processing outgoing frames anyway and only
+look if there are skbs still outstanding to be orphaned. We can
+stay lockless in this percpu counter since it's acceptable when we
+reach this path for the sum to be imprecise first, but we'll level
+out at 0 after all pending frames have reached the skb destructor
+eventually through tx reclaim. When people pin a tx process to
+particular CPUs, we expect overflows to happen in the reference
+counter as on one CPU we expect heavy increase; and distributed
+through ksoftirqd on all CPUs a decrease, for example. As
+David Laight points out, since the C language doesn't define the
+result of signed int overflow (i.e. rather than wrap, it is
+allowed to saturate as a possible outcome), we have to use
+unsigned int as reference count. The sum over all CPUs when tx
+is complete will result in 0 again.
+
+The BUG_ON() in tpacket_destruct_skb() we can remove as well. It
+can _only_ be set from inside tpacket_snd() path and we made sure
+to increase tx_ring.pending in any case before we called po->xmit(skb).
+So testing for tx_ring.pending == 0 is not too useful. Instead, it
+would rather have been useful to test if lower layers didn't orphan
+the skb so that we're missing ring slots being put back to
+TP_STATUS_AVAILABLE. But such a bug will be caught in user space
+already as we end up realizing that we do not have any
+TP_STATUS_AVAILABLE slots left anymore. Therefore, we're all set.
+
+Btw, in case of RX_RING path, we do not make use of the pending
+member, therefore we also don't need to use up any percpu memory
+here. Also note that __alloc_percpu() already returns a zero-filled
+percpu area, so initialization is done already.
+
+  [1] http://wiki.ipxwarzone.com/index.php5?title=Linux_packet_mmap
+
+Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

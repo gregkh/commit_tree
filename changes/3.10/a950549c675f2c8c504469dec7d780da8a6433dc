@@ -1,0 +1,66 @@
+ARC: copy_(to|from)_user() to honor usermode-access permissions
+
+This manifested as grep failing psuedo-randomly:
+
+-------------->8---------------------
+[ARCLinux]$ ip address show lo | grep inet
+[ARCLinux]$ ip address show lo | grep inet
+[ARCLinux]$ ip address show lo | grep inet
+[ARCLinux]$
+[ARCLinux]$ ip address show lo | grep inet
+    inet 127.0.0.1/8 scope host lo
+-------------->8---------------------
+
+ARC700 MMU provides fully orthogonal permission bits per page:
+Ur, Uw, Ux, Kr, Kw, Kx
+
+The user mode page permission templates used to have all Kernel mode
+access bits enabled.
+This caused a tricky race condition observed with uClibc buffered file
+read and UNIX pipes.
+
+1. Read access to an anon mapped page in libc .bss: write-protected
+   zero_page mapped: TLB Entry installed with Ur + K[rwx]
+
+2. grep calls libc:getc() -> buffered read layer calls read(2) with the
+   internal read buffer in same .bss page.
+   The read() call is on STDIN which has been redirected to a pipe.
+   read(2) => sys_read() => pipe_read() => copy_to_user()
+
+3. Since page has Kernel-write permission (despite being user-mode
+   write-protected), copy_to_user() suceeds w/o taking a MMU TLB-Miss
+   Exception (page-fault for ARC). core-MM is unaware that kernel
+   erroneously wrote to the reserved read-only zero-page (BUG #1)
+
+4. Control returns to userspace which now does a write to same .bss page
+   Since Linux MM is not aware that page has been modified by kernel, it
+   simply reassigns a new writable zero-init page to mapping, loosing the
+   prior write by kernel - effectively zero'ing out the libc read buffer
+   under the hood - hence grep doesn't see right data (BUG #2)
+
+The fix is to make all kernel-mode access permissions mirror the
+user-mode ones. Note that the kernel still has full access to pages,
+when accessed directly (w/o MMU) - this fix ensures that kernel-mode
+access in copy_to_from() path uses the same faulting access model as for
+pure user accesses to keep MM fully aware of page state.
+
+The issue is peudo-random because it only shows up if the TLB entry
+installed in #1 is present at the time of #3. If it is evicted out, due
+to TLB pressure or some-such, then copy_to_user() does take a TLB Miss
+Exception, with a routine write-to-anon COW processing installing a
+fresh page for kernel writes and also usable as it is in userspace.
+
+Further the issue was dormant for so long as it depends on where the
+libc internal read buffer (in .bss) is mapped at runtime.
+If it happens to reside in file-backed data mapping of libc (in the
+page-aligned slack space trailing the file backed data), loader zero
+padding the slack space, does the early cow page replacement, setting
+things up at the very beginning itself.
+
+With gcc 4.8 based builds, the libc buffer got pushed out to a real
+anon mapping which triggers the issue.
+
+Reported-by: Anton Kolesov <akolesov@synopsys.com>
+Cc: <stable@vger.kernel.org> # 3.9
+Signed-off-by: Vineet Gupta <vgupta@synopsys.com>
+

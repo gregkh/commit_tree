@@ -1,0 +1,84 @@
+mm: page_alloc: fair zone allocator policy
+
+Each zone that holds userspace pages of one workload must be aged at a
+speed proportional to the zone size.  Otherwise, the time an individual
+page gets to stay in memory depends on the zone it happened to be
+allocated in.  Asymmetry in the zone aging creates rather unpredictable
+aging behavior and results in the wrong pages being reclaimed, activated
+etc.
+
+But exactly this happens right now because of the way the page allocator
+and kswapd interact.  The page allocator uses per-node lists of all zones
+in the system, ordered by preference, when allocating a new page.  When
+the first iteration does not yield any results, kswapd is woken up and the
+allocator retries.  Due to the way kswapd reclaims zones below the high
+watermark while a zone can be allocated from when it is above the low
+watermark, the allocator may keep kswapd running while kswapd reclaim
+ensures that the page allocator can keep allocating from the first zone in
+the zonelist for extended periods of time.  Meanwhile the other zones
+rarely see new allocations and thus get aged much slower in comparison.
+
+The result is that the occasional page placed in lower zones gets
+relatively more time in memory, even gets promoted to the active list
+after its peers have long been evicted.  Meanwhile, the bulk of the
+working set may be thrashing on the preferred zone even though there may
+be significant amounts of memory available in the lower zones.
+
+Even the most basic test -- repeatedly reading a file slightly bigger than
+memory -- shows how broken the zone aging is.  In this scenario, no single
+page should be able stay in memory long enough to get referenced twice and
+activated, but activation happens in spades:
+
+  $ grep active_file /proc/zoneinfo
+      nr_inactive_file 0
+      nr_active_file 0
+      nr_inactive_file 0
+      nr_active_file 8
+      nr_inactive_file 1582
+      nr_active_file 11994
+  $ cat data data data data >/dev/null
+  $ grep active_file /proc/zoneinfo
+      nr_inactive_file 0
+      nr_active_file 70
+      nr_inactive_file 258753
+      nr_active_file 443214
+      nr_inactive_file 149793
+      nr_active_file 12021
+
+Fix this with a very simple round robin allocator.  Each zone is allowed a
+batch of allocations that is proportional to the zone's size, after which
+it is treated as full.  The batch counters are reset when all zones have
+been tried and the allocator enters the slowpath and kicks off kswapd
+reclaim.  Allocation and reclaim is now fairly spread out to all
+available/allowable zones:
+
+  $ grep active_file /proc/zoneinfo
+      nr_inactive_file 0
+      nr_active_file 0
+      nr_inactive_file 174
+      nr_active_file 4865
+      nr_inactive_file 53
+      nr_active_file 860
+  $ cat data data data data >/dev/null
+  $ grep active_file /proc/zoneinfo
+      nr_inactive_file 0
+      nr_active_file 0
+      nr_inactive_file 666622
+      nr_active_file 4988
+      nr_inactive_file 190969
+      nr_active_file 937
+
+When zone_reclaim_mode is enabled, allocations will now spread out to all
+zones on the local node, not just the first preferred zone (which on a 4G
+node might be a tiny Normal zone).
+
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Mel Gorman <mgorman@suse.de>
+Reviewed-by: Rik van Riel <riel@redhat.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Paul Bolle <paul.bollee@gmail.com>
+Cc: Zlatko Calusic <zcalusic@bitsync.net>
+Tested-by: Kevin Hilman <khilman@linaro.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

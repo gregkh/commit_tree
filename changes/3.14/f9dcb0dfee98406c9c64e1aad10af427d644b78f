@@ -1,0 +1,70 @@
+drm/i915: touch VGA MSR after we enable the power well
+
+Fixes regression introduced by:
+    commit bf51d5e2cda5d36d98e4b46ac7fca9461e512c41
+    Author: Paulo Zanoni <paulo.r.zanoni at intel.com>
+    Date:   Wed Jul 3 17:12:13 2013 -0300
+        drm/i915: switch disable_power_well default value to 1
+
+The bug I'm seeing can be reproduced with:
+  - Have vgacon configured/enabled
+  - Make sure the power well gets disabled, then enabled. You can
+    check this by seeing the messages print by hsw_set_power_well
+  - Stop your display manager
+  - echo 0 > /sys/class/vtconsole/vtcon1/bind
+
+I can easily reproduce this by blacklising snd_hda_intel and booting
+with eDP+HDMI.
+
+If you do this and then look at dmesg, you'll see we're printing
+infinite "Unclaimed register" messages. This is happening because
+we're stuck on an infinite loop inside console_unlock(), which is
+calling many functions from vgacon.c. And the code that's triggering
+the error messages is from vgacon_set_cursor_size().
+
+After we re-enable the power well, every time we read/write the VGA
+address 0x3d5 we get an "unclaimed register" interrupt (ERR_INT) and
+print error messages. If we write anything to the VGA MSR register (it
+doesn't really matter which value you write to bit 0), any
+reads/writes to 0x3d5 _don't_ trigger the "unclaimed register" errors
+anymore (even if MSR bit 0 is zero). So what happens with the current
+code is that when we unbind i915 and bind vgacon, we call
+console_unlock(). Function console_unlock() is responsible for
+printing any messages that were supposed to be print when the console
+was locked, so it calls the TTY layer, which calls the console layer,
+which calls vgacon to print the messages. At this point, vgacon
+eventually calls vgacon_set_cursor_size(), which touches 0x3d5, which
+triggers unclaimed register interrupts. The problem is that when we
+get these interrupts, we print the error messages, so we add more work
+to console_unlock(), which will try to print it again, and then call
+vgacon again, trigger a new interrupt, which will put more stuff to
+the buffer, and then we'll be stuck at console_unlock() forever.
+
+If you patch intel_uncore.c to not print anything when we detect
+unclaimed registers, we won't get into the console_unlock() infinite
+loop and the driver unbind will work just fine. We will still be
+getting interrupts every time vgacon touches those registers, but we
+will survive. This is a valid experiment, but IMHO it's not the real
+fix: if we don't print any error messages we will still keep getting
+the interrupts, and if we disable ERR_INT we won't get the interrupt
+anymore, but we will also stop getting all the other error interrupts.
+
+I talked about this problem with the HW engineer and his
+recommendation is "So don't do any VGA I/O or memory access while the
+power well is disabled, and make to re-program MSR after enabling the
+power well and before using VGA I/O or memory accesses.".
+
+Notice that this is just a partial fix to fd.o #67813. This fixes the
+case where the power well is already enabled when we unbind, not when
+it's disabled when we unbind.
+
+V2: - Rebase (first version was sent in September).
+V3: - Complete rewrite of the same fix: smaller implementation,
+      improved commit message.
+
+Testcase: igt/drv_module_reload
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=67813
+Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+

@@ -1,0 +1,107 @@
+poll: add poll_requested_events() and poll_does_not_wait() functions
+
+In some cases the poll() implementation in a driver has to do different
+things depending on the events the caller wants to poll for.  An example
+is when a driver needs to start a DMA engine if the caller polls for
+POLLIN, but doesn't want to do that if POLLIN is not requested but instead
+only POLLOUT or POLLPRI is requested.  This is something that can happen
+in the video4linux subsystem among others.
+
+Unfortunately, the current epoll/poll/select implementation doesn't
+provide that information reliably.  The poll_table_struct does have it: it
+has a key field with the event mask.  But once a poll() call matches one
+or more bits of that mask any following poll() calls are passed a NULL
+poll_table pointer.
+
+Also, the eventpoll implementation always left the key field at ~0 instead
+of using the requested events mask.
+
+This was changed in eventpoll.c so the key field now contains the actual
+events that should be polled for as set by the caller.
+
+The solution to the NULL poll_table pointer is to set the qproc field to
+NULL in poll_table once poll() matches the events, not the poll_table
+pointer itself.  That way drivers can obtain the mask through a new
+poll_requested_events inline.
+
+The poll_table_struct can still be NULL since some kernel code calls it
+internally (netfs_state_poll() in ./drivers/staging/pohmelfs/netfs.h).  In
+that case poll_requested_events() returns ~0 (i.e.  all events).
+
+Very rarely drivers might want to know whether poll_wait will actually
+wait.  If another earlier file descriptor in the set already matched the
+events the caller wanted to wait for, then the kernel will return from the
+select() call without waiting.  This might be useful information in order
+to avoid doing expensive work.
+
+A new helper function poll_does_not_wait() is added that drivers can use
+to detect this situation.  This is now used in sock_poll_wait() in
+include/net/sock.h.  This was the only place in the kernel that needed
+this information.
+
+Drivers should no longer access any of the poll_table internals, but use
+the poll_requested_events() and poll_does_not_wait() access functions
+instead.  In order to enforce that the poll_table fields are now prepended
+with an underscore and a comment was added warning against using them
+directly.
+
+This required a change in unix_dgram_poll() in unix/af_unix.c which used
+the key field to get the requested events.  It's been replaced by a call
+to poll_requested_events().
+
+For qproc it was especially important to change its name since the
+behavior of that field changes with this patch since this function pointer
+can now be NULL when that wasn't possible in the past.
+
+Any driver accessing the qproc or key fields directly will now fail to compile.
+
+Some notes regarding the correctness of this patch: the driver's poll()
+function is called with a 'struct poll_table_struct *wait' argument.  This
+pointer may or may not be NULL, drivers can never rely on it being one or
+the other as that depends on whether or not an earlier file descriptor in
+the select()'s fdset matched the requested events.
+
+There are only three things a driver can do with the wait argument:
+
+1) obtain the key field:
+
+	events = wait ? wait->key : ~0;
+
+   This will still work although it should be replaced with the new
+   poll_requested_events() function (which does exactly the same).
+   This will now even work better, since wait is no longer set to NULL
+   unnecessarily.
+
+2) use the qproc callback. This could be deadly since qproc can now be
+   NULL. Renaming qproc should prevent this from happening. There are no
+   kernel drivers that actually access this callback directly, BTW.
+
+3) test whether wait == NULL to determine whether poll would return without
+   waiting. This is no longer sufficient as the correct test is now
+   wait == NULL || wait->_qproc == NULL.
+
+   However, the worst that can happen here is a slight performance hit in
+   the case where wait != NULL and wait->_qproc == NULL. In that case the
+   driver will assume that poll_wait() will actually add the fd to the set
+   of waiting file descriptors. Of course, poll_wait() will not do that
+   since it tests for wait->_qproc. This will not break anything, though.
+
+   There is only one place in the whole kernel where this happens
+   (sock_poll_wait() in include/net/sock.h) and that code will be replaced
+   by a call to poll_does_not_wait() in the next patch.
+
+   Note that even if wait->_qproc != NULL drivers cannot rely on poll_wait()
+   actually waiting. The next file descriptor from the set might match the
+   event mask and thus any possible waits will never happen.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Reviewed-by: Jonathan Corbet <corbet@lwn.net>
+Reviewed-by: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Davide Libenzi <davidel@xmailserver.org>
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Cc: Mauro Carvalho Chehab <mchehab@infradead.org>
+Cc: David Miller <davem@davemloft.net>
+Cc: Eric Dumazet <eric.dumazet@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

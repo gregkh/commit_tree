@@ -1,0 +1,85 @@
+drm/ttm: provide dma aware ttm page pool code V9
+
+In TTM world the pages for the graphic drivers are kept in three different
+pools: write combined, uncached, and cached (write-back). When the pages
+are used by the graphic driver the graphic adapter via its built in MMU
+(or AGP) programs these pages in. The programming requires the virtual address
+(from the graphic adapter perspective) and the physical address (either System RAM
+or the memory on the card) which is obtained using the pci_map_* calls (which does the
+virtual to physical - or bus address translation). During the graphic application's
+"life" those pages can be shuffled around, swapped out to disk, moved from the
+VRAM to System RAM or vice-versa. This all works with the existing TTM pool code
+- except when we want to use the software IOTLB (SWIOTLB) code to "map" the physical
+addresses to the graphic adapter MMU. We end up programming the bounce buffer's
+physical address instead of the TTM pool memory's and get a non-worky driver.
+There are two solutions:
+1) using the DMA API to allocate pages that are screened by the DMA API, or
+2) using the pci_sync_* calls to copy the pages from the bounce-buffer and back.
+
+This patch fixes the issue by allocating pages using the DMA API. The second
+is a viable option - but it has performance drawbacks and potential correctness
+issues - think of the write cache page being bounced (SWIOTLB->TTM), the
+WC is set on the TTM page and the copy from SWIOTLB not making it to the TTM
+page until the page has been recycled in the pool (and used by another application).
+
+The bounce buffer does not get activated often - only in cases where we have
+a 32-bit capable card and we want to use a page that is allocated above the
+4GB limit. The bounce buffer offers the solution of copying the contents
+of that 4GB page to an location below 4GB and then back when the operation has been
+completed (or vice-versa). This is done by using the 'pci_sync_*' calls.
+Note: If you look carefully enough in the existing TTM page pool code you will
+notice the GFP_DMA32 flag is used  - which should guarantee that the provided page
+is under 4GB. It certainly is the case, except this gets ignored in two cases:
+ - If user specifies 'swiotlb=force' which bounces _every_ page.
+ - If user is using a Xen's PV Linux guest (which uses the SWIOTLB and the
+   underlaying PFN's aren't necessarily under 4GB).
+
+To not have this extra copying done the other option is to allocate the pages
+using the DMA API so that there is not need to map the page and perform the
+expensive 'pci_sync_*' calls.
+
+This DMA API capable TTM pool requires for this the 'struct device' to
+properly call the DMA API. It also has to track the virtual and bus address of
+the page being handed out in case it ends up being swapped out or de-allocated -
+to make sure it is de-allocated using the proper's 'struct device'.
+
+Implementation wise the code keeps two lists: one that is attached to the
+'struct device' (via the dev->dma_pools list) and a global one to be used when
+the 'struct device' is unavailable (think shrinker code). The global list can
+iterate over all of the 'struct device' and its associated dma_pool. The list
+in dev->dma_pools can only iterate the device's dma_pool.
+                                                            /[struct device_pool]\
+        /---------------------------------------------------| dev                |
+       /                                            +-------| dma_pool           |
+ /-----+------\                                    /        \--------------------/
+ |struct device|     /-->[struct dma_pool for WC]</         /[struct device_pool]\
+ | dma_pools   +----+                                     /-| dev                |
+ |  ...        |    \--->[struct dma_pool for uncached]<-/--| dma_pool           |
+ \-----+------/                                         /   \--------------------/
+        \----------------------------------------------/
+[Two pools associated with the device (WC and UC), and the parallel list
+containing the 'struct dev' and 'struct dma_pool' entries]
+
+The maximum amount of dma pools a device can have is six: write-combined,
+uncached, and cached; then there are the DMA32 variants which are:
+write-combined dma32, uncached dma32, and cached dma32.
+
+Currently this code only gets activated when any variant of the SWIOTLB IOMMU
+code is running (Intel without VT-d, AMD without GART, IBM Calgary and Xen PV
+with PCI devices).
+
+Tested-by: Michel Dänzer <michel@daenzer.net>
+[v1: Using swiotlb_nr_tbl instead of swiotlb_enabled]
+[v2: Major overhaul - added 'inuse_list' to seperate used from inuse and reorder
+the order of lists to get better performance.]
+[v3: Added comments/and some logic based on review, Added Jerome tag]
+[v4: rebase on top of ttm_tt & ttm_backend merge]
+[v5: rebase on top of ttm memory accounting overhaul]
+[v6: New rebase on top of more memory accouting changes]
+[v7: well rebase on top of no memory accounting changes]
+[v8: make sure pages list is initialized empty]
+[v9: calll ttm_mem_global_free_page in unpopulate for accurate accountg]
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Reviewed-by: Jerome Glisse <jglisse@redhat.com>
+Acked-by: Thomas Hellstrom <thellstrom@vmware.com>
+

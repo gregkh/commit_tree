@@ -1,0 +1,323 @@
+mm: vmscan: stall page reclaim and writeback pages based on dirty/writepage pages encountered
+
+Further testing of the "Reduce system disruption due to kswapd"
+discovered a few problems.  First and foremost, it's possible for pages
+under writeback to be freed which will lead to badness.  Second, as
+pages were not being swapped the file LRU was being scanned faster and
+clean file pages were being reclaimed.  In some cases this results in
+increased read IO to re-read data from disk.  Third, more pages were
+being written from kswapd context which can adversly affect IO
+performance.  Lastly, it was observed that PageDirty pages are not
+necessarily dirty on all filesystems (buffers can be clean while
+PageDirty is set and ->writepage generates no IO) and not all
+filesystems set PageWriteback when the page is being written (e.g.
+ext3).  This disconnect confuses the reclaim stalling logic.  This
+follow-up series is aimed at these problems.
+
+The tests were based on three kernels
+
+vanilla:	kernel 3.9 as that is what the current mmotm uses as a baseline
+mmotm-20130522	is mmotm as of 22nd May with "Reduce system disruption due to
+		kswapd" applied on top as per what should be in Andrew's tree
+		right now
+lessdisrupt-v7r10 is this follow-up series on top of the mmotm kernel
+
+The first test used memcached+memcachetest while some background IO was
+in progress as implemented by the parallel IO tests implement in MM
+Tests.  memcachetest benchmarks how many operations/second memcached can
+service.  It starts with no background IO on a freshly created ext4
+filesystem and then re-runs the test with larger amounts of IO in the
+background to roughly simulate a large copy in progress.  The
+expectation is that the IO should have little or no impact on
+memcachetest which is running entirely in memory.
+
+parallelio
+                                             3.9.0                       3.9.0                       3.9.0
+                                           vanilla          mm1-mmotm-20130522       mm1-lessdisrupt-v7r10
+Ops memcachetest-0M             23117.00 (  0.00%)          22780.00 ( -1.46%)          22763.00 ( -1.53%)
+Ops memcachetest-715M           23774.00 (  0.00%)          23299.00 ( -2.00%)          22934.00 ( -3.53%)
+Ops memcachetest-2385M           4208.00 (  0.00%)          24154.00 (474.00%)          23765.00 (464.76%)
+Ops memcachetest-4055M           4104.00 (  0.00%)          25130.00 (512.33%)          24614.00 (499.76%)
+Ops io-duration-0M                  0.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops io-duration-715M               12.00 (  0.00%)              7.00 ( 41.67%)              6.00 ( 50.00%)
+Ops io-duration-2385M             116.00 (  0.00%)             21.00 ( 81.90%)             21.00 ( 81.90%)
+Ops io-duration-4055M             160.00 (  0.00%)             36.00 ( 77.50%)             35.00 ( 78.12%)
+Ops swaptotal-0M                    0.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops swaptotal-715M             140138.00 (  0.00%)             18.00 ( 99.99%)             18.00 ( 99.99%)
+Ops swaptotal-2385M            385682.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops swaptotal-4055M            418029.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops swapin-0M                       0.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops swapin-715M                   144.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops swapin-2385M               134227.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops swapin-4055M               125618.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops minorfaults-0M            1536429.00 (  0.00%)        1531632.00 (  0.31%)        1533541.00 (  0.19%)
+Ops minorfaults-715M          1786996.00 (  0.00%)        1612148.00 (  9.78%)        1608832.00 (  9.97%)
+Ops minorfaults-2385M         1757952.00 (  0.00%)        1614874.00 (  8.14%)        1613541.00 (  8.21%)
+Ops minorfaults-4055M         1774460.00 (  0.00%)        1633400.00 (  7.95%)        1630881.00 (  8.09%)
+Ops majorfaults-0M                  1.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops majorfaults-715M              184.00 (  0.00%)            167.00 (  9.24%)            166.00 (  9.78%)
+Ops majorfaults-2385M           24444.00 (  0.00%)            155.00 ( 99.37%)             93.00 ( 99.62%)
+Ops majorfaults-4055M           21357.00 (  0.00%)            147.00 ( 99.31%)            134.00 ( 99.37%)
+
+memcachetest is the transactions/second reported by memcachetest. In
+        the vanilla kernel note that performance drops from around
+        23K/sec to just over 4K/second when there is 2385M of IO going
+        on in the background. With current mmotm, there is no collapse
+	in performance and with this follow-up series there is little
+	change.
+
+swaptotal is the total amount of swap traffic. With mmotm and the follow-up
+	series, the total amount of swapping is much reduced.
+
+                                 3.9.0       3.9.0       3.9.0
+                               vanillamm1-mmotm-20130522mm1-lessdisrupt-v7r10
+Minor Faults                  11160152    10706748    10622316
+Major Faults                     46305         755         678
+Swap Ins                        260249           0           0
+Swap Outs                       683860          18          18
+Direct pages scanned                 0         678        2520
+Kswapd pages scanned           6046108     8814900     1639279
+Kswapd pages reclaimed         1081954     1172267     1094635
+Direct pages reclaimed               0         566        2304
+Kswapd efficiency                  17%         13%         66%
+Kswapd velocity               5217.560    7618.953    1414.879
+Direct efficiency                 100%         83%         91%
+Direct velocity                  0.000       0.586       2.175
+Percentage direct scans             0%          0%          0%
+Zone normal velocity          5105.086    6824.681     671.158
+Zone dma32 velocity            112.473     794.858     745.896
+Zone dma velocity                0.000       0.000       0.000
+Page writes by reclaim     1929612.000 6861768.000   32821.000
+Page writes file               1245752     6861750       32803
+Page writes anon                683860          18          18
+Page reclaim immediate            7484          40         239
+Sector Reads                   1130320       93996       86900
+Sector Writes                 13508052    10823500    11804436
+Page rescued immediate               0           0           0
+Slabs scanned                    33536       27136       18560
+Direct inode steals                  0           0           0
+Kswapd inode steals               8641        1035           0
+Kswapd skipped wait                  0           0           0
+THP fault alloc                      8          37          33
+THP collapse alloc                 508         552         515
+THP splits                          24           1           1
+THP fault fallback                   0           0           0
+THP collapse fail                    0           0           0
+
+There are a number of observations to make here
+
+1. Swap outs are almost eliminated. Swap ins are 0 indicating that the
+   pages swapped were really unused anonymous pages. Related to that,
+   major faults are much reduced.
+
+2. kswapd efficiency was impacted by the initial series but with these
+   follow-up patches, the efficiency is now at 66% indicating that far
+   fewer pages were skipped during scanning due to dirty or writeback
+   pages.
+
+3. kswapd velocity is reduced indicating that fewer pages are being scanned
+   with the follow-up series as kswapd now stalls when the tail of the
+   LRU queue is full of unqueued dirty pages. The stall gives flushers a
+   chance to catch-up so kswapd can reclaim clean pages when it wakes
+
+4. In light of Zlatko's recent reports about zone scanning imbalances,
+   mmtests now reports scanning velocity on a per-zone basis. With mainline,
+   you can see that the scanning activity is dominated by the Normal
+   zone with over 45 times more scanning in Normal than the DMA32 zone.
+   With the series currently in mmotm, the ratio is slightly better but it
+   is still the case that the bulk of scanning is in the highest zone. With
+   this follow-up series, the ratio of scanning between the Normal and
+   DMA32 zone is roughly equal.
+
+5. As Dave Chinner observed, the current patches in mmotm increased the
+   number of pages written from kswapd context which is expected to adversly
+   impact IO performance. With the follow-up patches, far fewer pages are
+   written from kswapd context than the mainline kernel
+
+6. With the series in mmotm, fewer inodes were reclaimed by kswapd. With
+   the follow-up series, there is less slab shrinking activity and no inodes
+   were reclaimed.
+
+7. Note that "Sectors Read" is drastically reduced implying that the source
+   data being used for the IO is not being aggressively discarded due to
+   page reclaim skipping over dirty pages and reclaiming clean pages. Note
+   that the reducion in reads could also be due to inode data not being
+   re-read from disk after a slab shrink.
+
+                       3.9.0       3.9.0       3.9.0
+                     vanillamm1-mmotm-20130522mm1-lessdisrupt-v7r10
+Mean sda-avgqz        166.99       32.09       33.44
+Mean sda-await        853.64      192.76      185.43
+Mean sda-r_await        6.31        9.24        5.97
+Mean sda-w_await     2992.81      202.65      192.43
+Max  sda-avgqz       1409.91      718.75      698.98
+Max  sda-await       6665.74     3538.00     3124.23
+Max  sda-r_await       58.96      111.95       58.00
+Max  sda-w_await    28458.94     3977.29     3148.61
+
+In light of the changes in writes from reclaim context, the number of
+reads and Dave Chinner's concerns about IO performance I took a closer
+look at the IO stats for the test disk. Few observations
+
+1. The average queue size is reduced by the initial series and roughly
+   the same with this follow up.
+
+2. Average wait times for writes are reduced and as the IO
+   is completing faster it at least implies that the gain is because
+   flushers are writing the files efficiently instead of page reclaim
+   getting in the way.
+
+3. The reduction in maximum write latency is staggering. 28 seconds down
+   to 3 seconds.
+
+Jan Kara asked how NFS is affected by all of this. Unstable pages can
+be taken into account as one of the patches in the series shows but it
+is still the case that filesystems with unusual handling of dirty or
+writeback could still be treated better.
+
+Tests like postmark, fsmark and largedd showed up nothing useful. On my test
+setup, pages are simply not being written back from reclaim context with or
+without the patches and there are no changes in performance. My test setup
+probably is just not strong enough network-wise to be really interesting.
+
+I ran a longer-lived memcached test with IO going to NFS instead of a local disk
+
+parallelio
+                                             3.9.0                       3.9.0                       3.9.0
+                                           vanilla          mm1-mmotm-20130522       mm1-lessdisrupt-v7r10
+Ops memcachetest-0M             23323.00 (  0.00%)          23241.00 ( -0.35%)          23321.00 ( -0.01%)
+Ops memcachetest-715M           25526.00 (  0.00%)          24763.00 ( -2.99%)          23242.00 ( -8.95%)
+Ops memcachetest-2385M           8814.00 (  0.00%)          26924.00 (205.47%)          23521.00 (166.86%)
+Ops memcachetest-4055M           5835.00 (  0.00%)          26827.00 (359.76%)          25560.00 (338.05%)
+Ops io-duration-0M                  0.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops io-duration-715M               65.00 (  0.00%)             71.00 ( -9.23%)             11.00 ( 83.08%)
+Ops io-duration-2385M             129.00 (  0.00%)             94.00 ( 27.13%)             53.00 ( 58.91%)
+Ops io-duration-4055M             301.00 (  0.00%)            100.00 ( 66.78%)            108.00 ( 64.12%)
+Ops swaptotal-0M                    0.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops swaptotal-715M              14394.00 (  0.00%)            949.00 ( 93.41%)             63.00 ( 99.56%)
+Ops swaptotal-2385M            401483.00 (  0.00%)          24437.00 ( 93.91%)          30118.00 ( 92.50%)
+Ops swaptotal-4055M            554123.00 (  0.00%)          35688.00 ( 93.56%)          63082.00 ( 88.62%)
+Ops swapin-0M                       0.00 (  0.00%)              0.00 (  0.00%)              0.00 (  0.00%)
+Ops swapin-715M                  4522.00 (  0.00%)            560.00 ( 87.62%)             63.00 ( 98.61%)
+Ops swapin-2385M               169861.00 (  0.00%)           5026.00 ( 97.04%)          13917.00 ( 91.81%)
+Ops swapin-4055M               192374.00 (  0.00%)          10056.00 ( 94.77%)          25729.00 ( 86.63%)
+Ops minorfaults-0M            1445969.00 (  0.00%)        1520878.00 ( -5.18%)        1454024.00 ( -0.56%)
+Ops minorfaults-715M          1557288.00 (  0.00%)        1528482.00 (  1.85%)        1535776.00 (  1.38%)
+Ops minorfaults-2385M         1692896.00 (  0.00%)        1570523.00 (  7.23%)        1559622.00 (  7.87%)
+Ops minorfaults-4055M         1654985.00 (  0.00%)        1581456.00 (  4.44%)        1596713.00 (  3.52%)
+Ops majorfaults-0M                  0.00 (  0.00%)              1.00 (-99.00%)              0.00 (  0.00%)
+Ops majorfaults-715M              763.00 (  0.00%)            265.00 ( 65.27%)             75.00 ( 90.17%)
+Ops majorfaults-2385M           23861.00 (  0.00%)            894.00 ( 96.25%)           2189.00 ( 90.83%)
+Ops majorfaults-4055M           27210.00 (  0.00%)           1569.00 ( 94.23%)           4088.00 ( 84.98%)
+
+1. Performance does not collapse due to IO which is good. IO is also completing
+   faster. Note with mmotm, IO completes in a third of the time and faster again
+   with this series applied
+
+2. Swapping is reduced, although not eliminated. The figures for the follow-up
+   look bad but it does vary a bit as the stalling is not perfect for nfs
+   or filesystems like ext3 with unusual handling of dirty and writeback
+   pages
+
+3. There are swapins, particularly with larger amounts of IO indicating
+   that active pages are being reclaimed. However, the number of much
+   reduced.
+
+                                 3.9.0       3.9.0       3.9.0
+                               vanillamm1-mmotm-20130522mm1-lessdisrupt-v7r10
+Minor Faults                  36339175    35025445    35219699
+Major Faults                    310964       27108       51887
+Swap Ins                       2176399      173069      333316
+Swap Outs                      3344050      357228      504824
+Direct pages scanned              8972       77283       43242
+Kswapd pages scanned          20899983     8939566    14772851
+Kswapd pages reclaimed         6193156     5172605     5231026
+Direct pages reclaimed            8450       73802       39514
+Kswapd efficiency                  29%         57%         35%
+Kswapd velocity               3929.743    1847.499    3058.840
+Direct efficiency                  94%         95%         91%
+Direct velocity                  1.687      15.972       8.954
+Percentage direct scans             0%          0%          0%
+Zone normal velocity          3721.907     939.103    2185.142
+Zone dma32 velocity            209.522     924.368     882.651
+Zone dma velocity                0.000       0.000       0.000
+Page writes by reclaim     4082185.000  526319.000  537114.000
+Page writes file                738135      169091       32290
+Page writes anon               3344050      357228      504824
+Page reclaim immediate            9524         170     5595843
+Sector Reads                   8909900      861192     1483680
+Sector Writes                 13428980     1488744     2076800
+Page rescued immediate               0           0           0
+Slabs scanned                    38016       31744       28672
+Direct inode steals                  0           0           0
+Kswapd inode steals                424           0           0
+Kswapd skipped wait                  0           0           0
+THP fault alloc                     14          15         119
+THP collapse alloc                1767        1569        1618
+THP splits                          30          29          25
+THP fault fallback                   0           0           0
+THP collapse fail                    8           5           0
+Compaction stalls                   17          41         100
+Compaction success                   7          31          95
+Compaction failures                 10          10           5
+Page migrate success              7083       22157       62217
+Page migrate failure                 0           0           0
+Compaction pages isolated        14847       48758      135830
+Compaction migrate scanned       18328       48398      138929
+Compaction free scanned        2000255      355827     1720269
+Compaction cost                      7          24          68
+
+I guess the main takeaway again is the much reduced page writes
+from reclaim context and reduced reads.
+
+                       3.9.0       3.9.0       3.9.0
+                     vanillamm1-mmotm-20130522mm1-lessdisrupt-v7r10
+Mean sda-avgqz         23.58        0.35        0.44
+Mean sda-await        133.47       15.72       15.46
+Mean sda-r_await        4.72        4.69        3.95
+Mean sda-w_await      507.69       28.40       33.68
+Max  sda-avgqz        680.60       12.25       23.14
+Max  sda-await       3958.89      221.83      286.22
+Max  sda-r_await       63.86       61.23       67.29
+Max  sda-w_await    11710.38      883.57     1767.28
+
+And as before, write wait times are much reduced.
+
+This patch:
+
+The patch "mm: vmscan: Have kswapd writeback pages based on dirty pages
+encountered, not priority" decides whether to writeback pages from reclaim
+context based on the number of dirty pages encountered.  This situation is
+flagged too easily and flushers are not given the chance to catch up
+resulting in more pages being written from reclaim context and potentially
+impacting IO performance.  The check for PageWriteback is also misplaced
+as it happens within a PageDirty check which is nonsense as the dirty may
+have been cleared for IO.  The accounting is updated very late and pages
+that are already under writeback, were reactivated, could not unmapped or
+could not be released are all missed.  Similarly, a page is considered
+congested for reasons other than being congested and pages that cannot be
+written out in the correct context are skipped.  Finally, it considers
+stalling and writing back filesystem pages due to encountering dirty
+anonymous pages at the tail of the LRU which is dumb.
+
+This patch causes kswapd to begin writing filesystem pages from reclaim
+context only if page reclaim found that all filesystem pages at the tail
+of the LRU were unqueued dirty pages.  Before it starts writing filesystem
+pages, it will stall to give flushers a chance to catch up.  The decision
+on whether wait_iff_congested is also now determined by dirty filesystem
+pages only.  Congested pages are based on whether the underlying BDI is
+congested regardless of the context of the reclaiming process.
+
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: Jiri Slaby <jslaby@suse.cz>
+Cc: Valdis Kletnieks <Valdis.Kletnieks@vt.edu>
+Cc: Zlatko Calusic <zcalusic@bitsync.net>
+Cc: dormando <dormando@rydia.net>
+Cc: Trond Myklebust <trond.myklebust@fys.uio.no>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

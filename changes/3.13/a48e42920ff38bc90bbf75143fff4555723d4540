@@ -1,0 +1,83 @@
+net: introduce new macro net_get_random_once
+
+net_get_random_once is a new macro which handles the initialization
+of secret keys. It is possible to call it in the fast path. Only the
+initialization depends on the spinlock and is rather slow. Otherwise
+it should get used just before the key is used to delay the entropy
+extration as late as possible to get better randomness. It returns true
+if the key got initialized.
+
+The usage of static_keys for net_get_random_once is a bit uncommon so
+it needs some further explanation why this actually works:
+
+=== In the simple non-HAVE_JUMP_LABEL case we actually have ===
+no constrains to use static_key_(true|false) on keys initialized with
+STATIC_KEY_INIT_(FALSE|TRUE). So this path just expands in favor of
+the likely case that the initialization is already done. The key is
+initialized like this:
+
+___done_key = { .enabled = ATOMIC_INIT(0) }
+
+The check
+
+                if (!static_key_true(&___done_key))                     \
+
+expands into (pseudo code)
+
+                if (!likely(___done_key > 0))
+
+, so we take the fast path as soon as ___done_key is increased from the
+helper function.
+
+=== If HAVE_JUMP_LABELs are available this depends ===
+on patching of jumps into the prepared NOPs, which is done in
+jump_label_init at boot-up time (from start_kernel). It is forbidden
+and dangerous to use net_get_random_once in functions which are called
+before that!
+
+At compilation time NOPs are generated at the call sites of
+net_get_random_once. E.g. net/ipv6/inet6_hashtable.c:inet6_ehashfn (we
+need to call net_get_random_once two times in inet6_ehashfn, so two NOPs):
+
+      71:       0f 1f 44 00 00          nopl   0x0(%rax,%rax,1)
+      76:       0f 1f 44 00 00          nopl   0x0(%rax,%rax,1)
+
+Both will be patched to the actual jumps to the end of the function to
+call __net_get_random_once at boot time as explained above.
+
+arch_static_branch is optimized and inlined for false as return value and
+actually also returns false in case the NOP is placed in the instruction
+stream. So in the fast case we get a "return false". But because we
+initialize ___done_key with (enabled != (entries & 1)) this call-site
+will get patched up at boot thus returning true. The final check looks
+like this:
+
+                if (!static_key_true(&___done_key))                     \
+                        ___ret = __net_get_random_once(buf,             \
+
+expands to
+
+                if (!!static_key_false(&___done_key))                     \
+                        ___ret = __net_get_random_once(buf,             \
+
+So we get true at boot time and as soon as static_key_slow_inc is called
+on the key it will invert the logic and return false for the fast path.
+static_key_slow_inc will change the branch because it got initialized
+with .enabled == 0. After static_key_slow_inc is called on the key the
+branch is replaced with a nop again.
+
+=== Misc: ===
+The helper defers the increment into a workqueue so we don't
+have problems calling this code from atomic sections. A seperate boolean
+(___done) guards the case where we enter net_get_random_once again before
+the increment happend.
+
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Jason Baron <jbaron@redhat.com>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: "David S. Miller" <davem@davemloft.net>
+Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

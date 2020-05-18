@@ -1,0 +1,168 @@
+uprobes, mm, x86: Add the ability to install and remove uprobes breakpoints
+
+Add uprobes support to the core kernel, with x86 support.
+
+This commit adds the kernel facilities, the actual uprobes
+user-space ABI and perf probe support comes in later commits.
+
+General design:
+
+Uprobes are maintained in an rb-tree indexed by inode and offset
+(the offset here is from the start of the mapping). For a unique
+(inode, offset) tuple, there can be at most one uprobe in the
+rb-tree.
+
+Since the (inode, offset) tuple identifies a unique uprobe, more
+than one user may be interested in the same uprobe. This provides
+the ability to connect multiple 'consumers' to the same uprobe.
+
+Each consumer defines a handler and a filter (optional). The
+'handler' is run every time the uprobe is hit, if it matches the
+'filter' criteria.
+
+The first consumer of a uprobe causes the breakpoint to be
+inserted at the specified address and subsequent consumers are
+appended to this list.  On subsequent probes, the consumer gets
+appended to the existing list of consumers. The breakpoint is
+removed when the last consumer unregisters. For all other
+unregisterations, the consumer is removed from the list of
+consumers.
+
+Given a inode, we get a list of the mms that have mapped the
+inode. Do the actual registration if mm maps the page where a
+probe needs to be inserted/removed.
+
+We use a temporary list to walk through the vmas that map the
+inode.
+
+- The number of maps that map the inode, is not known before we
+  walk the rmap and keeps changing.
+- extending vm_area_struct wasn't recommended, it's a
+  size-critical data structure.
+- There can be more than one maps of the inode in the same mm.
+
+We add callbacks to the mmap methods to keep an eye on text vmas
+that are of interest to uprobes.  When a vma of interest is mapped,
+we insert the breakpoint at the right address.
+
+Uprobe works by replacing the instruction at the address defined
+by (inode, offset) with the arch specific breakpoint
+instruction. We save a copy of the original instruction at the
+uprobed address.
+
+This is needed for:
+
+ a. executing the instruction out-of-line (xol).
+ b. instruction analysis for any subsequent fixups.
+ c. restoring the instruction back when the uprobe is unregistered.
+
+We insert or delete a breakpoint instruction, and this
+breakpoint instruction is assumed to be the smallest instruction
+available on the platform. For fixed size instruction platforms
+this is trivially true, for variable size instruction platforms
+the breakpoint instruction is typically the smallest (often a
+single byte).
+
+Writing the instruction is done by COWing the page and changing
+the instruction during the copy, this even though most platforms
+allow atomic writes of the breakpoint instruction. This also
+mirrors the behaviour of a ptrace() memory write to a PRIVATE
+file map.
+
+The core worker is derived from KSM's replace_page() logic.
+
+In essence, similar to KSM:
+
+ a. allocate a new page and copy over contents of the page that
+    has the uprobed vaddr
+ b. modify the copy and insert the breakpoint at the required
+    address
+ c. switch the original page with the copy containing the
+    breakpoint
+ d. flush page tables.
+
+replace_page() is being replicated here because of some minor
+changes in the type of pages and also because Hugh Dickins had
+plans to improve replace_page() for KSM specific work.
+
+Instruction analysis on x86 is based on instruction decoder and
+determines if an instruction can be probed and determines the
+necessary fixups after singlestep.  Instruction analysis is done
+at probe insertion time so that we avoid having to repeat the
+same analysis every time a probe is hit.
+
+A lot of code here is due to the improvement/suggestions/inputs
+from Peter Zijlstra.
+
+Changelog:
+
+(v10):
+ - Add code to clear REX.B prefix as suggested by Denys Vlasenko
+   and Masami Hiramatsu.
+
+(v9):
+ - Use insn_offset_modrm as suggested by Masami Hiramatsu.
+
+(v7):
+
+ Handle comments from Peter Zijlstra:
+
+ - Dont take reference to inode. (expect inode to uprobe_register to be sane).
+ - Use PTR_ERR to set the return value.
+ - No need to take reference to inode.
+ - use PTR_ERR to return error value.
+ - register and uprobe_unregister share code.
+
+(v5):
+
+ - Modified del_consumer as per comments from Peter.
+ - Drop reference to inode before dropping reference to uprobe.
+ - Use i_size_read(inode) instead of inode->i_size.
+ - Ensure uprobe->consumers is NULL, before __uprobe_unregister() is called.
+ - Includes errno.h as recommended by Stephen Rothwell to fix a build issue
+   on sparc defconfig
+ - Remove restrictions while unregistering.
+ - Earlier code leaked inode references under some conditions while
+   registering/unregistering.
+ - Continue the vma-rmap walk even if the intermediate vma doesnt
+   meet the requirements.
+ - Validate the vma found by find_vma before inserting/removing the
+   breakpoint
+ - Call del_consumer under mutex_lock.
+ - Use hash locks.
+ - Handle mremap.
+ - Introduce find_least_offset_node() instead of close match logic in
+   find_uprobe
+ - Uprobes no more depends on MM_OWNER; No reference to task_structs
+   while inserting/removing a probe.
+ - Uses read_mapping_page instead of grab_cache_page so that the pages
+   have valid content.
+ - pass NULL to get_user_pages for the task parameter.
+ - call SetPageUptodate on the new page allocated in write_opcode.
+ - fix leaking a reference to the new page under certain conditions.
+ - Include Instruction Decoder if Uprobes gets defined.
+ - Remove const attributes for instruction prefix arrays.
+ - Uses mm_context to know if the application is 32 bit.
+
+Signed-off-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+Also-written-by: Jim Keniston <jkenisto@us.ibm.com>
+Reviewed-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Andi Kleen <andi@firstfloor.org>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Roland McGrath <roland@hack.frob.com>
+Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Cc: Arnaldo Carvalho de Melo <acme@infradead.org>
+Cc: Anton Arapov <anton@redhat.com>
+Cc: Ananth N Mavinakayanahalli <ananth@in.ibm.com>
+Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+Cc: Denys Vlasenko <vda.linux@googlemail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Linux-mm <linux-mm@kvack.org>
+Link: http://lkml.kernel.org/r/20120209092642.GE16600@linux.vnet.ibm.com
+[ Made various small edits to the commit log ]
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+

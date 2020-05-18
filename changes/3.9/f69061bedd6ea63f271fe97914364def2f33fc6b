@@ -1,0 +1,71 @@
+drm/i915: create a race-free reset detection
+
+With the previous patch the state transition handling of the reset
+code itself is now (hopefully) race free and solid. But that still
+leaves out everyone else - with the various lock-free wait paths
+we have there's the possibility that the reset happens between the
+point where we read the seqno we should wait on and the actual wait.
+
+And if __wait_seqno then never sees the RESET_IN_PROGRESS state, we'll
+happily wait for a seqno which will in all likelyhood never signal.
+
+In practice this is not a big problem since the X server gets
+constantly interrupted, and can then submit more work (hopefully) to
+unblock everyone else: As soon as a new seqno write lands, all waiters
+will unblock. But running the i-g-t reset testcase ZZ_hangman can
+expose this race, especially on slower hw with fewer cpu cores.
+
+Now looking forward to ARB_robustness and friends that's not the best
+possible behaviour, hence this patch adds a reset_counter to be able
+to detect any reset, even if a given thread never observed the
+in-progress state.
+
+The important part is to correctly order things:
+- The write side needs to increment the counter after any seqno gets
+  reset.  Hence we need to do that at the end of the reset work, and
+  again wake everyone up. We also need to place a barrier in between
+  any possible seqno changes and the counter increment, since any
+  unlock operations only guarantee that nothing leaks out, but not
+  that at later load operation gets moved ahead.
+- On the read side we need to ensure that no reset can sneak in and
+  invalidate the seqno. In all cases we can use the one-sided barrier
+  that unlock operations guarantee (of the lock protecting the
+  respective seqno/ring pair) to ensure correct ordering. Hence it is
+  sufficient to place the atomic read before the mutex/spin_unlock and
+  no additional barriers are required.
+
+The end-result of all this is that we need to wake up everyone twice
+in a reset operation:
+- First, before the reset starts, to get any lockholders of the locks,
+  so that the reset can proceed.
+- Second, after the reset is completed, to allow waiters to properly
+  and reliably detect the reset condition and bail out.
+
+I admit that this entire reset_counter thing smells a bit like
+overkill, but I think it's justified since it makes it really explicit
+what the bail-out condition is. And we need a reset counter anyway to
+implement ARB_robustness, and imo with finer-grained locking on the
+horizont this is the most resilient scheme I could think of.
+
+v2: Drop spurious change in the wait_for_error EXIT_COND - we only
+need to wait until we leave the reset-in-progress wedged state.
+
+v3: Don't play tricks with barriers in the throttle ioctl, the
+spin_unlock is barrier enough.
+
+I've also considered using a little helper to grab the current
+reset_counter, but then decided that hiding the atomic_read isn't a
+great idea, since having it explicitly show up in the code is a nice
+remainder to reviews to check the memory barriers.
+
+v4: Add a comment to explain why we need to fall through in
+__wait_seqno in the end variable assignments.
+
+v5: Review from Damien:
+- s/smb/smp/ in a comment
+- don't increment the reset counter after we've set it to WEDGED. Now
+  we (again) properly wedge the gpu when the reset fails.
+
+Reviewed-by: Damien Lespiau <damien.lespiau@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+

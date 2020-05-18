@@ -1,0 +1,121 @@
+mm: list_lru: fix almost infinite loop causing effective livelock
+
+I've seen a fair number of issues with kswapd and other processes
+appearing to get stuck in v3.12-rc.  Using sysrq-p many times seems to
+indicate that it gets stuck somewhere in list_lru_walk_node(), called
+from prune_icache_sb() and super_cache_scan().
+
+I never seem to be able to trigger a calltrace for functions above that
+point.
+
+So I decided to add the following to super_cache_scan():
+
+    @@ -81,10 +81,14 @@ static unsigned long super_cache_scan(struct shrinker *shrink,
+            inodes = list_lru_count_node(&sb->s_inode_lru, sc->nid);
+            dentries = list_lru_count_node(&sb->s_dentry_lru, sc->nid);
+            total_objects = dentries + inodes + fs_objects + 1;
+    +printk("%s:%u: %s: dentries %lu inodes %lu total %lu\n", current->comm, current->pid, __func__, dentries, inodes, total_objects);
+
+            /* proportion the scan between the caches */
+            dentries = mult_frac(sc->nr_to_scan, dentries, total_objects);
+            inodes = mult_frac(sc->nr_to_scan, inodes, total_objects);
+    +printk("%s:%u: %s: dentries %lu inodes %lu\n", current->comm, current->pid, __func__, dentries, inodes);
+    +BUG_ON(dentries == 0);
+    +BUG_ON(inodes == 0);
+
+            /*
+             * prune the dcache first as the icache is pinned by it, then
+    @@ -99,7 +103,7 @@ static unsigned long super_cache_scan(struct shrinker *shrink,
+                    freed += sb->s_op->free_cached_objects(sb, fs_objects,
+                                                           sc->nid);
+            }
+    -
+    +printk("%s:%u: %s: dentries %lu inodes %lu freed %lu\n", current->comm, current->pid, __func__, dentries, inodes, freed);
+            drop_super(sb);
+            return freed;
+     }
+
+and shortly thereafter, having applied some pressure, I got this:
+
+    update-apt-xapi:1616: super_cache_scan: dentries 25632 inodes 2 total 25635
+    update-apt-xapi:1616: super_cache_scan: dentries 1023 inodes 0
+    ------------[ cut here ]------------
+    Kernel BUG at c0101994 [verbose debug info unavailable]
+    Internal error: Oops - BUG: 0 [#3] SMP ARM
+    Modules linked in: fuse rfcomm bnep bluetooth hid_cypress
+    CPU: 0 PID: 1616 Comm: update-apt-xapi Tainted: G      D      3.12.0-rc7+ #154
+    task: daea1200 ti: c3bf8000 task.ti: c3bf8000
+    PC is at super_cache_scan+0x1c0/0x278
+    LR is at trace_hardirqs_on+0x14/0x18
+    Process update-apt-xapi (pid: 1616, stack limit = 0xc3bf8240)
+    ...
+    Backtrace:
+      (super_cache_scan) from [<c00cd69c>] (shrink_slab+0x254/0x4c8)
+      (shrink_slab) from [<c00d09a0>] (try_to_free_pages+0x3a0/0x5e0)
+      (try_to_free_pages) from [<c00c59cc>] (__alloc_pages_nodemask+0x5)
+      (__alloc_pages_nodemask) from [<c00e07c0>] (__pte_alloc+0x2c/0x13)
+      (__pte_alloc) from [<c00e3a70>] (handle_mm_fault+0x84c/0x914)
+      (handle_mm_fault) from [<c001a4cc>] (do_page_fault+0x1f0/0x3bc)
+      (do_page_fault) from [<c001a7b0>] (do_translation_fault+0xac/0xb8)
+      (do_translation_fault) from [<c000840c>] (do_DataAbort+0x38/0xa0)
+      (do_DataAbort) from [<c00133f8>] (__dabt_usr+0x38/0x40)
+
+Notice that we had a very low number of inodes, which were reduced to
+zero my mult_frac().
+
+Now, prune_icache_sb() calls list_lru_walk_node() passing that number of
+inodes (0) into that as the number of objects to scan:
+
+    long prune_icache_sb(struct super_block *sb, unsigned long nr_to_scan,
+                         int nid)
+    {
+            LIST_HEAD(freeable);
+            long freed;
+
+            freed = list_lru_walk_node(&sb->s_inode_lru, nid, inode_lru_isolate,
+                                           &freeable, &nr_to_scan);
+
+which does:
+
+    unsigned long
+    list_lru_walk_node(struct list_lru *lru, int nid, list_lru_walk_cb isolate,
+                       void *cb_arg, unsigned long *nr_to_walk)
+    {
+
+            struct list_lru_node    *nlru = &lru->node[nid];
+            struct list_head *item, *n;
+            unsigned long isolated = 0;
+
+            spin_lock(&nlru->lock);
+    restart:
+            list_for_each_safe(item, n, &nlru->list) {
+                    enum lru_status ret;
+
+                    /*
+                     * decrement nr_to_walk first so that we don't livelock if we
+                     * get stuck on large numbesr of LRU_RETRY items
+                     */
+                    if (--(*nr_to_walk) == 0)
+                            break;
+
+So, if *nr_to_walk was zero when this function was entered, that means
+we're wanting to operate on (~0UL)+1 objects - which might as well be
+infinite.
+
+Clearly this is not correct behaviour.  If we think about the behaviour
+of this function when *nr_to_walk is 1, then clearly it's wrong - we
+decrement first and then test for zero - which results in us doing
+nothing at all.  A post-decrement would give the desired behaviour -
+we'd try to walk one object and one object only if *nr_to_walk were one.
+
+It also gives the correct behaviour for zero - we exit at this point.
+
+Fixes: 5cedf721a7cd ("list_lru: fix broken LRU_RETRY behaviour")
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+Cc: Dave Chinner <dchinner@redhat.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+[ Modified to make sure we never underflow the count: this function gets
+  called in a loop, so the 0 -> ~0ul transition is dangerous  - Linus ]
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

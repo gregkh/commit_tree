@@ -1,0 +1,99 @@
+sh: Fix error synchronising kernel page tables
+
+The problem is caused by the interaction of two features in the Linux
+memory management code.
+
+A processes address space is described by a struct mm_struct, and
+every thread has a pointer to the mm it should run in. The exception
+to this are kernel threads, which don't have an mm, and so borrow
+the mm from the last thread which ran. The system is bootstrapped
+by the initial kernel thread using init's mm (even though init hasn't
+been created yet, its mm is the static init_mm).
+
+The other feature is how the kernel handles the page table which
+describes the portion of the address space which is only visible when
+executing inside the kernel, and which is shared by all threads. On
+the SH4 the only portion of the kernel's address space which described
+using the page table is called P3, from 0xc0000000 to 0xdfffffff. This
+portion of the address space is divided into three:
+  - mappings for dma_alloc_coherent()
+  - mappings for vmalloc() and ioremap()
+  - fixmap mappings, primarily used in copy_user_pages() to create
+    kernel mappings of user pages with the correct cache colour.
+
+To optimise the TLB miss handler we don't want to add an additional
+condition which checks whether the faulting address is in the user or
+the kernel portion of the address space, and so all page tables have a
+common portion which describes the kernel part of the address
+space. As the SH4 uses a two level page table, only the kernel portion
+of first level page table (the pgd entries) is duplicated. These all
+point to the same second level entries (the pte's), and so no memory
+is wasted.
+
+The reference page table for the kernel is called the swapper_pg_dir,
+and when a new page table is created for a new process the kernel
+portion of the page table is copied from swapper_pg_dir. This works
+fine when changes only occur in the second level of the kernel's page
+table, or the first level entries are created before any new user
+processes. However if a change occurs to the first level of the page
+table, and there are existing processes which don't have this entry in
+their page table, this new entry needs to be added. This is done on
+demand, when the kernel accesses a P3 address which isn't mapped using
+the current page table, the code in vmalloc_fault() copies the entry
+from the reference page table (swapper_pg_dir) into the current
+processes page table.
+
+The bug which this patch addresses is that the code in vmalloc_fault()
+was not copying addresses which fell in the dma_alloc_coherent()
+portion of the address space, and it should have been copying any P3
+address.
+
+Why we hadn't seen this before, and what made this hard to reproduce,
+is that normally the kernel will have called dma_alloc_coherent(), and
+accessed the memory mapping created, before any user process
+runs. Typically drivers such as USB or SATA will have created and used
+mappings of this type during the kernel initialisation, when probing
+for the attached devices, before init runs. Ethernet is slightly
+different, as it normally only creates and accesses
+dma_alloc_coherent() mappings when the network is brought up, but if
+kernel level IP configuration is used this will also occur before any
+user space process runs. So the first reproduction of this problem
+which we saw was occurred when USB and SATA were removed from the
+kernel, and then bring up Ethernet from user space using ifconfig.
+I'd like to thank Joseph Bormolini who did the hard work reducing the
+problem to this simple to reproduce criteria.
+
+In your case the situation is slightly different, and turns out to
+depends on the exact kernel configuration (which we had) and your
+ramdisk contents (which we didn't - hence the need for some assumptions).
+
+In this case the problem is a side effect of kernel level module
+loading. Kernel subsystems sometimes trigger the load of kernel
+modules directly, for example the crypto subsystem tries to load the
+cryptomgr and MTD tries to load modules for Flash partitioning if
+these are not built into the kernel. This is done by the kernel
+creating a user process which runs insmod to try and load the
+appropriate module.
+
+In order for this to cause problems the system must be running with a
+initrd or initramfs, which contains an insmod executable - if the
+kernel can't find an insmod to run, no user process is created, and
+the problem doesn't occur.  If an insmod is found, a process is
+created to run it, which will inherit the kernel portion of the
+swapper_pg_dir first level page table. It doesn't matter whether the
+inmod is successful or not, but when the the kernel scheduler context
+switches back to the kernel initialisation thread, the insmod's mm is
+'borrowed' by the kernel thread, as it doesn't have an address space
+of its own. (Reference counting is used to ensure this mm is not
+destroyed, even though the user process which caused its creation may no
+longer exist.) If this address space doesn't have a first level page
+table entry for the consistent mappings, and a driver tries to access
+such a mapping, we are in the same situation as described above,
+except this time in a kernel thread rather than a user thread
+executing inside the kernel.
+
+See bugzilla: 15425, 15836, 15862, 16106, 16793
+
+Signed-off-by: Stuart Menefy <stuart.menefy@st.com>
+Signed-off-by: Paul Mundt <lethal@linux-sh.org>
+

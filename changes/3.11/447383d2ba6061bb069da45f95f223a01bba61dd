@@ -1,0 +1,48 @@
+NFSD/sunrpc: avoid deadlock on TCP connection due to memory pressure.
+
+Since we enabled auto-tuning for sunrpc TCP connections we do not
+guarantee that there is enough write-space on each connection to
+queue a reply.
+
+If memory pressure causes the window to shrink too small, the request
+throttling in sunrpc/svc will not accept any requests so no more requests
+will be handled.  Even when pressure decreases the window will not
+grow again until data is sent on the connection.
+This means we get a deadlock:  no requests will be handled until there
+is more space, and no space will be allocated until a request is
+handled.
+
+This can be simulated by modifying svc_tcp_has_wspace to inflate the
+number of byte required and removing the 'svc_sock_setbufsize' calls
+in svc_setup_socket.
+
+I found that multiplying by 16 was enough to make the requirement
+exceed the default allocation.  With this modification in place:
+   mount -o vers=3,proto=tcp 127.0.0.1:/home /mnt
+would block and eventually time out because the nfs server could not
+accept any requests.
+
+This patch relaxes the request throttling to always allow at least one
+request through per connection.  It does this by checking both
+  sk_stream_min_wspace() and xprt->xpt_reserved
+are zero.
+The first is zero when the TCP transmit queue is empty.
+The second is zero when there are no RPC requests being processed.
+When both of these are zero the socket is idle and so one more
+request can safely be allowed through.
+
+Applying this patch allows the above mount command to succeed cleanly.
+Tracing shows that the allocated write buffer space quickly grows and
+after a few requests are handled, the extra tests are no longer needed
+to permit further requests to be processed.
+
+The main purpose of request throttling is to handle the case when one
+client is slow at collecting replies and the send queue gets full of
+replies that the client hasn't acknowledged (at the TCP level) yet.
+As we only change behaviour when the send queue is empty this main
+purpose is still preserved.
+
+Reported-by: Ben Myers <bpm@sgi.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+

@@ -1,0 +1,57 @@
+powerpc: Make linux pagetable walk safe with THP enabled
+
+We need to have irqs disabled to handle all the possible parallel update for
+linux page table without holding locks.
+
+Events that we are intersted in while walking page tables are
+1) Page fault
+2) umap
+3) THP split
+4) THP collapse
+
+A) local_irq_disabled:
+------------------------
+1) page fault:
+A none to valid transition via page fault is not an issue because we
+would either see a none or valid. If it is none, we would error out
+the page table walk. We may need to use on stack values when checking for
+type of page table elements, because if we do
+
+if (!is_hugepd()) {
+    if (!pmd_none() {
+       if (pmd_bad() {
+
+We could take that bad condition because the pmd got converted to a hugepd
+after the !is_hugepd check via a hugetlb fault.
+
+The right way would be to check for pmd_none higher up or use on stack value.
+
+2) A valid to none conversion via unmap:
+We can safely walk the upper level table, because we don't remove the the
+page table entries until rcu grace period. So even if we followed a
+wrong pointer we still have the pointer valid till the grace period.
+
+A PTE pointer returned need to be atomically checked for _PAGE_PRESENT and
+ _PAGE_BUSY. A valid pointer returned could becoming none later. To prevent
+pte_clear we take _PAGE_BUSY.
+
+3) THP split:
+A valid transparent hugepage is converted to nomal page. Before we split we
+do pmd_splitting_flush, which sets the hugepage PTE to _PAGE_SPLITTING
+So when walking page table we need to check for pmd_trans_splitting and
+handle that. The pte returned should also need to be checked for
+_PAGE_SPLITTING before setting _PAGE_BUSY similar to _PAGE_PRESENT. We save
+the value of PTE on stack and check for the flag in the local pte value.
+If we don't have the value set we can safely operate on the local pte value
+and we atomicaly set _PAGE_BUSY.
+
+4) THP collapse:
+A normal page gets converted to hugepage. In the collapse path, we
+mark the pmd none early (pmdp_clear_flush). With irq disabled, if we
+are aleady walking page table we would see the pmd_none and won't continue.
+If we see a valid PMD, we should still check for _PAGE_PRESENT before
+setting _PAGE_BUSY, to make sure we didn't collapse the PTE to a Huge PTE.
+
+Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+

@@ -1,0 +1,101 @@
+perf: Prevent race in unthrottling code
+
+The current throttling code triggers WARN below via following
+workload (only hit on AMD machine with 48 CPUs):
+
+  # while [ 1 ]; do perf record perf bench sched messaging; done
+
+  WARNING: at arch/x86/kernel/cpu/perf_event.c:1054 x86_pmu_start+0xc6/0x100()
+  SNIP
+  Call Trace:
+   <IRQ>  [<ffffffff815f62d6>] dump_stack+0x19/0x1b
+   [<ffffffff8105f531>] warn_slowpath_common+0x61/0x80
+   [<ffffffff8105f60a>] warn_slowpath_null+0x1a/0x20
+   [<ffffffff810213a6>] x86_pmu_start+0xc6/0x100
+   [<ffffffff81129dd2>] perf_adjust_freq_unthr_context.part.75+0x182/0x1a0
+   [<ffffffff8112a058>] perf_event_task_tick+0xc8/0xf0
+   [<ffffffff81093221>] scheduler_tick+0xd1/0x140
+   [<ffffffff81070176>] update_process_times+0x66/0x80
+   [<ffffffff810b9565>] tick_sched_handle.isra.15+0x25/0x60
+   [<ffffffff810b95e1>] tick_sched_timer+0x41/0x60
+   [<ffffffff81087c24>] __run_hrtimer+0x74/0x1d0
+   [<ffffffff810b95a0>] ? tick_sched_handle.isra.15+0x60/0x60
+   [<ffffffff81088407>] hrtimer_interrupt+0xf7/0x240
+   [<ffffffff81606829>] smp_apic_timer_interrupt+0x69/0x9c
+   [<ffffffff8160569d>] apic_timer_interrupt+0x6d/0x80
+   <EOI>  [<ffffffff81129f74>] ? __perf_event_task_sched_in+0x184/0x1a0
+   [<ffffffff814dd937>] ? kfree_skbmem+0x37/0x90
+   [<ffffffff815f2c47>] ? __slab_free+0x1ac/0x30f
+   [<ffffffff8118143d>] ? kfree+0xfd/0x130
+   [<ffffffff81181622>] kmem_cache_free+0x1b2/0x1d0
+   [<ffffffff814dd937>] kfree_skbmem+0x37/0x90
+   [<ffffffff814e03c4>] consume_skb+0x34/0x80
+   [<ffffffff8158b057>] unix_stream_recvmsg+0x4e7/0x820
+   [<ffffffff814d5546>] sock_aio_read.part.7+0x116/0x130
+   [<ffffffff8112c10c>] ? __perf_sw_event+0x19c/0x1e0
+   [<ffffffff814d5581>] sock_aio_read+0x21/0x30
+   [<ffffffff8119a5d0>] do_sync_read+0x80/0xb0
+   [<ffffffff8119ac85>] vfs_read+0x145/0x170
+   [<ffffffff8119b699>] SyS_read+0x49/0xa0
+   [<ffffffff810df516>] ? __audit_syscall_exit+0x1f6/0x2a0
+   [<ffffffff81604a19>] system_call_fastpath+0x16/0x1b
+  ---[ end trace 622b7e226c4a766a ]---
+
+The reason is a race in perf_event_task_tick() throttling code.
+The race flow (simplified code):
+
+  - perf_throttled_count is per cpu variable and is
+    CPU throttling flag, here starting with 0
+
+  - perf_throttled_seq is sequence/domain for allowed
+    count of interrupts within the tick, gets increased
+    each tick
+
+    on single CPU (CPU bounded event):
+
+      ... workload
+
+    perf_event_task_tick:
+    |
+    | T0    inc(perf_throttled_seq)
+    | T1    needs_unthr = xchg(perf_throttled_count, 0) == 0
+     tick gets interrupted:
+
+            ... event gets throttled under new seq ...
+
+      T2    last NMI comes, event is throttled - inc(perf_throttled_count)
+
+     back to tick:
+    | perf_adjust_freq_unthr_context:
+    |
+    | T3    unthrottling is skiped for event (needs_unthr == 0)
+    | T4    event is stop and started via freq adjustment
+    |
+    tick ends
+
+      ... workload
+      ... no sample is hit for event ...
+
+    perf_event_task_tick:
+    |
+    | T5    needs_unthr = xchg(perf_throttled_count, 0) != 0 (from T2)
+    | T6    unthrottling is done on event (interrupts == MAX_INTERRUPTS)
+    |       event is already started (from T4) -> WARN
+
+Fixing this by not checking needs_unthr again and thus
+check all events for unthrottling.
+
+Signed-off-by: Jiri Olsa <jolsa@redhat.com>
+Reported-by: Jan Stancek <jstancek@redhat.com>
+Suggested-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Corey Ashford <cjashfor@linux.vnet.ibm.com>
+Cc: Frederic Weisbecker <fweisbec@gmail.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Paul Mackerras <paulus@samba.org>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Andi Kleen <andi@firstfloor.org>
+Cc: Stephane Eranian <eranian@google.com>
+Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1377355554-8934-1-git-send-email-jolsa@redhat.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

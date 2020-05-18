@@ -1,0 +1,83 @@
+mremap: enforce rmap src/dst vma ordering in case of vma_merge() succeeding in copy_vma()
+
+migrate was doing an rmap_walk with speculative lock-less access on
+pagetables.  That could lead it to not serializing properly against mremap
+PT locks.  But a second problem remains in the order of vmas in the
+same_anon_vma list used by the rmap_walk.
+
+If vma_merge succeeds in copy_vma, the src vma could be placed after the
+dst vma in the same_anon_vma list.  That could still lead to migrate
+missing some pte.
+
+This patch adds an anon_vma_moveto_tail() function to force the dst vma at
+the end of the list before mremap starts to solve the problem.
+
+If the mremap is very large and there are a lots of parents or childs
+sharing the anon_vma root lock, this should still scale better than taking
+the anon_vma root lock around every pte copy practically for the whole
+duration of mremap.
+
+Update: Hugh noticed special care is needed in the error path where
+move_page_tables goes in the reverse direction, a second
+anon_vma_moveto_tail() call is needed in the error path.
+
+This program exercises the anon_vma_moveto_tail:
+
+===
+
+int main()
+{
+	static struct timeval oldstamp, newstamp;
+	long diffsec;
+	char *p, *p2, *p3, *p4;
+	if (posix_memalign((void **)&p, 2*1024*1024, SIZE))
+		perror("memalign"), exit(1);
+	if (posix_memalign((void **)&p2, 2*1024*1024, SIZE))
+		perror("memalign"), exit(1);
+	if (posix_memalign((void **)&p3, 2*1024*1024, SIZE))
+		perror("memalign"), exit(1);
+
+	memset(p, 0xff, SIZE);
+	printf("%p\n", p);
+	memset(p2, 0xff, SIZE);
+	memset(p3, 0x77, 4096);
+	if (memcmp(p, p2, SIZE))
+		printf("error\n");
+	p4 = mremap(p+SIZE/2, SIZE/2, SIZE/2, MREMAP_FIXED|MREMAP_MAYMOVE, p3);
+	if (p4 != p3)
+		perror("mremap"), exit(1);
+	p4 = mremap(p4, SIZE/2, SIZE/2, MREMAP_FIXED|MREMAP_MAYMOVE, p+SIZE/2);
+	if (p4 != p+SIZE/2)
+		perror("mremap"), exit(1);
+	if (memcmp(p, p2, SIZE))
+		printf("error\n");
+	printf("ok\n");
+
+	return 0;
+}
+===
+
+$ perf probe -a anon_vma_moveto_tail
+Add new event:
+  probe:anon_vma_moveto_tail (on anon_vma_moveto_tail)
+
+You can now use it on all perf tools, such as:
+
+        perf record -e probe:anon_vma_moveto_tail -aR sleep 1
+
+$ perf record -e probe:anon_vma_moveto_tail -aR ./anon_vma_moveto_tail
+0x7f2ca2800000
+ok
+[ perf record: Woken up 1 times to write data ]
+[ perf record: Captured and wrote 0.043 MB perf.data (~1860 samples) ]
+$ perf report --stdio
+   100.00%  anon_vma_moveto  [kernel.kallsyms]  [k] anon_vma_moveto_tail
+
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Reported-by: Nai Xia <nai.xia@gmail.com>
+Acked-by: Mel Gorman <mgorman@suse.de>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Pawel Sikora <pluto@agmk.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,120 @@
+ARM: fix vmlinux.lds.S discarding sections
+
+We are seeing linker errors caused by sections being discarded, despite
+the linker script trying to keep them.  The result is (eg):
+
+`.exit.text' referenced in section `.alt.smp.init' of drivers/built-in.o: defined in discarded section `.exit.text' of drivers/built-in.o
+`.exit.text' referenced in section `.alt.smp.init' of net/built-in.o: defined in discarded section `.exit.text' of net/built-in.o
+
+This is the relevent part of the linker script (reformatted to make it
+clearer):
+| SECTIONS
+| {
+| /*
+| * unwind exit sections must be discarded before the rest of the
+| * unwind sections get included.
+| */
+| /DISCARD/ : {
+| *(.ARM.exidx.exit.text)
+| *(.ARM.extab.exit.text)
+| }
+| ...
+| .exit.text : {
+| *(.exit.text)
+| *(.memexit.text)
+| }
+| ...
+| /DISCARD/ : {
+| *(.exit.text)
+| *(.memexit.text)
+| *(.exit.data)
+| *(.memexit.data)
+| *(.memexit.rodata)
+| *(.exitcall.exit)
+| *(.discard)
+| *(.discard.*)
+| }
+| }
+
+Now, this is what the linker manual says about discarded output sections:
+
+|    The special output section name `/DISCARD/' may be used to discard
+| input sections.  Any input sections which are assigned to an output
+| section named `/DISCARD/' are not included in the output file.
+
+No questions, no exceptions. It doesn't say "unless they are listed
+before the /DISCARD/ section." Now, this is what asn-generic/vmlinux.lds.S
+says:
+| /*
+|  * Default discarded sections.
+|  *
+|  * Some archs want to discard exit text/data at runtime rather than
+|  * link time due to cross-section references such as alt instructions,
+|  * bug table, eh_frame, etc. DISCARDS must be the last of output
+|  * section definitions so that such archs put those in earlier section
+|  * definitions.
+|  */
+
+And guess what - the list _always_ includes .exit.text etc.
+
+Now, what's actually happening is that the linker is reading the script,
+and it finds the first /DISCARD/ output section at the beginning of the
+script. It continues reading the script, and finds the 'DISCARD' macro
+at the end, which having been postprocessed results in another
+/DISCARD/ output section. As the linker already contains the earlier
+/DISCARD/ output section, it adds it to that existing section, so it
+effectively is placed at the start. This can be seen by using the -M
+option to ld:
+
+| Linker script and memory map
+|
+|                 0xc037c080                jiffies = jiffies_64
+|
+| /DISCARD/
+|  *(.ARM.exidx.exit.text)
+|  *(.ARM.extab.exit.text)
+|  *(.exit.text)
+|  *(.memexit.text)
+|  *(.exit.data)
+|  *(.memexit.data)
+|  *(.memexit.rodata)
+|  *(.exitcall.exit)
+|  *(.discard)
+|  *(.discard.*)
+|
+|                 0xc0008000                . = 0xc0008000
+|
+| .head.text      0xc0008000      0x1d0
+|                 0xc0008000                _text = .
+|  *(.head.text)
+|  .head.text     0xc0008000      0x1d0 arch/arm/kernel/head.o
+|                 0xc0008000                stext
+|
+| .text           0xc0008200   0x2d78d0
+|                 0xc0008200                _stext = .
+|                 0xc0008200                __exception_text_start = .
+|  *(.exception.text)
+|  .exception.text
+| ...
+
+As you can see, all the discarded sections are grouped together - and
+as a result of it being the first output section, they all appear before
+any other section.
+
+The result is that not only is the unwind information discarded (as
+intended), but also the .exit.text, despite us wanting to have the
+.exit.text preserved.
+
+We can't move the unwind information elsewhere, because it'll then be
+included even when we do actually discard the .exit.text (and similar)
+sections.
+
+So, work around this by avoiding the generic DISCARDS macro, and instead
+conditionalize the sections to be discarded ourselves.  This avoids the
+ambiguity in how the linker assigns input sections to output sections,
+making our script less dependent on undocumented linker behaviour.
+
+Reported-by: Rob Herring <robherring2@gmail.com>
+Tested-by: Mark Brown <broonie@opensource.wolfsonmicro.com>
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+

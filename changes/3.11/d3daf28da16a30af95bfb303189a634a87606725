@@ -1,0 +1,64 @@
+cgroup: use percpu refcnt for cgroup_subsys_states
+
+A css (cgroup_subsys_state) is how each cgroup is represented to a
+controller.  As such, it can be used in hot paths across the various
+subsystems different controllers are associated with.
+
+One of the common operations is reference counting, which up until now
+has been implemented using a global atomic counter and can have
+significant adverse impact on scalability.  For example, css refcnt
+can be gotten and put multiple times by blkcg for each IO request.
+For highops configurations which try to do as much per-cpu as
+possible, the global frequent refcnting can be very expensive.
+
+In general, given the various and hugely diverse paths css's end up
+being used from, we need to make it cheap and highly scalable.  In its
+usage, css refcnting isn't very different from module refcnting.
+
+This patch converts css refcnting to use the recently added
+percpu_ref.  css_get/tryget/put() directly maps to the matching
+percpu_ref operations and the deactivation logic is no longer
+necessary as percpu_ref already has refcnt killing.
+
+The only complication is that as the refcnt is per-cpu,
+percpu_ref_kill() in itself doesn't ensure that further tryget
+operations will fail, which we need to guarantee before invoking
+->css_offline()'s.  This is resolved collecting kill confirmation
+using percpu_ref_kill_and_confirm() and initiating the offline phase
+of destruction after all css refcnt's are confirmed to be seen as
+killed on all CPUs.  The previous patches already splitted destruction
+into two phases, so percpu_ref_kill_and_confirm() can be hooked up
+easily.
+
+This patch removes css_refcnt() which is used for rcu dereference
+sanity check in css_id().  While we can add a percpu refcnt API to ask
+the same question, css_id() itself is scheduled to be removed fairly
+soon, so let's not bother with it.  Just drop the sanity check and use
+rcu_dereference_raw() instead.
+
+v2: - init_cgroup_css() was calling percpu_ref_init() without checking
+      the return value.  This causes two problems - the obvious lack
+      of error handling and percpu_ref_init() being called from
+      cgroup_init_subsys() before the allocators are up, which
+      triggers warnings but doesn't cause actual problems as the
+      refcnt isn't used for roots anyway.  Fix both by moving
+      percpu_ref_init() to cgroup_create().
+
+    - The base references were put too early by
+      percpu_ref_kill_and_confirm() and cgroup_offline_fn() put the
+      refs one extra time.  This wasn't noticeable because css's go
+      through another RCU grace period before being freed.  Update
+      cgroup_destroy_locked() to grab an extra reference before
+      killing the refcnts.  This problem was noticed by Kent.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: Kent Overstreet <koverstreet@google.com>
+Acked-by: Li Zefan <lizefan@huawei.com>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Mike Snitzer <snitzer@redhat.com>
+Cc: Vivek Goyal <vgoyal@redhat.com>
+Cc: "Alasdair G. Kergon" <agk@redhat.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Mikulas Patocka <mpatocka@redhat.com>
+Cc: Glauber Costa <glommer@gmail.com>
+

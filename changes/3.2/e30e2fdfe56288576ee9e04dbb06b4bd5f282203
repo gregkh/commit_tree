@@ -1,0 +1,61 @@
+VFS: Fix race between CPU hotplug and lglocks
+
+Currently, the *_global_[un]lock_online() routines are not at all synchronized
+with CPU hotplug. Soft-lockups detected as a consequence of this race was
+reported earlier at https://lkml.org/lkml/2011/8/24/185. (Thanks to Cong Meng
+for finding out that the root-cause of this issue is the race condition
+between br_write_[un]lock() and CPU hotplug, which results in the lock states
+getting messed up).
+
+Fixing this race by just adding {get,put}_online_cpus() at appropriate places
+in *_global_[un]lock_online() is not a good option, because, then suddenly
+br_write_[un]lock() would become blocking, whereas they have been kept as
+non-blocking all this time, and we would want to keep them that way.
+
+So, overall, we want to ensure 3 things:
+1. br_write_lock() and br_write_unlock() must remain as non-blocking.
+2. The corresponding lock and unlock of the per-cpu spinlocks must not happen
+   for different sets of CPUs.
+3. Either prevent any new CPU online operation in between this lock-unlock, or
+   ensure that the newly onlined CPU does not proceed with its corresponding
+   per-cpu spinlock unlocked.
+
+To achieve all this:
+(a) We introduce a new spinlock that is taken by the *_global_lock_online()
+    routine and released by the *_global_unlock_online() routine.
+(b) We register a callback for CPU hotplug notifications, and this callback
+    takes the same spinlock as above.
+(c) We maintain a bitmap which is close to the cpu_online_mask, and once it is
+    initialized in the lock_init() code, all future updates to it are done in
+    the callback, under the above spinlock.
+(d) The above bitmap is used (instead of cpu_online_mask) while locking and
+    unlocking the per-cpu locks.
+
+The callback takes the spinlock upon the CPU_UP_PREPARE event. So, if the
+br_write_lock-unlock sequence is in progress, the callback keeps spinning,
+thus preventing the CPU online operation till the lock-unlock sequence is
+complete. This takes care of requirement (3).
+
+The bitmap that we maintain remains unmodified throughout the lock-unlock
+sequence, since all updates to it are managed by the callback, which takes
+the same spinlock as the one taken by the lock code and released only by the
+unlock routine. Combining this with (d) above, satisfies requirement (2).
+
+Overall, since we use a spinlock (mentioned in (a)) to prevent CPU hotplug
+operations from racing with br_write_lock-unlock, requirement (1) is also
+taken care of.
+
+By the way, it is to be noted that a CPU offline operation can actually run
+in parallel with our lock-unlock sequence, because our callback doesn't react
+to notifications earlier than CPU_DEAD (in order to maintain our bitmap
+properly). And this means, since we use our own bitmap (which is stale, on
+purpose) during the lock-unlock sequence, we could end up unlocking the
+per-cpu lock of an offline CPU (because we had locked it earlier, when the
+CPU was online), in order to satisfy requirement (2). But this is harmless,
+though it looks a bit awkward.
+
+Debugged-by: Cong Meng <mc@linux.vnet.ibm.com>
+Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Cc: stable@vger.kernel.org
+

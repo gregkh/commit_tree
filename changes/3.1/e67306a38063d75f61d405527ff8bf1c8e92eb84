@@ -1,0 +1,69 @@
+IB/qib: Defer HCA error events to tasklet
+
+With ib_qib options:
+
+    options ib_qib krcvqs=1 pcie_caps=0x51 rcvhdrcnt=4096 singleport=1 ibmtu=4
+
+a run of ib_write_bw -a yields the following:
+
+    ------------------------------------------------------------------
+     #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]
+     1048576   5000           2910.64            229.80
+    ------------------------------------------------------------------
+
+The top cpu use in a profile is:
+
+    CPU: Intel Architectural Perfmon, speed 2400.15 MHz (estimated)
+    Counted CPU_CLK_UNHALTED events (Clock cycles when not halted) with a unit mask
+    of 0x00 (No unit mask) count 1002300
+    Counted LLC_MISSES events (Last level cache demand requests from this core that
+    missed the LLC) with a unit mask of 0x41 (No unit mask) count 10000
+    samples  %        samples  %        app name                 symbol name
+    15237    29.2642  964      17.1195  ib_qib.ko                qib_7322intr
+    12320    23.6618  1040     18.4692  ib_qib.ko                handle_7322_errors
+    4106      7.8860  0              0  vmlinux                  vsnprintf
+
+
+Analysis of the stats, profile, the code, and the annotated profile indicate:
+ - All of the overflow interrupts (one per packet overflow) are
+   serviced on CPU0 with no mitigation on the frequency.
+ - All of the receive interrupts are being serviced by CPU0.  (That is
+   the way truescale.cmds statically allocates the kctx IRQs to CPU)
+ - The code is spending all of its time servicing QIB_I_C_ERROR
+   RcvEgrFullErr interrupts on CPU0, starving the packet receive
+   processing.
+ - The decode_err routine is very inefficient, using a printf variant
+   to format a "%s" and continues to loop when the errs mask has been
+   cleared.
+ - Both qib_7322intr and handle_7322_errors read pci registers, which
+   is very inefficient.
+
+The fix does the following:
+ - Adds a tasklet to service QIB_I_C_ERROR
+ - Replaces the very inefficient scnprintf() with a memcpy().  A field
+   is added to qib_hwerror_msgs to save the sizeof("string") at
+   compile time so that a strlen is not needed during err_decode().
+ - The most frequent errors (Overflows) are serviced first to exit the
+   loop as early as possible.
+ - The loop now exits as soon as the errs mask is clear rather than
+   fruitlessly looping through the msp array.
+
+With this fix the performance changes to:
+
+    ------------------------------------------------------------------
+     #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]
+     1048576   5000           2990.64            2941.35
+    ------------------------------------------------------------------
+
+During testing of the error handling overflow patch, it was determined
+that some CPU's were slower when servicing both overflow and receive
+interrupts on CPU0 with different MSI interrupt vectors.
+
+This patch adds an option (krcvq01_no_msi) to not use a dedicated MSI
+interrupt for kctx's < 2 and to service them on the default interrupt.
+For some CPUs, the cost of the interrupt enter/exit is more costly
+than then the additional PCI read in the default handler.
+
+Signed-off-by: Mike Marciniszyn <mike.marciniszyn@qlogic.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+

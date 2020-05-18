@@ -1,0 +1,97 @@
+tipc: remove 'links' list from tipc_bearer struct
+
+In our ongoing effort to simplify the TIPC locking structure,
+we see a need to remove the linked list for tipc_links
+in the bearer. This can be explained as follows.
+
+Currently, we have three different ways to access a link,
+via three different lists/tables:
+
+1: Via a node hash table:
+   Used by the time-critical outgoing/incoming data paths.
+   (e.g. link_send_sections_fast() and tipc_recv_msg() ):
+
+grab net_lock(read)
+   find node from node hash table
+   grab node_lock
+       select link
+       grab bearer_lock
+          send_msg()
+       release bearer_lock
+   release node lock
+release net_lock
+
+2: Via a global linked list for nodes:
+   Used by configuration commands (link_cmd_set_value())
+
+grab net_lock(read)
+   find node and link from global node list (using link name)
+   grab node_lock
+       update link
+   release node lock
+release net_lock
+
+(Same locking order as above. No problem.)
+
+3: Via the bearer's linked link list:
+   Used by notifications from interface (e.g. tipc_disable_bearer() )
+
+grab net_lock(write)
+   grab bearer_lock
+      get link ptr from bearer's link list
+      get node from link
+      grab node_lock
+         delete link
+      release node lock
+   release bearer_lock
+release net_lock
+
+(Different order from above, but works because we grab the
+outer net_lock in write mode first, excluding all other access.)
+
+The first major goal in our simplification effort is to get rid
+of the "big" net_lock, replacing it with rcu-locks when accessing
+the node list and node hash array. This will come in a later patch
+series.
+
+But to get there we first need to rewrite access methods ##2 and 3,
+since removal of net_lock would introduce three major problems:
+
+a) In access method #2, we access the link before taking the
+   protecting node_lock. This will not work once net_lock is gone,
+   so we will have to change the access order. We will deal with
+   this in a later commit in this series, "tipc: add node lock
+   protection to link found by link_find_link()".
+
+b) When the outer protection from net_lock is gone, taking
+   bearer_lock and node_lock in opposite order of method 1) and 2)
+   will become an obvious deadlock hazard. This is fixed in the
+   commit ("tipc: remove bearer_lock from tipc_bearer struct")
+   later in this series.
+
+c) Similar to what is described in problem a), access method #3
+   starts with using a link pointer that is unprotected by node_lock,
+   in order to via that pointer find the correct node struct and
+   lock it. Before we remove net_lock, this access order must be
+   altered. This is what we do with this commit.
+
+We can avoid introducing problem problem c) by even here using the
+global node list to find the node, before accessing its links. When
+we loop though the node list we use the own bearer identity as search
+criteria, thus easily finding the links that are associated to the
+resetting/disabling bearer. It should be noted that although this
+method is somewhat slower than the current list traversal, it is in
+no way time critical. This is only about resetting or deleting links,
+something that must be considered relatively infrequent events.
+
+As a bonus, we can get rid of the mutual pointers between links and
+bearers. After this commit, pointer dependency go in one direction
+only: from the link to the bearer.
+
+This commit pre-empts introduction of problem c) as described above.
+
+Signed-off-by: Ying Xue <ying.xue@windriver.com>
+Reviewed-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

@@ -1,0 +1,96 @@
+mm: try to distribute dirty pages fairly across zones
+
+The maximum number of dirty pages that exist in the system at any time is
+determined by a number of pages considered dirtyable and a user-configured
+percentage of those, or an absolute number in bytes.
+
+This number of dirtyable pages is the sum of memory provided by all the
+zones in the system minus their lowmem reserves and high watermarks, so
+that the system can retain a healthy number of free pages without having
+to reclaim dirty pages.
+
+But there is a flaw in that we have a zoned page allocator which does not
+care about the global state but rather the state of individual memory
+zones.  And right now there is nothing that prevents one zone from filling
+up with dirty pages while other zones are spared, which frequently leads
+to situations where kswapd, in order to restore the watermark of free
+pages, does indeed have to write pages from that zone's LRU list.  This
+can interfere so badly with IO from the flusher threads that major
+filesystems (btrfs, xfs, ext4) mostly ignore write requests from reclaim
+already, taking away the VM's only possibility to keep such a zone
+balanced, aside from hoping the flushers will soon clean pages from that
+zone.
+
+Enter per-zone dirty limits.  They are to a zone's dirtyable memory what
+the global limit is to the global amount of dirtyable memory, and try to
+make sure that no single zone receives more than its fair share of the
+globally allowed dirty pages in the first place.  As the number of pages
+considered dirtyable excludes the zones' lowmem reserves and high
+watermarks, the maximum number of dirty pages in a zone is such that the
+zone can always be balanced without requiring page cleaning.
+
+As this is a placement decision in the page allocator and pages are
+dirtied only after the allocation, this patch allows allocators to pass
+__GFP_WRITE when they know in advance that the page will be written to and
+become dirty soon.  The page allocator will then attempt to allocate from
+the first zone of the zonelist - which on NUMA is determined by the task's
+NUMA memory policy - that has not exceeded its dirty limit.
+
+At first glance, it would appear that the diversion to lower zones can
+increase pressure on them, but this is not the case.  With a full high
+zone, allocations will be diverted to lower zones eventually, so it is
+more of a shift in timing of the lower zone allocations.  Workloads that
+previously could fit their dirty pages completely in the higher zone may
+be forced to allocate from lower zones, but the amount of pages that
+"spill over" are limited themselves by the lower zones' dirty constraints,
+and thus unlikely to become a problem.
+
+For now, the problem of unfair dirty page distribution remains for NUMA
+configurations where the zones allowed for allocation are in sum not big
+enough to trigger the global dirty limits, wake up the flusher threads and
+remedy the situation.  Because of this, an allocation that could not
+succeed on any of the considered zones is allowed to ignore the dirty
+limits before going into direct reclaim or even failing the allocation,
+until a future patch changes the global dirty throttling and flusher
+thread activation so that they take individual zone states into account.
+
+			Test results
+
+15M DMA + 3246M DMA32 + 504 Normal = 3765M memory
+40% dirty ratio
+16G USB thumb drive
+10 runs of dd if=/dev/zero of=disk/zeroes bs=32k count=$((10 << 15))
+
+		seconds			nr_vmscan_write
+		        (stddev)	       min|     median|        max
+xfs
+vanilla:	 549.747( 3.492)	     0.000|      0.000|      0.000
+patched:	 550.996( 3.802)	     0.000|      0.000|      0.000
+
+fuse-ntfs
+vanilla:	1183.094(53.178)	 54349.000|  59341.000|  65163.000
+patched:	 558.049(17.914)	     0.000|      0.000|     43.000
+
+btrfs
+vanilla:	 573.679(14.015)	156657.000| 460178.000| 606926.000
+patched:	 563.365(11.368)	     0.000|      0.000|   1362.000
+
+ext4
+vanilla:	 561.197(15.782)	     0.000|2725438.000|4143837.000
+patched:	 568.806(17.496)	     0.000|      0.000|      0.000
+
+Signed-off-by: Johannes Weiner <jweiner@redhat.com>
+Reviewed-by: Minchan Kim <minchan.kim@gmail.com>
+Acked-by: Mel Gorman <mgorman@suse.de>
+Reviewed-by: Michal Hocko <mhocko@suse.cz>
+Tested-by: Wu Fengguang <fengguang.wu@intel.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Shaohua Li <shaohua.li@intel.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Chris Mason <chris.mason@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

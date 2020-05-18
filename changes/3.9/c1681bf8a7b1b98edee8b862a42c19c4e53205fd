@@ -1,0 +1,50 @@
+loop: prevent bdev freeing while device in use
+
+struct block_device lifecycle is defined by its inode (see fs/block_dev.c) -
+block_device allocated first time we access /dev/loopXX and deallocated on
+bdev_destroy_inode. When we create the device "losetup /dev/loopXX afile"
+we want that block_device stay alive until we destroy the loop device
+with "losetup -d".
+
+But because we do not hold /dev/loopXX inode its counter goes 0, and
+inode/bdev can be destroyed at any moment. Usually it happens at memory
+pressure or when user drops inode cache (like in the test below). When later in
+loop_clr_fd() we want to use bdev we have use-after-free error with following
+stack:
+
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000280
+  bd_set_size+0x10/0xa0
+  loop_clr_fd+0x1f8/0x420 [loop]
+  lo_ioctl+0x200/0x7e0 [loop]
+  lo_compat_ioctl+0x47/0xe0 [loop]
+  compat_blkdev_ioctl+0x341/0x1290
+  do_filp_open+0x42/0xa0
+  compat_sys_ioctl+0xc1/0xf20
+  do_sys_open+0x16e/0x1d0
+  sysenter_dispatch+0x7/0x1a
+
+To prevent use-after-free we need to grab the device in loop_set_fd()
+and put it later in loop_clr_fd().
+
+The issue is reprodusible on current Linus head and v3.3. Here is the test:
+
+  dd if=/dev/zero of=loop.file bs=1M count=1
+  while [ true ]; do
+    losetup /dev/loop0 loop.file
+    echo 2 > /proc/sys/vm/drop_caches
+    losetup -d /dev/loop0
+  done
+
+[ Doing bdgrab/bput in loop_set_fd/loop_clr_fd is safe, because every
+  time we call loop_set_fd() we check that loop_device->lo_state is
+  Lo_unbound and set it to Lo_bound If somebody will try to set_fd again
+  it will get EBUSY.  And if we try to loop_clr_fd() on unbound loop
+  device we'll get ENXIO.
+
+  loop_set_fd/loop_clr_fd (and any other loop ioctl) is called under
+  loop_device->lo_ctl_mutex. ]
+
+Signed-off-by: Anatol Pomozov <anatol.pomozov@gmail.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

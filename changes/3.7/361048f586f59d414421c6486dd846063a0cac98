@@ -1,0 +1,66 @@
+Btrfs: fix full backref problem when inserting shared block reference
+
+If we create several snapshots at the same time, the following BUG_ON() will be
+triggered.
+
+	kernel BUG at fs/btrfs/extent-tree.c:6047!
+
+Steps to reproduce:
+ # mkfs.btrfs <partition>
+ # mount <partition> <mnt>
+ # cd <mnt>
+ # for ((i=0;i<2400;i++)); do touch long_name_to_make_tree_more_deep$i; done
+ # for ((i=0; i<4; i++))
+ > do
+ > mkdir $i
+ > for ((j=0; j<200; j++))
+ > do
+ > btrfs sub snap . $i/$j
+ > done &
+ > done
+
+The reason is:
+Before transaction commit, some operations changed the fs tree and new tree
+blocks were allocated because of COW. We used the implicit non-shared back
+reference for those newly allocated tree blocks because they were not shared by
+two or more trees.
+
+And then we created the first snapshot for the fs tree, according to the back
+reference rules, we also used implicit back refs for the child tree blocks of
+the root node of the fs tree, now those child nodes/leaves were shared by two
+trees.
+
+Then We didn't deal with the delayed references, and continued to change the fs
+tree(created the second snapshot and inserted the dir item of the new snapshot
+into the fs tree). According to the rules of the back reference, we added full
+back refs for those tree blocks whose parents have be shared by two trees.
+Now some newly allocated tree blocks had two types of the references.
+
+As we know, the delayed reference system handles these delayed references from
+back to front, and the full delayed reference is inserted after the implicit
+ones. So when we dealt with the back references of those newly allocated tree
+blocks, the full references was dealt with at first. And if the first reference
+is a shared back reference and the tree block that the reference points to is
+newly allocated, It would be considered as a tree block which is shared by two
+or more trees when it is allocated and should be a full back reference not a
+implicit one, the flag of its reference also should be set to FULL_BACKREF.
+But in fact, it was a non-shared tree block with a implicit reference at
+beginning, so it was not compulsory to set the flags to FULL_BACKREF. So BUG_ON
+was triggered.
+
+We have several methods to fix this bug:
+1. deal with delayed references after the snapshot is created and before we
+   change the source tree of the snapshot. This is the easiest and safest way.
+2. modify the sort method of the delayed reference tree, make the full delayed
+   references be inserted before the implicit ones. It is also very easy, but
+   I don't know if it will introduce some problems or not.
+3. modify select_delayed_ref() and make it select the implicit delayed reference
+   at first. This way is not so good because it may wastes CPU time if we have
+   lots of delayed references.
+4. set the flags to FULL_BACKREF, this method is a little complex comparing with
+   the 1st way.
+
+I chose the 1st way to fix it.
+
+Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+

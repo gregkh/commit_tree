@@ -1,0 +1,92 @@
+ipc,shm: fix shm_file deletion races
+
+When IPC_RMID races with other shm operations there's potential for
+use-after-free of the shm object's associated file (shm_file).
+
+Here's the race before this patch:
+
+  TASK 1                     TASK 2
+  ------                     ------
+  shm_rmid()
+    ipc_lock_object()
+                             shmctl()
+                             shp = shm_obtain_object_check()
+
+    shm_destroy()
+      shum_unlock()
+      fput(shp->shm_file)
+                             ipc_lock_object()
+                             shmem_lock(shp->shm_file)
+                             <OOPS>
+
+The oops is caused because shm_destroy() calls fput() after dropping the
+ipc_lock.  fput() clears the file's f_inode, f_path.dentry, and
+f_path.mnt, which causes various NULL pointer references in task 2.  I
+reliably see the oops in task 2 if with shmlock, shmu
+
+This patch fixes the races by:
+1) set shm_file=NULL in shm_destroy() while holding ipc_object_lock().
+2) modify at risk operations to check shm_file while holding
+   ipc_object_lock().
+
+Example workloads, which each trigger oops...
+
+Workload 1:
+  while true; do
+    id=$(shmget 1 4096)
+    shm_rmid $id &
+    shmlock $id &
+    wait
+  done
+
+  The oops stack shows accessing NULL f_inode due to racing fput:
+    _raw_spin_lock
+    shmem_lock
+    SyS_shmctl
+
+Workload 2:
+  while true; do
+    id=$(shmget 1 4096)
+    shmat $id 4096 &
+    shm_rmid $id &
+    wait
+  done
+
+  The oops stack is similar to workload 1 due to NULL f_inode:
+    touch_atime
+    shmem_mmap
+    shm_mmap
+    mmap_region
+    do_mmap_pgoff
+    do_shmat
+    SyS_shmat
+
+Workload 3:
+  while true; do
+    id=$(shmget 1 4096)
+    shmlock $id
+    shm_rmid $id &
+    shmunlock $id &
+    wait
+  done
+
+  The oops stack shows second fput tripping on an NULL f_inode.  The
+  first fput() completed via from shm_destroy(), but a racing thread did
+  a get_file() and queued this fput():
+    locks_remove_flock
+    __fput
+    ____fput
+    task_work_run
+    do_notify_resume
+    int_signal
+
+Fixes: c2c737a0461e ("ipc,shm: shorten critical region for shmat")
+Fixes: 2caacaa82a51 ("ipc,shm: shorten critical region for shmctl")
+Signed-off-by: Greg Thelen <gthelen@google.com>
+Cc: Davidlohr Bueso <davidlohr@hp.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Manfred Spraul <manfred@colorfullife.com>
+Cc: <stable@vger.kernel.org>  # 3.10.17+ 3.11.6+
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

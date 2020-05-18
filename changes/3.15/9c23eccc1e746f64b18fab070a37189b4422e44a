@@ -1,0 +1,58 @@
+xfs: unmount does not wait for shutdown during unmount
+
+And interesting situation can occur if a log IO error occurs during
+the unmount of a filesystem. The cases reported have the same
+signature - the update of the superblock counters fails due to a log
+write IO error:
+
+XFS (dm-16): xfs_do_force_shutdown(0x2) called from line 1170 of file fs/xfs/xfs_log.c.  Return address = 0xffffffffa08a44a1
+XFS (dm-16): Log I/O Error Detected.  Shutting down filesystem
+XFS (dm-16): Unable to update superblock counters. Freespace may not be correct on next mount.
+XFS (dm-16): xfs_log_force: error 5 returned.
+XFS (¿-¿¿¿): Please umount the filesystem and rectify the problem(s)
+
+It can be seen that the last line of output contains a corrupt
+device name - this is because the log and xfs_mount structures have
+already been freed by the time this message is printed. A kernel
+oops closely follows.
+
+The issue is that the shutdown is occurring in a separate IO
+completion thread to the unmount. Once the shutdown processing has
+started and all the iclogs are marked with XLOG_STATE_IOERROR, the
+log shutdown code wakes anyone waiting on a log force so they can
+process the shutdown error. This wakes up the unmount code that
+is doing a synchronous transaction to update the superblock
+counters.
+
+The unmount path now sees all the iclogs are marked with
+XLOG_STATE_IOERROR and so never waits on them again, knowing that if
+it does, there will not be a wakeup trigger for it and we will hang
+the unmount if we do. Hence the unmount runs through all the
+remaining code and frees all the filesystem structures while the
+xlog_iodone() is still processing the shutdown. When the log
+shutdown processing completes, xfs_do_force_shutdown() emits the
+"Please umount the filesystem and rectify the problem(s)" message,
+and xlog_iodone() then aborts all the objects attached to the iclog.
+An iclog that has already been freed....
+
+The real issue here is that there is no serialisation point between
+the log IO and the unmount. We have serialisations points for log
+writes, log forces, reservations, etc, but we don't actually have
+any code that wakes for log IO to fully complete. We do that for all
+other types of object, so why not iclogbufs?
+
+Well, it turns out that we can easily do this. We've got xfs_buf
+handles, and that's what everyone else uses for IO serialisation.
+i.e. bp->b_sema. So, lets hold iclogbufs locked over IO, and only
+release the lock in xlog_iodone() when we are finished with the
+buffer. That way before we tear down the iclog, we can lock and
+unlock the buffer to ensure IO completion has finished completely
+before we tear it down.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Tested-by: Mike Snitzer <snitzer@redhat.com>
+Tested-by: Bob Mastors <bob.mastors@solidfire.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+

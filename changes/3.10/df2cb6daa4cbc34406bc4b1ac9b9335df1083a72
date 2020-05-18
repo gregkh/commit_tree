@@ -1,0 +1,45 @@
+block: Avoid deadlocks with bio allocation by stacking drivers
+
+Previously, if we ever try to allocate more than once from the same bio
+set while running under generic_make_request() (i.e. a stacking block
+driver), we risk deadlock.
+
+This is because of the code in generic_make_request() that converts
+recursion to iteration; any bios we submit won't actually be submitted
+(so they can complete and eventually be freed) until after we return -
+this means if we allocate a second bio, we're blocking the first one
+from ever being freed.
+
+Thus if enough threads call into a stacking block driver at the same
+time with bios that need multiple splits, and the bio_set's reserve gets
+used up, we deadlock.
+
+This can be worked around in the driver code - we could check if we're
+running under generic_make_request(), then mask out __GFP_WAIT when we
+go to allocate a bio, and if the allocation fails punt to workqueue and
+retry the allocation.
+
+But this is tricky and not a generic solution. This patch solves it for
+all users by inverting the previously described technique. We allocate a
+rescuer workqueue for each bio_set, and then in the allocation code if
+there are bios on current->bio_list we would be blocking, we punt them
+to the rescuer workqueue to be submitted.
+
+This guarantees forward progress for bio allocations under
+generic_make_request() provided each bio is submitted before allocating
+the next, and provided the bios are freed after they complete.
+
+Note that this doesn't do anything for allocation from other mempools.
+Instead of allocating per bio data structures from a mempool, code
+should use bio_set's front_pad.
+
+Tested it by forcing the rescue codepath to be taken (by disabling the
+first GFP_NOWAIT) attempt, and then ran it with bcache (which does a lot
+of arbitrary bio splitting) and verified that the rescuer was being
+invoked.
+
+Signed-off-by: Kent Overstreet <koverstreet@google.com>
+CC: Jens Axboe <axboe@kernel.dk>
+Acked-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: Muthukumar Ratty <muthur@gmail.com>
+

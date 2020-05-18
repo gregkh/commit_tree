@@ -1,0 +1,108 @@
+raid1: Rewrite the implementation of iobarrier.
+
+There is an iobarrier in raid1 because of contention between normal IO and
+resync IO.  It suspends all normal IO when resync/recovery happens.
+
+However if normal IO is out side the resync window, there is no contention.
+So this patch changes the barrier mechanism to only block IO that
+could contend with the resync that is currently happening.
+
+We partition the whole space into five parts.
+|---------|-----------|------------|----------------|-------|
+        start   next_resync   start_next_window    end_window
+
+start + RESYNC_WINDOW = next_resync
+next_resync + NEXT_NORMALIO_DISTANCE = start_next_window
+start_next_window + NEXT_NORMALIO_DISTANCE = end_window
+
+Firstly we introduce some concepts:
+
+1 - RESYNC_WINDOW: For resync, there are 32 resync requests at most at the
+      same time. A sync request is RESYNC_BLOCK_SIZE(64*1024).
+      So the RESYNC_WINDOW is 32 * RESYNC_BLOCK_SIZE, that is 2MB.
+2 - NEXT_NORMALIO_DISTANCE: the distance between next_resync
+      and start_next_window.  It also indicates the distance between
+      start_next_window and end_window.
+      It is currently 3 * RESYNC_WINDOW_SIZE but could be tuned if
+      this turned out not to be optimal.
+3 - next_resync: the next sector at which we will do sync IO.
+4 - start: a position which is at most RESYNC_WINDOW before
+      next_resync.
+5 - start_next_window:  a position which is NEXT_NORMALIO_DISTANCE
+      beyond next_resync.  Normal-io after this position doesn't need to
+      wait for resync-io to complete.
+6 - end_window:  a position which is 2 * NEXT_NORMALIO_DISTANCE beyond
+      next_resync.  This also doesn't need to wait, but is counted
+      differently.
+7 - current_window_requests:  the count of normalIO between
+      start_next_window and end_window.
+8 - next_window_requests: the count of normalIO after end_window.
+
+NormalIO will be partitioned into four types:
+
+NormIO1:  the end sector of bio is smaller or equal the start
+NormIO2:  the start sector of bio larger or equal to end_window
+NormIO3:  the start sector of bio larger or equal to
+          start_next_window.
+NormIO4:  the location between start_next_window and end_window
+
+|--------|-----------|--------------------|----------------|-------------|
+    | start   |   next_resync   |  start_next_window   |  end_window |
+ NormIO1   NormIO4            NormIO4                NormIO3      NormIO2
+
+For NormIO1, we don't need any io barrier.
+For NormIO4, we used a similar approach to the original iobarrier
+    mechanism.  The normalIO and resyncIO must be kept separate.
+For NormIO2/3, we add two fields to struct r1conf: "current_window_requests"
+    and "next_window_requests". They indicate the count of active
+    requests in the two window.
+    For these, we don't wait for resync io to complete.
+
+For resync action, if there are NormIO4s, we must wait for it.
+If not, we can proceed.
+But if resync action reaches start_next_window and
+current_window_requests > 0 (that is there are NormIO3s), we must
+wait until the current_window_requests becomes zero.
+When current_window_requests becomes zero,  start_next_window also
+moves forward. Then current_window_requests will replaced by
+next_window_requests.
+
+There is a problem which when and how to change from NormIO2 to
+NormIO3.  Only then can sync action progress.
+
+We add a field in struct r1conf "start_next_window".
+
+A: if start_next_window == MaxSector, it means there are no NormIO2/3.
+   So start_next_window = next_resync + NEXT_NORMALIO_DISTANCE
+B: if current_window_requests == 0 && next_window_requests != 0, it
+   means start_next_window move to end_window
+
+There is another problem which how to differentiate between
+old NormIO2(now it is NormIO3) and NormIO2.
+For example, there are many bios which are NormIO2 and a bio which is
+NormIO3. NormIO3 firstly completed, so the bios of NormIO2 became NormIO3.
+
+We add a field in struct r1bio "start_next_window".
+This is used to record the position conf->start_next_window when the call
+to wait_barrier() is made in make_request().
+
+In allow_barrier(), we check the conf->start_next_window.
+If r1bio->stat_next_window == conf->start_next_window, it means
+there is no transition between NormIO2 and NormIO3.
+If r1bio->start_next_window != conf->start_next_window, it mean
+there was a transition between NormIO2 and NormIO3.  There can only
+have been one transition.  So it only means the bio is old NormIO2.
+
+For one bio, there may be many r1bio's. So we make sure
+all the r1bio->start_next_window are the same value.
+If we met blocked_dev in make_request(), it must call allow_barrier
+and wait_barrier. So the former and the later value of
+conf->start_next_window will be change.
+If there are many r1bio's with differnet start_next_window,
+for the relevant bio, it depend on the last value of r1bio.
+It will cause error. To avoid this, we must wait for previous r1bios
+to complete.
+
+Signed-off-by: Jianpeng Ma <majianpeng@gmail.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+

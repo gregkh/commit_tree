@@ -1,0 +1,105 @@
+memcg: make oom_lock 0 and 1 based rather than counter
+
+Commit 867578cb ("memcg: fix oom kill behavior") introduced a oom_lock
+counter which is incremented by mem_cgroup_oom_lock when we are about to
+handle memcg OOM situation.  mem_cgroup_handle_oom falls back to a sleep
+if oom_lock > 1 to prevent from multiple oom kills at the same time.
+The counter is then decremented by mem_cgroup_oom_unlock called from the
+same function.
+
+This works correctly but it can lead to serious starvations when we have
+many processes triggering OOM and many CPUs available for them (I have
+tested with 16 CPUs).
+
+Consider a process (call it A) which gets the oom_lock (the first one
+that got to mem_cgroup_handle_oom and grabbed memcg_oom_mutex) and other
+processes that are blocked on the mutex.  While A releases the mutex and
+calls mem_cgroup_out_of_memory others will wake up (one after another)
+and increase the counter and fall into sleep (memcg_oom_waitq).
+
+Once A finishes mem_cgroup_out_of_memory it takes the mutex again and
+decreases oom_lock and wakes other tasks (if releasing memory by
+somebody else - e.g.  killed process - hasn't done it yet).
+
+A testcase would look like:
+  Assume malloc XXX is a program allocating XXX Megabytes of memory
+  which touches all allocated pages in a tight loop
+  # swapoff SWAP_DEVICE
+  # cgcreate -g memory:A
+  # cgset -r memory.oom_control=0   A
+  # cgset -r memory.limit_in_bytes= 200M
+  # for i in `seq 100`
+  # do
+  #     cgexec -g memory:A   malloc 10 &
+  # done
+
+The main problem here is that all processes still race for the mutex and
+there is no guarantee that we will get counter back to 0 for those that
+got back to mem_cgroup_handle_oom.  In the end the whole convoy
+in/decreases the counter but we do not get to 1 that would enable
+killing so nothing useful can be done.  The time is basically unbounded
+because it highly depends on scheduling and ordering on mutex (I have
+seen this taking hours...).
+
+This patch replaces the counter by a simple {un}lock semantic.  As
+mem_cgroup_oom_{un}lock works on the a subtree of a hierarchy we have to
+make sure that nobody else races with us which is guaranteed by the
+memcg_oom_mutex.
+
+We have to be careful while locking subtrees because we can encounter a
+subtree which is already locked: hierarchy:
+
+          A
+        /   \
+       B     \
+      /\      \
+     C  D     E
+
+B - C - D tree might be already locked.  While we want to enable locking
+E subtree because OOM situations cannot influence each other we
+definitely do not want to allow locking A.
+
+Therefore we have to refuse lock if any subtree is already locked and
+clear up the lock for all nodes that have been set up to the failure
+point.
+
+On the other hand we have to make sure that the rest of the world will
+recognize that a group is under OOM even though it doesn't have a lock.
+Therefore we have to introduce under_oom variable which is incremented
+and decremented for the whole subtree when we enter resp.  leave
+mem_cgroup_handle_oom.  under_oom, unlike oom_lock, doesn't need be
+updated under memcg_oom_mutex because its users only check a single
+group and they use atomic operations for that.
+
+This can be checked easily by the following test case:
+
+  # cgcreate -g memory:A
+  # cgset -r memory.use_hierarchy=1 A
+  # cgset -r memory.oom_control=1   A
+  # cgset -r memory.limit_in_bytes= 100M
+  # cgset -r memory.memsw.limit_in_bytes= 100M
+  # cgcreate -g memory:A/B
+  # cgset -r memory.oom_control=1 A/B
+  # cgset -r memory.limit_in_bytes=20M
+  # cgset -r memory.memsw.limit_in_bytes=20M
+  # cgexec -g memory:A/B malloc 30  &    #->this will be blocked by OOM of group B
+  # cgexec -g memory:A   malloc 80  &    #->this will be blocked by OOM of group A
+
+While B gets oom_lock A will not get it.  Both of them go into sleep and
+wait for an external action.  We can make the limit higher for A to
+enforce waking it up
+
+  # cgset -r memory.memsw.limit_in_bytes=300M A
+  # cgset -r memory.limit_in_bytes=300M A
+
+malloc in A has to wake up even though it doesn't have oom_lock.
+
+Finally, the unlock path is very easy because we always unlock only the
+subtree we have locked previously while we always decrement under_oom.
+
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+Signed-off-by: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: Balbir Singh <bsingharora@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

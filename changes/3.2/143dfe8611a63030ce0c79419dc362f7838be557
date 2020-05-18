@@ -1,0 +1,136 @@
+writeback: IO-less balance_dirty_pages()
+
+As proposed by Chris, Dave and Jan, don't start foreground writeback IO
+inside balance_dirty_pages(). Instead, simply let it idle sleep for some
+time to throttle the dirtying task. In the mean while, kick off the
+per-bdi flusher thread to do background writeback IO.
+
+RATIONALS
+=========
+
+- disk seeks on concurrent writeback of multiple inodes (Dave Chinner)
+
+  If every thread doing writes and being throttled start foreground
+  writeback, it leads to N IO submitters from at least N different
+  inodes at the same time, end up with N different sets of IO being
+  issued with potentially zero locality to each other, resulting in
+  much lower elevator sort/merge efficiency and hence we seek the disk
+  all over the place to service the different sets of IO.
+  OTOH, if there is only one submission thread, it doesn't jump between
+  inodes in the same way when congestion clears - it keeps writing to
+  the same inode, resulting in large related chunks of sequential IOs
+  being issued to the disk. This is more efficient than the above
+  foreground writeback because the elevator works better and the disk
+  seeks less.
+
+- lock contention and cache bouncing on concurrent IO submitters (Dave Chinner)
+
+  With this patchset, the fs_mark benchmark on a 12-drive software RAID0 goes
+  from CPU bound to IO bound, freeing "3-4 CPUs worth of spinlock contention".
+
+  * "CPU usage has dropped by ~55%", "it certainly appears that most of
+    the CPU time saving comes from the removal of contention on the
+    inode_wb_list_lock" (IMHO at least 10% comes from the reduction of
+    cacheline bouncing, because the new code is able to call much less
+    frequently into balance_dirty_pages() and hence access the global
+    page states)
+
+  * the user space "App overhead" is reduced by 20%, by avoiding the
+    cacheline pollution by the complex writeback code path
+
+  * "for a ~5% throughput reduction", "the number of write IOs have
+    dropped by ~25%", and the elapsed time reduced from 41:42.17 to
+    40:53.23.
+
+  * On a simple test of 100 dd, it reduces the CPU %system time from 30% to 3%,
+    and improves IO throughput from 38MB/s to 42MB/s.
+
+- IO size too small for fast arrays and too large for slow USB sticks
+
+  The write_chunk used by current balance_dirty_pages() cannot be
+  directly set to some large value (eg. 128MB) for better IO efficiency.
+  Because it could lead to more than 1 second user perceivable stalls.
+  Even the current 4MB write size may be too large for slow USB sticks.
+  The fact that balance_dirty_pages() starts IO on itself couples the
+  IO size to wait time, which makes it hard to do suitable IO size while
+  keeping the wait time under control.
+
+  Now it's possible to increase writeback chunk size proportional to the
+  disk bandwidth. In a simple test of 50 dd's on XFS, 1-HDD, 3GB ram,
+  the larger writeback size dramatically reduces the seek count to 1/10
+  (far beyond my expectation) and improves the write throughput by 24%.
+
+- long block time in balance_dirty_pages() hurts desktop responsiveness
+
+  Many of us may have the experience: it often takes a couple of seconds
+  or even long time to stop a heavy writing dd/cp/tar command with
+  Ctrl-C or "kill -9".
+
+- IO pipeline broken by bumpy write() progress
+
+  There are a broad class of "loop {read(buf); write(buf);}" applications
+  whose read() pipeline will be under-utilized or even come to a stop if
+  the write()s have long latencies _or_ don't progress in a constant rate.
+  The current threshold based throttling inherently transfers the large
+  low level IO completion fluctuations to bumpy application write()s,
+  and further deteriorates with increasing number of dirtiers and/or bdi's.
+
+  For example, when doing 50 dd's + 1 remote rsync to an XFS partition,
+  the rsync progresses very bumpy in legacy kernel, and throughput is
+  improved by 67% by this patchset. (plus the larger write chunk size,
+  it will be 93% speedup).
+
+  The new rate based throttling can support 1000+ dd's with excellent
+  smoothness, low latency and low overheads.
+
+For the above reasons, it's much better to do IO-less and low latency
+pauses in balance_dirty_pages().
+
+Jan Kara, Dave Chinner and me explored the scheme to let
+balance_dirty_pages() wait for enough writeback IO completions to
+safeguard the dirty limit. However it's found to have two problems:
+
+- in large NUMA systems, the per-cpu counters may have big accounting
+  errors, leading to big throttle wait time and jitters.
+
+- NFS may kill large amount of unstable pages with one single COMMIT.
+  Because NFS server serves COMMIT with expensive fsync() IOs, it is
+  desirable to delay and reduce the number of COMMITs. So it's not
+  likely to optimize away such kind of bursty IO completions, and the
+  resulted large (and tiny) stall times in IO completion based throttling.
+
+So here is a pause time oriented approach, which tries to control the
+pause time in each balance_dirty_pages() invocations, by controlling
+the number of pages dirtied before calling balance_dirty_pages(), for
+smooth and efficient dirty throttling:
+
+- avoid useless (eg. zero pause time) balance_dirty_pages() calls
+- avoid too small pause time (less than   4ms, which burns CPU power)
+- avoid too large pause time (more than 200ms, which hurts responsiveness)
+- avoid big fluctuations of pause times
+
+It can control pause times at will. The default policy (in a followup
+patch) will be to do ~10ms pauses in 1-dd case, and increase to ~100ms
+in 1000-dd case.
+
+BEHAVIOR CHANGE
+===============
+
+(1) dirty threshold
+
+Users will notice that the applications will get throttled once crossing
+the global (background + dirty)/2=15% threshold, and then balanced around
+17.5%. Before patch, the behavior is to just throttle it at 20% dirtyable
+memory in 1-dd case.
+
+Since the task will be soft throttled earlier than before, it may be
+perceived by end users as performance "slow down" if his application
+happens to dirty more than 15% dirtyable memory.
+
+(2) smoothness/responsiveness
+
+Users will notice a more responsive system during heavy writeback.
+"killall dd" will take effect instantly.
+
+Signed-off-by: Wu Fengguang <fengguang.wu@intel.com>
+

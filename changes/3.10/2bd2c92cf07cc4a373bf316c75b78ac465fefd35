@@ -1,0 +1,126 @@
+mutex: Queue mutex spinners with MCS lock to reduce cacheline contention
+
+The current mutex spinning code (with MUTEX_SPIN_ON_OWNER option
+turned on) allow multiple tasks to spin on a single mutex
+concurrently. A potential problem with the current approach is
+that when the mutex becomes available, all the spinning tasks
+will try to acquire the mutex more or less simultaneously. As a
+result, there will be a lot of cacheline bouncing especially on
+systems with a large number of CPUs.
+
+This patch tries to reduce this kind of contention by putting
+the mutex spinners into a queue so that only the first one in
+the queue will try to acquire the mutex. This will reduce
+contention and allow all the tasks to move forward faster.
+
+The queuing of mutex spinners is done using an MCS lock based
+implementation which will further reduce contention on the mutex
+cacheline than a similar ticket spinlock based implementation.
+This patch will add a new field into the mutex data structure
+for holding the MCS lock. This expands the mutex size by 8 bytes
+for 64-bit system and 4 bytes for 32-bit system. This overhead
+will be avoid if the MUTEX_SPIN_ON_OWNER option is turned off.
+
+The following table shows the jobs per minute (JPM) scalability
+data on an 8-node 80-core Westmere box with a 3.7.10 kernel. The
+numactl command is used to restrict the running of the fserver
+workloads to 1/2/4/8 nodes with hyperthreading off.
+
++-----------------+-----------+-----------+-------------+----------+
+|  Configuration  | Mean JPM  | Mean JPM  |  Mean JPM   | % Change |
+|                 | w/o patch | patch 1   | patches 1&2 |  1->1&2  |
++-----------------+------------------------------------------------+
+|                 |              User Range 1100 - 2000            |
++-----------------+------------------------------------------------+
+| 8 nodes, HT off |  227972   |  227237   |   305043    |  +34.2%  |
+| 4 nodes, HT off |  393503   |  381558   |   394650    |   +3.4%  |
+| 2 nodes, HT off |  334957   |  325240   |   338853    |   +4.2%  |
+| 1 node , HT off |  198141   |  197972   |   198075    |   +0.1%  |
++-----------------+------------------------------------------------+
+|                 |              User Range 200 - 1000             |
++-----------------+------------------------------------------------+
+| 8 nodes, HT off |  282325   |  312870   |   332185    |   +6.2%  |
+| 4 nodes, HT off |  390698   |  378279   |   393419    |   +4.0%  |
+| 2 nodes, HT off |  336986   |  326543   |   340260    |   +4.2%  |
+| 1 node , HT off |  197588   |  197622   |   197582    |    0.0%  |
++-----------------+-----------+-----------+-------------+----------+
+
+At low user range 10-100, the JPM differences were within +/-1%.
+So they are not that interesting.
+
+The fserver workload uses mutex spinning extensively. With just
+the mutex change in the first patch, there is no noticeable
+change in performance.  Rather, there is a slight drop in
+performance. This mutex spinning patch more than recovers the
+lost performance and show a significant increase of +30% at high
+user load with the full 8 nodes. Similar improvements were also
+seen in a 3.8 kernel.
+
+The table below shows the %time spent by different kernel
+functions as reported by perf when running the fserver workload
+at 1500 users with all 8 nodes.
+
++-----------------------+-----------+---------+-------------+
+|        Function       |  % time   | % time  |   % time    |
+|                       | w/o patch | patch 1 | patches 1&2 |
++-----------------------+-----------+---------+-------------+
+| __read_lock_failed    |  34.96%   | 34.91%  |   29.14%    |
+| __write_lock_failed   |  10.14%   | 10.68%  |    7.51%    |
+| mutex_spin_on_owner   |   3.62%   |  3.42%  |    2.33%    |
+| mspin_lock            |    N/A    |   N/A   |    9.90%    |
+| __mutex_lock_slowpath |   1.46%   |  0.81%  |    0.14%    |
+| _raw_spin_lock        |   2.25%   |  2.50%  |    1.10%    |
++-----------------------+-----------+---------+-------------+
+
+The fserver workload for an 8-node system is dominated by the
+contention in the read/write lock. Mutex contention also plays a
+role. With the first patch only, mutex contention is down (as
+shown by the __mutex_lock_slowpath figure) which help a little
+bit. We saw only a few percents improvement with that.
+
+By applying patch 2 as well, the single mutex_spin_on_owner
+figure is now split out into an additional mspin_lock figure.
+The time increases from 3.42% to 11.23%. It shows a great
+reduction in contention among the spinners leading to a 30%
+improvement. The time ratio 9.9/2.33=4.3 indicates that there
+are on average 4+ spinners waiting in the spin_lock loop for
+each spinner in the mutex_spin_on_owner loop. Contention in
+other locking functions also go down by quite a lot.
+
+The table below shows the performance change of both patches 1 &
+2 over patch 1 alone in other AIM7 workloads (at 8 nodes,
+hyperthreading off).
+
++--------------+---------------+----------------+-----------------+
+|   Workload   | mean % change | mean % change  | mean % change   |
+|              | 10-100 users  | 200-1000 users | 1100-2000 users |
++--------------+---------------+----------------+-----------------+
+| alltests     |      0.0%     |     -0.8%      |     +0.6%       |
+| five_sec     |     -0.3%     |     +0.8%      |     +0.8%       |
+| high_systime |     +0.4%     |     +2.4%      |     +2.1%       |
+| new_fserver  |     +0.1%     |    +14.1%      |    +34.2%       |
+| shared       |     -0.5%     |     -0.3%      |     -0.4%       |
+| short        |     -1.7%     |     -9.8%      |     -8.3%       |
++--------------+---------------+----------------+-----------------+
+
+The short workload is the only one that shows a decline in
+performance probably due to the spinner locking and queuing
+overhead.
+
+Signed-off-by: Waiman Long <Waiman.Long@hp.com>
+Reviewed-by: Davidlohr Bueso <davidlohr.bueso@hp.com>
+Acked-by: Rik van Riel <riel@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Chandramouleeswaran Aswin <aswin@hp.com>
+Cc: Norton Scott J <scott.norton@hp.com>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Dave Jones <davej@redhat.com>
+Cc: Clark Williams <williams@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1366226594-5506-4-git-send-email-Waiman.Long@hp.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

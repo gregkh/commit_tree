@@ -1,0 +1,87 @@
+Btrfs: fix infinite path build loops in incremental send
+
+The send operation processes inodes by their ascending number, and assumes
+that any rename/move operation can be successfully performed (sent to the
+caller) once all previous inodes (those with a smaller inode number than the
+one we're currently processing) were processed.
+
+This is not true when an incremental send had to process an hierarchical change
+between 2 snapshots where the parent-children relationship between directory
+inodes was reversed - that is, parents became children and children became
+parents. This situation made the path building code go into an infinite loop,
+which kept allocating more and more memory that eventually lead to a krealloc
+warning being displayed in dmesg:
+
+  WARNING: CPU: 1 PID: 5705 at mm/page_alloc.c:2477 __alloc_pages_nodemask+0x365/0xad0()
+  Modules linked in: btrfs raid6_pq xor pci_stub vboxpci(O) vboxnetadp(O) vboxnetflt(O) vboxdrv(O) snd_hda_codec_hdmi snd_hda_codec_realtek joydev radeon snd_hda_intel snd_hda_codec snd_hwdep snd_seq_midi snd_pcm psmouse i915 snd_rawmidi serio_raw snd_seq_midi_event lpc_ich snd_seq snd_timer ttm snd_seq_device rfcomm drm_kms_helper parport_pc bnep bluetooth drm ppdev snd soundcore i2c_algo_bit snd_page_alloc binfmt_misc video lp parport r8169 mii hid_generic usbhid hid
+  CPU: 1 PID: 5705 Comm: btrfs Tainted: G           O 3.13.0-rc7-fdm-btrfs-next-18+ #3
+  Hardware name: To Be Filled By O.E.M. To Be Filled By O.E.M./Z77 Pro4, BIOS P1.50 09/04/2012
+  [ 5381.660441]  00000000000009ad ffff8806f6f2f4e8 ffffffff81777434 0000000000000007
+  [ 5381.660447]  0000000000000000 ffff8806f6f2f528 ffffffff8104a9ec ffff8807038f36f0
+  [ 5381.660452]  0000000000000000 0000000000000206 ffff8807038f2490 ffff8807038f36f0
+  [ 5381.660457] Call Trace:
+  [ 5381.660464]  [<ffffffff81777434>] dump_stack+0x4e/0x68
+  [ 5381.660471]  [<ffffffff8104a9ec>] warn_slowpath_common+0x8c/0xc0
+  [ 5381.660476]  [<ffffffff8104aa3a>] warn_slowpath_null+0x1a/0x20
+  [ 5381.660480]  [<ffffffff81144995>] __alloc_pages_nodemask+0x365/0xad0
+  [ 5381.660487]  [<ffffffff8108313f>] ? local_clock+0x4f/0x60
+  [ 5381.660491]  [<ffffffff811430e8>] ? free_one_page+0x98/0x440
+  [ 5381.660495]  [<ffffffff8108313f>] ? local_clock+0x4f/0x60
+  [ 5381.660502]  [<ffffffff8113fae4>] ? __get_free_pages+0x14/0x50
+  [ 5381.660508]  [<ffffffff81095fb8>] ? trace_hardirqs_off_caller+0x28/0xd0
+  [ 5381.660515]  [<ffffffff81183caf>] alloc_pages_current+0x10f/0x1f0
+  [ 5381.660520]  [<ffffffff8113fae4>] ? __get_free_pages+0x14/0x50
+  [ 5381.660524]  [<ffffffff8113fae4>] __get_free_pages+0x14/0x50
+  [ 5381.660530]  [<ffffffff8115dace>] kmalloc_order_trace+0x3e/0x100
+  [ 5381.660536]  [<ffffffff81191ea0>] __kmalloc_track_caller+0x220/0x230
+  [ 5381.660560]  [<ffffffffa0729fdb>] ? fs_path_ensure_buf.part.12+0x6b/0x200 [btrfs]
+  [ 5381.660564]  [<ffffffff8178085c>] ? retint_restore_args+0xe/0xe
+  [ 5381.660569]  [<ffffffff811580ef>] krealloc+0x6f/0xb0
+  [ 5381.660586]  [<ffffffffa0729fdb>] fs_path_ensure_buf.part.12+0x6b/0x200 [btrfs]
+  [ 5381.660601]  [<ffffffffa072a208>] fs_path_prepare_for_add+0x98/0xb0 [btrfs]
+  [ 5381.660615]  [<ffffffffa072a2bc>] fs_path_add_path+0x2c/0x60 [btrfs]
+  [ 5381.660628]  [<ffffffffa072c55c>] get_cur_path+0x7c/0x1c0 [btrfs]
+
+Even without this loop, the incremental send couldn't succeed, because it would attempt
+to send a rename/move operation for the lower inode before the highest inode number was
+renamed/move. This issue is easy to trigger with the following steps:
+
+  $ mkfs.btrfs -f /dev/sdb3
+  $ mount /dev/sdb3 /mnt/btrfs
+  $ mkdir -p /mnt/btrfs/a/b/c/d
+  $ mkdir /mnt/btrfs/a/b/c2
+  $ btrfs subvol snapshot -r /mnt/btrfs /mnt/btrfs/snap1
+  $ mv /mnt/btrfs/a/b/c/d /mnt/btrfs/a/b/c2/d2
+  $ mv /mnt/btrfs/a/b/c /mnt/btrfs/a/b/c2/d2/cc
+  $ btrfs subvol snapshot -r /mnt/btrfs /mnt/btrfs/snap2
+  $ btrfs send -p /mnt/btrfs/snap1 /mnt/btrfs/snap2 > /tmp/incremental.send
+
+The structure of the filesystem when the first snapshot is taken is:
+
+	 .                       (ino 256)
+	 |-- a                   (ino 257)
+	     |-- b               (ino 258)
+	         |-- c           (ino 259)
+	         |   |-- d       (ino 260)
+                 |
+	         |-- c2          (ino 261)
+
+And its structure when the second snapshot is taken is:
+
+	 .                       (ino 256)
+	 |-- a                   (ino 257)
+	     |-- b               (ino 258)
+	         |-- c2          (ino 261)
+	             |-- d2      (ino 260)
+	                 |-- cc  (ino 259)
+
+Before the move/rename operation is performed for the inode 259, the
+move/rename for inode 260 must be performed, since 259 is now a child
+of 260.
+
+A test case for xfstests, with a more complex scenario, will follow soon.
+
+Signed-off-by: Filipe David Borba Manana <fdmanana@gmail.com>
+Signed-off-by: Josef Bacik <jbacik@fb.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

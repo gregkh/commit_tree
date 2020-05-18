@@ -1,0 +1,61 @@
+kernel/audit_tree.c:audit_add_tree_rule(): protect `rule' from kill_rules()
+
+audit_add_tree_rule() must set 'rule->tree = NULL;' firstly, to protect
+the rule itself freed in kill_rules().
+
+The reason is when it is killed, the 'rule' itself may have already
+released, we should not access it.  one example: we add a rule to an
+inode, just at the same time the other task is deleting this inode.
+
+The work flow for adding a rule:
+
+    audit_receive() -> (need audit_cmd_mutex lock)
+      audit_receive_skb() ->
+        audit_receive_msg() ->
+          audit_receive_filter() ->
+            audit_add_rule() ->
+              audit_add_tree_rule() -> (need audit_filter_mutex lock)
+                ...
+                unlock audit_filter_mutex
+                get_tree()
+                ...
+                iterate_mounts() -> (iterate all related inodes)
+                  tag_mount() ->
+                    tag_trunk() ->
+                      create_trunk() -> (assume it is 1st rule)
+                        fsnotify_add_mark() ->
+                          fsnotify_add_inode_mark() ->  (add mark to inode->i_fsnotify_marks)
+                        ...
+                        get_tree(); (each inode will get one)
+                ...
+                lock audit_filter_mutex
+
+The work flow for deleting an inode:
+
+    __destroy_inode() ->
+     fsnotify_inode_delete() ->
+       __fsnotify_inode_delete() ->
+        fsnotify_clear_marks_by_inode() ->  (get mark from inode->i_fsnotify_marks)
+          fsnotify_destroy_mark() ->
+           fsnotify_destroy_mark_locked() ->
+             audit_tree_freeing_mark() ->
+               evict_chunk() ->
+                 ...
+                 tree->goner = 1
+                 ...
+                 kill_rules() ->   (assume current->audit_context == NULL)
+                   call_rcu() ->   (rule->tree != NULL)
+                     audit_free_rule_rcu() ->
+                       audit_free_rule()
+                 ...
+                 audit_schedule_prune() ->  (assume current->audit_context == NULL)
+                   kthread_run() ->    (need audit_cmd_mutex and audit_filter_mutex lock)
+                     prune_one() ->    (delete it from prue_list)
+                       put_tree(); (match the original get_tree above)
+
+Signed-off-by: Chen Gang <gang.chen@asianux.com>
+Cc: Eric Paris <eparis@redhat.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

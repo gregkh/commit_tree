@@ -1,0 +1,129 @@
+powerpc: POWER7 optimised copy_to_user/copy_from_user using VMX
+
+Implement a POWER7 optimised copy_to_user/copy_from_user using VMX.
+For large aligned copies this new loop is over 10% faster, and for
+large unaligned copies it is over 200% faster.
+
+If we take a fault we fall back to the old version, this keeps
+things relatively simple and easy to verify.
+
+On POWER7 unaligned stores rarely slow down - they only flush when
+a store crosses a 4KB page boundary. Furthermore this flush is
+handled completely in hardware and should be 20-30 cycles.
+
+Unaligned loads on the other hand flush much more often - whenever
+crossing a 128 byte cache line, or a 32 byte sector if either sector
+is an L1 miss.
+
+Considering this information we really want to get the loads aligned
+and not worry about the alignment of the stores. Microbenchmarks
+confirm that this approach is much faster than the current unaligned
+copy loop that uses shifts and rotates to ensure both loads and
+stores are aligned.
+
+We also want to try and do the stores in cacheline aligned, cacheline
+sized chunks. If the store queue is unable to merge an entire
+cacheline of stores then the L2 cache will have to do a
+read/modify/write. Even worse, we will serialise this with the stores
+in the next iteration of the copy loop since both iterations hit
+the same cacheline.
+
+Based on this, the new loop does the following things:
+
+1 - 127 bytes
+Get the source 8 byte aligned and use 8 byte loads and stores. Pretty
+boring and similar to how the current loop works.
+
+128 - 4095 bytes
+Get the source 8 byte aligned and use 8 byte loads and stores,
+1 cacheline at a time. We aren't doing the stores in cacheline
+aligned chunks so we will potentially serialise once per cacheline.
+Even so it is much better than the loop we have today.
+
+4096 - bytes
+If both source and destination have the same alignment get them both
+16 byte aligned, then get the destination cacheline aligned. Do
+cacheline sized loads and stores using VMX.
+
+If source and destination do not have the same alignment, we get the
+destination cacheline aligned, and use permute to do aligned loads.
+
+In both cases the VMX loop should be optimal - we always do aligned
+loads and stores and are always doing stores in cacheline aligned,
+cacheline sized chunks.
+
+To be able to use VMX we must be careful about interrupts and
+sleeping. We don't use the VMX loop when in an interrupt (which should
+be rare anyway) and we wrap the VMX loop in disable/enable_pagefault
+and fall back to the existing copy_tofrom_user loop if we do need to
+sleep.
+
+The VMX breakpoint of 4096 bytes was chosen using this microbenchmark:
+
+http://ozlabs.org/~anton/junkcode/copy_to_user.c
+
+Since we are using VMX and there is a cost to saving and restoring
+the user VMX state there are two broad cases we need to benchmark:
+
+- Best case - userspace never uses VMX
+
+- Worst case - userspace always uses VMX
+
+In reality a userspace process will sit somewhere between these two
+extremes. Since we need to test both aligned and unaligned copies we
+end up with 4 combinations. The point at which the VMX loop begins to
+win is:
+
+0% VMX
+aligned		2048 bytes
+unaligned	2048 bytes
+
+100% VMX
+aligned		16384 bytes
+unaligned	8192 bytes
+
+Considering this is a microbenchmark, the data is hot in cache and
+the VMX loop has better store queue merging properties we set the
+breakpoint to 4096 bytes, a little below the unaligned breakpoints.
+
+Some future optimisations we can look at:
+
+- Looking at the perf data, a significant part of the cost when a
+  task is always using VMX is the extra exception we take to restore
+  the VMX state. As such we should do something similar to the x86
+  optimisation that restores FPU state for heavy users. ie:
+
+        /*
+         * If the task has used fpu the last 5 timeslices, just do a full
+         * restore of the math state immediately to avoid the trap; the
+         * chances of needing FPU soon are obviously high now
+         */
+        preload_fpu = tsk_used_math(next_p) && next_p->fpu_counter > 5;
+
+  and
+
+        /*
+         * fpu_counter contains the number of consecutive context switches
+         * that the FPU is used. If this is over a threshold, the lazy fpu
+         * saving becomes unlazy to save the trap. This is an unsigned char
+         * so that after 256 times the counter wraps and the behavior turns
+         * lazy again; this to deal with bursty apps that only use FPU for
+         * a short time
+         */
+
+- We could create a paca bit to mirror the VMX enabled MSR bit and check
+  that first, avoiding multiple calls to calling enable_kernel_altivec.
+  That should help with iovec based system calls like readv.
+
+- We could have two VMX breakpoints, one for when we know the user VMX
+  state is loaded into the registers and one when it isn't. This could
+  be a second bit in the paca so we can calculate the break points quickly.
+
+- One suggestion from Ben was to save and restore the VSX registers
+  we use inline instead of using enable_kernel_altivec.
+
+[BenH: Fixed a problem with preempt and fixed build without CONFIG_ALTIVEC]
+
+Signed-off-by: Anton Blanchard <anton@samba.org>
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+

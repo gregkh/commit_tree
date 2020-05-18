@@ -1,0 +1,52 @@
+HID: usbhid: hid-core: submit queued urbs before suspend
+
+If any userspace program has opened a keyboard device, the input core
+de-activates the keyboard's LEDs upon suspend().  It does this by sending
+individual EV_LED[LED_X]=0 events to the underlying device driver by
+directly calling the driver's registered event() handler.
+
+The usb-hid driver event() handler processes each request by immediately
+attempting to submit a CTRL URB to turn off the LED.  USB URB submission
+is asynchronous.  First the URB is added to the head of the ctrl queue.
+Then, if the CTRL_RUNNING flag is false, the URB is submitted immediately
+(and CTRL_RUNNING is set).  If the CTRL_RUNNING flag was already true,
+then the newly queued URB is submitted in the ctrl completion handler when
+all previously submitted URBs have completed.  When all queued URBs have
+been submitted, the completion handler clears the CTRL_RUNNING flag.
+
+In the 2-LED suspend case, at input suspend(), 2 LED event CTRL URBs get
+queued, with only the first actually submitted.  Soon after input
+suspend() handler finishes, the usb-hid suspend() handler gets called.
+Since this is NOT a PM_EVENT_AUTO suspend, the handler sets
+REPORTED_IDLE, then waits for io to complete.
+
+Unfortunately, this usually happens while the first LED request is
+actually still being processed.  Thus when the completion handler tries
+to submit the second LED request it fails, since REPORTED_IDLE is
+already set!  This REPORTED_IDLE check failure causes the completion
+handler to complete, however without clearing the CTRL_RUNNING flag.
+This, in turn, means that the suspend() handler's wait_io() condition
+is never satisfied, and instead it times out after 10 seconds, aborting
+the original system suspend.
+
+This patch changes the behavior to the following:
+  (1) allow completion handler to finish submitting all queued URBs, even if
+      REPORTED_IDLE is set.  This guarantees that all URBs queued before the
+      hid-core suspend() call will be submitted before the system is
+      suspended.
+  (2) if REPORTED_IDLE is set and the URB queue is empty, queue, but
+      don't submit, new URB submission requests.  These queued requests get
+      submitted when resume() flushes the URB queue. This is similar to the
+      existing behavior, however, any requests that arrive while the queue is
+      not yet empty will still get submitted before suspend.
+  (3) set the RUNNING flag when flushing the URB queue in resume().
+      This keeps URBs that were queued in (2) from colliding with any new
+      URBs that are being submitted during the resume process.  The new URB
+      submission requests upon resume get properly queued behind the ones
+      being flushed instead of the current situation where they collide,
+      causing memory corruption and oopses.
+
+Signed-off-by: Daniel Kurtz <djkurtz@chromium.org>
+Acked-by: Oliver Neukum <oneukum@suse.de>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+

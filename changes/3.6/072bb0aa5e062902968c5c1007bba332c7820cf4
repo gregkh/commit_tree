@@ -1,0 +1,140 @@
+mm: sl[au]b: add knowledge of PFMEMALLOC reserve pages
+
+When a user or administrator requires swap for their application, they
+create a swap partition and file, format it with mkswap and activate it
+with swapon.  Swap over the network is considered as an option in diskless
+systems.  The two likely scenarios are when blade servers are used as part
+of a cluster where the form factor or maintenance costs do not allow the
+use of disks and thin clients.
+
+The Linux Terminal Server Project recommends the use of the Network Block
+Device (NBD) for swap according to the manual at
+https://sourceforge.net/projects/ltsp/files/Docs-Admin-Guide/LTSPManual.pdf/download
+There is also documentation and tutorials on how to setup swap over NBD at
+places like https://help.ubuntu.com/community/UbuntuLTSP/EnableNBDSWAP The
+nbd-client also documents the use of NBD as swap.  Despite this, the fact
+is that a machine using NBD for swap can deadlock within minutes if swap
+is used intensively.  This patch series addresses the problem.
+
+The core issue is that network block devices do not use mempools like
+normal block devices do.  As the host cannot control where they receive
+packets from, they cannot reliably work out in advance how much memory
+they might need.  Some years ago, Peter Zijlstra developed a series of
+patches that supported swap over an NFS that at least one distribution is
+carrying within their kernels.  This patch series borrows very heavily
+from Peter's work to support swapping over NBD as a pre-requisite to
+supporting swap-over-NFS.  The bulk of the complexity is concerned with
+preserving memory that is allocated from the PFMEMALLOC reserves for use
+by the network layer which is needed for both NBD and NFS.
+
+Patch 1 adds knowledge of the PFMEMALLOC reserves to SLAB and SLUB to
+	preserve access to pages allocated under low memory situations
+	to callers that are freeing memory.
+
+Patch 2 optimises the SLUB fast path to avoid pfmemalloc checks
+
+Patch 3 introduces __GFP_MEMALLOC to allow access to the PFMEMALLOC
+	reserves without setting PFMEMALLOC.
+
+Patch 4 opens the possibility for softirqs to use PFMEMALLOC reserves
+	for later use by network packet processing.
+
+Patch 5 only sets page->pfmemalloc when ALLOC_NO_WATERMARKS was required
+
+Patch 6 ignores memory policies when ALLOC_NO_WATERMARKS is set.
+
+Patches 7-12 allows network processing to use PFMEMALLOC reserves when
+	the socket has been marked as being used by the VM to clean pages. If
+	packets are received and stored in pages that were allocated under
+	low-memory situations and are unrelated to the VM, the packets
+	are dropped.
+
+	Patch 11 reintroduces __skb_alloc_page which the networking
+	folk may object to but is needed in some cases to propogate
+	pfmemalloc from a newly allocated page to an skb. If there is a
+	strong objection, this patch can be dropped with the impact being
+	that swap-over-network will be slower in some cases but it should
+	not fail.
+
+Patch 13 is a micro-optimisation to avoid a function call in the
+	common case.
+
+Patch 14 tags NBD sockets as being SOCK_MEMALLOC so they can use
+	PFMEMALLOC if necessary.
+
+Patch 15 notes that it is still possible for the PFMEMALLOC reserve
+	to be depleted. To prevent this, direct reclaimers get throttled on
+	a waitqueue if 50% of the PFMEMALLOC reserves are depleted.  It is
+	expected that kswapd and the direct reclaimers already running
+	will clean enough pages for the low watermark to be reached and
+	the throttled processes are woken up.
+
+Patch 16 adds a statistic to track how often processes get throttled
+
+Some basic performance testing was run using kernel builds, netperf on
+loopback for UDP and TCP, hackbench (pipes and sockets), iozone and
+sysbench.  Each of them were expected to use the sl*b allocators
+reasonably heavily but there did not appear to be significant performance
+variances.
+
+For testing swap-over-NBD, a machine was booted with 2G of RAM with a
+swapfile backed by NBD.  8*NUM_CPU processes were started that create
+anonymous memory mappings and read them linearly in a loop.  The total
+size of the mappings were 4*PHYSICAL_MEMORY to use swap heavily under
+memory pressure.
+
+Without the patches and using SLUB, the machine locks up within minutes
+and runs to completion with them applied.  With SLAB, the story is
+different as an unpatched kernel run to completion.  However, the patched
+kernel completed the test 45% faster.
+
+MICRO
+                                         3.5.0-rc2 3.5.0-rc2
+					 vanilla     swapnbd
+Unrecognised test vmscan-anon-mmap-write
+MMTests Statistics: duration
+Sys Time Running Test (seconds)             197.80    173.07
+User+Sys Time Running Test (seconds)        206.96    182.03
+Total Elapsed Time (seconds)               3240.70   1762.09
+
+This patch: mm: sl[au]b: add knowledge of PFMEMALLOC reserve pages
+
+Allocations of pages below the min watermark run a risk of the machine
+hanging due to a lack of memory.  To prevent this, only callers who have
+PF_MEMALLOC or TIF_MEMDIE set and are not processing an interrupt are
+allowed to allocate with ALLOC_NO_WATERMARKS.  Once they are allocated to
+a slab though, nothing prevents other callers consuming free objects
+within those slabs.  This patch limits access to slab pages that were
+alloced from the PFMEMALLOC reserves.
+
+When this patch is applied, pages allocated from below the low watermark
+are returned with page->pfmemalloc set and it is up to the caller to
+determine how the page should be protected.  SLAB restricts access to any
+page with page->pfmemalloc set to callers which are known to able to
+access the PFMEMALLOC reserve.  If one is not available, an attempt is
+made to allocate a new page rather than use a reserve.  SLUB is a bit more
+relaxed in that it only records if the current per-CPU page was allocated
+from PFMEMALLOC reserve and uses another partial slab if the caller does
+not have the necessary GFP or process flags.  This was found to be
+sufficient in tests to avoid hangs due to SLUB generally maintaining
+smaller lists than SLAB.
+
+In low-memory conditions it does mean that !PFMEMALLOC allocators can fail
+a slab allocation even though free objects are available because they are
+being preserved for callers that are freeing pages.
+
+[a.p.zijlstra@chello.nl: Original implementation]
+[sebastian@breakpoint.cc: Correct order of page flag clearing]
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Cc: David Miller <davem@davemloft.net>
+Cc: Neil Brown <neilb@suse.de>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Mike Christie <michaelc@cs.wisc.edu>
+Cc: Eric B Munson <emunson@mgebm.net>
+Cc: Eric Dumazet <eric.dumazet@gmail.com>
+Cc: Sebastian Andrzej Siewior <sebastian@breakpoint.cc>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Christoph Lameter <cl@linux.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

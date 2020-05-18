@@ -1,0 +1,109 @@
+tcp: refine TSO splits
+
+While investigating performance problems on small RPC workloads,
+I noticed linux TCP stack was always splitting the last TSO skb
+into two parts (skbs). One being a multiple of MSS, and a small one
+with the Push flag. This split is done even if TCP_NODELAY is set,
+or if no small packet is in flight.
+
+Example with request/response of 4K/4K
+
+IP A > B: . ack 68432 win 2783 <nop,nop,timestamp 6524593 6525001>
+IP A > B: . 65537:68433(2896) ack 69632 win 2783 <nop,nop,timestamp 6524593 6525001>
+IP A > B: P 68433:69633(1200) ack 69632 win 2783 <nop,nop,timestamp 6524593 6525001>
+IP B > A: . ack 68433 win 2768 <nop,nop,timestamp 6525001 6524593>
+IP B > A: . 69632:72528(2896) ack 69633 win 2768 <nop,nop,timestamp 6525001 6524593>
+IP B > A: P 72528:73728(1200) ack 69633 win 2768 <nop,nop,timestamp 6525001 6524593>
+IP A > B: . ack 72528 win 2783 <nop,nop,timestamp 6524593 6525001>
+IP A > B: . 69633:72529(2896) ack 73728 win 2783 <nop,nop,timestamp 6524593 6525001>
+IP A > B: P 72529:73729(1200) ack 73728 win 2783 <nop,nop,timestamp 6524593 6525001>
+
+We can avoid this split by including the Nagle tests at the right place.
+
+Note : If some NIC had trouble sending TSO packets with a partial
+last segment, we would have hit the problem in GRO/forwarding workload already.
+
+tcp_minshall_update() is moved to tcp_output.c and is updated as we might
+feed a TSO packet with a partial last segment.
+
+This patch tremendously improves performance, as the traffic now looks
+like :
+
+IP A > B: . ack 98304 win 2783 <nop,nop,timestamp 6834277 6834685>
+IP A > B: P 94209:98305(4096) ack 98304 win 2783 <nop,nop,timestamp 6834277 6834685>
+IP B > A: . ack 98305 win 2768 <nop,nop,timestamp 6834686 6834277>
+IP B > A: P 98304:102400(4096) ack 98305 win 2768 <nop,nop,timestamp 6834686 6834277>
+IP A > B: . ack 102400 win 2783 <nop,nop,timestamp 6834279 6834686>
+IP A > B: P 98305:102401(4096) ack 102400 win 2783 <nop,nop,timestamp 6834279 6834686>
+IP B > A: . ack 102401 win 2768 <nop,nop,timestamp 6834687 6834279>
+IP B > A: P 102400:106496(4096) ack 102401 win 2768 <nop,nop,timestamp 6834687 6834279>
+IP A > B: . ack 106496 win 2783 <nop,nop,timestamp 6834280 6834687>
+IP A > B: P 102401:106497(4096) ack 106496 win 2783 <nop,nop,timestamp 6834280 6834687>
+IP B > A: . ack 106497 win 2768 <nop,nop,timestamp 6834688 6834280>
+IP B > A: P 106496:110592(4096) ack 106497 win 2768 <nop,nop,timestamp 6834688 6834280>
+
+Before :
+
+lpq83:~# nstat >/dev/null;perf stat ./super_netperf 200 -t TCP_RR -H lpq84 -l 20 -- -r 4K,4K
+280774
+
+ Performance counter stats for './super_netperf 200 -t TCP_RR -H lpq84 -l 20 -- -r 4K,4K':
+
+     205719.049006 task-clock                #    9.278 CPUs utilized
+         8,449,968 context-switches          #    0.041 M/sec
+         1,935,997 CPU-migrations            #    0.009 M/sec
+           160,541 page-faults               #    0.780 K/sec
+   548,478,722,290 cycles                    #    2.666 GHz                     [83.20%]
+   455,240,670,857 stalled-cycles-frontend   #   83.00% frontend cycles idle    [83.48%]
+   272,881,454,275 stalled-cycles-backend    #   49.75% backend  cycles idle    [66.73%]
+   166,091,460,030 instructions              #    0.30  insns per cycle
+                                             #    2.74  stalled cycles per insn [83.39%]
+    29,150,229,399 branches                  #  141.699 M/sec                   [83.30%]
+     1,943,814,026 branch-misses             #    6.67% of all branches         [83.32%]
+
+      22.173517844 seconds time elapsed
+
+lpq83:~# nstat | egrep "IpOutRequests|IpExtOutOctets"
+IpOutRequests                   16851063           0.0
+IpExtOutOctets                  23878580777        0.0
+
+After patch :
+
+lpq83:~# nstat >/dev/null;perf stat ./super_netperf 200 -t TCP_RR -H lpq84 -l 20 -- -r 4K,4K
+280877
+
+ Performance counter stats for './super_netperf 200 -t TCP_RR -H lpq84 -l 20 -- -r 4K,4K':
+
+     107496.071918 task-clock                #    4.847 CPUs utilized
+         5,635,458 context-switches          #    0.052 M/sec
+         1,374,707 CPU-migrations            #    0.013 M/sec
+           160,920 page-faults               #    0.001 M/sec
+   281,500,010,924 cycles                    #    2.619 GHz                     [83.28%]
+   228,865,069,307 stalled-cycles-frontend   #   81.30% frontend cycles idle    [83.38%]
+   142,462,742,658 stalled-cycles-backend    #   50.61% backend  cycles idle    [66.81%]
+    95,227,712,566 instructions              #    0.34  insns per cycle
+                                             #    2.40  stalled cycles per insn [83.43%]
+    16,209,868,171 branches                  #  150.795 M/sec                   [83.20%]
+       874,252,952 branch-misses             #    5.39% of all branches         [83.37%]
+
+      22.175821286 seconds time elapsed
+
+lpq83:~# nstat | egrep "IpOutRequests|IpExtOutOctets"
+IpOutRequests                   11239428           0.0
+IpExtOutOctets                  23595191035        0.0
+
+Indeed, the occupancy of tx skbs (IpExtOutOctets/IpOutRequests) is higher :
+2099 instead of 1417, thus helping GRO to be more efficient when using FQ packet
+scheduler.
+
+Many thanks to Neal for review and ideas.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Yuchung Cheng <ycheng@google.com>
+Cc: Neal Cardwell <ncardwell@google.com>
+Cc: Nandita Dukkipati <nanditad@google.com>
+Cc: Van Jacobson <vanj@google.com>
+Acked-by: Neal Cardwell <ncardwell@google.com>
+Tested-by: Neal Cardwell <ncardwell@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

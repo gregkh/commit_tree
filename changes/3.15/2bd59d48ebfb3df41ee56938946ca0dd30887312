@@ -1,0 +1,146 @@
+cgroup: convert to kernfs
+
+cgroup filesystem code was derived from the original sysfs
+implementation which was heavily intertwined with vfs objects and
+locking with the goal of re-using the existing vfs infrastructure.
+That experiment turned out rather disastrous and sysfs switched, a
+long time ago, to distributed filesystem model where a separate
+representation is maintained which is queried by vfs.  Unfortunately,
+cgroup stuck with the failed experiment all these years and
+accumulated even more problems over time.
+
+Locking and object lifetime management being entangled with vfs is
+probably the most egregious.  vfs is never designed to be misused like
+this and cgroup ends up jumping through various convoluted dancing to
+make things work.  Even then, operations across multiple cgroups can't
+be done safely as it'll deadlock with rename locking.
+
+Recently, kernfs is separated out from sysfs so that it can be used by
+users other than sysfs.  This patch converts cgroup to use kernfs,
+which will bring the following benefits.
+
+* Separation from vfs internals.  Locking and object lifetime
+  management is contained in cgroup proper making things a lot
+  simpler.  This removes significant amount of locking convolutions,
+  hairy object lifetime rules and the restriction on multi-cgroup
+  operations.
+
+* Can drop a lot of code to implement filesystem interface as most are
+  provided by kernfs.
+
+* Proper "severing" semantics, which allows controllers to not worry
+  about lingering file accesses after offline.
+
+While the preceding patches did as much as possible to make the
+transition less painful, large part of the conversion has to be one
+discrete step making this patch rather large.  The rest of the commit
+message lists notable changes in different areas.
+
+Overall
+-------
+
+* vfs constructs replaced with kernfs ones.  cgroup->dentry w/ ->kn,
+  cgroupfs_root->sb w/ ->kf_root.
+
+* All dentry accessors are removed.  Helpers to map from kernfs
+  constructs are added.
+
+* All vfs plumbing around dentry, inode and bdi removed.
+
+* cgroup_mount() now directly looks for matching root and then
+  proceeds to create a new one if not found.
+
+Synchronization and object lifetime
+-----------------------------------
+
+* vfs inode locking removed.  Among other things, this removes the
+  need for the convolution in cgroup_cfts_commit().  Future patches
+  will further simplify it.
+
+* vfs refcnting replaced with cgroup internal ones.  cgroup->refcnt,
+  cgroupfs_root->refcnt added.  cgroup_put_root() now directly puts
+  root->refcnt and when it reaches zero proceeds to destroy it thus
+  merging cgroup_put_root() and the former cgroup_kill_sb().
+  Simliarly, cgroup_put() now directly schedules cgroup_free_rcu()
+  when refcnt reaches zero.
+
+* Unlike before, kernfs objects don't hold onto cgroup objects.  When
+  cgroup destroys a kernfs node, all existing operations are drained
+  and the association is broken immediately.  The same for
+  cgroupfs_roots and mounts.
+
+* All operations which come through kernfs guarantee that the
+  associated cgroup is and stays valid for the duration of operation;
+  however, there are two paths which need to find out the associated
+  cgroup from dentry without going through kernfs -
+  css_tryget_from_dir() and cgroupstats_build().  For these two,
+  kernfs_node->priv is RCU managed so that they can dereference it
+  under RCU read lock.
+
+File and directory handling
+---------------------------
+
+* File and directory operations converted to kernfs_ops and
+  kernfs_syscall_ops.
+
+* xattrs is implicitly supported by kernfs.  No need to worry about it
+  from cgroup.  This means that "xattr" mount option is no longer
+  necessary.  A future patch will add a deprecated warning message
+  when sane_behavior.
+
+* When cftype->max_write_len > PAGE_SIZE, it's necessary to make a
+  private copy of one of the kernfs_ops to set its atomic_write_len.
+  cftype->kf_ops is added and cgroup_init/exit_cftypes() are updated
+  to handle it.
+
+* cftype->lockdep_key added so that kernfs lockdep annotation can be
+  per cftype.
+
+* Inidividual file entries and open states are now managed by kernfs.
+  No need to worry about them from cgroup.  cfent, cgroup_open_file
+  and their friends are removed.
+
+* kernfs_nodes are created deactivated and kernfs_activate()
+  invocations added to places where creation of new nodes are
+  committed.
+
+* cgroup_rmdir() uses kernfs_[un]break_active_protection() for
+  self-removal.
+
+v2: - Li pointed out in an earlier patch that specifying "name="
+      during mount without subsystem specification should succeed if
+      there's an existing hierarchy with a matching name although it
+      should fail with -EINVAL if a new hierarchy should be created.
+      Prior to the conversion, this used by handled by deferring
+      failure from NULL return from cgroup_root_from_opts(), which was
+      necessary because root was being created before checking for
+      existing ones.  Note that cgroup_root_from_opts() returned an
+      ERR_PTR() value for error conditions which require immediate
+      mount failure.
+
+      As we now have separate search and creation steps, deferring
+      failure from cgroup_root_from_opts() is no longer necessary.
+      cgroup_root_from_opts() is updated to always return ERR_PTR()
+      value on failure.
+
+    - The logic to match existing roots is updated so that a mount
+      attempt with a matching name but different subsys_mask are
+      rejected.  This was handled by a separate matching loop under
+      the comment "Check for name clashes with existing mounts" but
+      got lost during conversion.  Merge the check into the main
+      search loop.
+
+    - Add __rcu __force casting in RCU_INIT_POINTER() in
+      cgroup_destroy_locked() to avoid the sparse address space
+      warning reported by kbuild test bot.  Maybe we want an explicit
+      interface to use kn->priv as RCU protected pointer?
+
+v3: Make CONFIG_CGROUPS select CONFIG_KERNFS.
+
+v4: Rebased on top of 0ab02ca8f887 ("cgroup: protect modifications to
+    cgroup_idr with cgroup_mutex").
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Acked-by: Li Zefan <lizefan@huawei.com>
+Cc: kbuild test robot fengguang.wu@intel.com>
+

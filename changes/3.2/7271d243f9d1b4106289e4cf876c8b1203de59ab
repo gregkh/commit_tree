@@ -1,0 +1,61 @@
+xfs: don't serialise adjacent concurrent direct IO appending writes
+
+For append write workloads, extending the file requires a certain
+amount of exclusive locking to be done up front to ensure sanity in
+things like ensuring that we've zeroed any allocated regions
+between the old EOF and the start of the new IO.
+
+For single threads, this typically isn't a problem, and for large
+IOs we don't serialise enough for it to be a problem for two
+threads on really fast block devices. However for smaller IO and
+larger thread counts we have a problem.
+
+Take 4 concurrent sequential, single block sized and aligned IOs.
+After the first IO is submitted but before it completes, we end up
+with this state:
+
+        IO 1    IO 2    IO 3    IO 4
+      +-------+-------+-------+-------+
+      ^       ^
+      |       |
+      |       |
+      |       |
+      |       \- ip->i_new_size
+      \- ip->i_size
+
+And the IO is done without exclusive locking because offset <=
+ip->i_size. When we submit IO 2, we see offset > ip->i_size, and
+grab the IO lock exclusive, because there is a chance we need to do
+EOF zeroing. However, there is already an IO in progress that avoids
+the need for IO zeroing because offset <= ip->i_new_size. hence we
+could avoid holding the IO lock exlcusive for this. Hence after
+submission of the second IO, we'd end up this state:
+
+        IO 1    IO 2    IO 3    IO 4
+      +-------+-------+-------+-------+
+      ^               ^
+      |               |
+      |               |
+      |               |
+      |               \- ip->i_new_size
+      \- ip->i_size
+
+There is no need to grab the i_mutex of the IO lock in exclusive
+mode if we don't need to invalidate the page cache. Taking these
+locks on every direct IO effective serialises them as taking the IO
+lock in exclusive mode has to wait for all shared holders to drop
+the lock. That only happens when IO is complete, so effective it
+prevents dispatch of concurrent direct IO writes to the same inode.
+
+And so you can see that for the third concurrent IO, we'd avoid
+exclusive locking for the same reason we avoided the exclusive lock
+for the second IO.
+
+Fixing this is a bit more complex than that, because we need to hold
+a write-submission local value of ip->i_new_size to that clearing
+the value is only done if no other thread has updated it before our
+IO completes.....
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Alex Elder <aelder@sgi.com>
+

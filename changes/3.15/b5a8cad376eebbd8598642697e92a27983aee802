@@ -1,0 +1,97 @@
+thp: close race between split and zap huge pages
+
+Sasha Levin has reported two THP BUGs[1][2].  I believe both of them
+have the same root cause.  Let's look to them one by one.
+
+The first bug[1] is "kernel BUG at mm/huge_memory.c:1829!".  It's
+BUG_ON(mapcount != page_mapcount(page)) in __split_huge_page().  From my
+testing I see that page_mapcount() is higher than mapcount here.
+
+I think it happens due to race between zap_huge_pmd() and
+page_check_address_pmd().  page_check_address_pmd() misses PMD which is
+under zap:
+
+	CPU0						CPU1
+						zap_huge_pmd()
+						  pmdp_get_and_clear()
+__split_huge_page()
+  anon_vma_interval_tree_foreach()
+    __split_huge_page_splitting()
+      page_check_address_pmd()
+        mm_find_pmd()
+	  /*
+	   * We check if PMD present without taking ptl: no
+	   * serialization against zap_huge_pmd(). We miss this PMD,
+	   * it's not accounted to 'mapcount' in __split_huge_page().
+	   */
+	  pmd_present(pmd) == 0
+
+  BUG_ON(mapcount != page_mapcount(page)) // CRASH!!!
+
+						  page_remove_rmap(page)
+						    atomic_add_negative(-1, &page->_mapcount)
+
+The second bug[2] is "kernel BUG at mm/huge_memory.c:1371!".
+It's VM_BUG_ON_PAGE(!PageHead(page), page) in zap_huge_pmd().
+
+This happens in similar way:
+
+	CPU0						CPU1
+						zap_huge_pmd()
+						  pmdp_get_and_clear()
+						  page_remove_rmap(page)
+						    atomic_add_negative(-1, &page->_mapcount)
+__split_huge_page()
+  anon_vma_interval_tree_foreach()
+    __split_huge_page_splitting()
+      page_check_address_pmd()
+        mm_find_pmd()
+	  pmd_present(pmd) == 0	/* The same comment as above */
+  /*
+   * No crash this time since we already decremented page->_mapcount in
+   * zap_huge_pmd().
+   */
+  BUG_ON(mapcount != page_mapcount(page))
+
+  /*
+   * We split the compound page here into small pages without
+   * serialization against zap_huge_pmd()
+   */
+  __split_huge_page_refcount()
+						VM_BUG_ON_PAGE(!PageHead(page), page); // CRASH!!!
+
+So my understanding the problem is pmd_present() check in mm_find_pmd()
+without taking page table lock.
+
+The bug was introduced by me commit with commit 117b0791ac42. Sorry for
+that. :(
+
+Let's open code mm_find_pmd() in page_check_address_pmd() and do the
+check under page table lock.
+
+Note that __page_check_address() does the same for PTE entires
+if sync != 0.
+
+I've stress tested split and zap code paths for 36+ hours by now and
+don't see crashes with the patch applied. Before it took <20 min to
+trigger the first bug and few hours for second one (if we ignore
+first).
+
+[1] https://lkml.kernel.org/g/<53440991.9090001@oracle.com>
+[2] https://lkml.kernel.org/g/<5310C56C.60709@oracle.com>
+
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reported-by: Sasha Levin <sasha.levin@oracle.com>
+Tested-by: Sasha Levin <sasha.levin@oracle.com>
+Cc: Bob Liu <lliubbo@gmail.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Michel Lespinasse <walken@google.com>
+Cc: Dave Jones <davej@redhat.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: <stable@vger.kernel.org>	[3.13+]
+
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

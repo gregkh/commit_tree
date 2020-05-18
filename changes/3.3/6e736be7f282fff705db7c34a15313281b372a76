@@ -1,0 +1,72 @@
+block: make ioc get/put interface more conventional and fix race on alloction
+
+Ignoring copy_io() during fork, io_context can be allocated from two
+places - current_io_context() and set_task_ioprio().  The former is
+always called from local task while the latter can be called from
+different task.  The synchornization between them are peculiar and
+dubious.
+
+* current_io_context() doesn't grab task_lock() and assumes that if it
+  saw %NULL ->io_context, it would stay that way until allocation and
+  assignment is complete.  It has smp_wmb() between alloc/init and
+  assignment.
+
+* set_task_ioprio() grabs task_lock() for assignment and does
+  smp_read_barrier_depends() between "ioc = task->io_context" and "if
+  (ioc)".  Unfortunately, this doesn't achieve anything - the latter
+  is not a dependent load of the former.  ie, if ioc itself were being
+  dereferenced "ioc->xxx", it would mean something (not sure what tho)
+  but as the code currently stands, the dependent read barrier is
+  noop.
+
+As only one of the the two test-assignment sequences is task_lock()
+protected, the task_lock() can't do much about race between the two.
+Nothing prevents current_io_context() and set_task_ioprio() allocating
+its own ioc for the same task and overwriting the other's.
+
+Also, set_task_ioprio() can race with exiting task and create a new
+ioc after exit_io_context() is finished.
+
+ioc get/put doesn't have any reason to be complex.  The only hot path
+is accessing the existing ioc of %current, which is simple to achieve
+given that ->io_context is never destroyed as long as the task is
+alive.  All other paths can happily go through task_lock() like all
+other task sub structures without impacting anything.
+
+This patch updates ioc get/put so that it becomes more conventional.
+
+* alloc_io_context() is replaced with get_task_io_context().  This is
+  the only interface which can acquire access to ioc of another task.
+  On return, the caller has an explicit reference to the object which
+  should be put using put_io_context() afterwards.
+
+* The functionality of current_io_context() remains the same but when
+  creating a new ioc, it shares the code path with
+  get_task_io_context() and always goes through task_lock().
+
+* get_io_context() now means incrementing ref on an ioc which the
+  caller already has access to (be that an explicit refcnt or implicit
+  %current one).
+
+* PF_EXITING inhibits creation of new io_context and once
+  exit_io_context() is finished, it's guaranteed that both ioc
+  acquisition functions return %NULL.
+
+* All users are updated.  Most are trivial but
+  smp_read_barrier_depends() removal from cfq_get_io_context() needs a
+  bit of explanation.  I suppose the original intention was to ensure
+  ioc->ioprio is visible when set_task_ioprio() allocates new
+  io_context and installs it; however, this wouldn't have worked
+  because set_task_ioprio() doesn't have wmb between init and install.
+  There are other problems with this which will be fixed in another
+  patch.
+
+* While at it, use NUMA_NO_NODE instead of -1 for wildcard node
+  specification.
+
+-v2: Vivek spotted contamination from debug patch.  Removed.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

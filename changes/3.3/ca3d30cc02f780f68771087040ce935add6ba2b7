@@ -1,0 +1,196 @@
+x86_64, asm: Optimise fls(), ffs() and fls64()
+
+fls(N), ffs(N) and fls64(N) can be optimised on x86_64.  Currently they use a
+CMOV instruction after the BSR/BSF to set the destination register to -1 if the
+value to be scanned was 0 (in which case BSR/BSF set the Z flag).
+
+Instead, according to the AMD64 specification, we can make use of the fact that
+BSR/BSF doesn't modify its output register if its input is 0.  By preloading
+the output with -1 and incrementing the result, we achieve the desired result
+without the need for a conditional check.
+
+The Intel x86_64 specification, however, says that the result of BSR/BSF in
+such a case is undefined.  That said, when queried, one of the Intel CPU
+architects said that the behaviour on all Intel CPUs is that:
+
+ (1) with BSRQ/BSFQ, the 64-bit destination register is written with its
+     original value if the source is 0, thus, in essence, giving the effect we
+     want.  And,
+
+ (2) with BSRL/BSFL, the lower half of the 64-bit destination register is
+     written with its original value if the source is 0, and the upper half is
+     cleared, thus giving us the effect we want (we return a 4-byte int).
+
+Further, it was indicated that they (Intel) are unlikely to get away with
+changing the behaviour.
+
+It might be possible to optimise the 32-bit versions of these functions, but
+there's a lot more variation, and so the effective non-destructive property of
+BSRL/BSRF cannot be relied on.
+
+[ hpa: specifically, some 486 chips are known to NOT have this property. ]
+
+I have benchmarked these functions on my Core2 Duo test machine using the
+following program:
+
+	#include <stdlib.h>
+	#include <stdio.h>
+
+	#ifndef __x86_64__
+	#error
+	#endif
+
+	#define PAGE_SHIFT 12
+
+	typedef unsigned long long __u64, u64;
+	typedef unsigned int __u32, u32;
+	#define noinline	__attribute__((noinline))
+
+	static __always_inline int fls64(__u64 x)
+	{
+		long bitpos = -1;
+
+		asm("bsrq %1,%0"
+		    : "+r" (bitpos)
+		    : "rm" (x));
+		return bitpos + 1;
+	}
+
+	static inline unsigned long __fls(unsigned long word)
+	{
+		asm("bsr %1,%0"
+		    : "=r" (word)
+		    : "rm" (word));
+		return word;
+	}
+	static __always_inline int old_fls64(__u64 x)
+	{
+		if (x == 0)
+			return 0;
+		return __fls(x) + 1;
+	}
+
+	static noinline // __attribute__((const))
+	int old_get_order(unsigned long size)
+	{
+		int order;
+
+		size = (size - 1) >> (PAGE_SHIFT - 1);
+		order = -1;
+		do {
+			size >>= 1;
+			order++;
+		} while (size);
+		return order;
+	}
+
+	static inline __attribute__((const))
+	int get_order_old_fls64(unsigned long size)
+	{
+		int order;
+		size--;
+		size >>= PAGE_SHIFT;
+		order = old_fls64(size);
+		return order;
+	}
+
+	static inline __attribute__((const))
+	int get_order(unsigned long size)
+	{
+		int order;
+		size--;
+		size >>= PAGE_SHIFT;
+		order = fls64(size);
+		return order;
+	}
+
+	unsigned long prevent_optimise_out;
+
+	static noinline unsigned long test_old_get_order(void)
+	{
+		unsigned long n, total = 0;
+		long rep, loop;
+
+		for (rep = 1000000; rep > 0; rep--) {
+			for (loop = 0; loop <= 16384; loop += 4) {
+				n = 1UL << loop;
+				total += old_get_order(n);
+			}
+		}
+		return total;
+	}
+
+	static noinline unsigned long test_get_order_old_fls64(void)
+	{
+		unsigned long n, total = 0;
+		long rep, loop;
+
+		for (rep = 1000000; rep > 0; rep--) {
+			for (loop = 0; loop <= 16384; loop += 4) {
+				n = 1UL << loop;
+				total += get_order_old_fls64(n);
+			}
+		}
+		return total;
+	}
+
+	static noinline unsigned long test_get_order(void)
+	{
+		unsigned long n, total = 0;
+		long rep, loop;
+
+		for (rep = 1000000; rep > 0; rep--) {
+			for (loop = 0; loop <= 16384; loop += 4) {
+				n = 1UL << loop;
+				total += get_order(n);
+			}
+		}
+		return total;
+	}
+
+	int main(int argc, char **argv)
+	{
+		unsigned long total;
+
+		switch (argc) {
+		case 1:  total = test_old_get_order();		break;
+		case 2:  total = test_get_order_old_fls64();	break;
+		default: total = test_get_order();		break;
+		}
+		prevent_optimise_out = total;
+		return 0;
+	}
+
+This allows me to test the use of the old fls64() implementation and the new
+fls64() implementation and also to contrast these to the out-of-line loop-based
+implementation of get_order().  The results were:
+
+	warthog>time ./get_order
+	real    1m37.191s
+	user    1m36.313s
+	sys     0m0.861s
+	warthog>time ./get_order x
+	real    0m16.892s
+	user    0m16.586s
+	sys     0m0.287s
+	warthog>time ./get_order x x
+	real    0m7.731s
+	user    0m7.727s
+	sys     0m0.002s
+
+Using the current upstream fls64() as a basis for an inlined get_order() [the
+second result above] is much faster than using the current out-of-line
+loop-based get_order() [the first result above].
+
+Using my optimised inline fls64()-based get_order() [the third result above]
+is even faster still.
+
+[ hpa: changed the selection of 32 vs 64 bits to use CONFIG_X86_64
+  instead of comparing BITS_PER_LONG, updated comments, rebased manually
+  on top of 83d99df7c4bf x86, bitops: Move fls64.h inside __KERNEL__ ]
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Link: http://lkml.kernel.org/r/20111213145654.14362.39868.stgit@warthog.procyon.org.uk
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: H. Peter Anvin <hpa@linux.intel.com>
+

@@ -1,0 +1,87 @@
+n_gsm: race between ld close and gsmtty open
+
+ttyA has ld associated to n_gsm, when ttyA is closing, it triggers
+to release gsmttyB's ld data dlci[B], then race would happen if gsmttyB
+is opening in parallel.
+
+Here are race cases we found recently in test:
+
+CASE #1
+====================================================================
+releasing dlci[B] race with gsmtty_install(gsmttyB), then panic
+in gsmtty_open(gsmttyB), as below:
+
+ tty_release(ttyA)                  tty_open(gsmttyB)
+     |                                   |
+   -----                           gsmtty_install(gsmttyB)
+     |                                   |
+   -----                    gsm_dlci_alloc(gsmttyB) => alloc dlci[B]
+ tty_ldisc_release(ttyA)               -----
+     |                                   |
+ gsm_dlci_release(dlci[B])             -----
+     |                                   |
+ gsm_dlci_free(dlci[B])                -----
+     |                                   |
+   -----                           gsmtty_open(gsmttyB)
+
+ gsmtty_open()
+ {
+     struct gsm_dlci *dlci = tty->driver_data; => here it uses dlci[B]
+     ...
+ }
+
+ In gsmtty_open(gsmttyA), it uses dlci[B] which was release, so hit a panic.
+=====================================================================
+
+CASE #2
+=====================================================================
+releasing dlci[0] race with gsmtty_install(gsmttyB), then panic
+in gsmtty_open(), as below:
+
+ tty_release(ttyA)                  tty_open(gsmttyB)
+     |                                   |
+   -----                           gsmtty_install(gsmttyB)
+     |                                   |
+   -----                    gsm_dlci_alloc(gsmttyB) => alloc dlci[B]
+     |                                   |
+   -----                         gsmtty_open(gsmttyB) fail
+     |                                   |
+   -----                           tty_release(gsmttyB)
+     |                                   |
+   -----                           gsmtty_close(gsmttyB)
+     |                                   |
+   -----                        gsmtty_detach_dlci(dlci[B])
+     |                                   |
+   -----                             dlci_put(dlci[B])
+     |                                   |
+ tty_ldisc_release(ttyA)               -----
+     |                                   |
+ gsm_dlci_release(dlci[0])             -----
+     |                                   |
+ gsm_dlci_free(dlci[0])                -----
+     |                                   |
+   -----                             dlci_put(dlci[0])
+
+ In gsmtty_detach_dlci(dlci[B]), it tries to use dlci[0] which was released,
+ then hit panic.
+=====================================================================
+
+IMHO, n_gsm tty operations would refer released ldisc,  as long as
+gsm_dlci_release() has chance to release ldisc data when some gsmtty operations
+are not completed..
+
+This patch is try to avoid it by:
+
+1) in n_gsm driver, use a global gsm spin lock to avoid gsm_dlci_release() run in
+parallel with gsmtty_install();
+
+2) Increase dlci's ref count in gsmtty_install() instead of in gsmtty_open(), the
+purpose is to prevent gsm_dlci_release() releasing dlci after gsmtty_install()
+allocats dlci but before gsmtty_open increases dlci's ref count;
+
+3) Decrease dlci's ref count in gsmtty_remove(), which is a tty framework api, and
+this is the opposite process of step 2).
+
+Signed-off-by: Chao Bi <chao.bi@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

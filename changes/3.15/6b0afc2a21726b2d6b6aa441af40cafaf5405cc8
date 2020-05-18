@@ -1,0 +1,71 @@
+kernfs, sysfs, driver-core: implement kernfs_remove_self() and its wrappers
+
+Sometimes it's necessary to implement a node which wants to delete
+nodes including itself.  This isn't straightforward because of kernfs
+active reference.  While a file operation is in progress, an active
+reference is held and kernfs_remove() waits for all such references to
+drain before completing.  For a self-deleting node, this is a deadlock
+as kernfs_remove() ends up waiting for an active reference that itself
+is sitting on top of.
+
+This currently is worked around in the sysfs layer using
+sysfs_schedule_callback() which makes such removals asynchronous.
+While it works, it's rather cumbersome and inherently breaks
+synchronicity of the operation - the file operation which triggered
+the operation may complete before the removal is finished (or even
+started) and the removal may fail asynchronously.  If a removal
+operation is immmediately followed by another operation which expects
+the specific name to be available (e.g. removal followed by rename
+onto the same name), there's no way to make the latter operation
+reliable.
+
+The thing is there's no inherent reason for this to be asynchrnous.
+All that's necessary to do this synchronous is a dedicated operation
+which drops its own active ref and deactivates self.  This patch
+implements kernfs_remove_self() and its wrappers in sysfs and driver
+core.  kernfs_remove_self() is to be called from one of the file
+operations, drops the active ref the task is holding, removes the self
+node, and restores active ref to the dead node so that the ref is
+balanced afterwards.  __kernfs_remove() is updated so that it takes an
+early exit if the target node is already fully removed so that the
+active ref restored by kernfs_remove_self() after removal doesn't
+confuse the deactivation path.
+
+This makes implementing self-deleting nodes very easy.  The normal
+removal path doesn't even need to be changed to use
+kernfs_remove_self() for the self-deleting node.  The method can
+invoke kernfs_remove_self() on itself before proceeding the normal
+removal path.  kernfs_remove() invoked on the node by the normal
+deletion path will simply be ignored.
+
+This will replace sysfs_schedule_callback().  A subtle feature of
+sysfs_schedule_callback() is that it collapses multiple invocations -
+even if multiple removals are triggered, the removal callback is run
+only once.  An equivalent effect can be achieved by testing the return
+value of kernfs_remove_self() - only the one which gets %true return
+value should proceed with actual deletion.  All other instances of
+kernfs_remove_self() will wait till the enclosing kernfs operation
+which invoked the winning instance of kernfs_remove_self() finishes
+and then return %false.  This trivially makes all users of
+kernfs_remove_self() automatically show correct synchronous behavior
+even when there are multiple concurrent operations - all "echo 1 >
+delete" instances will finish only after the whole operation is
+completed by one of the instances.
+
+Note that manipulation of active ref is implemented in separate public
+functions - kernfs_[un]break_active_protection().
+kernfs_remove_self() is the only user at the moment but this will be
+used to cater to more complex cases.
+
+v2: For !CONFIG_SYSFS, dummy version kernfs_remove_self() was missing
+    and sysfs_remove_file_self() had incorrect return type.  Fix it.
+    Reported by kbuild test bot.
+
+v3: kernfs_[un]break_active_protection() separated out from
+    kernfs_remove_self() and exposed as public API.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Cc: kbuild test robot <fengguang.wu@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

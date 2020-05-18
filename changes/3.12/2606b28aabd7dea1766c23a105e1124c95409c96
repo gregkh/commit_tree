@@ -1,0 +1,67 @@
+USB: Fix breakage in ffs_fs_mount()
+
+	There's a bunch of failure exits in ffs_fs_mount() with
+seriously broken recovery logics.  Most of that appears to stem
+from misunderstanding of the ->kill_sb() semantics; unlike
+->put_super() it is called for *all* superblocks of given type,
+no matter how (in)complete the setup had been.  ->put_super()
+is called only if ->s_root is not NULL; any failure prior to
+setting ->s_root will have the call of ->put_super() skipped.
+->kill_sb(), OTOH, awaits every superblock that has come from
+sget().
+
+Current behaviour of ffs_fs_mount():
+
+We have struct ffs_sb_fill_data data on stack there.  We do
+	ffs_dev = functionfs_acquire_dev_callback(dev_name);
+and store that in data.private_data.  Then we call mount_nodev(),
+passing it ffs_sb_fill() as a callback.  That will either fail
+outright, or manage to call ffs_sb_fill().  There we allocate an
+instance of struct ffs_data, slap the value of ffs_dev (picked
+from data.private_data) into ffs->private_data and overwrite
+data.private_data by storing ffs into an overlapping member
+(data.ffs_data).  Then we store ffs into sb->s_fs_info and attempt
+to set the rest of the things up (root inode, root dentry, then
+create /ep0 there).  Any of those might fail.  Should that
+happen, we get ffs_fs_kill_sb() called before mount_nodev()
+returns.  If mount_nodev() fails for any reason whatsoever,
+we proceed to
+	functionfs_release_dev_callback(data.ffs_data);
+
+That's broken in a lot of ways.  Suppose the thing has failed in
+allocation of e.g. root inode or dentry.  We have
+	functionfs_release_dev_callback(ffs);
+	ffs_data_put(ffs);
+done by ffs_fs_kill_sb() (ffs accessed via sb->s_fs_info), followed by
+	functionfs_release_dev_callback(ffs);
+from ffs_fs_mount() (via data.ffs_data).  Note that the second
+functionfs_release_dev_callback() has every chance to be done to freed memory.
+
+Suppose we fail *before* root inode allocation.  What happens then?
+ffs_fs_kill_sb() doesn't do anything to ffs (it's either not called at all,
+or it doesn't have a pointer to ffs stored in sb->s_fs_info).  And
+	functionfs_release_dev_callback(data.ffs_data);
+is called by ffs_fs_mount(), but here we are in nasal daemon country - we
+are reading from a member of union we'd never stored into.  In practice,
+we'll get what we used to store into the overlapping field, i.e. ffs_dev.
+And then we get screwed, since we treat it (struct gfs_ffs_obj * in
+disguise, returned by functionfs_acquire_dev_callback()) as struct
+ffs_data *, pick what would've been ffs_data ->private_data from it
+(*well* past the actual end of the struct gfs_ffs_obj - struct ffs_data
+is much bigger) and poke in whatever it points to.
+
+FWIW, there's a minor leak on top of all that in case if ffs_sb_fill()
+fails on kstrdup() - ffs is obviously forgotten.
+
+The thing is, there is no point in playing all those games with union.
+Just allocate and initialize ffs_data *before* calling mount_nodev() and
+pass a pointer to it via data.ffs_data.  And once it's stored in
+sb->s_fs_info, clear data.ffs_data, so that ffs_fs_mount() knows that
+it doesn't need to kill the sucker manually - from that point on
+we'll have it done by ->kill_sb().
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Acked-by: Michal Nazarewicz <mina86@mina86.com>
+Cc: stable <stable@vger.kernel.org> # 3.3+
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

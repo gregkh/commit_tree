@@ -1,0 +1,55 @@
+shmem: fix negative rss in memcg memory.stat
+
+When adding the page_private checks before calling shmem_replace_page(), I
+did realize that there is a further race, but thought it too unlikely to
+need a hurried fix.
+
+But independently I've been chasing why a mem cgroup's memory.stat
+sometimes shows negative rss after all tasks have gone: I expected it to
+be a stats gathering bug, but actually it's shmem swapping's fault.
+
+It's an old surprise, that when you lock_page(lookup_swap_cache(swap)),
+the page may have been removed from swapcache before getting the lock; or
+it may have been freed and reused and be back in swapcache; and it can
+even be using the same swap location as before (page_private same).
+
+The swapoff case is already secure against this (swap cannot be reused
+until the whole area has been swapped off, and a new swapped on); and
+shmem_getpage_gfp() is protected by shmem_add_to_page_cache()'s check for
+the expected radix_tree entry - but a little too late.
+
+By that time, we might have already decided to shmem_replace_page(): I
+don't know of a problem from that, but I'd feel more at ease not to do so
+spuriously.  And we have already done mem_cgroup_cache_charge(), on
+perhaps the wrong mem cgroup: and this charge is not then undone on the
+error path, because PageSwapCache ends up preventing that.
+
+It's this last case which causes the occasional negative rss in
+memory.stat: the page is charged here as cache, but (sometimes) found to
+be anon when eventually it's uncharged - and in between, it's an
+undeserved charge on the wrong memcg.
+
+Fix this by adding an earlier check on the radix_tree entry: it's
+inelegant to descend the tree twice, but swapping is not the fast path,
+and a better solution would need a pair (try+commit) of memcg calls, and a
+rework of shmem_replace_page() to keep out of the swapcache.
+
+We can use the added shmem_confirm_swap() function to replace the
+find_get_page+page_cache_release we were already doing on the error path.
+And add a comment on that -EEXIST: it seems a peculiar errno to be using,
+but originates from its use in radix_tree_insert().
+
+[It can be surprising to see positive rss left in a memcg's memory.stat
+after all tasks have gone, since it is supposed to count anonymous but not
+shmem.  Aside from sharing anon pages via fork with a task in some other
+memcg, it often happens after swapping: because a swap page can't be freed
+while under writeback, nor while locked.  So it's not an error, and these
+residual pages are easily freed once pressure demands.]
+
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: Michal Hocko <mhocko@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,35 @@
+Btrfs: fix how we do delalloc reservations and how we free reservations on error
+
+Running xfstests 269 with some tracing my scripts kept spitting out errors about
+releasing bytes that we didn't actually have reserved.  This took me down a huge
+rabbit hole and it turns out the way we deal with reserved_extents is wrong,
+we need to only be setting it if the reservation succeeds, otherwise the free()
+method will come in and unreserve space that isn't actually reserved yet, which
+can lead to other warnings and such.  The math was all working out right in the
+end, but it caused all sorts of other issues in addition to making my scripts
+yell and scream and generally make it impossible for me to track down the
+original issue I was looking for.  The other problem is with our error handling
+in the reservation code.  There are two cases that we need to deal with
+
+1) We raced with free.  In this case free won't free anything because csum_bytes
+is modified before we dro the lock in our reservation path, so free rightly
+doesn't release any space because the reservation code may be depending on that
+reservation.  However if we fail, we need the reservation side to do the free at
+that point since that space is no longer in use.  So as it stands the code was
+doing this fine and it worked out, except in case #2
+
+2) We don't race with free.  Nobody comes in and changes anything, and our
+reservation fails.  In this case we didn't reserve anything anyway and we just
+need to clean up csum_bytes but not free anything.  So we keep track of
+csum_bytes before we drop the lock and if it hasn't changed we know we can just
+decrement csum_bytes and carry on.
+
+Because of the case where we can race with free()'s since we have to drop our
+spin_lock to do the reservation, I'm going to serialize all reservations with
+the i_mutex.  We already get this for free in the heavy use paths, truncate and
+file write all hold the i_mutex, just needed to add it to page_mkwrite and
+various ioctl/balance things.  With this patch my space leak scripts no longer
+scream bloody murder.  Thanks,
+
+Signed-off-by: Josef Bacik <josef@redhat.com>
+

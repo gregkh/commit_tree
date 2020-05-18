@@ -1,0 +1,46 @@
+svcrpc: avoid memory-corruption on pool shutdown
+
+Socket callbacks use svc_xprt_enqueue() to add an xprt to a
+pool->sp_sockets list.  In normal operation a server thread will later
+come along and take the xprt off that list.  On shutdown, after all the
+threads have exited, we instead manually walk the sv_tempsocks and
+sv_permsocks lists to find all the xprt's and delete them.
+
+So the sp_sockets lists don't really matter any more.  As a result,
+we've mostly just ignored them and hoped they would go away.
+
+Which has gotten us into trouble; witness for example ebc63e531cc6
+"svcrpc: fix list-corrupting race on nfsd shutdown", the result of Ben
+Greear noticing that a still-running svc_xprt_enqueue() could re-add an
+xprt to an sp_sockets list just before it was deleted.  The fix was to
+remove it from the list at the end of svc_delete_xprt().  But that only
+made corruption less likely--I can see nothing that prevents a
+svc_xprt_enqueue() from adding another xprt to the list at the same
+moment that we're removing this xprt from the list.  In fact, despite
+the earlier xpo_detach(), I don't even see what guarantees that
+svc_xprt_enqueue() couldn't still be running on this xprt.
+
+So, instead, note that svc_xprt_enqueue() essentially does:
+	lock sp_lock
+		if XPT_BUSY unset
+			add to sp_sockets
+	unlock sp_lock
+
+So, if we do:
+
+	set XPT_BUSY on every xprt.
+	Empty every sp_sockets list, under the sp_socks locks.
+
+Then we're left knowing that the sp_sockets lists are all empty and will
+stay that way, since any svc_xprt_enqueue() will check XPT_BUSY under
+the sp_lock and see it set.
+
+And *then* we can continue deleting the xprt's.
+
+(Thanks to Jeff Layton for being correctly suspicious of this code....)
+
+Cc: Ben Greear <greearb@candelatech.com>
+Cc: Jeff Layton <jlayton@redhat.com>
+Cc: stable@kernel.org
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+

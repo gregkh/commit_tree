@@ -1,0 +1,67 @@
+block, cfq: unlink cfq_io_context's immediately
+
+cic is association between io_context and request_queue.  A cic is
+linked from both ioc and q and should be destroyed when either one
+goes away.  As ioc and q both have their own locks, locking becomes a
+bit complex - both orders work for removal from one but not from the
+other.
+
+Currently, cfq tries to circumvent this locking order issue with RCU.
+ioc->lock nests inside queue_lock but the radix tree and cic's are
+also protected by RCU allowing either side to walk their lists without
+grabbing lock.
+
+This rather unconventional use of RCU quickly devolves into extremely
+fragile convolution.  e.g. The following is from cfqd going away too
+soon after ioc and q exits raced.
+
+ general protection fault: 0000 [#1] PREEMPT SMP
+ CPU 2
+ Modules linked in:
+ [   88.503444]
+ Pid: 599, comm: hexdump Not tainted 3.1.0-rc10-work+ #158 Bochs Bochs
+ RIP: 0010:[<ffffffff81397628>]  [<ffffffff81397628>] cfq_exit_single_io_context+0x58/0xf0
+ ...
+ Call Trace:
+  [<ffffffff81395a4a>] call_for_each_cic+0x5a/0x90
+  [<ffffffff81395ab5>] cfq_exit_io_context+0x15/0x20
+  [<ffffffff81389130>] exit_io_context+0x100/0x140
+  [<ffffffff81098a29>] do_exit+0x579/0x850
+  [<ffffffff81098d5b>] do_group_exit+0x5b/0xd0
+  [<ffffffff81098de7>] sys_exit_group+0x17/0x20
+  [<ffffffff81b02f2b>] system_call_fastpath+0x16/0x1b
+
+The only real hot path here is cic lookup during request
+initialization and avoiding extra locking requires very confined use
+of RCU.  This patch makes cic removal from both ioc and request_queue
+perform double-locking and unlink immediately.
+
+* From q side, the change is almost trivial as ioc->lock nests inside
+  queue_lock.  It just needs to grab each ioc->lock as it walks
+  cic_list and unlink it.
+
+* From ioc side, it's a bit more difficult because of inversed lock
+  order.  ioc needs its lock to walk its cic_list but can't grab the
+  matching queue_lock and needs to perform unlock-relock dancing.
+
+  Unlinking is now wholly done from put_io_context() and fast path is
+  optimized by using the queue_lock the caller already holds, which is
+  by far the most common case.  If the ioc accessed multiple devices,
+  it tries with trylock.  In unlikely cases of fast path failure, it
+  falls back to full double-locking dance from workqueue.
+
+Double-locking isn't the prettiest thing in the world but it's *far*
+simpler and more understandable than RCU trick without adding any
+meaningful overhead.
+
+This still leaves a lot of now unnecessary RCU logics.  Future patches
+will trim them.
+
+-v2: Vivek pointed out that cic->q was being dereferenced after
+     cic->release() was called.  Updated to use local variable @this_q
+     instead.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

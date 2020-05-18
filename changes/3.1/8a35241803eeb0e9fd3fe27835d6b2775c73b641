@@ -1,0 +1,66 @@
+ptrace: fix ptrace_signal() && STOP_DEQUEUED interaction
+
+Simple test-case,
+
+	int main(void)
+	{
+		int pid, status;
+
+		pid = fork();
+		if (!pid) {
+			pause();
+			assert(0);
+			return 0x23;
+		}
+
+		assert(ptrace(PTRACE_ATTACH, pid, 0,0) == 0);
+		assert(wait(&status) == pid);
+		assert(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+
+		kill(pid, SIGCONT);	// <--- also clears STOP_DEQUEUD
+
+		assert(ptrace(PTRACE_CONT, pid, 0,0) == 0);
+		assert(wait(&status) == pid);
+		assert(WIFSTOPPED(status) && WSTOPSIG(status) == SIGCONT);
+
+		assert(ptrace(PTRACE_CONT, pid, 0, SIGSTOP) == 0);
+		assert(wait(&status) == pid);
+		assert(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+
+		kill(pid, SIGKILL);
+		return 0;
+	}
+
+Without the patch it hangs. After the patch SIGSTOP "injected" by the
+tracer is not ignored and stops the tracee.
+
+Note also that if this test-case uses, say, SIGWINCH instead of SIGCONT,
+everything works without the patch. This can't be right, and this is
+confusing.
+
+The problem is that SIGSTOP (or any other sig_kernel_stop() signal) has
+no effect without JOBCTL_STOP_DEQUEUED. This means it is simply ignored
+after PTRACE_CONT unless JOBCTL_STOP_DEQUEUED was set "by accident", say
+it wasn't cleared after initial SIGSTOP sent by PTRACE_ATTACH.
+
+At first glance we could change ptrace_signal() to add STOP_DEQUEUED
+after return from ptrace_stop(), but this is not right in case when the
+tracer does not change the reported SIGSTOP and SIGCONT comes in between.
+This is even more wrong with PT_SEIZED, SIGCONT adds JOBCTL_TRAP_NOTIFY
+which will be "lost" during the TRAP_STOP | TRAP_NOTIFY report.
+
+So lets add STOP_DEQUEUED _before_ we report the signal. It has no effect
+unless sig_kernel_stop() == T after the tracer resumes us, and in the
+latter case the pending STOP_DEQUEUED means no SIGCONT in between, we
+should stop.
+
+Note also that if SIGCONT was sent, PT_SEIZED tracee will correctly
+report PTRACE_EVENT_STOP/SIGTRAP and thus the tracer can notice the fact
+SIGSTOP was cancelled.
+
+Also, move the current->ptrace check from ptrace_signal() to its caller,
+get_signal_to_deliver(), this looks more natural.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+

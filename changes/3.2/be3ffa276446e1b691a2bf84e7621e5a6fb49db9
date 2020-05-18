@@ -1,0 +1,120 @@
+writeback: dirty rate control
+
+It's all about bdi->dirty_ratelimit, which aims to be (write_bw / N)
+when there are N dd tasks.
+
+On write() syscall, use bdi->dirty_ratelimit
+============================================
+
+    balance_dirty_pages(pages_dirtied)
+    {
+        task_ratelimit = bdi->dirty_ratelimit * bdi_position_ratio();
+        pause = pages_dirtied / task_ratelimit;
+        sleep(pause);
+    }
+
+On every 200ms, update bdi->dirty_ratelimit
+===========================================
+
+    bdi_update_dirty_ratelimit()
+    {
+        task_ratelimit = bdi->dirty_ratelimit * bdi_position_ratio();
+        balanced_dirty_ratelimit = task_ratelimit * write_bw / dirty_rate;
+        bdi->dirty_ratelimit = balanced_dirty_ratelimit
+    }
+
+Estimation of balanced bdi->dirty_ratelimit
+===========================================
+
+balanced task_ratelimit
+-----------------------
+
+balance_dirty_pages() needs to throttle tasks dirtying pages such that
+the total amount of dirty pages stays below the specified dirty limit in
+order to avoid memory deadlocks. Furthermore we desire fairness in that
+tasks get throttled proportionally to the amount of pages they dirty.
+
+IOW we want to throttle tasks such that we match the dirty rate to the
+writeout bandwidth, this yields a stable amount of dirty pages:
+
+        dirty_rate == write_bw                                          (1)
+
+The fairness requirement gives us:
+
+        task_ratelimit = balanced_dirty_ratelimit
+                       == write_bw / N                                  (2)
+
+where N is the number of dd tasks.  We don't know N beforehand, but
+still can estimate balanced_dirty_ratelimit within 200ms.
+
+Start by throttling each dd task at rate
+
+        task_ratelimit = task_ratelimit_0                               (3)
+                         (any non-zero initial value is OK)
+
+After 200ms, we measured
+
+        dirty_rate = # of pages dirtied by all dd's / 200ms
+        write_bw   = # of pages written to the disk / 200ms
+
+For the aggressive dd dirtiers, the equality holds
+
+        dirty_rate == N * task_rate
+                   == N * task_ratelimit_0                              (4)
+Or
+        task_ratelimit_0 == dirty_rate / N                              (5)
+
+Now we conclude that the balanced task ratelimit can be estimated by
+
+                                                      write_bw
+        balanced_dirty_ratelimit = task_ratelimit_0 * ----------        (6)
+                                                      dirty_rate
+
+Because with (4) and (5) we can get the desired equality (1):
+
+                                                       write_bw
+        balanced_dirty_ratelimit == (dirty_rate / N) * ----------
+                                                       dirty_rate
+                                 == write_bw / N
+
+Then using the balanced task ratelimit we can compute task pause times like:
+
+        task_pause = task->nr_dirtied / task_ratelimit
+
+task_ratelimit with position control
+------------------------------------
+
+However, while the above gives us means of matching the dirty rate to
+the writeout bandwidth, it at best provides us with a stable dirty page
+count (assuming a static system). In order to control the dirty page
+count such that it is high enough to provide performance, but does not
+exceed the specified limit we need another control.
+
+The dirty position control works by extending (2) to
+
+        task_ratelimit = balanced_dirty_ratelimit * pos_ratio           (7)
+
+where pos_ratio is a negative feedback function that subjects to
+
+1) f(setpoint) = 1.0
+2) df/dx < 0
+
+That is, if the dirty pages are ABOVE the setpoint, we throttle each
+task a bit more HEAVY than balanced_dirty_ratelimit, so that the dirty
+pages are created less fast than they are cleaned, thus DROP to the
+setpoints (and the reverse).
+
+Based on (7) and the assumption that both dirty_ratelimit and pos_ratio
+remains CONSTANT for the past 200ms, we get
+
+        task_ratelimit_0 = balanced_dirty_ratelimit * pos_ratio         (8)
+
+Putting (8) into (6), we get the formula used in
+bdi_update_dirty_ratelimit():
+
+                                                write_bw
+        balanced_dirty_ratelimit *= pos_ratio * ----------              (9)
+                                                dirty_rate
+
+Signed-off-by: Wu Fengguang <fengguang.wu@intel.com>
+

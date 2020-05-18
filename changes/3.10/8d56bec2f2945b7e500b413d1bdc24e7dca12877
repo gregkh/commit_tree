@@ -1,0 +1,65 @@
+ARC: [mm] optimize needless full mm TLB flush on munmap
+
+munmap ends up calling tlb_flush() which for ARC was flushing the entire
+TLB unconditionally (by moving the MMU to a new ASID)
+
+do_munmap
+  unmap_region
+    unmap_vmas
+      unmap_single_vma
+         unmap_page_range
+            tlb_start_vma
+            zap_pud_range
+            tlb_end_vma()
+  tlb_finish_mmu
+    tlb_flush()  ---> unconditional flush_tlb_mm()
+
+So even a single page munmap, a frequent operation when uClibc dynamic
+linker (ldso) is loading the dependent shared libraries, would move the
+the ASID multiple times - needlessly invalidating the pre-faulted TLB
+entries (and increasing the rate of ASID wraparound + full TLB flush).
+
+This is now optimised to only be called if tlb->full_mm (which means
+for exit/execve) cases only. And for those cases, flush_tlb_mm() is
+already optimised to be a no-op for mm->mm_users == 0.
+
+So essentially there are no mmore full mm flushes - except for fork which
+anyhow needs it for properly COW'ing parent address space.
+
+munmap now needs to do TLB range flush, which is implemented with
+tlb_end_vma()
+
+Results
+-------
+1. ASID now consistenly moves by 4 during a simple ls (as opposed to 5 or
+   7 before).
+
+2. LMBench microbenchmark also shows improvements
+
+Basic system parameters
+------------------------------------------------------------------------------
+Host                 OS Description              Mhz  tlb  cache  mem scal
+                                                     pages line   par load
+                                                           bytes
+--------- ------------- ----------------------- ---- ----- ----- ------ ----
+3.9-rc5-0 Linux 3.9.0-r 3.9-rc5-0404-gcc-4.4-ba   80     8    64 1.1000 1
+3.9-rc5-0 Linux 3.9.0-r 3.9-rc5-0405-avoid-full   80     8    64 1.1200 1
+
+Processor, Processes - times in microseconds - smaller is better
+------------------------------------------------------------------------------
+Host                 OS  Mhz null null      open slct sig  sig  fork exec sh
+                             call  I/O stat clos TCP  inst hndl proc proc proc
+--------- ------------- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+3.9-rc5-0 Linux 3.9.0-r   80 4.81 8.69 68.6 118. 239. 8.53 31.6 4839 13.K 34.K
+3.9-rc5-0 Linux 3.9.0-r   80 4.46 8.36 53.8 91.3 223. 8.12 24.2 4725 13.K 33.K
+
+File & VM system latencies in microseconds - smaller is better
+-------------------------------------------------------------------------------
+Host                 OS   0K File      10K File     Mmap    Prot   Page 100fd
+                        Create Delete Create Delete Latency Fault  Fault selct
+--------- ------------- ------ ------ ------ ------ ------- ----- ------- -----
+3.9-rc5-0 Linux 3.9.0-r  314.7  223.2 1054.9  390.2  3615.0 1.590 20.1 126.6
+3.9-rc5-0 Linux 3.9.0-r  265.8  183.8 1014.2  314.1  3193.0 6.910 18.8 110.4
+
+Signed-off-by: Vineet Gupta <vgupta@synopsys.com>
+

@@ -1,0 +1,61 @@
+xfs: on-stack delayed write buffer lists
+
+Queue delwri buffers on a local on-stack list instead of a per-buftarg one,
+and write back the buffers per-process instead of by waking up xfsbufd.
+
+This is now easily doable given that we have very few places left that write
+delwri buffers:
+
+ - log recovery:
+	Only done at mount time, and already forcing out the buffers
+	synchronously using xfs_flush_buftarg
+
+ - quotacheck:
+	Same story.
+
+ - dquot reclaim:
+	Writes out dirty dquots on the LRU under memory pressure.  We might
+	want to look into doing more of this via xfsaild, but it's already
+	more optimal than the synchronous inode reclaim that writes each
+	buffer synchronously.
+
+ - xfsaild:
+	This is the main beneficiary of the change.  By keeping a local list
+	of buffers to write we reduce latency of writing out buffers, and
+	more importably we can remove all the delwri list promotions which
+	were hitting the buffer cache hard under sustained metadata loads.
+
+The implementation is very straight forward - xfs_buf_delwri_queue now gets
+a new list_head pointer that it adds the delwri buffers to, and all callers
+need to eventually submit the list using xfs_buf_delwi_submit or
+xfs_buf_delwi_submit_nowait.  Buffers that already are on a delwri list are
+skipped in xfs_buf_delwri_queue, assuming they already are on another delwri
+list.  The biggest change to pass down the buffer list was done to the AIL
+pushing. Now that we operate on buffers the trylock, push and pushbuf log
+item methods are merged into a single push routine, which tries to lock the
+item, and if possible add the buffer that needs writeback to the buffer list.
+This leads to much simpler code than the previous split but requires the
+individual IOP_PUSH instances to unlock and reacquire the AIL around calls
+to blocking routines.
+
+Given that xfsailds now also handle writing out buffers, the conditions for
+log forcing and the sleep times needed some small changes.  The most
+important one is that we consider an AIL busy as long we still have buffers
+to push, and the other one is that we do increment the pushed LSN for
+buffers that are under flushing at this moment, but still count them towards
+the stuck items for restart purposes.  Without this we could hammer on stuck
+items without ever forcing the log and not make progress under heavy random
+delete workloads on fast flash storage devices.
+
+[ Dave Chinner:
+	- rebase on previous patches.
+	- improved comments for XBF_DELWRI_Q handling
+	- fix XBF_ASYNC handling in queue submission (test 106 failure)
+	- rename delwri submit function buffer list parameters for clarity
+	- xfs_efd_item_push() should return XFS_ITEM_PINNED ]
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Mark Tinguely <tinguely@sgi.com>
+Signed-off-by: Ben Myers <bpm@sgi.com>
+

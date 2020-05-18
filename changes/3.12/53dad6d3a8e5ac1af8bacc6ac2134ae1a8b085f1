@@ -1,0 +1,47 @@
+ipc: fix race with LSMs
+
+Currently, IPC mechanisms do security and auditing related checks under
+RCU.  However, since security modules can free the security structure,
+for example, through selinux_[sem,msg_queue,shm]_free_security(), we can
+race if the structure is freed before other tasks are done with it,
+creating a use-after-free condition.  Manfred illustrates this nicely,
+for instance with shared mem and selinux:
+
+ -> do_shmat calls rcu_read_lock()
+ -> do_shmat calls shm_object_check().
+     Checks that the object is still valid - but doesn't acquire any locks.
+     Then it returns.
+ -> do_shmat calls security_shm_shmat (e.g. selinux_shm_shmat)
+ -> selinux_shm_shmat calls ipc_has_perm()
+ -> ipc_has_perm accesses ipc_perms->security
+
+shm_close()
+ -> shm_close acquires rw_mutex & shm_lock
+ -> shm_close calls shm_destroy
+ -> shm_destroy calls security_shm_free (e.g. selinux_shm_free_security)
+ -> selinux_shm_free_security calls ipc_free_security(&shp->shm_perm)
+ -> ipc_free_security calls kfree(ipc_perms->security)
+
+This patch delays the freeing of the security structures after all RCU
+readers are done.  Furthermore it aligns the security life cycle with
+that of the rest of IPC - freeing them based on the reference counter.
+For situations where we need not free security, the current behavior is
+kept.  Linus states:
+
+ "... the old behavior was suspect for another reason too: having the
+  security blob go away from under a user sounds like it could cause
+  various other problems anyway, so I think the old code was at least
+  _prone_ to bugs even if it didn't have catastrophic behavior."
+
+I have tested this patch with IPC testcases from LTP on both my
+quad-core laptop and on a 64 core NUMA server.  In both cases selinux is
+enabled, and tests pass for both voluntary and forced preemption models.
+While the mentioned races are theoretical (at least no one as reported
+them), I wanted to make sure that this new logic doesn't break anything
+we weren't aware of.
+
+Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Davidlohr Bueso <davidlohr@hp.com>
+Acked-by: Manfred Spraul <manfred@colorfullife.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

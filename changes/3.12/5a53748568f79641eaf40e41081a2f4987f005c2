@@ -1,0 +1,73 @@
+mm/page-writeback.c: add strictlimit feature
+
+The feature prevents mistrusted filesystems (ie: FUSE mounts created by
+unprivileged users) to grow a large number of dirty pages before
+throttling.  For such filesystems balance_dirty_pages always check bdi
+counters against bdi limits.  I.e.  even if global "nr_dirty" is under
+"freerun", it's not allowed to skip bdi checks.  The only use case for now
+is fuse: it sets bdi max_ratio to 1% by default and system administrators
+are supposed to expect that this limit won't be exceeded.
+
+The feature is on if a BDI is marked by BDI_CAP_STRICTLIMIT flag.  A
+filesystem may set the flag when it initializes its BDI.
+
+The problematic scenario comes from the fact that nobody pays attention to
+the NR_WRITEBACK_TEMP counter (i.e.  number of pages under fuse
+writeback).  The implementation of fuse writeback releases original page
+(by calling end_page_writeback) almost immediately.  A fuse request queued
+for real processing bears a copy of original page.  Hence, if userspace
+fuse daemon doesn't finalize write requests in timely manner, an
+aggressive mmap writer can pollute virtually all memory by those temporary
+fuse page copies.  They are carefully accounted in NR_WRITEBACK_TEMP, but
+nobody cares.
+
+To make further explanations shorter, let me use "NR_WRITEBACK_TEMP
+problem" as a shortcut for "a possibility of uncontrolled grow of amount
+of RAM consumed by temporary pages allocated by kernel fuse to process
+writeback".
+
+The problem was very easy to reproduce.  There is a trivial example
+filesystem implementation in fuse userspace distribution: fusexmp_fh.c.  I
+added "sleep(1);" to the write methods, then recompiled and mounted it.
+Then created a huge file on the mount point and run a simple program which
+mmap-ed the file to a memory region, then wrote a data to the region.  An
+hour later I observed almost all RAM consumed by fuse writeback.  Since
+then some unrelated changes in kernel fuse made it more difficult to
+reproduce, but it is still possible now.
+
+Putting this theoretical happens-in-the-lab thing aside, there is another
+thing that really hurts real world (FUSE) users.  This is write-through
+page cache policy FUSE currently uses.  I.e.  handling write(2), kernel
+fuse populates page cache and flushes user data to the server
+synchronously.  This is excessively suboptimal.  Pavel Emelyanov's patches
+("writeback cache policy") solve the problem, but they also make resolving
+NR_WRITEBACK_TEMP problem absolutely necessary.  Otherwise, simply copying
+a huge file to a fuse mount would result in memory starvation.  Miklos,
+the maintainer of FUSE, believes strictlimit feature the way to go.
+
+And eventually putting FUSE topics aside, there is one more use-case for
+strictlimit feature.  Using a slow USB stick (mass storage) in a machine
+with huge amount of RAM installed is a well-known pain.  Let's make simple
+computations.  Assuming 64GB of RAM installed, existing implementation of
+balance_dirty_pages will start throttling only after 9.6GB of RAM becomes
+dirty (freerun == 15% of total RAM).  So, the command "cp 9GB_file
+/media/my-usb-storage/" may return in a few seconds, but subsequent
+"umount /media/my-usb-storage/" will take more than two hours if effective
+throughput of the storage is, to say, 1MB/sec.
+
+After inclusion of strictlimit feature, it will be trivial to add a knob
+(e.g.  /sys/devices/virtual/bdi/x:y/strictlimit) to enable it on demand.
+Manually or via udev rule.  May be I'm wrong, but it seems to be quite a
+natural desire to limit the amount of dirty memory for some devices we are
+not fully trust (in the sense of sustainable throughput).
+
+[akpm@linux-foundation.org: fix warning in page-writeback.c]
+Signed-off-by: Maxim Patlasov <MPatlasov@parallels.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Wu Fengguang <fengguang.wu@intel.com>
+Cc: Pavel Emelyanov <xemul@parallels.com>
+Cc: James Bottomley <James.Bottomley@HansenPartnership.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

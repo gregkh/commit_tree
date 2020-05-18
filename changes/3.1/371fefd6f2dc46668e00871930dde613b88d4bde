@@ -1,0 +1,63 @@
+KVM: PPC: Allow book3s_hv guests to use SMT processor modes
+
+This lifts the restriction that book3s_hv guests can only run one
+hardware thread per core, and allows them to use up to 4 threads
+per core on POWER7.  The host still has to run single-threaded.
+
+This capability is advertised to qemu through a new KVM_CAP_PPC_SMT
+capability.  The return value of the ioctl querying this capability
+is the number of vcpus per virtual CPU core (vcore), currently 4.
+
+To use this, the host kernel should be booted with all threads
+active, and then all the secondary threads should be offlined.
+This will put the secondary threads into nap mode.  KVM will then
+wake them from nap mode and use them for running guest code (while
+they are still offline).  To wake the secondary threads, we send
+them an IPI using a new xics_wake_cpu() function, implemented in
+arch/powerpc/sysdev/xics/icp-native.c.  In other words, at this stage
+we assume that the platform has a XICS interrupt controller and
+we are using icp-native.c to drive it.  Since the woken thread will
+need to acknowledge and clear the IPI, we also export the base
+physical address of the XICS registers using kvmppc_set_xics_phys()
+for use in the low-level KVM book3s code.
+
+When a vcpu is created, it is assigned to a virtual CPU core.
+The vcore number is obtained by dividing the vcpu number by the
+number of threads per core in the host.  This number is exported
+to userspace via the KVM_CAP_PPC_SMT capability.  If qemu wishes
+to run the guest in single-threaded mode, it should make all vcpu
+numbers be multiples of the number of threads per core.
+
+We distinguish three states of a vcpu: runnable (i.e., ready to execute
+the guest), blocked (that is, idle), and busy in host.  We currently
+implement a policy that the vcore can run only when all its threads
+are runnable or blocked.  This way, if a vcpu needs to execute elsewhere
+in the kernel or in qemu, it can do so without being starved of CPU
+by the other vcpus.
+
+When a vcore starts to run, it executes in the context of one of the
+vcpu threads.  The other vcpu threads all go to sleep and stay asleep
+until something happens requiring the vcpu thread to return to qemu,
+or to wake up to run the vcore (this can happen when another vcpu
+thread goes from busy in host state to blocked).
+
+It can happen that a vcpu goes from blocked to runnable state (e.g.
+because of an interrupt), and the vcore it belongs to is already
+running.  In that case it can start to run immediately as long as
+the none of the vcpus in the vcore have started to exit the guest.
+We send the next free thread in the vcore an IPI to get it to start
+to execute the guest.  It synchronizes with the other threads via
+the vcore->entry_exit_count field to make sure that it doesn't go
+into the guest if the other vcpus are exiting by the time that it
+is ready to actually enter the guest.
+
+Note that there is no fixed relationship between the hardware thread
+number and the vcpu number.  Hardware threads are assigned to vcpus
+as they become runnable, so we will always use the lower-numbered
+hardware threads in preference to higher-numbered threads if not all
+the vcpus in the vcore are runnable, regardless of which vcpus are
+runnable.
+
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+

@@ -1,0 +1,56 @@
+radix_tree: take radix_tree_path off stack
+
+Down, down in the deepest depths of GFP_NOIO page reclaim, we have
+shrink_page_list() calling __remove_mapping() calling __delete_from_
+swap_cache() or __delete_from_page_cache().
+
+You would not expect those to need much stack, but in fact they call
+radix_tree_delete(): which declares a 192-byte radix_tree_path array on
+its stack (to record the node,offsets it visits when descending, in case
+it needs to ascend to update them).  And if any tag is still set [1],
+that calls radix_tree_tag_clear(), which declares a further such
+192-byte radix_tree_path array on the stack.  (At least we have
+interrupts disabled here, so won't then be pushing registers too.)
+
+That was probably a good choice when most users were 32-bit (array of
+half the size), and adding fields to radix_tree_node would have bloated
+it unnecessarily.  But nowadays many are 64-bit, and each
+radix_tree_node contains a struct rcu_head, which is only used when
+freeing; whereas the radix_tree_path info is only used for updating the
+tree (deleting, clearing tags or setting tags if tagged) when a lock
+must be held, of no interest when accessing the tree locklessly.
+
+So add a parent pointer to the radix_tree_node, in union with the
+rcu_head, and remove all uses of the radix_tree_path.  There would be
+space in that union to save the offset when descending as before (we can
+argue that a lock must already be held to exclude other users), but
+recalculating it when ascending is both easy (a constant shift and a
+constant mask) and uncommon, so it seems better just to do that.
+
+Two little optimizations: no need to decrement height when descending,
+adjusting shift is enough; and once radix_tree_tag_if_tagged() has set
+tag on a node and its ancestors, it need not ascend from that node
+again.
+
+perf on the radix tree test harness reports radix_tree_insert() as 2%
+slower (now having to set parent), but radix_tree_delete() 24% faster.
+Surely that's an exaggeration from rtth's artificially low map shift 3,
+but forcing it back to 6 still rates radix_tree_delete() 8% faster.
+
+[1] Can a pagecache tag (dirty, writeback or towrite) actually still be
+set at the time of radix_tree_delete()? Perhaps not if the filesystem is
+well-behaved.  But although I've not tracked any stack overflow down to
+this cause, I have observed a curious case in which a dirty tag is set
+and left set on tmpfs: page migration's migrate_page_copy() happens to
+use __set_page_dirty_nobuffers() to set PageDirty on the newpage, and
+that sets PAGECACHE_TAG_DIRTY as a side-effect - harmless to a
+filesystem which doesn't use tags, except for this stack depth issue.
+
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Nai Xia <nai.xia@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

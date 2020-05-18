@@ -1,0 +1,131 @@
+powerpc: Define virtual-physical translations for RELOCATABLE
+
+We find the runtime address of _stext and relocate ourselves based
+on the following calculation.
+
+	virtual_base = ALIGN(KERNELBASE,KERNEL_TLB_PIN_SIZE) +
+			MODULO(_stext.run,KERNEL_TLB_PIN_SIZE)
+
+relocate() is called with the Effective Virtual Base Address (as
+shown below)
+
+            | Phys. Addr| Virt. Addr |
+Page        |------------------------|
+Boundary    |           |            |
+            |           |            |
+            |           |            |
+Kernel Load |___________|_ __ _ _ _ _|<- Effective
+Addr(_stext)|           |      ^     |Virt. Base Addr
+            |           |      |     |
+            |           |      |     |
+            |           |reloc_offset|
+            |           |      |     |
+            |           |      |     |
+            |           |______v_____|<-(KERNELBASE)%TLB_SIZE
+            |           |            |
+            |           |            |
+            |           |            |
+Page        |-----------|------------|
+Boundary    |           |            |
+
+On BookE, we need __va() & __pa() early in the boot process to access
+the device tree.
+
+Currently this has been defined as :
+
+#define __va(x) ((void *)(unsigned long)((phys_addr_t)(x) -
+						PHYSICAL_START + KERNELBASE)
+where:
+ PHYSICAL_START is kernstart_addr - a variable updated at runtime.
+ KERNELBASE	is the compile time Virtual base address of kernel.
+
+This won't work for us, as kernstart_addr is dynamic and will yield different
+results for __va()/__pa() for same mapping.
+
+e.g.,
+
+Let the kernel be loaded at 64MB and KERNELBASE be 0xc0000000 (same as
+PAGE_OFFSET).
+
+In this case, we would be mapping 0 to 0xc0000000, and kernstart_addr = 64M
+
+Now __va(1MB) = (0x100000) - (0x4000000) + 0xc0000000
+		= 0xbc100000 , which is wrong.
+
+it should be : 0xc0000000 + 0x100000 = 0xc0100000
+
+On platforms which support AMP, like PPC_47x (based on 44x), the kernel
+could be loaded at highmem. Hence we cannot always depend on the compile
+time constants for mapping.
+
+Here are the possible solutions:
+
+1) Update kernstart_addr(PHSYICAL_START) to match the Physical address of
+compile time KERNELBASE value, instead of the actual Physical_Address(_stext).
+
+The disadvantage is that we may break other users of PHYSICAL_START. They
+could be replaced with __pa(_stext).
+
+2) Redefine __va() & __pa() with relocation offset
+
+#ifdef	CONFIG_RELOCATABLE_PPC32
+#define __va(x) ((void *)(unsigned long)((phys_addr_t)(x) - PHYSICAL_START + (KERNELBASE + RELOC_OFFSET)))
+#define __pa(x) ((unsigned long)(x) + PHYSICAL_START - (KERNELBASE + RELOC_OFFSET))
+#endif
+
+where, RELOC_OFFSET could be
+
+  a) A variable, say relocation_offset (like kernstart_addr), updated
+     at boot time. This impacts performance, as we have to load an additional
+     variable from memory.
+
+		OR
+
+  b) #define RELOC_OFFSET ((PHYSICAL_START & PPC_PIN_SIZE_OFFSET_MASK) - \
+                      (KERNELBASE & PPC_PIN_SIZE_OFFSET_MASK))
+
+   This introduces more calculations for doing the translation.
+
+3) Redefine __va() & __pa() with a new variable
+
+i.e,
+
+#define __va(x) ((void *)(unsigned long)((phys_addr_t)(x) + VIRT_PHYS_OFFSET))
+
+where VIRT_PHYS_OFFSET :
+
+#ifdef CONFIG_RELOCATABLE_PPC32
+#define VIRT_PHYS_OFFSET virt_phys_offset
+#else
+#define VIRT_PHYS_OFFSET (KERNELBASE - PHYSICAL_START)
+#endif /* CONFIG_RELOCATABLE_PPC32 */
+
+where virt_phy_offset is updated at runtime to :
+
+	Effective KERNELBASE - kernstart_addr.
+
+Taking our example, above:
+
+virt_phys_offset = effective_kernelstart_vaddr - kernstart_addr
+		 = 0xc0400000 - 0x400000
+		 = 0xc0000000
+	and
+
+	__va(0x100000) = 0xc0000000 + 0x100000 = 0xc0100000
+	 which is what we want.
+
+I have implemented (3) in the following patch which has same cost of
+operation as the existing one.
+
+I have tested the patches on 440x platforms only. However this should
+work fine for PPC_47x also, as we only depend on the runtime address
+and the current TLB XLAT entry for the startup code, which is available
+in r25. I don't have access to a 47x board yet. So, it would be great if
+somebody could test this on 47x.
+
+Signed-off-by: Suzuki K. Poulose <suzuki@in.ibm.com>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: Kumar Gala <galak@kernel.crashing.org>
+Cc: linuxppc-dev <linuxppc-dev@lists.ozlabs.org>
+Signed-off-by: Josh Boyer <jwboyer@gmail.com>
+

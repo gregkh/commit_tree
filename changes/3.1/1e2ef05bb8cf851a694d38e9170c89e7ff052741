@@ -1,0 +1,80 @@
+PM: Limit race conditions between runtime PM and system sleep (v2)
+
+One of the roles of the PM core is to prevent different PM callbacks
+executed for the same device object from racing with each other.
+Unfortunately, after commit e8665002477f0278f84f898145b1f141ba26ee26
+(PM: Allow pm_runtime_suspend() to succeed during system suspend)
+runtime PM callbacks may be executed concurrently with system
+suspend/resume callbacks for the same device.
+
+The main reason for commit e8665002477f0278f84f898145b1f141ba26ee26
+was that some subsystems and device drivers wanted to use runtime PM
+helpers, pm_runtime_suspend() and pm_runtime_put_sync() in
+particular, for carrying out the suspend of devices in their
+.suspend() callbacks.  However, as it's been determined recently,
+there are multiple reasons not to do so, inlcuding:
+
+ * The caller really doesn't control the runtime PM usage counters,
+   because user space can access them through sysfs and effectively
+   block runtime PM.  That means using pm_runtime_suspend() or
+   pm_runtime_get_sync() to suspend devices during system suspend
+   may or may not work.
+
+ * If a driver calls pm_runtime_suspend() from its .suspend()
+   callback, it causes the subsystem's .runtime_suspend() callback to
+   be executed, which leads to the call sequence:
+
+   subsys->suspend(dev)
+      driver->suspend(dev)
+         pm_runtime_suspend(dev)
+            subsys->runtime_suspend(dev)
+
+   recursive from the subsystem's point of view.  For some subsystems
+   that may actually work (e.g. the platform bus type), but for some
+   it will fail in a rather spectacular fashion (e.g. PCI).  In each
+   case it means a layering violation.
+
+ * Both the subsystem and the driver can provide .suspend_noirq()
+   callbacks for system suspend that can do whatever the
+   .runtime_suspend() callbacks do just fine, so it really isn't
+   necessary to call pm_runtime_suspend() during system suspend.
+
+ * The runtime PM's handling of wakeup devices is usually different
+   from the system suspend's one, so .runtime_suspend() may simply be
+   inappropriate for system suspend.
+
+ * System suspend is supposed to work even if CONFIG_PM_RUNTIME is
+   unset.
+
+ * The runtime PM workqueue is frozen before system suspend, so if
+   whatever the driver is going to do during system suspend depends
+   on it, that simply won't work.
+
+Still, there is a good reason to allow pm_runtime_resume() to
+succeed during system suspend and resume (for instance, some
+subsystems and device drivers may legitimately use it to ensure that
+their devices are in full-power states before suspending them).
+Moreover, there is no reason to prevent runtime PM callbacks from
+being executed in parallel with the system suspend/resume .prepare()
+and .complete() callbacks and the code removed by commit
+e8665002477f0278f84f898145b1f141ba26ee26 went too far in this
+respect.  On the other hand, runtime PM callbacks, including
+.runtime_resume(), must not be executed during system suspend's
+"late" stage of suspending devices and during system resume's "early"
+device resume stage.
+
+Taking all of the above into consideration, make the PM core
+acquire a runtime PM reference to every device and resume it if
+there's a runtime PM resume request pending right before executing
+the subsystem-level .suspend() callback for it.  Make the PM core
+drop references to all devices right after executing the
+subsystem-level .resume() callbacks for them.  Additionally,
+make the PM core disable the runtime PM framework for all devices
+during system suspend, after executing the subsystem-level .suspend()
+callbacks for them, and enable the runtime PM framework for all
+devices during system resume, right before executing the
+subsystem-level .resume() callbacks for them.
+
+Signed-off-by: Rafael J. Wysocki <rjw@sisk.pl>
+Acked-by: Kevin Hilman <khilman@ti.com>
+

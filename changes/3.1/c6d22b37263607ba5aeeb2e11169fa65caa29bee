@@ -1,0 +1,65 @@
+PM / Domains: Allow callbacks to execute all runtime PM helpers
+
+A deadlock may occur if one of the PM domains' .start_device() or
+.stop_device() callbacks or a device driver's .runtime_suspend() or
+.runtime_resume() callback executed by the core generic PM domain
+code uses a "wrong" runtime PM helper function.  This happens, for
+example, if .runtime_resume() from one device's driver calls
+pm_runtime_resume() for another device in the same PM domain.
+A similar situation may take place if a device's parent is in the
+same PM domain, in which case the runtime PM framework may execute
+pm_genpd_runtime_resume() automatically for the parent (if it is
+suspended at the moment).  This, of course, is undesirable, so
+the generic PM domains code should be modified to prevent it from
+happening.
+
+The runtime PM framework guarantees that pm_genpd_runtime_suspend()
+and pm_genpd_runtime_resume() won't be executed in parallel for
+the same device, so the generic PM domains code need not worry
+about those cases.  Still, it needs to prevent the other possible
+race conditions between pm_genpd_runtime_suspend(),
+pm_genpd_runtime_resume(), pm_genpd_poweron() and pm_genpd_poweroff()
+from happening and it needs to avoid deadlocks at the same time.
+To this end, modify the generic PM domains code to relax
+synchronization rules so that:
+
+* pm_genpd_poweron() doesn't wait for the PM domain status to
+  change from GPD_STATE_BUSY.  If it finds that the status is
+  not GPD_STATE_POWER_OFF, it returns without powering the domain on
+  (it may modify the status depending on the circumstances).
+
+* pm_genpd_poweroff() returns as soon as it finds that the PM
+  domain's status changed from GPD_STATE_BUSY after it's released
+  the PM domain's lock.
+
+* pm_genpd_runtime_suspend() doesn't wait for the PM domain status
+  to change from GPD_STATE_BUSY after executing the domain's
+  .stop_device() callback and executes pm_genpd_poweroff() only
+  if pm_genpd_runtime_resume() is not executed in parallel.
+
+* pm_genpd_runtime_resume() doesn't wait for the PM domain status
+  to change from GPD_STATE_BUSY after executing pm_genpd_poweron()
+  and sets the domain's status to GPD_STATE_BUSY and increments its
+  counter of resuming devices (introduced by this change) immediately
+  after acquiring the lock.  The counter of resuming devices is then
+  decremented after executing __pm_genpd_runtime_resume() for the
+  device and the domain's status is reset to GPD_STATE_ACTIVE (unless
+  there are more resuming devices in the domain, in which case the
+  status remains GPD_STATE_BUSY).
+
+This way, for example, if a device driver's .runtime_resume()
+callback executes pm_runtime_resume() for another device in the same
+PM domain, pm_genpd_poweron() called by pm_genpd_runtime_resume()
+invoked by the runtime PM framework will not block and it will see
+that there's nothing to do for it.  Next, the PM domain's lock will
+be acquired without waiting for its status to change from
+GPD_STATE_BUSY and the device driver's .runtime_resume() callback
+will be executed.  In turn, if pm_runtime_suspend() is executed by
+one device driver's .runtime_resume() callback for another device in
+the same PM domain, pm_genpd_poweroff() executed by
+pm_genpd_runtime_suspend() invoked by the runtime PM framework as a
+result will notice that one of the devices in the domain is being
+resumed, so it will return immediately.
+
+Signed-off-by: Rafael J. Wysocki <rjw@sisk.pl>
+

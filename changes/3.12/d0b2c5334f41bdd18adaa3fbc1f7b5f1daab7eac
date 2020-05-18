@@ -1,0 +1,50 @@
+drm/prime: Always add exported buffers to the handle cache
+
+... not only when the dma-buf is freshly created. In contrived
+examples someone else could have exported/imported the dma-buf already
+and handed us the gem object with a flink name. If such on object gets
+reexported as a dma_buf we won't have it in the handle cache already,
+which breaks the guarantee that for dma-buf imports we always hand
+back an existing handle if there is one.
+
+This is exercised by igt/prime_self_import/with_one_bo_two_files
+
+Now if we extend the locked sections just a notch more we can also
+plug th racy buf/handle cache setup in handle_to_fd:
+
+If evil userspace races a concurrent gem close against a prime export
+operation we can end up tearing down the gem handle before the dma buf
+handle cache is set up. When handle_to_fd gets around to adding the
+handle to the cache there will be no one left to clean it up,
+effectily leaking the bo (and the dma-buf, since the handle cache
+holds a ref on the dma-buf):
+
+Thread A			Thread B
+
+handle_to_fd:
+
+lookup gem object from handle
+creates new dma_buf
+
+				gem_close on the same handle
+				obj->dma_buf is set, but file priv buf
+				handle cache has no entry
+
+				obj->handle_count drops to 0
+
+drm_prime_add_buf_handle sets up the handle cache
+
+-> We have a dma-buf reference in the handle cache, but since the
+handle_count of the gem object already dropped to 0 no on will clean
+it up. When closing the drm device fd we'll hit the WARN_ON in
+drm_prime_destroy_file_private.
+
+The important change is to extend the critical section of the
+filp->prime.lock to cover the gem handle lookup. This serializes with
+a concurrent gem handle close.
+
+This leak is exercised by igt/prime_self_import/export-vs-gem_close-race
+
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+

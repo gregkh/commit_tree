@@ -1,0 +1,308 @@
+mm: limit growth of 3% hardcoded other user reserve
+
+Add user_reserve_kbytes knob.
+
+Limit the growth of the memory reserved for other user processes to
+min(3% current process size, user_reserve_pages).  Only about 8MB is
+necessary to enable recovery in the default mode, and only a few hundred
+MB are required even when overcommit is disabled.
+
+user_reserve_pages defaults to min(3% free pages, 128MB)
+
+I arrived at 128MB by taking the max VSZ of sshd, login, bash, and top ...
+then adding the RSS of each.
+
+This only affects OVERCOMMIT_NEVER mode.
+
+Background
+
+1. user reserve
+
+__vm_enough_memory reserves a hardcoded 3% of the current process size for
+other applications when overcommit is disabled.  This was done so that a
+user could recover if they launched a memory hogging process.  Without the
+reserve, a user would easily run into a message such as:
+
+bash: fork: Cannot allocate memory
+
+2. admin reserve
+
+Additionally, a hardcoded 3% of free memory is reserved for root in both
+overcommit 'guess' and 'never' modes.  This was intended to prevent a
+scenario where root-cant-log-in and perform recovery operations.
+
+Note that this reserve shrinks, and doesn't guarantee a useful reserve.
+
+Motivation
+
+The two hardcoded memory reserves should be updated to account for current
+memory sizes.
+
+Also, the admin reserve would be more useful if it didn't shrink too much.
+
+When the current code was originally written, 1GB was considered
+"enterprise".  Now the 3% reserve can grow to multiple GB on large memory
+systems, and it only needs to be a few hundred MB at most to enable a user
+or admin to recover a system with an unwanted memory hogging process.
+
+I've found that reducing these reserves is especially beneficial for a
+specific type of application load:
+
+ * single application system
+ * one or few processes (e.g. one per core)
+ * allocating all available memory
+ * not initializing every page immediately
+ * long running
+
+I've run scientific clusters with this sort of load.  A long running job
+sometimes failed many hours (weeks of CPU time) into a calculation.  They
+weren't initializing all of their memory immediately, and they weren't
+using calloc, so I put systems into overcommit 'never' mode.  These
+clusters run diskless and have no swap.
+
+However, with the current reserves, a user wishing to allocate as much
+memory as possible to one process may be prevented from using, for
+example, almost 2GB out of 32GB.
+
+The effect is less, but still significant when a user starts a job with
+one process per core.  I have repeatedly seen a set of processes
+requesting the same amount of memory fail because one of them could not
+allocate the amount of memory a user would expect to be able to allocate.
+For example, Message Passing Interfce (MPI) processes, one per core.  And
+it is similar for other parallel programming frameworks.
+
+Changing this reserve code will make the overcommit never mode more useful
+by allowing applications to allocate nearly all of the available memory.
+
+Also, the new admin_reserve_kbytes will be safer than the current behavior
+since the hardcoded 3% of available memory reserve can shrink to something
+useless in the case where applications have grabbed all available memory.
+
+Risks
+
+* "bash: fork: Cannot allocate memory"
+
+  The downside of the first patch-- which creates a tunable user reserve
+  that is only used in overcommit 'never' mode--is that an admin can set
+  it so low that a user may not be able to kill their process, even if
+  they already have a shell prompt.
+
+  Of course, a user can get in the same predicament with the current 3%
+  reserve--they just have to launch processes until 3% becomes negligible.
+
+* root-cant-log-in problem
+
+  The second patch, adding the tunable rootuser_reserve_pages, allows
+  the admin to shoot themselves in the foot by setting it too small.  They
+  can easily get the system into a state where root-can't-log-in.
+
+  However, the new admin_reserve_kbytes will be safer than the current
+  behavior since the hardcoded 3% of available memory reserve can shrink
+  to something useless in the case where applications have grabbed all
+  available memory.
+
+Alternatives
+
+ * Memory cgroups provide a more flexible way to limit application memory.
+
+   Not everyone wants to set up cgroups or deal with their overhead.
+
+ * We could create a fourth overcommit mode which provides smaller reserves.
+
+   The size of useful reserves may be drastically different depending
+   on the whether the system is embedded or enterprise.
+
+ * Force users to initialize all of their memory or use calloc.
+
+   Some users don't want/expect the system to overcommit when they malloc.
+   Overcommit 'never' mode is for this scenario, and it should work well.
+
+The new user and admin reserve tunables are simple to use, with low
+overhead compared to cgroups.  The patches preserve current behavior where
+3% of memory is less than 128MB, except that the admin reserve doesn't
+shrink to an unusable size under pressure.  The code allows admins to tune
+for embedded and enterprise usage.
+
+FAQ
+
+ * How is the root-cant-login problem addressed?
+   What happens if admin_reserve_pages is set to 0?
+
+   Root is free to shoot themselves in the foot by setting
+   admin_reserve_kbytes too low.
+
+   On x86_64, the minimum useful reserve is:
+     8MB for overcommit 'guess'
+   128MB for overcommit 'never'
+
+   admin_reserve_pages defaults to min(3% free memory, 8MB)
+
+   So, anyone switching to 'never' mode needs to adjust
+   admin_reserve_pages.
+
+ * How do you calculate a minimum useful reserve?
+
+   A user or the admin needs enough memory to login and perform
+   recovery operations, which includes, at a minimum:
+
+   sshd or login + bash (or some other shell) + top (or ps, kill, etc.)
+
+   For overcommit 'guess', we can sum resident set sizes (RSS)
+   because we only need enough memory to handle what the recovery
+   programs will typically use. On x86_64 this is about 8MB.
+
+   For overcommit 'never', we can take the max of their virtual sizes (VSZ)
+   and add the sum of their RSS. We use VSZ instead of RSS because mode
+   forces us to ensure we can fulfill all of the requested memory allocations--
+   even if the programs only use a fraction of what they ask for.
+   On x86_64 this is about 128MB.
+
+   When swap is enabled, reserves are useful even when they are as
+   small as 10MB, regardless of overcommit mode.
+
+   When both swap and overcommit are disabled, then the admin should
+   tune the reserves higher to be absolutley safe. Over 230MB each
+   was safest in my testing.
+
+ * What happens if user_reserve_pages is set to 0?
+
+   Note, this only affects overcomitt 'never' mode.
+
+   Then a user will be able to allocate all available memory minus
+   admin_reserve_kbytes.
+
+   However, they will easily see a message such as:
+
+   "bash: fork: Cannot allocate memory"
+
+   And they won't be able to recover/kill their application.
+   The admin should be able to recover the system if
+   admin_reserve_kbytes is set appropriately.
+
+ * What's the difference between overcommit 'guess' and 'never'?
+
+   "Guess" allows an allocation if there are enough free + reclaimable
+   pages. It has a hardcoded 3% of free pages reserved for root.
+
+   "Never" allows an allocation if there is enough swap + a configurable
+   percentage (default is 50) of physical RAM. It has a hardcoded 3% of
+   free pages reserved for root, like "Guess" mode. It also has a
+   hardcoded 3% of the current process size reserved for additional
+   applications.
+
+ * Why is overcommit 'guess' not suitable even when an app eventually
+   writes to every page? It takes free pages, file pages, available
+   swap pages, reclaimable slab pages into consideration. In other words,
+   these are all pages available, then why isn't overcommit suitable?
+
+   Because it only looks at the present state of the system. It
+   does not take into account the memory that other applications have
+   malloced, but haven't initialized yet. It overcommits the system.
+
+Test Summary
+
+There was little change in behavior in the default overcommit 'guess'
+mode with swap enabled before and after the patch. This was expected.
+
+Systems run most predictably (i.e. no oom kills) in overcommit 'never'
+mode with swap enabled. This also allowed the most memory to be allocated
+to a user application.
+
+Overcommit 'guess' mode without swap is a bad idea. It is easy to
+crash the system. None of the other tested combinations crashed.
+This matches my experience on the Roadrunner supercomputer.
+
+Without the tunable user reserve, a system in overcommit 'never' mode
+and without swap does not allow the admin to recover, although the
+admin can.
+
+With the new tunable reserves, a system in overcommit 'never' mode
+and without swap can be configured to:
+
+1. maximize user-allocatable memory, running close to the edge of
+recoverability
+
+2. maximize recoverability, sacrificing allocatable memory to
+ensure that a user cannot take down a system
+
+Test Description
+
+Fedora 18 VM - 4 x86_64 cores, 5725MB RAM, 4GB Swap
+
+System is booted into multiuser console mode, with unnecessary services
+turned off. Caches were dropped before each test.
+
+Hogs are user memtester processes that attempt to allocate all free memory
+as reported by /proc/meminfo
+
+In overcommit 'never' mode, memory_ratio=100
+
+Test Results
+
+3.9.0-rc1-mm1
+
+Overcommit | Swap | Hogs | MB Got/Wanted | OOMs | User Recovery | Admin Recovery
+----------   ----   ----   -------------   ----   -------------   --------------
+guess        yes    1      5432/5432       no     yes             yes
+guess        yes    4      5444/5444       1      yes             yes
+guess        no     1      5302/5449       no     yes             yes
+guess        no     4      -               crash  no              no
+
+never        yes    1      5460/5460       1      yes             yes
+never        yes    4      5460/5460       1      yes             yes
+never        no     1      5218/5432       no     no              yes
+never        no     4      5203/5448       no     no              yes
+
+3.9.0-rc1-mm1-tunablereserves
+
+User and Admin Recovery show their respective reserves, if applicable.
+
+Overcommit | Swap | Hogs | MB Got/Wanted | OOMs | User Recovery | Admin Recovery
+----------   ----   ----   -------------   ----   -------------   --------------
+guess        yes    1      5419/5419       no     - yes           8MB yes
+guess        yes    4      5436/5436       1      - yes           8MB yes
+guess        no     1      5440/5440       *      - yes           8MB yes
+guess        no     4      -               crash  - no            8MB no
+
+* process would successfully mlock, then the oom killer would pick it
+
+never        yes    1      5446/5446       no     10MB yes        20MB yes
+never        yes    4      5456/5456       no     10MB yes        20MB yes
+never        no     1      5387/5429       no     128MB no        8MB barely
+never        no     1      5323/5428       no     226MB barely    8MB barely
+never        no     1      5323/5428       no     226MB barely    8MB barely
+
+never        no     1      5359/5448       no     10MB no         10MB barely
+
+never        no     1      5323/5428       no     0MB no          10MB barely
+never        no     1      5332/5428       no     0MB no          50MB yes
+never        no     1      5293/5429       no     0MB no          90MB yes
+
+never        no     1      5001/5427       no     230MB yes       338MB yes
+never        no     4*     4998/5424       no     230MB yes       338MB yes
+
+* more memtesters were launched, able to allocate approximately another 100MB
+
+Future Work
+
+ - Test larger memory systems.
+
+ - Test an embedded image.
+
+ - Test other architectures.
+
+ - Time malloc microbenchmarks.
+
+ - Would it be useful to be able to set overcommit policy for
+   each memory cgroup?
+
+ - Some lines are slightly above 80 chars.
+   Perhaps define a macro to convert between pages and kb?
+   Other places in the kernel do this.
+
+[akpm@linux-foundation.org: coding-style fixes]
+[akpm@linux-foundation.org: make init_user_reserve() static]
+Signed-off-by: Andrew Shewmaker <agshew@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

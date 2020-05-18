@@ -1,0 +1,62 @@
+FS-Cache: The retrieval remaining-pages counter needs to be atomic_t
+
+struct fscache_retrieval contains a count of the number of pages that still
+need some processing (n_pages).  This is decremented as the pages are
+processed.
+
+However, this needs to be atomic as fscache_retrieval_complete() (I think) just
+occasionally may be called from cachefiles_read_backing_file() and
+cachefiles_read_copier() simultaneously.
+
+This happens when an fscache_read_or_alloc_pages() request containing a lot of
+pages (say a couple of hundred) is being processed.  The read on each backing
+page is dispatched individually because we need to insert a monitor into the
+waitqueue to catch when the read completes.  However, under low-memory
+conditions, we might be forced to wait in the allocator - and this gives the
+I/O on the backing page a chance to complete first.
+
+When the I/O completes, fscache_enqueue_retrieval() chucks the retrieval onto
+the workqueue without waiting for the operation to finish the initial I/O
+dispatch (we want to release any pages we can as soon as we can), thus both can
+end up running simultaneously and potentially attempting to partially complete
+the retrieval simultaneously (ENOMEM may occur, backing pages may already be in
+the page cache).
+
+This was demonstrated by parallelling the non-atomic counter with an atomic
+counter and printing both of them when the assertion fails.  At this point, the
+atomic counter has reached zero, but the non-atomic counter has not.
+
+To fix this, make the counter an atomic_t.
+
+This results in the following bug appearing
+
+	FS-Cache: Assertion failed
+	3 == 5 is false
+	------------[ cut here ]------------
+	kernel BUG at fs/fscache/operation.c:421!
+
+or
+
+	FS-Cache: Assertion failed
+	3 == 5 is false
+	------------[ cut here ]------------
+	kernel BUG at fs/fscache/operation.c:414!
+
+With a backtrace like the following:
+
+RIP: 0010:[<ffffffffa0211b1d>] fscache_put_operation+0x1ad/0x240 [fscache]
+Call Trace:
+ [<ffffffffa0213185>] fscache_retrieval_work+0x55/0x270 [fscache]
+ [<ffffffffa0213130>] ? fscache_retrieval_work+0x0/0x270 [fscache]
+ [<ffffffff81090b10>] worker_thread+0x170/0x2a0
+ [<ffffffff81096d10>] ? autoremove_wake_function+0x0/0x40
+ [<ffffffff810909a0>] ? worker_thread+0x0/0x2a0
+ [<ffffffff81096966>] kthread+0x96/0xa0
+ [<ffffffff8100c0ca>] child_rip+0xa/0x20
+ [<ffffffff810968d0>] ? kthread+0x0/0xa0
+ [<ffffffff8100c0c0>] ? child_rip+0x0/0x20
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Reviewed-and-tested-By: Milosz Tanski <milosz@adfin.com>
+Acked-by: Jeff Layton <jlayton@redhat.com>
+

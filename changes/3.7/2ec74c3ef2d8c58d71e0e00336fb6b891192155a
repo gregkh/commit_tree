@@ -1,0 +1,100 @@
+mm: move all mmu notifier invocations to be done outside the PT lock
+
+In order to allow sleeping during mmu notifier calls, we need to avoid
+invoking them under the page table spinlock.  This patch solves the
+problem by calling invalidate_page notification after releasing the lock
+(but before freeing the page itself), or by wrapping the page invalidation
+with calls to invalidate_range_begin and invalidate_range_end.
+
+To prevent accidental changes to the invalidate_range_end arguments after
+the call to invalidate_range_begin, the patch introduces a convention of
+saving the arguments in consistently named locals:
+
+	unsigned long mmun_start;	/* For mmu_notifiers */
+	unsigned long mmun_end;	/* For mmu_notifiers */
+
+	...
+
+	mmun_start = ...
+	mmun_end = ...
+	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+
+	...
+
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+
+The patch changes code to use this convention for all calls to
+mmu_notifier_invalidate_range_start/end, except those where the calls are
+close enough so that anyone who glances at the code can see the values
+aren't changing.
+
+This patchset is a preliminary step towards on-demand paging design to be
+added to the RDMA stack.
+
+Why do we want on-demand paging for Infiniband?
+
+  Applications register memory with an RDMA adapter using system calls,
+  and subsequently post IO operations that refer to the corresponding
+  virtual addresses directly to HW.  Until now, this was achieved by
+  pinning the memory during the registration calls.  The goal of on demand
+  paging is to avoid pinning the pages of registered memory regions (MRs).
+   This will allow users the same flexibility they get when swapping any
+  other part of their processes address spaces.  Instead of requiring the
+  entire MR to fit in physical memory, we can allow the MR to be larger,
+  and only fit the current working set in physical memory.
+
+Why should anyone care?  What problems are users currently experiencing?
+
+  This can make programming with RDMA much simpler.  Today, developers
+  that are working with more data than their RAM can hold need either to
+  deregister and reregister memory regions throughout their process's
+  life, or keep a single memory region and copy the data to it.  On demand
+  paging will allow these developers to register a single MR at the
+  beginning of their process's life, and let the operating system manage
+  which pages needs to be fetched at a given time.  In the future, we
+  might be able to provide a single memory access key for each process
+  that would provide the entire process's address as one large memory
+  region, and the developers wouldn't need to register memory regions at
+  all.
+
+Is there any prospect that any other subsystems will utilise these
+infrastructural changes?  If so, which and how, etc?
+
+  As for other subsystems, I understand that XPMEM wanted to sleep in
+  MMU notifiers, as Christoph Lameter wrote at
+  http://lkml.indiana.edu/hypermail/linux/kernel/0802.1/0460.html and
+  perhaps Andrea knows about other use cases.
+
+  Scheduling in mmu notifications is required since we need to sync the
+  hardware with the secondary page tables change.  A TLB flush of an IO
+  device is inherently slower than a CPU TLB flush, so our design works by
+  sending the invalidation request to the device, and waiting for an
+  interrupt before exiting the mmu notifier handler.
+
+Avi said:
+
+  kvm may be a buyer.  kvm::mmu_lock, which serializes guest page
+  faults, also protects long operations such as destroying large ranges.
+  It would be good to convert it into a spinlock, but as it is used inside
+  mmu notifiers, this cannot be done.
+
+  (there are alternatives, such as keeping the spinlock and using a
+  generation counter to do the teardown in O(1), which is what the "may"
+  is doing up there).
+
+[akpm@linux-foundation.orgpossible speed tweak in hugetlb_cow(), cleanups]
+Signed-off-by: Andrea Arcangeli <andrea@qumranet.com>
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Haggai Eran <haggaie@mellanox.com>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Xiao Guangrong <xiaoguangrong@linux.vnet.ibm.com>
+Cc: Or Gerlitz <ogerlitz@mellanox.com>
+Cc: Haggai Eran <haggaie@mellanox.com>
+Cc: Shachar Raindel <raindel@mellanox.com>
+Cc: Liran Liss <liranl@mellanox.com>
+Cc: Christoph Lameter <cl@linux-foundation.org>
+Cc: Avi Kivity <avi@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

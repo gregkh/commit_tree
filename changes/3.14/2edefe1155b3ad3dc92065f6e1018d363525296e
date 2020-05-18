@@ -1,0 +1,67 @@
+memcg, slab: fix races in per-memcg cache creation/destruction
+
+We obtain a per-memcg cache from a root kmem_cache by dereferencing an
+entry of the root cache's memcg_params::memcg_caches array.  If we find
+no cache for a memcg there on allocation, we initiate the memcg cache
+creation (see memcg_kmem_get_cache()).  The cache creation proceeds
+asynchronously in memcg_create_kmem_cache() in order to avoid lock
+clashes, so there can be several threads trying to create the same
+kmem_cache concurrently, but only one of them may succeed.  However, due
+to a race in the code, it is not always true.  The point is that the
+memcg_caches array can be relocated when we activate kmem accounting for
+a memcg (see memcg_update_all_caches(), memcg_update_cache_size()).  If
+memcg_update_cache_size() and memcg_create_kmem_cache() proceed
+concurrently as described below, we can leak a kmem_cache.
+
+Asume two threads schedule creation of the same kmem_cache.  One of them
+successfully creates it.  Another one should fail then, but if
+memcg_create_kmem_cache() interleaves with memcg_update_cache_size() as
+follows, it won't:
+
+  memcg_create_kmem_cache()             memcg_update_cache_size()
+  (called w/o mutexes held)             (called with slab_mutex,
+                                         set_limit_mutex held)
+  -------------------------             -------------------------
+
+  mutex_lock(&memcg_cache_mutex)
+
+                                        s->memcg_params=kzalloc(...)
+
+  new_cachep=cache_from_memcg_idx(cachep,idx)
+  // new_cachep==NULL => proceed to creation
+
+                                        s->memcg_params->memcg_caches[i]
+                                            =cur_params->memcg_caches[i]
+
+  // kmem_cache_create_memcg takes slab_mutex
+  // so we will hang around until
+  // memcg_update_cache_size finishes, but
+  // nothing will prevent it from succeeding so
+  // memcg_caches[idx] will be overwritten in
+  // memcg_register_cache!
+
+  new_cachep = kmem_cache_create_memcg(...)
+  mutex_unlock(&memcg_cache_mutex)
+
+Let's fix this by moving the check for existence of the memcg cache to
+kmem_cache_create_memcg() to be called under the slab_mutex and make it
+return NULL if so.
+
+A similar race is possible when destroying a memcg cache (see
+kmem_cache_destroy()).  Since memcg_unregister_cache(), which clears the
+pointer in the memcg_caches array, is called w/o protection, we can race
+with memcg_update_cache_size() and omit clearing the pointer.  Therefore
+memcg_unregister_cache() should be moved before we release the
+slab_mutex.
+
+Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Glauber Costa <glommer@gmail.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Balbir Singh <bsingharora@gmail.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Christoph Lameter <cl@linux.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

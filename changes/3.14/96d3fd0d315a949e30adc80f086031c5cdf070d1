@@ -1,0 +1,171 @@
+rcu: Break call_rcu() deadlock involving scheduler and perf
+
+Dave Jones got the following lockdep splat:
+
+>  ======================================================
+>  [ INFO: possible circular locking dependency detected ]
+>  3.12.0-rc3+ #92 Not tainted
+>  -------------------------------------------------------
+>  trinity-child2/15191 is trying to acquire lock:
+>   (&rdp->nocb_wq){......}, at: [<ffffffff8108ff43>] __wake_up+0x23/0x50
+>
+> but task is already holding lock:
+>   (&ctx->lock){-.-...}, at: [<ffffffff81154c19>] perf_event_exit_task+0x109/0x230
+>
+> which lock already depends on the new lock.
+>
+>
+> the existing dependency chain (in reverse order) is:
+>
+> -> #3 (&ctx->lock){-.-...}:
+>         [<ffffffff810cc243>] lock_acquire+0x93/0x200
+>         [<ffffffff81733f90>] _raw_spin_lock+0x40/0x80
+>         [<ffffffff811500ff>] __perf_event_task_sched_out+0x2df/0x5e0
+>         [<ffffffff81091b83>] perf_event_task_sched_out+0x93/0xa0
+>         [<ffffffff81732052>] __schedule+0x1d2/0xa20
+>         [<ffffffff81732f30>] preempt_schedule_irq+0x50/0xb0
+>         [<ffffffff817352b6>] retint_kernel+0x26/0x30
+>         [<ffffffff813eed04>] tty_flip_buffer_push+0x34/0x50
+>         [<ffffffff813f0504>] pty_write+0x54/0x60
+>         [<ffffffff813e900d>] n_tty_write+0x32d/0x4e0
+>         [<ffffffff813e5838>] tty_write+0x158/0x2d0
+>         [<ffffffff811c4850>] vfs_write+0xc0/0x1f0
+>         [<ffffffff811c52cc>] SyS_write+0x4c/0xa0
+>         [<ffffffff8173d4e4>] tracesys+0xdd/0xe2
+>
+> -> #2 (&rq->lock){-.-.-.}:
+>         [<ffffffff810cc243>] lock_acquire+0x93/0x200
+>         [<ffffffff81733f90>] _raw_spin_lock+0x40/0x80
+>         [<ffffffff810980b2>] wake_up_new_task+0xc2/0x2e0
+>         [<ffffffff81054336>] do_fork+0x126/0x460
+>         [<ffffffff81054696>] kernel_thread+0x26/0x30
+>         [<ffffffff8171ff93>] rest_init+0x23/0x140
+>         [<ffffffff81ee1e4b>] start_kernel+0x3f6/0x403
+>         [<ffffffff81ee1571>] x86_64_start_reservations+0x2a/0x2c
+>         [<ffffffff81ee1664>] x86_64_start_kernel+0xf1/0xf4
+>
+> -> #1 (&p->pi_lock){-.-.-.}:
+>         [<ffffffff810cc243>] lock_acquire+0x93/0x200
+>         [<ffffffff8173419b>] _raw_spin_lock_irqsave+0x4b/0x90
+>         [<ffffffff810979d1>] try_to_wake_up+0x31/0x350
+>         [<ffffffff81097d62>] default_wake_function+0x12/0x20
+>         [<ffffffff81084af8>] autoremove_wake_function+0x18/0x40
+>         [<ffffffff8108ea38>] __wake_up_common+0x58/0x90
+>         [<ffffffff8108ff59>] __wake_up+0x39/0x50
+>         [<ffffffff8110d4f8>] __call_rcu_nocb_enqueue+0xa8/0xc0
+>         [<ffffffff81111450>] __call_rcu+0x140/0x820
+>         [<ffffffff81111b8d>] call_rcu+0x1d/0x20
+>         [<ffffffff81093697>] cpu_attach_domain+0x287/0x360
+>         [<ffffffff81099d7e>] build_sched_domains+0xe5e/0x10a0
+>         [<ffffffff81efa7fc>] sched_init_smp+0x3b7/0x47a
+>         [<ffffffff81ee1f4e>] kernel_init_freeable+0xf6/0x202
+>         [<ffffffff817200be>] kernel_init+0xe/0x190
+>         [<ffffffff8173d22c>] ret_from_fork+0x7c/0xb0
+>
+> -> #0 (&rdp->nocb_wq){......}:
+>         [<ffffffff810cb7ca>] __lock_acquire+0x191a/0x1be0
+>         [<ffffffff810cc243>] lock_acquire+0x93/0x200
+>         [<ffffffff8173419b>] _raw_spin_lock_irqsave+0x4b/0x90
+>         [<ffffffff8108ff43>] __wake_up+0x23/0x50
+>         [<ffffffff8110d4f8>] __call_rcu_nocb_enqueue+0xa8/0xc0
+>         [<ffffffff81111450>] __call_rcu+0x140/0x820
+>         [<ffffffff81111bb0>] kfree_call_rcu+0x20/0x30
+>         [<ffffffff81149abf>] put_ctx+0x4f/0x70
+>         [<ffffffff81154c3e>] perf_event_exit_task+0x12e/0x230
+>         [<ffffffff81056b8d>] do_exit+0x30d/0xcc0
+>         [<ffffffff8105893c>] do_group_exit+0x4c/0xc0
+>         [<ffffffff810589c4>] SyS_exit_group+0x14/0x20
+>         [<ffffffff8173d4e4>] tracesys+0xdd/0xe2
+>
+> other info that might help us debug this:
+>
+> Chain exists of:
+>   &rdp->nocb_wq --> &rq->lock --> &ctx->lock
+>
+>   Possible unsafe locking scenario:
+>
+>         CPU0                    CPU1
+>         ----                    ----
+>    lock(&ctx->lock);
+>                                 lock(&rq->lock);
+>                                 lock(&ctx->lock);
+>    lock(&rdp->nocb_wq);
+>
+>  *** DEADLOCK ***
+>
+> 1 lock held by trinity-child2/15191:
+>  #0:  (&ctx->lock){-.-...}, at: [<ffffffff81154c19>] perf_event_exit_task+0x109/0x230
+>
+> stack backtrace:
+> CPU: 2 PID: 15191 Comm: trinity-child2 Not tainted 3.12.0-rc3+ #92
+>  ffffffff82565b70 ffff880070c2dbf8 ffffffff8172a363 ffffffff824edf40
+>  ffff880070c2dc38 ffffffff81726741 ffff880070c2dc90 ffff88022383b1c0
+>  ffff88022383aac0 0000000000000000 ffff88022383b188 ffff88022383b1c0
+> Call Trace:
+>  [<ffffffff8172a363>] dump_stack+0x4e/0x82
+>  [<ffffffff81726741>] print_circular_bug+0x200/0x20f
+>  [<ffffffff810cb7ca>] __lock_acquire+0x191a/0x1be0
+>  [<ffffffff810c6439>] ? get_lock_stats+0x19/0x60
+>  [<ffffffff8100b2f4>] ? native_sched_clock+0x24/0x80
+>  [<ffffffff810cc243>] lock_acquire+0x93/0x200
+>  [<ffffffff8108ff43>] ? __wake_up+0x23/0x50
+>  [<ffffffff8173419b>] _raw_spin_lock_irqsave+0x4b/0x90
+>  [<ffffffff8108ff43>] ? __wake_up+0x23/0x50
+>  [<ffffffff8108ff43>] __wake_up+0x23/0x50
+>  [<ffffffff8110d4f8>] __call_rcu_nocb_enqueue+0xa8/0xc0
+>  [<ffffffff81111450>] __call_rcu+0x140/0x820
+>  [<ffffffff8109bc8f>] ? local_clock+0x3f/0x50
+>  [<ffffffff81111bb0>] kfree_call_rcu+0x20/0x30
+>  [<ffffffff81149abf>] put_ctx+0x4f/0x70
+>  [<ffffffff81154c3e>] perf_event_exit_task+0x12e/0x230
+>  [<ffffffff81056b8d>] do_exit+0x30d/0xcc0
+>  [<ffffffff810c9af5>] ? trace_hardirqs_on_caller+0x115/0x1e0
+>  [<ffffffff810c9bcd>] ? trace_hardirqs_on+0xd/0x10
+>  [<ffffffff8105893c>] do_group_exit+0x4c/0xc0
+>  [<ffffffff810589c4>] SyS_exit_group+0x14/0x20
+>  [<ffffffff8173d4e4>] tracesys+0xdd/0xe2
+
+The underlying problem is that perf is invoking call_rcu() with the
+scheduler locks held, but in NOCB mode, call_rcu() will with high
+probability invoke the scheduler -- which just might want to use its
+locks.  The reason that call_rcu() needs to invoke the scheduler is
+to wake up the corresponding rcuo callback-offload kthread, which
+does the job of starting up a grace period and invoking the callbacks
+afterwards.
+
+One solution (championed on a related problem by Lai Jiangshan) is to
+simply defer the wakeup to some point where scheduler locks are no longer
+held.  Since we don't want to unnecessarily incur the cost of such
+deferral, the task before us is threefold:
+
+1.	Determine when it is likely that a relevant scheduler lock is held.
+
+2.	Defer the wakeup in such cases.
+
+3.	Ensure that all deferred wakeups eventually happen, preferably
+	sooner rather than later.
+
+We use irqs_disabled_flags() as a proxy for relevant scheduler locks
+being held.  This works because the relevant locks are always acquired
+with interrupts disabled.  We may defer more often than needed, but that
+is at least safe.
+
+The wakeup deferral is tracked via a new field in the per-CPU and
+per-RCU-flavor rcu_data structure, namely ->nocb_defer_wakeup.
+
+This flag is checked by the RCU core processing.  The __rcu_pending()
+function now checks this flag, which causes rcu_check_callbacks()
+to initiate RCU core processing at each scheduling-clock interrupt
+where this flag is set.  Of course this is not sufficient because
+scheduling-clock interrupts are often turned off (the things we used to
+be able to count on!).  So the flags are also checked on entry to any
+state that RCU considers to be idle, which includes both NO_HZ_IDLE idle
+state and NO_HZ_FULL user-mode-execution state.
+
+This approach should allow call_rcu() to be invoked regardless of what
+locks you might be holding, the key word being "should".
+
+Reported-by: Dave Jones <davej@redhat.com>
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+

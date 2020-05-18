@@ -1,0 +1,93 @@
+FS-Cache: Simplify cookie retention for fscache_objects, fixing oops
+
+Simplify the way fscache cache objects retain their cookie.  The way I
+implemented the cookie storage handling made synchronisation a pain (ie. the
+object state machine can't rely on the cookie actually still being there).
+
+Instead of the the object being detached from the cookie and the cookie being
+freed in __fscache_relinquish_cookie(), we defer both operations:
+
+ (*) The detachment of the object from the list in the cookie now takes place
+     in fscache_drop_object() and is thus governed by the object state machine
+     (fscache_detach_from_cookie() has been removed).
+
+ (*) The release of the cookie is now in fscache_object_destroy() - which is
+     called by the cache backend just before it frees the object.
+
+This means that the fscache_cookie struct is now available to the cache all the
+way through from ->alloc_object() to ->drop_object() and ->put_object() -
+meaning that it's no longer necessary to take object->lock to guarantee access.
+
+However, __fscache_relinquish_cookie() doesn't wait for the object to go all
+the way through to destruction before letting the netfs proceed.  That would
+massively slow down the netfs.  Since __fscache_relinquish_cookie() leaves the
+cookie around, in must therefore break all attachments to the netfs - which
+includes ->def, ->netfs_data and any outstanding page read/writes.
+
+To handle this, struct fscache_cookie now has an n_active counter:
+
+ (1) This starts off initialised to 1.
+
+ (2) Any time the cache needs to get at the netfs data, it calls
+     fscache_use_cookie() to increment it - if it is not zero.  If it was zero,
+     then access is not permitted.
+
+ (3) When the cache has finished with the data, it calls fscache_unuse_cookie()
+     to decrement it.  This does a wake-up on it if it reaches 0.
+
+ (4) __fscache_relinquish_cookie() decrements n_active and then waits for it to
+     reach 0.  The initialisation to 1 in step (1) ensures that we only get
+     wake ups when we're trying to get rid of the cookie.
+
+This leaves __fscache_relinquish_cookie() a lot simpler.
+
+
+***
+This fixes a problem in the current code whereby if fscache_invalidate() is
+followed sufficiently quickly by fscache_relinquish_cookie() then it is
+possible for __fscache_relinquish_cookie() to have detached the cookie from the
+object and cleared the pointer before a thread is dispatched to process the
+invalidation state in the object state machine.
+
+Since the pending write clearance was deferred to the invalidation state to
+make it asynchronous, we need to either wait in relinquishment for the stores
+tree to be cleared in the invalidation state or we need to handle the clearance
+in relinquishment.
+
+Further, if the relinquishment code does clear the tree, then the invalidation
+state need to make the clearance contingent on still having the cookie to hand
+(since that's where the tree is rooted) and we have to prevent the cookie from
+disappearing for the duration.
+
+This can lead to an oops like the following:
+
+BUG: unable to handle kernel NULL pointer dereference at 000000000000000c
+...
+RIP: 0010:[<ffffffff8151023e>] _spin_lock+0xe/0x30
+...
+CR2: 000000000000000c ...
+...
+Process kslowd002 (...)
+....
+Call Trace:
+ [<ffffffffa01c3278>] fscache_invalidate_writes+0x38/0xd0 [fscache]
+ [<ffffffff810096f0>] ? __switch_to+0xd0/0x320
+ [<ffffffff8105e759>] ? find_busiest_queue+0x69/0x150
+ [<ffffffff8110ddd4>] ? slow_work_enqueue+0x104/0x180
+ [<ffffffffa01c1303>] fscache_object_slow_work_execute+0x5e3/0x9d0 [fscache]
+ [<ffffffff81096b67>] ? bit_waitqueue+0x17/0xd0
+ [<ffffffff8110e233>] slow_work_execute+0x233/0x310
+ [<ffffffff8110e515>] slow_work_thread+0x205/0x360
+ [<ffffffff81096ca0>] ? autoremove_wake_function+0x0/0x40
+ [<ffffffff8110e310>] ? slow_work_thread+0x0/0x360
+ [<ffffffff81096936>] kthread+0x96/0xa0
+ [<ffffffff8100c0ca>] child_rip+0xa/0x20
+ [<ffffffff810968a0>] ? kthread+0x0/0xa0
+ [<ffffffff8100c0c0>] ? child_rip+0x0/0x20
+
+The parameter to fscache_invalidate_writes() was object->cookie which is NULL.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Tested-By: Milosz Tanski <milosz@adfin.com>
+Acked-by: Jeff Layton <jlayton@redhat.com>
+

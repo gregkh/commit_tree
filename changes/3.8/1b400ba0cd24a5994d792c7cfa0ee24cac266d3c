@@ -1,0 +1,55 @@
+KVM: PPC: Book3S HV: Improve handling of local vs. global TLB invalidations
+
+When we change or remove a HPT (hashed page table) entry, we can do
+either a global TLB invalidation (tlbie) that works across the whole
+machine, or a local invalidation (tlbiel) that only affects this core.
+Currently we do local invalidations if the VM has only one vcpu or if
+the guest requests it with the H_LOCAL flag, though the guest Linux
+kernel currently doesn't ever use H_LOCAL.  Then, to cope with the
+possibility that vcpus moving around to different physical cores might
+expose stale TLB entries, there is some code in kvmppc_hv_entry to
+flush the whole TLB of entries for this VM if either this vcpu is now
+running on a different physical core from where it last ran, or if this
+physical core last ran a different vcpu.
+
+There are a number of problems on POWER7 with this as it stands:
+
+- The TLB invalidation is done per thread, whereas it only needs to be
+  done per core, since the TLB is shared between the threads.
+- With the possibility of the host paging out guest pages, the use of
+  H_LOCAL by an SMP guest is dangerous since the guest could possibly
+  retain and use a stale TLB entry pointing to a page that had been
+  removed from the guest.
+- The TLB invalidations that we do when a vcpu moves from one physical
+  core to another are unnecessary in the case of an SMP guest that isn't
+  using H_LOCAL.
+- The optimization of using local invalidations rather than global should
+  apply to guests with one virtual core, not just one vcpu.
+
+(None of this applies on PPC970, since there we always have to
+invalidate the whole TLB when entering and leaving the guest, and we
+can't support paging out guest memory.)
+
+To fix these problems and simplify the code, we now maintain a simple
+cpumask of which cpus need to flush the TLB on entry to the guest.
+(This is indexed by cpu, though we only ever use the bits for thread
+0 of each core.)  Whenever we do a local TLB invalidation, we set the
+bits for every cpu except the bit for thread 0 of the core that we're
+currently running on.  Whenever we enter a guest, we test and clear the
+bit for our core, and flush the TLB if it was set.
+
+On initial startup of the VM, and when resetting the HPT, we set all the
+bits in the need_tlb_flush cpumask, since any core could potentially have
+stale TLB entries from the previous VM to use the same LPID, or the
+previous contents of the HPT.
+
+Then, we maintain a count of the number of online virtual cores, and use
+that when deciding whether to use a local invalidation rather than the
+number of online vcpus.  The code to make that decision is extracted out
+into a new function, global_invalidates().  For multi-core guests on
+POWER7 (i.e. when we are using mmu notifiers), we now never do local
+invalidations regardless of the H_LOCAL flag.
+
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+

@@ -1,0 +1,56 @@
+perf/x86/p4: Fix counter corruption when using lots of perf groups
+
+On a P4 box stressing perf with:
+
+   ./perf record -o perf.data ./perf stat -v ./perf bench all
+
+it was noticed that a slew of unknown NMIs would pop out rather quickly.
+
+Painfully debugging this ancient platform, led me to notice cross cpu counter
+corruption.
+
+The P4 machine is special in that it has 18 counters, half are used for cpu0
+and the other half is for cpu1 (or all 18 if hyperthreading is disabled).  But
+the splitting of the counters has to be actively managed by the software.
+
+In this particular bug, one of the cpu0 specific counters was being used by
+cpu1 and caused all sorts of random unknown nmis.
+
+I am not entirely sure on the corruption path, but what happens is:
+
+ o perf schedules a group with p4_pmu_schedule_events()
+ o inside p4_pmu_schedule_events(), it notices an hwc pointer is being reused
+   but for a different cpu, so it 'swaps' the config bits and returns the
+   updated 'assign' array with a _new_ index.
+ o perf schedules another group with p4_pmu_schedule_events()
+ o inside p4_pmu_schedule_events(), it notices an hwc pointer is being reused
+   (the same one as above) but for the _same_ cpu [BUG!!], so it updates the
+   'assign' array to use the _old_ (wrong cpu) index because the _new_ index is in
+   an earlier part of the 'assign' array (and hasn't been committed yet).
+ o perf commits the transaction using the wrong index and corrupts the other cpu
+
+The [BUG!!] is because the 'hwc->config' is updated but not the 'hwc->idx'.  So
+the check for 'p4_should_swap_ts()' is correct the first time around but
+incorrect the second time around (because hwc->config was updated in between).
+
+I think the spirit of perf was to not modify anything until all the
+transactions had a chance to 'test' if they would succeed, and if so, commit
+atomically.  However, P4 breaks this spirit by touching the hwc->config
+element.
+
+So my fix is to continue the un-perf like breakage, by assigning hwc->idx to -1
+on swap to tell follow up group scheduling to find a new index.
+
+Of course if the transaction fails rolling this back will be difficult, but
+that is not different than how the current code works. :-)  And I wasn't sure
+how much effort to cleanup the code I should do for a platform that is almost
+10 years old by now.
+
+Hence the lazy fix.
+
+Signed-off-by: Don Zickus <dzickus@redhat.com>
+Acked-by: Cyrill Gorcunov <gorcunov@openvz.org>
+Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1391024270-19469-1-git-send-email-dzickus@redhat.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

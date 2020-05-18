@@ -1,0 +1,107 @@
+arm64: atomics: fix use of acquire + release for full barrier semantics
+
+Linux requires a number of atomic operations to provide full barrier
+semantics, that is no memory accesses after the operation can be
+observed before any accesses up to and including the operation in
+program order.
+
+On arm64, these operations have been incorrectly implemented as follows:
+
+	// A, B, C are independent memory locations
+
+	<Access [A]>
+
+	// atomic_op (B)
+1:	ldaxr	x0, [B]		// Exclusive load with acquire
+	<op(B)>
+	stlxr	w1, x0, [B]	// Exclusive store with release
+	cbnz	w1, 1b
+
+	<Access [C]>
+
+The assumption here being that two half barriers are equivalent to a
+full barrier, so the only permitted ordering would be A -> B -> C
+(where B is the atomic operation involving both a load and a store).
+
+Unfortunately, this is not the case by the letter of the architecture
+and, in fact, the accesses to A and C are permitted to pass their
+nearest half barrier resulting in orderings such as Bl -> A -> C -> Bs
+or Bl -> C -> A -> Bs (where Bl is the load-acquire on B and Bs is the
+store-release on B). This is a clear violation of the full barrier
+requirement.
+
+The simple way to fix this is to implement the same algorithm as ARMv7
+using explicit barriers:
+
+	<Access [A]>
+
+	// atomic_op (B)
+	dmb	ish		// Full barrier
+1:	ldxr	x0, [B]		// Exclusive load
+	<op(B)>
+	stxr	w1, x0, [B]	// Exclusive store
+	cbnz	w1, 1b
+	dmb	ish		// Full barrier
+
+	<Access [C]>
+
+but this has the undesirable effect of introducing *two* full barrier
+instructions. A better approach is actually the following, non-intuitive
+sequence:
+
+	<Access [A]>
+
+	// atomic_op (B)
+1:	ldxr	x0, [B]		// Exclusive load
+	<op(B)>
+	stlxr	w1, x0, [B]	// Exclusive store with release
+	cbnz	w1, 1b
+	dmb	ish		// Full barrier
+
+	<Access [C]>
+
+The simple observations here are:
+
+  - The dmb ensures that no subsequent accesses (e.g. the access to C)
+    can enter or pass the atomic sequence.
+
+  - The dmb also ensures that no prior accesses (e.g. the access to A)
+    can pass the atomic sequence.
+
+  - Therefore, no prior access can pass a subsequent access, or
+    vice-versa (i.e. A is strictly ordered before C).
+
+  - The stlxr ensures that no prior access can pass the store component
+    of the atomic operation.
+
+The only tricky part remaining is the ordering between the ldxr and the
+access to A, since the absence of the first dmb means that we're now
+permitting re-ordering between the ldxr and any prior accesses.
+
+From an (arbitrary) observer's point of view, there are two scenarios:
+
+  1. We have observed the ldxr. This means that if we perform a store to
+     [B], the ldxr will still return older data. If we can observe the
+     ldxr, then we can potentially observe the permitted re-ordering
+     with the access to A, which is clearly an issue when compared to
+     the dmb variant of the code. Thankfully, the exclusive monitor will
+     save us here since it will be cleared as a result of the store and
+     the ldxr will retry. Notice that any use of a later memory
+     observation to imply observation of the ldxr will also imply
+     observation of the access to A, since the stlxr/dmb ensure strict
+     ordering.
+
+  2. We have not observed the ldxr. This means we can perform a store
+     and influence the later ldxr. However, that doesn't actually tell
+     us anything about the access to [A], so we've not lost anything
+     here either when compared to the dmb variant.
+
+This patch implements this solution for our barriered atomic operations,
+ensuring that we satisfy the full barrier requirements where they are
+needed.
+
+Cc: <stable@vger.kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+

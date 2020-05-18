@@ -1,0 +1,102 @@
+KEYS: Correctly destroy key payloads when their keytype is removed
+
+unregister_key_type() has code to mark a key as dead and make it unavailable in
+one loop and then destroy all those unavailable key payloads in the next loop.
+However, the loop to mark keys dead renders the key undetectable to the second
+loop by changing the key type pointer also.
+
+Fix this by the following means:
+
+ (1) The key code has two garbage collectors: one deletes unreferenced keys and
+     the other alters keyrings to delete links to old dead, revoked and expired
+     keys.  They can end up holding each other up as both want to scan the key
+     serial tree under spinlock.  Combine these into a single routine.
+
+ (2) Move the dead key marking, dead link removal and dead key removal into the
+     garbage collector as a three phase process running over the three cycles
+     of the normal garbage collection procedure.  This is tracked by the
+     KEY_GC_REAPING_DEAD_1, _2 and _3 state flags.
+
+     unregister_key_type() then just unlinks the key type from the list, wakes
+     up the garbage collector and waits for the third phase to complete.
+
+ (3) Downgrade the key types sem in unregister_key_type() once it has deleted
+     the key type from the list so that it doesn't block the keyctl() syscall.
+
+ (4) Dead keys that cannot be simply removed in the third phase have their
+     payloads destroyed with the key's semaphore write-locked to prevent
+     interference by the keyctl() syscall.  There should be no in-kernel users
+     of dead keys of that type by the point of unregistration, though keyctl()
+     may be holding a reference.
+
+ (5) Only perform timer recalculation in the GC if the timer actually expired.
+     If it didn't, we'll get another cycle when it goes off - and if the key
+     that actually triggered it has been removed, it's not a problem.
+
+ (6) Only garbage collect link if the timer expired or if we're doing dead key
+     clean up phase 2.
+
+ (7) As only key_garbage_collector() is permitted to use rb_erase() on the key
+     serial tree, it doesn't need to revalidate its cursor after dropping the
+     spinlock as the node the cursor points to must still exist in the tree.
+
+ (8) Drop the spinlock in the GC if there is contention on it or if we need to
+     reschedule.  After dealing with that, get the spinlock again and resume
+     scanning.
+
+This has been tested in the following ways:
+
+ (1) Run the keyutils testsuite against it.
+
+ (2) Using the AF_RXRPC and RxKAD modules to test keytype removal:
+
+     Load the rxrpc_s key type:
+
+	# insmod /tmp/af-rxrpc.ko
+	# insmod /tmp/rxkad.ko
+
+     Create a key (http://people.redhat.com/~dhowells/rxrpc/listen.c):
+
+	# /tmp/listen &
+	[1] 8173
+
+     Find the key:
+
+	# grep rxrpc_s /proc/keys
+	091086e1 I--Q--     1 perm 39390000     0     0 rxrpc_s   52:2
+
+     Link it to a session keyring, preferably one with a higher serial number:
+
+	# keyctl link 0x20e36251 @s
+
+     Kill the process (the key should remain as it's linked to another place):
+
+	# fg
+	/tmp/listen
+	^C
+
+     Remove the key type:
+
+	rmmod rxkad
+	rmmod af-rxrpc
+
+     This can be made a more effective test by altering the following part of
+     the patch:
+
+	if (unlikely(gc_state & KEY_GC_REAPING_DEAD_2)) {
+		/* Make sure everyone revalidates their keys if we marked a
+		 * bunch as being dead and make sure all keyring ex-payloads
+		 * are destroyed.
+		 */
+		kdebug("dead sync");
+		synchronize_rcu();
+
+     To call synchronize_rcu() in GC phase 1 instead.  That causes that the
+     keyring's old payload content to hang around longer until it's RCU
+     destroyed - which usually happens after GC phase 3 is complete.  This
+     allows the destroy_dead_key branch to be tested.
+
+Reported-by: Benjamin Coddington <bcodding@gmail.com>
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: James Morris <jmorris@namei.org>
+

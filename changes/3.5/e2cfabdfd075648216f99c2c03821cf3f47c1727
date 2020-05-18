@@ -1,0 +1,149 @@
+seccomp: add system call filtering using BPF
+
+[This patch depends on luto@mit.edu's no_new_privs patch:
+   https://lkml.org/lkml/2012/1/30/264
+ The whole series including Andrew's patches can be found here:
+   https://github.com/redpig/linux/tree/seccomp
+ Complete diff here:
+   https://github.com/redpig/linux/compare/1dc65fed...seccomp
+]
+
+This patch adds support for seccomp mode 2.  Mode 2 introduces the
+ability for unprivileged processes to install system call filtering
+policy expressed in terms of a Berkeley Packet Filter (BPF) program.
+This program will be evaluated in the kernel for each system call
+the task makes and computes a result based on data in the format
+of struct seccomp_data.
+
+A filter program may be installed by calling:
+  struct sock_fprog fprog = { ... };
+  ...
+  prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog);
+
+The return value of the filter program determines if the system call is
+allowed to proceed or denied.  If the first filter program installed
+allows prctl(2) calls, then the above call may be made repeatedly
+by a task to further reduce its access to the kernel.  All attached
+programs must be evaluated before a system call will be allowed to
+proceed.
+
+Filter programs will be inherited across fork/clone and execve.
+However, if the task attaching the filter is unprivileged
+(!CAP_SYS_ADMIN) the no_new_privs bit will be set on the task.  This
+ensures that unprivileged tasks cannot attach filters that affect
+privileged tasks (e.g., setuid binary).
+
+There are a number of benefits to this approach. A few of which are
+as follows:
+- BPF has been exposed to userland for a long time
+- BPF optimization (and JIT'ing) are well understood
+- Userland already knows its ABI: system call numbers and desired
+  arguments
+- No time-of-check-time-of-use vulnerable data accesses are possible.
+- system call arguments are loaded on access only to minimize copying
+  required for system call policy decisions.
+
+Mode 2 support is restricted to architectures that enable
+HAVE_ARCH_SECCOMP_FILTER.  In this patch, the primary dependency is on
+syscall_get_arguments().  The full desired scope of this feature will
+add a few minor additional requirements expressed later in this series.
+Based on discussion, SECCOMP_RET_ERRNO and SECCOMP_RET_TRACE seem to be
+the desired additional functionality.
+
+No architectures are enabled in this patch.
+
+Signed-off-by: Will Drewry <wad@chromium.org>
+Acked-by: Serge Hallyn <serge.hallyn@canonical.com>
+Reviewed-by: Indan Zupancic <indan@nul.nu>
+Acked-by: Eric Paris <eparis@redhat.com>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+
+v18: - rebase to v3.4-rc2
+     - s/chk/check/ (akpm@linux-foundation.org,jmorris@namei.org)
+     - allocate with GFP_KERNEL|__GFP_NOWARN (indan@nul.nu)
+     - add a comment for get_u32 regarding endianness (akpm@)
+     - fix other typos, style mistakes (akpm@)
+     - added acked-by
+v17: - properly guard seccomp filter needed headers (leann@ubuntu.com)
+     - tighten return mask to 0x7fff0000
+v16: - no change
+v15: - add a 4 instr penalty when counting a path to account for seccomp_filter
+       size (indan@nul.nu)
+     - drop the max insns to 256KB (indan@nul.nu)
+     - return ENOMEM if the max insns limit has been hit (indan@nul.nu)
+     - move IP checks after args (indan@nul.nu)
+     - drop !user_filter check (indan@nul.nu)
+     - only allow explicit bpf codes (indan@nul.nu)
+     - exit_code -> exit_sig
+v14: - put/get_seccomp_filter takes struct task_struct
+       (indan@nul.nu,keescook@chromium.org)
+     - adds seccomp_chk_filter and drops general bpf_run/chk_filter user
+     - add seccomp_bpf_load for use by net/core/filter.c
+     - lower max per-process/per-hierarchy: 1MB
+     - moved nnp/capability check prior to allocation
+       (all of the above: indan@nul.nu)
+v13: - rebase on to 88ebdda6159ffc15699f204c33feb3e431bf9bdc
+v12: - added a maximum instruction count per path (indan@nul.nu,oleg@redhat.com)
+     - removed copy_seccomp (keescook@chromium.org,indan@nul.nu)
+     - reworded the prctl_set_seccomp comment (indan@nul.nu)
+v11: - reorder struct seccomp_data to allow future args expansion (hpa@zytor.com)
+     - style clean up, @compat dropped, compat_sock_fprog32 (indan@nul.nu)
+     - do_exit(SIGSYS) (keescook@chromium.org, luto@mit.edu)
+     - pare down Kconfig doc reference.
+     - extra comment clean up
+v10: - seccomp_data has changed again to be more aesthetically pleasing
+       (hpa@zytor.com)
+     - calling convention is noted in a new u32 field using syscall_get_arch.
+       This allows for cross-calling convention tasks to use seccomp filters.
+       (hpa@zytor.com)
+     - lots of clean up (thanks, Indan!)
+ v9: - n/a
+ v8: - use bpf_chk_filter, bpf_run_filter. update load_fns
+     - Lots of fixes courtesy of indan@nul.nu:
+     -- fix up load behavior, compat fixups, and merge alloc code,
+     -- renamed pc and dropped __packed, use bool compat.
+     -- Added a hidden CONFIG_SECCOMP_FILTER to synthesize non-arch
+        dependencies
+ v7:  (massive overhaul thanks to Indan, others)
+     - added CONFIG_HAVE_ARCH_SECCOMP_FILTER
+     - merged into seccomp.c
+     - minimal seccomp_filter.h
+     - no config option (part of seccomp)
+     - no new prctl
+     - doesn't break seccomp on systems without asm/syscall.h
+       (works but arg access always fails)
+     - dropped seccomp_init_task, extra free functions, ...
+     - dropped the no-asm/syscall.h code paths
+     - merges with network sk_run_filter and sk_chk_filter
+ v6: - fix memory leak on attach compat check failure
+     - require no_new_privs || CAP_SYS_ADMIN prior to filter
+       installation. (luto@mit.edu)
+     - s/seccomp_struct_/seccomp_/ for macros/functions (amwang@redhat.com)
+     - cleaned up Kconfig (amwang@redhat.com)
+     - on block, note if the call was compat (so the # means something)
+ v5: - uses syscall_get_arguments
+       (indan@nul.nu,oleg@redhat.com, mcgrathr@chromium.org)
+      - uses union-based arg storage with hi/lo struct to
+        handle endianness.  Compromises between the two alternate
+        proposals to minimize extra arg shuffling and account for
+        endianness assuming userspace uses offsetof().
+        (mcgrathr@chromium.org, indan@nul.nu)
+      - update Kconfig description
+      - add include/seccomp_filter.h and add its installation
+      - (naive) on-demand syscall argument loading
+      - drop seccomp_t (eparis@redhat.com)
+ v4:  - adjusted prctl to make room for PR_[SG]ET_NO_NEW_PRIVS
+      - now uses current->no_new_privs
+        (luto@mit.edu,torvalds@linux-foundation.com)
+      - assign names to seccomp modes (rdunlap@xenotime.net)
+      - fix style issues (rdunlap@xenotime.net)
+      - reworded Kconfig entry (rdunlap@xenotime.net)
+ v3:  - macros to inline (oleg@redhat.com)
+      - init_task behavior fixed (oleg@redhat.com)
+      - drop creator entry and extra NULL check (oleg@redhat.com)
+      - alloc returns -EINVAL on bad sizing (serge.hallyn@canonical.com)
+      - adds tentative use of "always_unprivileged" as per
+        torvalds@linux-foundation.org and luto@mit.edu
+ v2:  - (patch 2 only)
+Signed-off-by: James Morris <james.l.morris@oracle.com>
+

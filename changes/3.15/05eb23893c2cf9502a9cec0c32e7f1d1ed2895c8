@@ -1,0 +1,61 @@
+cxgb4/iw_cxgb4: Doorbell Drop Avoidance Bug Fixes
+
+The current logic suffers from a slow response time to disable user DB
+usage, and also fails to avoid DB FIFO drops under heavy load. This commit
+fixes these deficiencies and makes the avoidance logic more optimal.
+This is done by more efficiently notifying the ULDs of potential DB
+problems, and implements a smoother flow control algorithm in iw_cxgb4,
+which is the ULD that puts the most load on the DB fifo.
+
+Design:
+
+cxgb4:
+
+Direct ULD callback from the DB FULL/DROP interrupt handler.  This allows
+the ULD to stop doing user DB writes as quickly as possible.
+
+While user DB usage is disabled, the LLD will accumulate DB write events
+for its queues.  Then once DB usage is reenabled, a single DB write is
+done for each queue with its accumulated write count.  This reduces the
+load put on the DB fifo when reenabling.
+
+iw_cxgb4:
+
+Instead of marking each qp to indicate DB writes are disabled, we create
+a device-global status page that each user process maps.  This allows
+iw_cxgb4 to only set this single bit to disable all DB writes for all
+user QPs vs traversing the idr of all the active QPs.  If the libcxgb4
+doesn't support this, then we fall back to the old approach of marking
+each QP.  Thus we allow the new driver to work with an older libcxgb4.
+
+When the LLD upcalls iw_cxgb4 indicating DB FULL, we disable all DB writes
+via the status page and transition the DB state to STOPPED.  As user
+processes see that DB writes are disabled, they call into iw_cxgb4
+to submit their DB write events.  Since the DB state is in STOPPED,
+the QP trying to write gets enqueued on a new DB "flow control" list.
+As subsequent DB writes are submitted for this flow controlled QP, the
+amount of writes are accumulated for each QP on the flow control list.
+So all the user QPs that are actively ringing the DB get put on this
+list and the number of writes they request are accumulated.
+
+When the LLD upcalls iw_cxgb4 indicating DB EMPTY, which is in a workq
+context, we change the DB state to FLOW_CONTROL, and begin resuming all
+the QPs that are on the flow control list.  This logic runs on until
+the flow control list is empty or we exit FLOW_CONTROL mode (due to
+a DB DROP upcall, for example).  QPs are removed from this list, and
+their accumulated DB write counts written to the DB FIFO.  Sets of QPs,
+called chunks in the code, are removed at one time. The chunk size is 64.
+So 64 QPs are resumed at a time, and before the next chunk is resumed, the
+logic waits (blocks) for the DB FIFO to drain.  This prevents resuming to
+quickly and overflowing the FIFO.  Once the flow control list is empty,
+the db state transitions back to NORMAL and user QPs are again allowed
+to write directly to the user DB register.
+
+The algorithm is designed such that if the DB write load is high enough,
+then all the DB writes get submitted by the kernel using this flow
+controlled approach to avoid DB drops.  As the load lightens though, we
+resume to normal DB writes directly by user applications.
+
+Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

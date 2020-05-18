@@ -1,0 +1,108 @@
+ptrace: implement TRAP_NOTIFY and use it for group stop events
+
+Currently there's no way for ptracer to find out whether group stop
+finished other than polling with INTERRUPT - GETSIGINFO - CONT
+sequence.  This patch implements group stop notification for ptracer
+using STOP traps.
+
+When group stop state of a seized tracee changes, JOBCTL_TRAP_NOTIFY
+is set, which schedules a STOP trap which is sticky - it isn't cleared
+by other traps and at least one STOP trap will happen eventually.
+STOP trap is synchronization point for event notification and the
+tracer can determine the current group stop state by looking at the
+signal number portion of exit code (si_status from waitid(2) or
+si_code from PTRACE_GETSIGINFO).
+
+Notifications are generated both on start and end of group stops but,
+because group stop participation always happens before STOP trap, this
+doesn't cause an extra trap while tracee is participating in group
+stop.  The symmetry will be useful later.
+
+Note that this notification works iff tracee is not trapped.
+Currently there is no way to be notified of group stop state changes
+while tracee is trapped.  This will be addressed by a later patch.
+
+An example program follows.
+
+  #define PTRACE_SEIZE		0x4206
+  #define PTRACE_INTERRUPT	0x4207
+
+  #define PTRACE_SEIZE_DEVEL	0x80000000
+
+  static const struct timespec ts1s = { .tv_sec = 1 };
+
+  int main(int argc, char **argv)
+  {
+	  pid_t tracee, tracer;
+	  int i;
+
+	  tracee = fork();
+	  if (!tracee)
+		  while (1)
+			  pause();
+
+	  tracer = fork();
+	  if (!tracer) {
+		  siginfo_t si;
+
+		  ptrace(PTRACE_SEIZE, tracee, NULL,
+			 (void *)(unsigned long)PTRACE_SEIZE_DEVEL);
+		  ptrace(PTRACE_INTERRUPT, tracee, NULL, NULL);
+	  repeat:
+		  waitid(P_PID, tracee, NULL, WSTOPPED);
+
+		  ptrace(PTRACE_GETSIGINFO, tracee, NULL, &si);
+		  if (!si.si_code) {
+			  printf("tracer: SIG %d\n", si.si_signo);
+			  ptrace(PTRACE_CONT, tracee, NULL,
+				 (void *)(unsigned long)si.si_signo);
+			  goto repeat;
+		  }
+		  printf("tracer: stopped=%d signo=%d\n",
+			 si.si_signo != SIGTRAP, si.si_signo);
+		  ptrace(PTRACE_CONT, tracee, NULL, NULL);
+		  goto repeat;
+	  }
+
+	  for (i = 0; i < 3; i++) {
+		  nanosleep(&ts1s, NULL);
+		  printf("mother: SIGSTOP\n");
+		  kill(tracee, SIGSTOP);
+		  nanosleep(&ts1s, NULL);
+		  printf("mother: SIGCONT\n");
+		  kill(tracee, SIGCONT);
+	  }
+	  nanosleep(&ts1s, NULL);
+
+	  kill(tracer, SIGKILL);
+	  kill(tracee, SIGKILL);
+	  return 0;
+  }
+
+In the above program, tracer keeps tracee running and gets
+notification of each group stop state changes.
+
+  # ./test-notify
+  tracer: stopped=0 signo=5
+  mother: SIGSTOP
+  tracer: SIG 19
+  tracer: stopped=1 signo=19
+  mother: SIGCONT
+  tracer: stopped=0 signo=5
+  tracer: SIG 18
+  mother: SIGSTOP
+  tracer: SIG 19
+  tracer: stopped=1 signo=19
+  mother: SIGCONT
+  tracer: stopped=0 signo=5
+  tracer: SIG 18
+  mother: SIGSTOP
+  tracer: SIG 19
+  tracer: stopped=1 signo=19
+  mother: SIGCONT
+  tracer: stopped=0 signo=5
+  tracer: SIG 18
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+

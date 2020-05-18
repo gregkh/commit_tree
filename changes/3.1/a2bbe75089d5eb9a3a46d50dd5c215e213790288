@@ -1,0 +1,104 @@
+x86: Don't use frame pointer to save old stack on irq entry
+
+rbp is used in SAVE_ARGS_IRQ to save the old stack pointer
+in order to restore it later in ret_from_intr.
+
+It is convenient because we save its value in the irq regs
+and it's easily restored using the leave instruction.
+
+However this is a kind of abuse of the frame pointer which
+role is to help unwinding the kernel by chaining frames
+together, each node following the return address to the
+previous frame.
+
+But although we are breaking the frame by changing the stack
+pointer, there is no preceding return address before the new
+frame. Hence using the frame pointer to link the two stacks
+breaks the stack unwinders that find a random value instead of
+a return address here.
+
+There is no workaround that can work in every case. We are using
+the fixup_bp_irq_link() function to dereference that abused frame
+pointer in the case of non nesting interrupt (which means stack
+changed).
+But that doesn't fix the case of interrupts that don't change the
+stack (but we still have the unconditional frame link), which is
+the case of hardirq interrupting softirq. We have no way to detect
+this transition so the frame irq link is considered as a real frame
+pointer and the return address is dereferenced but it is still a
+spurious one.
+
+There are two possible results of this: either the spurious return
+address, a random stack value, luckily belongs to the kernel text
+and then the unwinding can continue and we just have a weird entry
+in the stack trace. Or it doesn't belong to the kernel text and
+unwinding stops there.
+
+This is the reason why stacktraces (including perf callchains) on
+irqs that interrupted softirqs don't work very well.
+
+To solve this, we don't save the old stack pointer on rbp anymore
+but we save it to a scratch register that we push on the new
+stack and that we pop back later on irq return.
+
+This preserves the whole frame chain without spurious return addresses
+in the middle and drops the need for the horrid fixup_bp_irq_link()
+workaround.
+
+And finally irqs that interrupt softirq are sanely unwinded.
+
+Before:
+
+    99.81%         perf  [kernel.kallsyms]  [k] perf_pending_event
+                   |
+                   --- perf_pending_event
+                       irq_work_run
+                       smp_irq_work_interrupt
+                       irq_work_interrupt
+                      |
+                      |--41.60%-- __read
+                      |          |
+                      |          |--99.90%-- create_worker
+                      |          |          bench_sched_messaging
+                      |          |          cmd_bench
+                      |          |          run_builtin
+                      |          |          main
+                      |          |          __libc_start_main
+                      |           --0.10%-- [...]
+
+After:
+
+     1.64%  swapper  [kernel.kallsyms]  [k] perf_pending_event
+            |
+            --- perf_pending_event
+                irq_work_run
+                smp_irq_work_interrupt
+                irq_work_interrupt
+               |
+               |--95.00%-- arch_irq_work_raise
+               |          irq_work_queue
+               |          __perf_event_overflow
+               |          perf_swevent_overflow
+               |          perf_swevent_event
+               |          perf_tp_event
+               |          perf_trace_softirq
+               |          __do_softirq
+               |          call_softirq
+               |          do_softirq
+               |          irq_exit
+               |          |
+               |          |--73.68%-- smp_apic_timer_interrupt
+               |          |          apic_timer_interrupt
+               |          |          |
+               |          |          |--96.43%-- amd_e400_idle
+               |          |          |          cpu_idle
+               |          |          |          start_secondary
+
+Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+Cc: Ingo Molnar <mingo@elte.hu>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jan Beulich <JBeulich@novell.com>
+

@@ -1,0 +1,66 @@
+raid5: offload stripe handle to workqueue
+
+This is another attempt to create multiple threads to handle raid5 stripes.
+This time I use workqueue.
+
+raid5 handles request (especially write) in stripe unit. A stripe is page size
+aligned/long and acrosses all disks. Writing to any disk sector, raid5 runs a
+state machine for the corresponding stripe, which includes reading some disks
+of the stripe, calculating parity, and writing some disks of the stripe. The
+state machine is running in raid5d thread currently. Since there is only one
+thread, it doesn't scale well for high speed storage. An obvious solution is
+multi-threading.
+
+To get better performance, we have some requirements:
+a. locality. stripe corresponding to request submitted from one cpu is better
+handled in thread in local cpu or local node. local cpu is preferred but some
+times could be a bottleneck, for example, parity calculation is too heavy.
+local node running has wide adaptability.
+b. configurablity. Different setup of raid5 array might need diffent
+configuration. Especially the thread number. More threads don't always mean
+better performance because of lock contentions.
+
+My original implementation is creating some kernel threads. There are
+interfaces to control which cpu's stripe each thread should handle. And
+userspace can set affinity of the threads. This provides biggest flexibility
+and configurability. But it's hard to use and apparently a new thread pool
+implementation is disfavor.
+
+Recent workqueue improvement is quite promising. unbound workqueue will be
+bound to numa node. If WQ_SYSFS is set in workqueue, there are sysfs option to
+do affinity setting. For example, we can only include one HT sibling in
+affinity. Since work is non-reentrant by default, and we can control running
+thread number by limiting dispatched work_struct number.
+
+In this patch, I created several stripe worker group. A group is a numa node.
+stripes from cpus of one node will be added to a group list. Workqueue thread
+of one node will only handle stripes of worker group of the node. In this way,
+stripe handling has numa node locality. And as I said, we can control thread
+number by limiting dispatched work_struct number.
+
+The work_struct callback function handles several stripes in one run. A typical
+work queue usage is to run one unit in each work_struct. In raid5 case, the
+unit is a stripe. But we can't do that:
+a. Though handling a stripe doesn't need lock because of reference accounting
+and stripe isn't in any list, queuing a work_struct for each stripe will make
+workqueue lock contended very heavily.
+b. blk_start_plug()/blk_finish_plug() should surround stripe handle, as we
+might dispatch request. If each work_struct only handles one stripe, such block
+plug is meaningless.
+
+This implementation can't do very fine grained configuration. But the numa
+binding is most popular usage model, should be enough for most workloads.
+
+Note: since we have only one stripe queue, switching to multi-thread might
+decrease request size dispatching down to low level layer. The impact depends
+on thread number, raid configuration and workload. So multi-thread raid5 might
+not be proper for all setups.
+
+Changes V1 -> V2:
+1. remove WQ_NON_REENTRANT
+2. disabling multi-threading by default
+3. Add more descriptions in changelog
+
+Signed-off-by: Shaohua Li <shli@fusionio.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+

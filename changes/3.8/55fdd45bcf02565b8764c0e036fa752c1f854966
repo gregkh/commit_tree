@@ -1,0 +1,88 @@
+ixgbevf: fix softirq-safe to unsafe splat on internal mbx_lock
+
+The lockdep splat below identifies a case where irq safe to unsafe
+lock order is detected. Resolved by making mbx_lock bh.
+
+======================================================
+[ INFO: SOFTIRQ-safe -> SOFTIRQ-unsafe lock order detected ]
+3.6.0-rc5jk-net-next+ #119 Not tainted
+------------------------------------------------------
+ip/2608 [HC0[0]:SC0[2]:HE1:SE0] is trying to acquire:
+ (&(&adapter->mbx_lock)->rlock){+.+...}, at: [<ffffffffa008114e>] ixgbevf_set_rx_mode+0x36/0xd2 [ixgbevf]
+
+and this task is already holding:
+ (_xmit_ETHER){+.....}, at: [<ffffffff814097c8>] dev_set_rx_mode+0x1e/0x33
+which would create a new lock dependency:
+ (_xmit_ETHER){+.....} -> (&(&adapter->mbx_lock)->rlock){+.+...}
+
+but this new dependency connects a SOFTIRQ-irq-safe lock:
+ (&(&mc->mca_lock)->rlock){+.-...}
+... which became SOFTIRQ-irq-safe at:
+  [<ffffffff81092ee5>] __lock_acquire+0x2f2/0xdf3
+  [<ffffffff81093b11>] lock_acquire+0x12b/0x158
+  [<ffffffff814bdbcd>] _raw_spin_lock_bh+0x4a/0x7d
+  [<ffffffffa011a740>] mld_ifc_timer_expire+0x1b2/0x282 [ipv6]
+  [<ffffffff81054580>] run_timer_softirq+0x2a2/0x3ee
+  [<ffffffff8104cc42>] __do_softirq+0x161/0x2b9
+  [<ffffffff814c6a7c>] call_softirq+0x1c/0x30
+  [<ffffffff81011bc7>] do_softirq+0x4b/0xa3
+  [<ffffffff8104c8d5>] irq_exit+0x53/0xd7
+  [<ffffffff814c734d>] do_IRQ+0x9d/0xb4
+  [<ffffffff814be56f>] ret_from_intr+0x0/0x1a
+  [<ffffffff813de21c>] cpuidle_enter+0x12/0x14
+  [<ffffffff813de235>] cpuidle_enter_state+0x17/0x3f
+  [<ffffffff813deb6c>] cpuidle_idle_call+0x140/0x21c
+  [<ffffffff8101764c>] cpu_idle+0x79/0xcd
+  [<ffffffff814a59f5>] rest_init+0x149/0x150
+  [<ffffffff81ca2cbc>] start_kernel+0x37c/0x389
+  [<ffffffff81ca22dd>] x86_64_start_reservations+0xb8/0xbd
+  [<ffffffff81ca23e3>] x86_64_start_kernel+0x101/0x110
+
+to a SOFTIRQ-irq-unsafe lock:
+ (&(&adapter->mbx_lock)->rlock){+.+...}
+... which became SOFTIRQ-irq-unsafe at:
+...  [<ffffffff81092f59>] __lock_acquire+0x366/0xdf3
+  [<ffffffff81093b11>] lock_acquire+0x12b/0x158
+  [<ffffffff814bd862>] _raw_spin_lock+0x45/0x7a
+  [<ffffffffa0080fde>] ixgbevf_negotiate_api+0x3d/0x6d [ixgbevf]
+  [<ffffffffa008404b>] ixgbevf_open+0x6c/0x43e [ixgbevf]
+  [<ffffffff8140b2c1>] __dev_open+0xa0/0xe6
+  [<ffffffff814099b6>] __dev_change_flags+0xbe/0x142
+  [<ffffffff8140b1eb>] dev_change_flags+0x21/0x57
+  [<ffffffff8141a523>] do_setlink+0x2e2/0x7f4
+  [<ffffffff8141ad8c>] rtnl_newlink+0x277/0x4bb
+  [<ffffffff81419c08>] rtnetlink_rcv_msg+0x236/0x253
+  [<ffffffff8142f92d>] netlink_rcv_skb+0x43/0x94
+  [<ffffffff814199cb>] rtnetlink_rcv+0x26/0x2d
+  [<ffffffff8142f6dc>] netlink_unicast+0xee/0x174
+  [<ffffffff8142ff12>] netlink_sendmsg+0x26a/0x288
+  [<ffffffff813f5a0d>] __sock_sendmsg_nosec+0x58/0x61
+  [<ffffffff813f7d57>] __sock_sendmsg+0x3d/0x48
+  [<ffffffff813f7ed9>] sock_sendmsg+0x6e/0x87
+  [<ffffffff813f93d4>] __sys_sendmsg+0x206/0x288
+  [<ffffffff813f95ce>] sys_sendmsg+0x42/0x60
+  [<ffffffff814c57a9>] system_call_fastpath+0x16/0x1b
+
+other info that might help us debug this:
+
+Chain exists of:
+  &(&mc->mca_lock)->rlock --> _xmit_ETHER --> &(&adapter->mbx_lock)->rlock
+
+ Possible interrupt unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&(&adapter->mbx_lock)->rlock);
+                               local_irq_disable();
+                               lock(&(&mc->mca_lock)->rlock);
+                               lock(_xmit_ETHER);
+  <Interrupt>
+    lock(&(&mc->mca_lock)->rlock);
+
+ *** DEADLOCK ***
+
+Signed-off-by: John Fastabend <john.r.fastabend@intel.com>
+Acked-by: Greg Rose <gregory.v.rose@intel.com>
+Tested-by: Sibai Li <sibai.li@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+

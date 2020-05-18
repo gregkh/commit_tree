@@ -1,0 +1,56 @@
+kobject: fix kset_find_obj() race with concurrent last kobject_put()
+
+Anatol Pomozov identified a race condition that hits module unloading
+and re-loading.  To quote Anatol:
+
+ "This is a race codition that exists between kset_find_obj() and
+  kobject_put().  kset_find_obj() might return kobject that has refcount
+  equal to 0 if this kobject is freeing by kobject_put() in other
+  thread.
+
+  Here is timeline for the crash in case if kset_find_obj() searches for
+  an object tht nobody holds and other thread is doing kobject_put() on
+  the same kobject:
+
+    THREAD A (calls kset_find_obj())     THREAD B (calls kobject_put())
+    splin_lock()
+                                         atomic_dec_return(kobj->kref), counter gets zero here
+                                         ... starts kobject cleanup ....
+                                         spin_lock() // WAIT thread A in kobj_kset_leave()
+    iterate over kset->list
+    atomic_inc(kobj->kref) (counter becomes 1)
+    spin_unlock()
+                                         spin_lock() // taken
+                                         // it does not know that thread A increased counter so it
+                                         remove obj from list
+                                         spin_unlock()
+                                         vfree(module) // frees module object with containing kobj
+
+    // kobj points to freed memory area!!
+    kobject_put(kobj) // OOPS!!!!
+
+  The race above happens because module.c tries to use kset_find_obj()
+  when somebody unloads module.  The module.c code was introduced in
+  commit 6494a93d55fa"
+
+Anatol supplied a patch specific for module.c that worked around the
+problem by simply not using kset_find_obj() at all, but rather than make
+a local band-aid, this just fixes kset_find_obj() to be thread-safe
+using the proper model of refusing the get a new reference if the
+refcount has already dropped to zero.
+
+See examples of this proper refcount handling not only in the kref
+documentation, but in various other equivalent uses of this pattern by
+grepping for atomic_inc_not_zero().
+
+[ Side note: the module race does indicate that module loading and
+  unloading is not properly serialized wrt sysfs information using the
+  module mutex.  That may require further thought, but this is the
+  correct fix at the kobject layer regardless. ]
+
+Reported-analyzed-and-tested-by: Anatol Pomozov <anatol.pomozov@gmail.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: stable@vger.kernel.org
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

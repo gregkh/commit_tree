@@ -1,0 +1,81 @@
+block: fix request_queue lifetime handling by making blk_queue_cleanup() properly shutdown
+
+request_queue is refcounted but actually depdends on lifetime
+management from the queue owner - on blk_cleanup_queue(), block layer
+expects that there's no request passing through request_queue and no
+new one will.
+
+This is fundamentally broken.  The queue owner (e.g. SCSI layer)
+doesn't have a way to know whether there are other active users before
+calling blk_cleanup_queue() and other users (e.g. bsg) don't have any
+guarantee that the queue is and would stay valid while it's holding a
+reference.
+
+With delay added in blk_queue_bio() before queue_lock is grabbed, the
+following oops can be easily triggered when a device is removed with
+in-flight IOs.
+
+ sd 0:0:1:0: [sdb] Stopping disk
+ ata1.01: disabled
+ general protection fault: 0000 [#1] PREEMPT SMP
+ CPU 2
+ Modules linked in:
+
+ Pid: 648, comm: test_rawio Not tainted 3.1.0-rc3-work+ #56 Bochs Bochs
+ RIP: 0010:[<ffffffff8137d651>]  [<ffffffff8137d651>] elv_rqhash_find+0x61/0x100
+ ...
+ Process test_rawio (pid: 648, threadinfo ffff880019efa000, task ffff880019ef8a80)
+ ...
+ Call Trace:
+  [<ffffffff8137d774>] elv_merge+0x84/0xe0
+  [<ffffffff81385b54>] blk_queue_bio+0xf4/0x400
+  [<ffffffff813838ea>] generic_make_request+0xca/0x100
+  [<ffffffff81383994>] submit_bio+0x74/0x100
+  [<ffffffff811c53ec>] dio_bio_submit+0xbc/0xc0
+  [<ffffffff811c610e>] __blockdev_direct_IO+0x92e/0xb40
+  [<ffffffff811c39f7>] blkdev_direct_IO+0x57/0x60
+  [<ffffffff8113b1c5>] generic_file_aio_read+0x6d5/0x760
+  [<ffffffff8118c1ca>] do_sync_read+0xda/0x120
+  [<ffffffff8118ce55>] vfs_read+0xc5/0x180
+  [<ffffffff8118cfaa>] sys_pread64+0x9a/0xb0
+  [<ffffffff81afaf6b>] system_call_fastpath+0x16/0x1b
+
+This happens because blk_queue_cleanup() destroys the queue and
+elevator whether IOs are in progress or not and DEAD tests are
+sprinkled in the request processing path without proper
+synchronization.
+
+Similar problem exists for blk-throtl.  On queue cleanup, blk-throtl
+is shutdown whether it has requests in it or not.  Depending on
+timing, it either oopses or throttled bios are lost putting tasks
+which are waiting for bio completion into eternal D state.
+
+The way it should work is having the usual clear distinction between
+shutdown and release.  Shutdown drains all currently pending requests,
+marks the queue dead, and performs partial teardown of the now
+unnecessary part of the queue.  Even after shutdown is complete,
+reference holders are still allowed to issue requests to the queue
+although they will be immmediately failed.  The rest of teardown
+happens on release.
+
+This patch makes the following changes to make blk_queue_cleanup()
+behave as proper shutdown.
+
+* QUEUE_FLAG_DEAD is now set while holding both q->exit_mutex and
+  queue_lock.
+
+* Unsynchronized DEAD check in generic_make_request_checks() removed.
+  This couldn't make any meaningful difference as the queue could die
+  after the check.
+
+* blk_drain_queue() updated such that it can drain all requests and is
+  now called during cleanup.
+
+* blk_throtl updated such that it checks DEAD on grabbing queue_lock,
+  drains all throttled bios during cleanup and free td when queue is
+  released.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

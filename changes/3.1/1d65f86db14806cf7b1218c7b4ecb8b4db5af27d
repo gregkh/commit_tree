@@ -1,0 +1,66 @@
+mm: preallocate page before lock_page() at filemap COW
+
+Currently we are keeping faulted page locked throughout whole __do_fault
+call (except for page_mkwrite code path) after calling file system's fault
+code.  If we do early COW, we allocate a new page which has to be charged
+for a memcg (mem_cgroup_newpage_charge).
+
+This function, however, might block for unbounded amount of time if memcg
+oom killer is disabled or fork-bomb is running because the only way out of
+the OOM situation is either an external event or OOM-situation fix.
+
+In the end we are keeping the faulted page locked and blocking other
+processes from faulting it in which is not good at all because we are
+basically punishing potentially an unrelated process for OOM condition in
+a different group (I have seen stuck system because of ld-2.11.1.so being
+locked).
+
+We can do test easily.
+
+ % cgcreate -g memory:A
+ % cgset -r memory.limit_in_bytes=64M A
+ % cgset -r memory.memsw.limit_in_bytes=64M A
+ % cd kernel_dir; cgexec -g memory:A make -j
+
+Then, the whole system will live-locked until you kill 'make -j'
+by hands (or push reboot...) This is because some important page in a
+a shared library are locked.
+
+Considering again, the new page is not necessary to be allocated
+with lock_page() held. And usual page allocation may dive into
+long memory reclaim loop with holding lock_page() and can cause
+very long latency.
+
+There are 3 ways.
+  1. do allocation/charge before lock_page()
+     Pros. - simple and can handle page allocation in the same manner.
+             This will reduce holding time of lock_page() in general.
+     Cons. - we do page allocation even if ->fault() returns error.
+
+  2. do charge after unlock_page(). Even if charge fails, it's just OOM.
+     Pros. - no impact to non-memcg path.
+     Cons. - implemenation requires special cares of LRU and we need to modify
+             page_add_new_anon_rmap()...
+
+  3. do unlock->charge->lock again method.
+     Pros. - no impact to non-memcg path.
+     Cons. - This may kill LOCK_PAGE_RETRY optimization. We need to release
+             lock and get it again...
+
+This patch moves "charge" and memory allocation for COW page
+before lock_page(). Then, we can avoid scanning LRU with holding
+a lock on a page and latency under lock_page() will be reduced.
+
+Then, above livelock disappears.
+
+[akpm@linux-foundation.org: fix code layout]
+Signed-off-by: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Reported-by: Lutz Vieweg <lvml@5t9.de>
+Original-idea-by: Michal Hocko <mhocko@suse.cz>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Ying Han <yinghan@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Daisuke Nishimura <nishimura@mxp.nes.nec.co.jp>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

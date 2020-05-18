@@ -1,0 +1,130 @@
+powerpc: Don't corrupt transactional state when using FP/VMX in kernel
+
+Currently, when we have a process using the transactional memory
+facilities on POWER8 (that is, the processor is in transactional
+or suspended state), and the process enters the kernel and the
+kernel then uses the floating-point or vector (VMX/Altivec) facility,
+we end up corrupting the user-visible FP/VMX/VSX state.  This
+happens, for example, if a page fault causes a copy-on-write
+operation, because the copy_page function will use VMX to do the
+copy on POWER8.  The test program below demonstrates the bug.
+
+The bug happens because when FP/VMX state for a transactional process
+is stored in the thread_struct, we store the checkpointed state in
+.fp_state/.vr_state and the transactional (current) state in
+.transact_fp/.transact_vr.  However, when the kernel wants to use
+FP/VMX, it calls enable_kernel_fp() or enable_kernel_altivec(),
+which saves the current state in .fp_state/.vr_state.  Furthermore,
+when we return to the user process we return with FP/VMX/VSX
+disabled.  The next time the process uses FP/VMX/VSX, we don't know
+which set of state (the current register values, .fp_state/.vr_state,
+or .transact_fp/.transact_vr) we should be using, since we have no
+way to tell if we are still in the same transaction, and if not,
+whether the previous transaction succeeded or failed.
+
+Thus it is necessary to strictly adhere to the rule that if FP has
+been enabled at any point in a transaction, we must keep FP enabled
+for the user process with the current transactional state in the
+FP registers, until we detect that it is no longer in a transaction.
+Similarly for VMX; once enabled it must stay enabled until the
+process is no longer transactional.
+
+In order to keep this rule, we add a new thread_info flag which we
+test when returning from the kernel to userspace, called TIF_RESTORE_TM.
+This flag indicates that there is FP/VMX/VSX state to be restored
+before entering userspace, and when it is set the .tm_orig_msr field
+in the thread_struct indicates what state needs to be restored.
+The restoration is done by restore_tm_state().  The TIF_RESTORE_TM
+bit is set by new giveup_fpu/altivec_maybe_transactional helpers,
+which are called from enable_kernel_fp/altivec, giveup_vsx, and
+flush_fp/altivec_to_thread instead of giveup_fpu/altivec.
+
+The other thing to be done is to get the transactional FP/VMX/VSX
+state from .fp_state/.vr_state when doing reclaim, if that state
+has been saved there by giveup_fpu/altivec_maybe_transactional.
+Having done this, we set the FP/VMX bit in the thread's MSR after
+reclaim to indicate that that part of the state is now valid
+(having been reclaimed from the processor's checkpointed state).
+
+Finally, in the signal handling code, we move the clearing of the
+transactional state bits in the thread's MSR a bit earlier, before
+calling flush_fp_to_thread(), so that we don't unnecessarily set
+the TIF_RESTORE_TM bit.
+
+This is the test program:
+
+/* Michael Neuling 4/12/2013
+ *
+ * See if the altivec state is leaked out of an aborted transaction due to
+ * kernel vmx copy loops.
+ *
+ *   gcc -m64 htm_vmxcopy.c -o htm_vmxcopy
+ *
+ */
+
+/* We don't use all of these, but for reference: */
+
+int main(int argc, char *argv[])
+{
+	long double vecin = 1.3;
+	long double vecout;
+	unsigned long pgsize = getpagesize();
+	int i;
+	int fd;
+	int size = pgsize*16;
+	char tmpfile[] = "/tmp/page_faultXXXXXX";
+	char buf[pgsize];
+	char *a;
+	uint64_t aborted = 0;
+
+	fd = mkstemp(tmpfile);
+	assert(fd >= 0);
+
+	memset(buf, 0, pgsize);
+	for (i = 0; i < size; i += pgsize)
+		assert(write(fd, buf, pgsize) == pgsize);
+
+	unlink(tmpfile);
+
+	a = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+	assert(a != MAP_FAILED);
+
+	asm __volatile__(
+		"lxvd2x 40,0,%[vecinptr] ; " // set 40 to initial value
+		TBEGIN
+		"beq	3f ;"
+		TSUSPEND
+		"xxlxor 40,40,40 ; " // set 40 to 0
+		"std	5, 0(%[map]) ;" // cause kernel vmx copy page
+		TABORT
+		TRESUME
+		TEND
+		"li	%[res], 0 ;"
+		"b	5f ;"
+		"3: ;" // Abort handler
+		"li	%[res], 1 ;"
+		"5: ;"
+		"stxvd2x 40,0,%[vecoutptr] ; "
+		: [res]"=r"(aborted)
+		: [vecinptr]"r"(&vecin),
+		  [vecoutptr]"r"(&vecout),
+		  [map]"r"(a)
+		: "memory", "r0", "r3", "r4", "r5", "r6", "r7");
+
+	if (aborted && (vecin != vecout)){
+		printf("FAILED: vector state leaked on abort %f != %f\n",
+		       (double)vecin, (double)vecout);
+		exit(1);
+	}
+
+	munmap(a, size);
+
+	close(fd);
+
+	printf("PASSED!\n");
+	return 0;
+}
+
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+

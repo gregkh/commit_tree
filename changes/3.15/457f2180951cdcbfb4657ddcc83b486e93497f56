@@ -1,0 +1,77 @@
+s390/uaccess: rework uaccess code - fix locking issues
+
+The current uaccess code uses a page table walk in some circumstances,
+e.g. in case of the in atomic futex operations or if running on old
+hardware which doesn't support the mvcos instruction.
+
+However it turned out that the page table walk code does not correctly
+lock page tables when accessing page table entries.
+In other words: a different cpu may invalidate a page table entry while
+the current cpu inspects the pte. This may lead to random data corruption.
+
+Adding correct locking however isn't trivial for all uaccess operations.
+Especially copy_in_user() is problematic since that requires to hold at
+least two locks, but must be protected against ABBA deadlock when a
+different cpu also performs a copy_in_user() operation.
+
+So the solution is a different approach where we change address spaces:
+
+User space runs in primary address mode, or access register mode within
+vdso code, like it currently already does.
+
+The kernel usually also runs in home space mode, however when accessing
+user space the kernel switches to primary or secondary address mode if
+the mvcos instruction is not available or if a compare-and-swap (futex)
+instruction on a user space address is performed.
+KVM however is special, since that requires the kernel to run in home
+address space while implicitly accessing user space with the sie
+instruction.
+
+So we end up with:
+
+User space:
+- runs in primary or access register mode
+- cr1 contains the user asce
+- cr7 contains the user asce
+- cr13 contains the kernel asce
+
+Kernel space:
+- runs in home space mode
+- cr1 contains the user or kernel asce
+  -> the kernel asce is loaded when a uaccess requires primary or
+     secondary address mode
+- cr7 contains the user or kernel asce, (changed with set_fs())
+- cr13 contains the kernel asce
+
+In case of uaccess the kernel changes to:
+- primary space mode in case of a uaccess (copy_to_user) and uses
+  e.g. the mvcp instruction to access user space. However the kernel
+  will stay in home space mode if the mvcos instruction is available
+- secondary space mode in case of futex atomic operations, so that the
+  instructions come from primary address space and data from secondary
+  space
+
+In case of kvm the kernel runs in home space mode, but cr1 gets switched
+to contain the gmap asce before the sie instruction gets executed. When
+the sie instruction is finished cr1 will be switched back to contain the
+user asce.
+
+A context switch between two processes will always load the kernel asce
+for the next process in cr1. So the first exit to user space is a bit
+more expensive (one extra load control register instruction) than before,
+however keeps the code rather simple.
+
+In sum this means there is no need to perform any error prone page table
+walks anymore when accessing user space.
+
+The patch seems to be rather large, however it mainly removes the
+the page table walk code and restores the previously deleted "standard"
+uaccess code, with a couple of changes.
+
+The uaccess without mvcos mode can be enforced with the "uaccess_primary"
+kernel parameter.
+
+Reported-by: Christian Borntraeger <borntraeger@de.ibm.com>
+Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+

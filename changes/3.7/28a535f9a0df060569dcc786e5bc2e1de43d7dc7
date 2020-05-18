@@ -1,0 +1,67 @@
+ext4: completed_io locking cleanup
+
+Current unwritten extent conversion state-machine is very fuzzy.
+- For unknown reason it performs conversion under i_mutex. What for?
+  My diagnosis:
+  We already protect extent tree with i_data_sem, truncate and punch_hole
+  should wait for DIO, so the only data we have to protect is end_io->flags
+  modification, but only flush_completed_IO and end_io_work modified this
+  flags and we can serialize them via i_completed_io_lock.
+
+  Currently all these games with mutex_trylock result in the following deadlock
+   truncate:                          kworker:
+    ext4_setattr                       ext4_end_io_work
+    mutex_lock(i_mutex)
+    inode_dio_wait(inode)  ->BLOCK
+                             DEADLOCK<- mutex_trylock()
+                                        inode_dio_done()
+  #TEST_CASE1_BEGIN
+  MNT=/mnt_scrach
+  unlink $MNT/file
+  fallocate -l $((1024*1024*1024)) $MNT/file
+  aio-stress -I 100000 -O -s 100m -n -t 1 -c 10 -o 2 -o 3 $MNT/file
+  sleep 2
+  truncate -s 0 $MNT/file
+  #TEST_CASE1_END
+
+Or use 286's xfstests https://github.com/dmonakhov/xfstests/blob/devel/286
+
+This patch makes state machine simple and clean:
+
+(1) xxx_end_io schedule final extent conversion simply by calling
+    ext4_add_complete_io(), which append it to ei->i_completed_io_list
+    NOTE1: because of (2A) work should be queued only if
+    ->i_completed_io_list was empty, otherwise the work is scheduled already.
+
+(2) ext4_flush_completed_IO is responsible for handling all pending
+    end_io from ei->i_completed_io_list
+    Flushing sequence consists of following stages:
+    A) LOCKED: Atomically drain completed_io_list to local_list
+    B) Perform extents conversion
+    C) LOCKED: move converted io's to to_free list for final deletion
+       	     This logic depends on context which we was called from.
+    D) Final end_io context destruction
+    NOTE1: i_mutex is no longer required because end_io->flags modification
+    is protected by ei->ext4_complete_io_lock
+
+Full list of changes:
+- Move all completion end_io related routines to page-io.c in order to improve
+  logic locality
+- Move open coded logic from various xx_end_xx routines to ext4_add_complete_io()
+- remove EXT4_IO_END_FSYNC
+- Improve SMP scalability by removing useless i_mutex which does not
+  protect io->flags anymore.
+- Reduce lock contention on i_completed_io_lock by optimizing list walk.
+- Rename ext4_end_io_nolock to end4_end_io and make it static
+- Check flush completion status to ext4_ext_punch_hole(). Because it is
+  not good idea to punch blocks from corrupted inode.
+
+Changes since V3 (in request to Jan's comments):
+  Fall back to active flush_completed_IO() approach in order to prevent
+  performance issues with nolocked DIO reads.
+Changes since V2:
+  Fix use-after-free caused by race truncate vs end_io_work
+
+Signed-off-by: Dmitry Monakhov <dmonakhov@openvz.org>
+Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+

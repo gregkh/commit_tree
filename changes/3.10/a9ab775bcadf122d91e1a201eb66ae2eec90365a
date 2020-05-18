@@ -1,0 +1,50 @@
+workqueue: directly restore CPU affinity of workers from CPU_ONLINE
+
+Rebinding workers of a per-cpu pool after a CPU comes online involves
+a lot of back-and-forth mostly because only the task itself could
+adjust CPU affinity if PF_THREAD_BOUND was set.
+
+As CPU_ONLINE itself couldn't adjust affinity, it had to somehow
+coerce the workers themselves to perform set_cpus_allowed_ptr().  Due
+to the various states a worker can be in, this led to three different
+paths a worker may be rebound.  worker->rebind_work is queued to busy
+workers.  Idle ones are signaled by unlinking worker->entry and call
+idle_worker_rebind().  The manager isn't covered by either and
+implements its own mechanism.
+
+PF_THREAD_BOUND has been relaced with PF_NO_SETAFFINITY and CPU_ONLINE
+itself now can manipulate CPU affinity of workers.  This patch
+replaces the existing rebind mechanism with direct one where
+CPU_ONLINE iterates over all workers using for_each_pool_worker(),
+restores CPU affinity, and clears WORKER_UNBOUND.
+
+There are a couple subtleties.  All bound idle workers should have
+their runqueues set to that of the bound CPU; however, if the target
+task isn't running, set_cpus_allowed_ptr() just updates the
+cpus_allowed mask deferring the actual migration to when the task
+wakes up.  This is worked around by waking up idle workers after
+restoring CPU affinity before any workers can become bound.
+
+Another subtlety is stems from matching @pool->nr_running with the
+number of running unbound workers.  While DISASSOCIATED, all workers
+are unbound and nr_running is zero.  As workers become bound again,
+nr_running needs to be adjusted accordingly; however, there is no good
+way to tell whether a given worker is running without poking into
+scheduler internals.  Instead of clearing UNBOUND directly,
+rebind_workers() replaces UNBOUND with another new NOT_RUNNING flag -
+REBOUND, which will later be cleared by the workers themselves while
+preparing for the next round of work item execution.  The only change
+needed for the workers is clearing REBOUND along with PREP.
+
+* This patch leaves for_each_busy_worker() without any user.  Removed.
+
+* idle_worker_rebind(), busy_worker_rebind_fn(), worker->rebind_work
+  and rebind logic in manager_workers() removed.
+
+* worker_thread() now looks at WORKER_DIE instead of testing whether
+  @worker->entry is empty to determine whether it needs to do
+  something special as dying is the only special thing now.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: Lai Jiangshan <laijs@cn.fujitsu.com>
+

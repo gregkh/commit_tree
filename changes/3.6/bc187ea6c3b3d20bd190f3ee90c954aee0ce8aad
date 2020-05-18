@@ -1,0 +1,36 @@
+target: Check sess_tearing_down in target_get_sess_cmd()
+
+Target core code assumes that target_splice_sess_cmd_list() has set
+sess_tearing_down and moved the list of pending commands to
+sess_wait_list, no more commands will be added to the session; if any
+are added, nothing keeps the se_session from being freed while the
+command is still in flight, which e.g. leads to use-after-free of
+se_cmd->se_sess in target_release_cmd_kref().
+
+To enforce this invariant, put a check of sess_tearing_down inside of
+sess_cmd_lock in target_get_sess_cmd(); any checks before this are
+racy and can lead to the use-after-free described above.  For example,
+the qla_target check in qlt_do_work() checks sess_tearing_down from
+work thread context but then drops all locks before calling
+target_submit_cmd() (as it must, since that is a sleeping function).
+
+However, since no locks are held, anything can happen with respect to
+the session it has looked up -- although it does correctly get
+sess_kref within its lock, so the memory won't be freed while
+target_submit_cmd() is actually running, nothing stops eg an ACL from
+being dropped and calling ->shutdown_session() (which calls into
+target_splice_sess_cmd_list()) before we get to target_get_sess_cmd().
+Once this happens, the se_session memory can be freed as soon as
+target_submit_cmd() returns and qlt_do_work() drops its reference,
+even though we've just added a command to sess_cmd_list.
+
+To prevent this use-after-free, check sess_tearing_down inside of
+sess_cmd_lock right before target_get_sess_cmd() adds a command to
+sess_cmd_list; this is synchronized with target_splice_sess_cmd_list()
+so that every command is either waited for or not added to the queue.
+
+(nab: Keep target_submit_cmd() returning void for now..)
+
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+

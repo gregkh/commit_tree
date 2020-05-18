@@ -1,0 +1,52 @@
+aio: v4 ensure access to ctx->ring_pages is correctly serialised for migration
+
+As reported by Tang Chen, Gu Zheng and Yasuaki Isimatsu, the following issues
+exist in the aio ring page migration support.
+
+As a result, for example, we have the following problem:
+
+            thread 1                      |              thread 2
+                                          |
+aio_migratepage()                         |
+ |-> take ctx->completion_lock            |
+ |-> migrate_page_copy(new, old)          |
+ |   *NOW*, ctx->ring_pages[idx] == old   |
+                                          |
+                                          |    *NOW*, ctx->ring_pages[idx] == old
+                                          |    aio_read_events_ring()
+                                          |     |-> ring = kmap_atomic(ctx->ring_pages[0])
+                                          |     |-> ring->head = head;          *HERE, write to the old ring page*
+                                          |     |-> kunmap_atomic(ring);
+                                          |
+ |-> ctx->ring_pages[idx] = new           |
+ |   *BUT NOW*, the content of            |
+ |    ring_pages[idx] is old.             |
+ |-> release ctx->completion_lock         |
+
+As above, the new ring page will not be updated.
+
+Fix this issue, as well as prevent races in aio_ring_setup() by holding
+the ring_lock mutex during kioctx setup and page migration.  This avoids
+the overhead of taking another spinlock in aio_read_events_ring() as Tang's
+and Gu's original fix did, pushing the overhead into the migration code.
+
+Note that to handle the nesting of ring_lock inside of mmap_sem, the
+migratepage operation uses mutex_trylock().  Page migration is not a 100%
+critical operation in this case, so the ocassional failure can be
+tolerated.  This issue was reported by Sasha Levin.
+
+Based on feedback from Linus, avoid the extra taking of ctx->completion_lock.
+Instead, make page migration fully serialised by mapping->private_lock, and
+have aio_free_ring() simply disconnect the kioctx from the mapping by calling
+put_aio_ring_file() before touching ctx->ring_pages[].  This simplifies the
+error handling logic in aio_migratepage(), and should improve robustness.
+
+v4: always do mutex_unlock() in cases when kioctx setup fails.
+
+Reported-by: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+Reported-by: Sasha Levin <sasha.levin@oracle.com>
+Signed-off-by: Benjamin LaHaise <bcrl@kvack.org>
+Cc: Tang Chen <tangchen@cn.fujitsu.com>
+Cc: Gu Zheng <guz.fnst@cn.fujitsu.com>
+Cc: stable@vger.kernel.org
+

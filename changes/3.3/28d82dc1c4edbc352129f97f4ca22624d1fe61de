@@ -1,0 +1,83 @@
+epoll: limit paths
+
+The current epoll code can be tickled to run basically indefinitely in
+both loop detection path check (on ep_insert()), and in the wakeup paths.
+The programs that tickle this behavior set up deeply linked networks of
+epoll file descriptors that cause the epoll algorithms to traverse them
+indefinitely.  A couple of these sample programs have been previously
+posted in this thread: https://lkml.org/lkml/2011/2/25/297.
+
+To fix the loop detection path check algorithms, I simply keep track of
+the epoll nodes that have been already visited.  Thus, the loop detection
+becomes proportional to the number of epoll file descriptor and links.
+This dramatically decreases the run-time of the loop check algorithm.  In
+one diabolical case I tried it reduced the run-time from 15 mintues (all
+in kernel time) to .3 seconds.
+
+Fixing the wakeup paths could be done at wakeup time in a similar manner
+by keeping track of nodes that have already been visited, but the
+complexity is harder, since there can be multiple wakeups on different
+cpus...Thus, I've opted to limit the number of possible wakeup paths when
+the paths are created.
+
+This is accomplished, by noting that the end file descriptor points that
+are found during the loop detection pass (from the newly added link), are
+actually the sources for wakeup events.  I keep a list of these file
+descriptors and limit the number and length of these paths that emanate
+from these 'source file descriptors'.  In the current implemetation I
+allow 1000 paths of length 1, 500 of length 2, 100 of length 3, 50 of
+length 4 and 10 of length 5.  Note that it is sufficient to check the
+'source file descriptors' reachable from the newly added link, since no
+other 'source file descriptors' will have newly added links.  This allows
+us to check only the wakeup paths that may have gotten too long, and not
+re-check all possible wakeup paths on the system.
+
+In terms of the path limit selection, I think its first worth noting that
+the most common case for epoll, is probably the model where you have 1
+epoll file descriptor that is monitoring n number of 'source file
+descriptors'.  In this case, each 'source file descriptor' has a 1 path of
+length 1.  Thus, I believe that the limits I'm proposing are quite
+reasonable and in fact may be too generous.  Thus, I'm hoping that the
+proposed limits will not prevent any workloads that currently work to
+fail.
+
+In terms of locking, I have extended the use of the 'epmutex' to all
+epoll_ctl add and remove operations.  Currently its only used in a subset
+of the add paths.  I need to hold the epmutex, so that we can correctly
+traverse a coherent graph, to check the number of paths.  I believe that
+this additional locking is probably ok, since its in the setup/teardown
+paths, and doesn't affect the running paths, but it certainly is going to
+add some extra overhead.  Also, worth noting is that the epmuex was
+recently added to the ep_ctl add operations in the initial path loop
+detection code using the argument that it was not on a critical path.
+
+Another thing to note here, is the length of epoll chains that is allowed.
+Currently, eventpoll.c defines:
+
+/* Maximum number of nesting allowed inside epoll sets */
+#define EP_MAX_NESTS 4
+
+This basically means that I am limited to a graph depth of 5 (EP_MAX_NESTS
++ 1).  However, this limit is currently only enforced during the loop
+check detection code, and only when the epoll file descriptors are added
+in a certain order.  Thus, this limit is currently easily bypassed.  The
+newly added check for wakeup paths, stricly limits the wakeup paths to a
+length of 5, regardless of the order in which ep's are linked together.
+Thus, a side-effect of the new code is a more consistent enforcement of
+the graph depth.
+
+Thus far, I've tested this, using the sample programs previously
+mentioned, which now either return quickly or return -EINVAL.  I've also
+testing using the piptest.c epoll tester, which showed no difference in
+performance.  I've also created a number of different epoll networks and
+tested that they behave as expectded.
+
+I believe this solves the original diabolical test cases, while still
+preserving the sane epoll nesting.
+
+Signed-off-by: Jason Baron <jbaron@redhat.com>
+Cc: Nelson Elhage <nelhage@ksplice.com>
+Cc: Davide Libenzi <davidel@xmailserver.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

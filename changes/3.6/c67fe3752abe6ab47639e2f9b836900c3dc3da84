@@ -1,0 +1,90 @@
+mm: compaction: Abort async compaction if locks are contended or taking too long
+
+Jim Schutt reported a problem that pointed at compaction contending
+heavily on locks.  The workload is straight-forward and in his own words;
+
+	The systems in question have 24 SAS drives spread across 3 HBAs,
+	running 24 Ceph OSD instances, one per drive.  FWIW these servers
+	are dual-socket Intel 5675 Xeons w/48 GB memory.  I've got ~160
+	Ceph Linux clients doing dd simultaneously to a Ceph file system
+	backed by 12 of these servers.
+
+Early in the test everything looks fine
+
+  procs -------------------memory------------------ ---swap-- -----io---- --system-- -----cpu-------
+   r  b       swpd       free       buff      cache   si   so    bi    bo   in   cs  us sy  id wa st
+  31 15          0     287216        576   38606628    0    0     2  1158    2   14   1  3  95  0  0
+  27 15          0     225288        576   38583384    0    0    18 2222016 203357 134876  11 56  17 15  0
+  28 17          0     219256        576   38544736    0    0    11 2305932 203141 146296  11 49  23 17  0
+   6 18          0     215596        576   38552872    0    0     7 2363207 215264 166502  12 45  22 20  0
+  22 18          0     226984        576   38596404    0    0     3 2445741 223114 179527  12 43  23 22  0
+
+and then it goes to pot
+
+  procs -------------------memory------------------ ---swap-- -----io---- --system-- -----cpu-------
+   r  b       swpd       free       buff      cache   si   so    bi    bo   in   cs  us sy  id wa st
+  163  8          0     464308        576   36791368    0    0    11 22210  866  536   3 13  79  4  0
+  207 14          0     917752        576   36181928    0    0   712 1345376 134598 47367   7 90   1  2  0
+  123 12          0     685516        576   36296148    0    0   429 1386615 158494 60077   8 84   5  3  0
+  123 12          0     598572        576   36333728    0    0  1107 1233281 147542 62351   7 84   5  4  0
+  622  7          0     660768        576   36118264    0    0   557 1345548 151394 59353   7 85   4  3  0
+  223 11          0     283960        576   36463868    0    0    46 1107160 121846 33006   6 93   1  1  0
+
+Note that system CPU usage is very high blocks being written out has
+dropped by 42%. He analysed this with perf and found
+
+  perf record -g -a sleep 10
+  perf report --sort symbol --call-graph fractal,5
+    34.63%  [k] _raw_spin_lock_irqsave
+            |
+            |--97.30%-- isolate_freepages
+            |          compaction_alloc
+            |          unmap_and_move
+            |          migrate_pages
+            |          compact_zone
+            |          compact_zone_order
+            |          try_to_compact_pages
+            |          __alloc_pages_direct_compact
+            |          __alloc_pages_slowpath
+            |          __alloc_pages_nodemask
+            |          alloc_pages_vma
+            |          do_huge_pmd_anonymous_page
+            |          handle_mm_fault
+            |          do_page_fault
+            |          page_fault
+            |          |
+            |          |--87.39%-- skb_copy_datagram_iovec
+            |          |          tcp_recvmsg
+            |          |          inet_recvmsg
+            |          |          sock_recvmsg
+            |          |          sys_recvfrom
+            |          |          system_call
+            |          |          __recv
+            |          |          |
+            |          |           --100.00%-- (nil)
+            |          |
+            |           --12.61%-- memcpy
+             --2.70%-- [...]
+
+There was other data but primarily it is all showing that compaction is
+contended heavily on the zone->lock and zone->lru_lock.
+
+commit [b2eef8c0: mm: compaction: minimise the time IRQs are disabled
+while isolating pages for migration] noted that it was possible for
+migration to hold the lru_lock for an excessive amount of time. Very
+broadly speaking this patch expands the concept.
+
+This patch introduces compact_checklock_irqsave() to check if a lock
+is contended or the process needs to be scheduled. If either condition
+is true then async compaction is aborted and the caller is informed.
+The page allocator will fail a THP allocation if compaction failed due
+to contention. This patch also introduces compact_trylock_irqsave()
+which will acquire the lock only if it is not contended and the process
+does not need to schedule.
+
+Reported-by: Jim Schutt <jaschut@sandia.gov>
+Tested-by: Jim Schutt <jaschut@sandia.gov>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

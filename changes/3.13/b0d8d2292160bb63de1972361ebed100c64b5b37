@@ -1,0 +1,47 @@
+vfs: fix subtle use-after-free of pipe_inode_info
+
+The pipe code was trying (and failing) to be very careful about freeing
+the pipe info only after the last access, with a pattern like:
+
+        spin_lock(&inode->i_lock);
+        if (!--pipe->files) {
+                inode->i_pipe = NULL;
+                kill = 1;
+        }
+        spin_unlock(&inode->i_lock);
+        __pipe_unlock(pipe);
+        if (kill)
+                free_pipe_info(pipe);
+
+where the final freeing is done last.
+
+HOWEVER.  The above is actually broken, because while the freeing is
+done at the end, if we have two racing processes releasing the pipe
+inode info, the one that *doesn't* free it will decrement the ->files
+count, and unlock the inode i_lock, but then still use the
+"pipe_inode_info" afterwards when it does the "__pipe_unlock(pipe)".
+
+This is *very* hard to trigger in practice, since the race window is
+very small, and adding debug options seems to just hide it by slowing
+things down.
+
+Simon originally reported this way back in July as an Oops in
+kmem_cache_allocate due to a single bit corruption (due to the final
+"spin_unlock(pipe->mutex.wait_lock)" incrementing a field in a different
+allocation that had re-used the free'd pipe-info), it's taken this long
+to figure out.
+
+Since the 'pipe->files' accesses aren't even protected by the pipe lock
+(we very much use the inode lock for that), the simple solution is to
+just drop the pipe lock early.  And since there were two users of this
+pattern, create a helper function for it.
+
+Introduced commit ba5bb147330a ("pipe: take allocation and freeing of
+pipe_inode_info out of ->i_mutex").
+
+Reported-by: Simon Kirby <sim@hostway.ca>
+Reported-by: Ian Applegate <ia@cloudflare.com>
+Acked-by: Al Viro <viro@zeniv.linux.org.uk>
+Cc: stable@kernel.org   # v3.10+
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

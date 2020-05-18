@@ -1,0 +1,52 @@
+raid5: relieve lock contention in get_active_stripe()
+
+get_active_stripe() is the last place we have lock contention. It has two
+paths. One is stripe isn't found and new stripe is allocated, the other is
+stripe is found.
+
+The first path basically calls __find_stripe and init_stripe. It accesses
+conf->generation, conf->previous_raid_disks, conf->raid_disks,
+conf->prev_chunk_sectors, conf->chunk_sectors, conf->max_degraded,
+conf->prev_algo, conf->algorithm, the stripe_hashtbl and inactive_list. Except
+stripe_hashtbl and inactive_list, other fields are changed very rarely.
+
+With this patch, we split inactive_list and add new hash locks. Each free
+stripe belongs to a specific inactive list. Which inactive list is determined
+by stripe's lock_hash. Note, even a stripe hasn't a sector assigned, it has a
+lock_hash assigned. Stripe's inactive list is protected by a hash lock, which
+is determined by it's lock_hash too. The lock_hash is derivied from current
+stripe_hashtbl hash, which guarantees any stripe_hashtbl list will be assigned
+to a specific lock_hash, so we can use new hash lock to protect stripe_hashtbl
+list too. The goal of the new hash locks introduced is we can only use the new
+locks in the first path of get_active_stripe(). Since we have several hash
+locks, lock contention is relieved significantly.
+
+The first path of get_active_stripe() accesses other fields, since they are
+changed rarely, changing them now need take conf->device_lock and all hash
+locks. For a slow path, this isn't a problem.
+
+If we need lock device_lock and hash lock, we always lock hash lock first. The
+tricky part is release_stripe and friends. We need take device_lock first.
+Neil's suggestion is we put inactive stripes to a temporary list and readd it
+to inactive_list after device_lock is released. In this way, we add stripes to
+temporary list with device_lock hold and remove stripes from the list with hash
+lock hold. So we don't allow concurrent access to the temporary list, which
+means we need allocate temporary list for all participants of release_stripe.
+
+One downside is free stripes are maintained in their inactive list, they can't
+across between the lists. By default, we have total 256 stripes and 8 lists, so
+each list will have 32 stripes. It's possible one list has free stripe but
+other list hasn't. The chance should be rare because stripes allocation are
+even distributed. And we can always allocate more stripes for cache, several
+mega bytes memory isn't a big deal.
+
+This completely removes the lock contention of the first path of
+get_active_stripe(). It slows down the second code path a little bit though
+because we now need takes two locks, but since the hash lock isn't contended,
+the overhead should be quite small (several atomic instructions). The second
+path of get_active_stripe() (basically sequential write or big request size
+randwrite) still has lock contentions.
+
+Signed-off-by: Shaohua Li <shli@fusionio.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+

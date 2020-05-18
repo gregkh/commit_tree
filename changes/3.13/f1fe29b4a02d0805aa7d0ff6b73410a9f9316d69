@@ -1,0 +1,116 @@
+NFS: Use i_writecount to control whether to get an fscache cookie in nfs_open()
+
+Use i_writecount to control whether to get an fscache cookie in nfs_open() as
+NFS does not do write caching yet.  I *think* this is the cause of a problem
+encountered by Mark Moseley whereby __fscache_uncache_page() gets a NULL
+pointer dereference because cookie->def is NULL:
+
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000010
+IP: [<ffffffff812a1903>] __fscache_uncache_page+0x23/0x160
+PGD 0
+Thread overran stack, or stack corrupted
+Oops: 0000 [#1] SMP
+Modules linked in: ...
+CPU: 7 PID: 18993 Comm: php Not tainted 3.11.1 #1
+Hardware name: Dell Inc. PowerEdge R420/072XWF, BIOS 1.3.5 08/21/2012
+task: ffff8804203460c0 ti: ffff880420346640
+RIP: 0010:[<ffffffff812a1903>] __fscache_uncache_page+0x23/0x160
+RSP: 0018:ffff8801053af878 EFLAGS: 00210286
+RAX: 0000000000000000 RBX: ffff8800be2f8780 RCX: ffff88022ffae5e8
+RDX: 0000000000004c66 RSI: ffffea00055ff440 RDI: ffff8800be2f8780
+RBP: ffff8801053af898 R08: 0000000000000001 R09: 0000000000000003
+R10: 0000000000000000 R11: 0000000000000000 R12: ffffea00055ff440
+R13: 0000000000001000 R14: ffff8800c50be538 R15: 0000000000000000
+FS: 0000000000000000(0000) GS:ffff88042fc60000(0063) knlGS:00000000e439c700
+CS: 0010 DS: 002b ES: 002b CR0: 0000000080050033
+CR2: 0000000000000010 CR3: 0000000001d8f000 CR4: 00000000000607f0
+Stack:
+...
+Call Trace:
+[<ffffffff81365a72>] __nfs_fscache_invalidate_page+0x42/0x70
+[<ffffffff813553d5>] nfs_invalidate_page+0x75/0x90
+[<ffffffff811b8f5e>] truncate_inode_page+0x8e/0x90
+[<ffffffff811b90ad>] truncate_inode_pages_range.part.12+0x14d/0x620
+[<ffffffff81d6387d>] ? __mutex_lock_slowpath+0x1fd/0x2e0
+[<ffffffff811b95d3>] truncate_inode_pages_range+0x53/0x70
+[<ffffffff811b969d>] truncate_inode_pages+0x2d/0x40
+[<ffffffff811b96ff>] truncate_pagecache+0x4f/0x70
+[<ffffffff81356840>] nfs_setattr_update_inode+0xa0/0x120
+[<ffffffff81368de4>] nfs3_proc_setattr+0xc4/0xe0
+[<ffffffff81357f78>] nfs_setattr+0xc8/0x150
+[<ffffffff8122d95b>] notify_change+0x1cb/0x390
+[<ffffffff8120a55b>] do_truncate+0x7b/0xc0
+[<ffffffff8121f96c>] do_last+0xa4c/0xfd0
+[<ffffffff8121ffbc>] path_openat+0xcc/0x670
+[<ffffffff81220a0e>] do_filp_open+0x4e/0xb0
+[<ffffffff8120ba1f>] do_sys_open+0x13f/0x2b0
+[<ffffffff8126aaf6>] compat_SyS_open+0x36/0x50
+[<ffffffff81d7204c>] sysenter_dispatch+0x7/0x24
+
+The code at the instruction pointer was disassembled:
+
+> (gdb) disas __fscache_uncache_page
+> Dump of assembler code for function __fscache_uncache_page:
+> ...
+> 0xffffffff812a18ff <+31>: mov 0x48(%rbx),%rax
+> 0xffffffff812a1903 <+35>: cmpb $0x0,0x10(%rax)
+> 0xffffffff812a1907 <+39>: je 0xffffffff812a19cd <__fscache_uncache_page+237>
+
+These instructions make up:
+
+	ASSERTCMP(cookie->def->type, !=, FSCACHE_COOKIE_TYPE_INDEX);
+
+That cmpb is the faulting instruction (%rax is 0).  So cookie->def is NULL -
+which presumably means that the cookie has already been at least partway
+through __fscache_relinquish_cookie().
+
+What I think may be happening is something like a three-way race on the same
+file:
+
+	PROCESS 1	PROCESS 2	PROCESS 3
+	===============	===============	===============
+	open(O_TRUNC|O_WRONLY)
+			open(O_RDONLY)
+					open(O_WRONLY)
+	-->nfs_open()
+	-->nfs_fscache_set_inode_cookie()
+	nfs_fscache_inode_lock()
+	nfs_fscache_disable_inode_cookie()
+	__fscache_relinquish_cookie()
+	nfs_inode->fscache = NULL
+	<--nfs_fscache_set_inode_cookie()
+
+			-->nfs_open()
+			-->nfs_fscache_set_inode_cookie()
+			nfs_fscache_inode_lock()
+			nfs_fscache_enable_inode_cookie()
+			__fscache_acquire_cookie()
+			nfs_inode->fscache = cookie
+			<--nfs_fscache_set_inode_cookie()
+	<--nfs_open()
+	-->nfs_setattr()
+	...
+	...
+	-->nfs_invalidate_page()
+	-->__nfs_fscache_invalidate_page()
+	cookie = nfsi->fscache
+					-->nfs_open()
+					-->nfs_fscache_set_inode_cookie()
+					nfs_fscache_inode_lock()
+					nfs_fscache_disable_inode_cookie()
+					-->__fscache_relinquish_cookie()
+	-->__fscache_uncache_page(cookie)
+	<crash>
+					<--__fscache_relinquish_cookie()
+					nfs_inode->fscache = NULL
+					<--nfs_fscache_set_inode_cookie()
+
+What is needed is something to prevent process #2 from reacquiring the cookie
+- and I think checking i_writecount should do the trick.
+
+It's also possible to have a two-way race on this if the file is opened
+O_TRUNC|O_RDONLY instead.
+
+Reported-by: Mark Moseley <moseleymark@gmail.com>
+Signed-off-by: David Howells <dhowells@redhat.com>
+

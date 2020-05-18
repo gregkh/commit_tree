@@ -1,0 +1,48 @@
+NFS: fix the handling of NFS_INO_INVALID_DATA flag in nfs_revalidate_mapping
+
+There is a possible race in how the nfs_invalidate_mapping function is
+handled.  Currently, we go and invalidate the pages in the file and then
+clear NFS_INO_INVALID_DATA.
+
+The problem is that it's possible for a stale page to creep into the
+mapping after the page was invalidated (i.e., via readahead). If another
+writer comes along and sets the flag after that happens but before
+invalidate_inode_pages2 returns then we could clear the flag
+without the cache having been properly invalidated.
+
+So, we must clear the flag first and then invalidate the pages. Doing
+this however, opens another race:
+
+It's possible to have two concurrent read() calls that end up in
+nfs_revalidate_mapping at the same time. The first one clears the
+NFS_INO_INVALID_DATA flag and then goes to call nfs_invalidate_mapping.
+
+Just before calling that though, the other task races in, checks the
+flag and finds it cleared. At that point, it trusts that the mapping is
+good and gets the lock on the page, allowing the read() to be satisfied
+from the cache even though the data is no longer valid.
+
+These effects are easily manifested by running diotest3 from the LTP
+test suite on NFS. That program does a series of DIO writes and buffered
+reads. The operations are serialized and page-aligned but the existing
+code fails the test since it occasionally allows a read to come out of
+the cache incorrectly. While mixing direct and buffered I/O isn't
+recommended, I believe it's possible to hit this in other ways that just
+use buffered I/O, though that situation is much harder to reproduce.
+
+The problem is that the checking/clearing of that flag and the
+invalidation of the mapping really need to be atomic. Fix this by
+serializing concurrent invalidations with a bitlock.
+
+At the same time, we also need to allow other places that check
+NFS_INO_INVALID_DATA to check whether we might be in the middle of
+invalidating the file, so fix up a couple of places that do that
+to look for the new NFS_INO_INVALIDATING flag.
+
+Doing this requires us to be careful not to set the bitlock
+unnecessarily, so this code only does that if it believes it will
+be doing an invalidation.
+
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+

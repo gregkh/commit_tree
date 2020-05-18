@@ -1,0 +1,63 @@
+xfs: fix shutdown hang on invalid inode during create
+
+When the new inode verify in xfs_iread() fails, the create
+transaction is aborted and a shutdown occurs. The subsequent unmount
+then hangs in xfs_wait_buftarg() on a buffer that has an elevated
+hold count. Debug showed that it was an AGI buffer getting stuck:
+
+[   22.576147] XFS (vdb): buffer 0x2/0x1, hold 0x2 stuck
+[   22.976213] XFS (vdb): buffer 0x2/0x1, hold 0x2 stuck
+[   23.376206] XFS (vdb): buffer 0x2/0x1, hold 0x2 stuck
+[   23.776325] XFS (vdb): buffer 0x2/0x1, hold 0x2 stuck
+
+The trace of this buffer leading up to the shutdown (trimmed for
+brevity) looks like:
+
+xfs_buf_init:        bno 0x2 nblks 0x1 hold 1 caller xfs_buf_get_map
+xfs_buf_get:         bno 0x2 len 0x200 hold 1 caller xfs_buf_read_map
+xfs_buf_read:        bno 0x2 len 0x200 hold 1 caller xfs_trans_read_buf_map
+xfs_buf_iorequest:   bno 0x2 nblks 0x1 hold 1 caller _xfs_buf_read
+xfs_buf_hold:        bno 0x2 nblks 0x1 hold 1 caller xfs_buf_iorequest
+xfs_buf_rele:        bno 0x2 nblks 0x1 hold 2 caller xfs_buf_iorequest
+xfs_buf_iowait:      bno 0x2 nblks 0x1 hold 1 caller _xfs_buf_read
+xfs_buf_ioerror:     bno 0x2 len 0x200 hold 1 caller xfs_buf_bio_end_io
+xfs_buf_iodone:      bno 0x2 nblks 0x1 hold 1 caller _xfs_buf_ioend
+xfs_buf_iowait_done: bno 0x2 nblks 0x1 hold 1 caller _xfs_buf_read
+xfs_buf_hold:        bno 0x2 nblks 0x1 hold 1 caller xfs_buf_item_init
+xfs_trans_read_buf:  bno 0x2 len 0x200 hold 2 recur 0 refcount 1
+xfs_trans_brelse:    bno 0x2 len 0x200 hold 2 recur 0 refcount 1
+xfs_buf_item_relse:  bno 0x2 nblks 0x1 hold 2 caller xfs_trans_brelse
+xfs_buf_rele:        bno 0x2 nblks 0x1 hold 2 caller xfs_buf_item_relse
+xfs_buf_unlock:      bno 0x2 nblks 0x1 hold 1 caller xfs_trans_brelse
+xfs_buf_rele:        bno 0x2 nblks 0x1 hold 1 caller xfs_trans_brelse
+xfs_buf_trylock:     bno 0x2 nblks 0x1 hold 2 caller _xfs_buf_find
+xfs_buf_find:        bno 0x2 len 0x200 hold 2 caller xfs_buf_get_map
+xfs_buf_get:         bno 0x2 len 0x200 hold 2 caller xfs_buf_read_map
+xfs_buf_read:        bno 0x2 len 0x200 hold 2 caller xfs_trans_read_buf_map
+xfs_buf_hold:        bno 0x2 nblks 0x1 hold 2 caller xfs_buf_item_init
+xfs_trans_read_buf:  bno 0x2 len 0x200 hold 3 recur 0 refcount 1
+xfs_trans_log_buf:   bno 0x2 len 0x200 hold 3 recur 0 refcount 1
+xfs_buf_item_unlock: bno 0x2 len 0x200 hold 3 flags DIRTY liflags ABORTED
+xfs_buf_unlock:      bno 0x2 nblks 0x1 hold 3 caller xfs_buf_item_unlock
+xfs_buf_rele:        bno 0x2 nblks 0x1 hold 3 caller xfs_buf_item_unlock
+
+And that is the AGI buffer from cold cache read into memory to
+transaction abort. You can see at transaction abort the bli is dirty
+and only has a single reference. The item is not pinned, and it's
+not in the AIL. Hence the only reference to it is this transaction.
+
+The problem is that the xfs_buf_item_unlock() call is dropping the
+last reference to the xfs_buf_log_item attached to the buffer (which
+holds a reference to the buffer), but it is not freeing the
+xfs_buf_log_item. Hence nothing will ever release the buffer, and
+the unmount hangs waiting for this reference to go away.
+
+The fix is simple - xfs_buf_item_unlock needs to detect the last
+reference going away in this case and free the xfs_buf_log_item to
+release the reference it holds on the buffer.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Ben Myers <bpm@sgi.com>
+Signed-off-by: Ben Myers <bpm@sgi.com>
+
+

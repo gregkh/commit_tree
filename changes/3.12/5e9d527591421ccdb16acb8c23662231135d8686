@@ -1,0 +1,86 @@
+ipc/sem.c: fix race in sem_lock()
+
+The exclusion of complex operations in sem_lock() is insufficient: after
+acquiring the per-semaphore lock, a simple op must first check that
+sem_perm.lock is not locked and only after that test check
+complex_count.  The current code does it the other way around - and that
+creates a race.  Details are below.
+
+The patch is a complete rewrite of sem_lock(), based in part on the code
+from Mike Galbraith.  It removes all gotos and all loops and thus the
+risk of livelocks.
+
+I have tested the patch (together with the next one) on my i3 laptop and
+it didn't cause any problems.
+
+The bug is probably also present in 3.10 and 3.11, but for these kernels
+it might be simpler just to move the test of sma->complex_count after
+the spin_is_locked() test.
+
+Details of the bug:
+
+Assume:
+ - sma->complex_count = 0.
+ - Thread 1: semtimedop(complex op that must sleep)
+ - Thread 2: semtimedop(simple op).
+
+Pseudo-Trace:
+
+Thread 1: sem_lock(): acquire sem_perm.lock
+Thread 1: sem_lock(): check for ongoing simple ops
+			Nothing ongoing, thread 2 is still before sem_lock().
+Thread 1: try_atomic_semop()
+	<<< preempted.
+
+Thread 2: sem_lock():
+        static inline int sem_lock(struct sem_array *sma, struct sembuf *sops,
+                                      int nsops)
+        {
+                int locknum;
+         again:
+                if (nsops == 1 && !sma->complex_count) {
+                        struct sem *sem = sma->sem_base + sops->sem_num;
+
+                        /* Lock just the semaphore we are interested in. */
+                        spin_lock(&sem->lock);
+
+                        /*
+                         * If sma->complex_count was set while we were spinning,
+                         * we may need to look at things we did not lock here.
+                         */
+                        if (unlikely(sma->complex_count)) {
+                                spin_unlock(&sem->lock);
+                                goto lock_array;
+                        }
+        <<<<<<<<<
+	<<< complex_count is still 0.
+	<<<
+        <<< Here it is preempted
+        <<<<<<<<<
+
+Thread 1: try_atomic_semop() returns, notices that it must sleep.
+Thread 1: increases sma->complex_count.
+Thread 1: drops sem_perm.lock
+Thread 2:
+                /*
+                 * Another process is holding the global lock on the
+                 * sem_array; we cannot enter our critical section,
+                 * but have to wait for the global lock to be released.
+                 */
+                if (unlikely(spin_is_locked(&sma->sem_perm.lock))) {
+                        spin_unlock(&sem->lock);
+                        spin_unlock_wait(&sma->sem_perm.lock);
+                        goto again;
+                }
+	<<< sem_perm.lock already dropped, thus no "goto again;"
+
+                locknum = sops->sem_num;
+
+Signed-off-by: Manfred Spraul <manfred@colorfullife.com>
+Cc: Mike Galbraith <bitbucket@online.de>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Davidlohr Bueso <davidlohr.bueso@hp.com>
+Cc: <stable@vger.kernel.org>	[3.10+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

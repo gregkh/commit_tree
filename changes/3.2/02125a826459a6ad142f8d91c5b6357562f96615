@@ -1,0 +1,49 @@
+fix apparmor dereferencing potentially freed dentry, sanitize __d_path() API
+
+__d_path() API is asking for trouble and in case of apparmor d_namespace_path()
+getting just that.  The root cause is that when __d_path() misses the root
+it had been told to look for, it stores the location of the most remote ancestor
+in *root.  Without grabbing references.  Sure, at the moment of call it had
+been pinned down by what we have in *path.  And if we raced with umount -l, we
+could have very well stopped at vfsmount/dentry that got freed as soon as
+prepend_path() dropped vfsmount_lock.
+
+It is safe to compare these pointers with pre-existing (and known to be still
+alive) vfsmount and dentry, as long as all we are asking is "is it the same
+address?".  Dereferencing is not safe and apparmor ended up stepping into
+that.  d_namespace_path() really wants to examine the place where we stopped,
+even if it's not connected to our namespace.  As the result, it looked
+at ->d_sb->s_magic of a dentry that might've been already freed by that point.
+All other callers had been careful enough to avoid that, but it's really
+a bad interface - it invites that kind of trouble.
+
+The fix is fairly straightforward, even though it's bigger than I'd like:
+	* prepend_path() root argument becomes const.
+	* __d_path() is never called with NULL/NULL root.  It was a kludge
+to start with.  Instead, we have an explicit function - d_absolute_root().
+Same as __d_path(), except that it doesn't get root passed and stops where
+it stops.  apparmor and tomoyo are using it.
+	* __d_path() returns NULL on path outside of root.  The main
+caller is show_mountinfo() and that's precisely what we pass root for - to
+skip those outside chroot jail.  Those who don't want that can (and do)
+use d_path().
+	* __d_path() root argument becomes const.  Everyone agrees, I hope.
+	* apparmor does *NOT* try to use __d_path() or any of its variants
+when it sees that path->mnt is an internal vfsmount.  In that case it's
+definitely not mounted anywhere and dentry_path() is exactly what we want
+there.  Handling of sysctl()-triggered weirdness is moved to that place.
+	* if apparmor is asked to do pathname relative to chroot jail
+and __d_path() tells it we it's not in that jail, the sucker just calls
+d_absolute_path() instead.  That's the other remaining caller of __d_path(),
+BTW.
+        * seq_path_root() does _NOT_ return -ENAMETOOLONG (it's stupid anyway -
+the normal seq_file logics will take care of growing the buffer and redoing
+the call of ->show() just fine).  However, if it gets path not reachable
+from root, it returns SEQ_SKIP.  The only caller adjusted (i.e. stopped
+ignoring the return value as it used to do).
+
+Reviewed-by: John Johansen <john.johansen@canonical.com>
+ACKed-by: John Johansen <john.johansen@canonical.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Cc: stable@vger.kernel.org
+

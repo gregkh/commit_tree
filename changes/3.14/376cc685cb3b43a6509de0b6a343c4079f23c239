@@ -1,0 +1,58 @@
+Btrfs: fix the reserved space leak caused by the race between nonlock dio and buffered io
+
+When we ran sysbench on the fs with compression, the following WARN_ONs were
+triggered:
+ fs/btrfs/inode.c:7829	WARN_ON(BTRFS_I(inode)->outstanding_extents);
+ fs/btrfs/inode.c:7830	WARN_ON(BTRFS_I(inode)->reserved_extents);
+ fs/btrfs/inode.c:7832	WARN_ON(BTRFS_I(inode)->csum_bytes);
+
+Steps to reproduce:
+ # mkfs.btrfs -f <dev>
+ # mount -o compress <dev> <mnt>
+ # cd <mnt>
+ # sysbench --test=fileio --num-threads=8 --file-total-size=8G \
+ > --file-block-size=32K --file-io-mode=rndwr --file-fsync-freq=0 \
+ > --file-fsync-end=no --max-requests=300000 --file-extra-flags=direct \
+ > --file-test-mode=sync prepare
+ # cd -
+ # umount <mnt>
+ # mount -o compress <dev> <mnt>
+ # cd <mnt>
+ # sysbench --test=fileio --num-threads=8 --file-total-size=8G \
+ > --file-block-size=32K --file-io-mode=rndwr --file-fsync-freq=0 \
+ > --file-fsync-end=no --max-requests=300000 --file-extra-flags=direct \
+ > --file-test-mode=sync run
+ # cd -
+ # umount <mnt>
+
+The reason of this problem is:
+Task0				Task1
+btrfs_direct_IO
+  unlock(&inode->i_mutex)
+				lock(&inode->i_mutex)
+				reserve_space()
+				prepare_pages()
+				  lock_extent()
+				  clear_extent()
+				  unlock_extent()
+  lock_extent()
+  test_extent(uptodate)
+    return false
+				copy_data()
+				set_delalloc_extent()
+  extent need compress
+    go back to buffered write
+  clear_extent(DELALLOC | DIRTY)
+  unlock_extent()
+
+Task 0 and 1 wrote the same place, and task0 cleared the delalloc flag which
+was set by task1, it made the dirty pages in that extents couldn't be flushed
+into the disk, so the reserved space for that extent was not released at
+the end.
+
+This patch fixes the above bug by unlocking the extent after the delalloc.
+
+Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+Signed-off-by: Josef Bacik <jbacik@fb.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

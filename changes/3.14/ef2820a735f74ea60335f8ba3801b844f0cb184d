@@ -1,0 +1,259 @@
+net: sctp: Fix a_rwnd/rwnd management to reflect real state of the receiver's buffer
+
+Implementation of (a)rwnd calculation might lead to severe performance issues
+and associations completely stalling. These problems are described and solution
+is proposed which improves lksctp's robustness in congestion state.
+
+1) Sudden drop of a_rwnd and incomplete window recovery afterwards
+
+Data accounted in sctp_assoc_rwnd_decrease takes only payload size (sctp data),
+but size of sk_buff, which is blamed against receiver buffer, is not accounted
+in rwnd. Theoretically, this should not be the problem as actual size of buffer
+is double the amount requested on the socket (SO_RECVBUF). Problem here is
+that this will have bad scaling for data which is less then sizeof sk_buff.
+E.g. in 4G (LTE) networks, link interfacing radio side will have a large portion
+of traffic of this size (less then 100B).
+
+An example of sudden drop and incomplete window recovery is given below. Node B
+exhibits problematic behavior. Node A initiates association and B is configured
+to advertise rwnd of 10000. A sends messages of size 43B (size of typical sctp
+message in 4G (LTE) network). On B data is left in buffer by not reading socket
+in userspace.
+
+Lets examine when we will hit pressure state and declare rwnd to be 0 for
+scenario with above stated parameters (rwnd == 10000, chunk size == 43, each
+chunk is sent in separate sctp packet)
+
+Logic is implemented in sctp_assoc_rwnd_decrease:
+
+socket_buffer (see below) is maximum size which can be held in socket buffer
+(sk_rcvbuf). current_alloced is amount of data currently allocated (rx_count)
+
+A simple expression is given for which it will be examined after how many
+packets for above stated parameters we enter pressure state:
+
+We start by condition which has to be met in order to enter pressure state:
+
+	socket_buffer < currently_alloced;
+
+currently_alloced is represented as size of sctp packets received so far and not
+yet delivered to userspace. x is the number of chunks/packets (since there is no
+bundling, and each chunk is delivered in separate packet, we can observe each
+chunk also as sctp packet, and what is important here, having its own sk_buff):
+
+	socket_buffer < x*each_sctp_packet;
+
+each_sctp_packet is sctp chunk size + sizeof(struct sk_buff). socket_buffer is
+twice the amount of initially requested size of socket buffer, which is in case
+of sctp, twice the a_rwnd requested:
+
+	2*rwnd < x*(payload+sizeof(struc sk_buff));
+
+sizeof(struct sk_buff) is 190 (3.13.0-rc4+). Above is stated that rwnd is 10000
+and each payload size is 43
+
+	20000 < x(43+190);
+
+	x > 20000/233;
+
+	x ~> 84;
+
+After ~84 messages, pressure state is entered and 0 rwnd is advertised while
+received 84*43B ~= 3612B sctp data. This is why external observer notices sudden
+drop from 6474 to 0, as it will be now shown in example:
+
+IP A.34340 > B.12345: sctp (1) [INIT] [init tag: 1875509148] [rwnd: 81920] [OS: 10] [MIS: 65535] [init TSN: 1096057017]
+IP B.12345 > A.34340: sctp (1) [INIT ACK] [init tag: 3198966556] [rwnd: 10000] [OS: 10] [MIS: 10] [init TSN: 902132839]
+IP A.34340 > B.12345: sctp (1) [COOKIE ECHO]
+IP B.12345 > A.34340: sctp (1) [COOKIE ACK]
+IP A.34340 > B.12345: sctp (1) [DATA] (B)(E) [TSN: 1096057017] [SID: 0] [SSEQ 0] [PPID 0x18]
+IP B.12345 > A.34340: sctp (1) [SACK] [cum ack 1096057017] [a_rwnd 9957] [#gap acks 0] [#dup tsns 0]
+IP A.34340 > B.12345: sctp (1) [DATA] (B)(E) [TSN: 1096057018] [SID: 0] [SSEQ 1] [PPID 0x18]
+IP B.12345 > A.34340: sctp (1) [SACK] [cum ack 1096057018] [a_rwnd 9957] [#gap acks 0] [#dup tsns 0]
+IP A.34340 > B.12345: sctp (1) [DATA] (B)(E) [TSN: 1096057019] [SID: 0] [SSEQ 2] [PPID 0x18]
+IP B.12345 > A.34340: sctp (1) [SACK] [cum ack 1096057019] [a_rwnd 9914] [#gap acks 0] [#dup tsns 0]
+<...>
+IP A.34340 > B.12345: sctp (1) [DATA] (B)(E) [TSN: 1096057098] [SID: 0] [SSEQ 81] [PPID 0x18]
+IP B.12345 > A.34340: sctp (1) [SACK] [cum ack 1096057098] [a_rwnd 6517] [#gap acks 0] [#dup tsns 0]
+IP A.34340 > B.12345: sctp (1) [DATA] (B)(E) [TSN: 1096057099] [SID: 0] [SSEQ 82] [PPID 0x18]
+IP B.12345 > A.34340: sctp (1) [SACK] [cum ack 1096057099] [a_rwnd 6474] [#gap acks 0] [#dup tsns 0]
+IP A.34340 > B.12345: sctp (1) [DATA] (B)(E) [TSN: 1096057100] [SID: 0] [SSEQ 83] [PPID 0x18]
+
+--> Sudden drop
+
+IP B.12345 > A.34340: sctp (1) [SACK] [cum ack 1096057100] [a_rwnd 0] [#gap acks 0] [#dup tsns 0]
+
+At this point, rwnd_press stores current rwnd value so it can be later restored
+in sctp_assoc_rwnd_increase. This however doesn't happen as condition to start
+slowly increasing rwnd until rwnd_press is returned to rwnd is never met. This
+condition is not met since rwnd, after it hit 0, must first reach rwnd_press by
+adding amount which is read from userspace. Let us observe values in above
+example. Initial a_rwnd is 10000, pressure was hit when rwnd was ~6500 and the
+amount of actual sctp data currently waiting to be delivered to userspace
+is ~3500. When userspace starts to read, sctp_assoc_rwnd_increase will be blamed
+only for sctp data, which is ~3500. Condition is never met, and when userspace
+reads all data, rwnd stays on 3569.
+
+IP B.12345 > A.34340: sctp (1) [SACK] [cum ack 1096057100] [a_rwnd 1505] [#gap acks 0] [#dup tsns 0]
+IP B.12345 > A.34340: sctp (1) [SACK] [cum ack 1096057100] [a_rwnd 3010] [#gap acks 0] [#dup tsns 0]
+IP A.34340 > B.12345: sctp (1) [DATA] (B)(E) [TSN: 1096057101] [SID: 0] [SSEQ 84] [PPID 0x18]
+IP B.12345 > A.34340: sctp (1) [SACK] [cum ack 1096057101] [a_rwnd 3569] [#gap acks 0] [#dup tsns 0]
+
+--> At this point userspace read everything, rwnd recovered only to 3569
+
+IP A.34340 > B.12345: sctp (1) [DATA] (B)(E) [TSN: 1096057102] [SID: 0] [SSEQ 85] [PPID 0x18]
+IP B.12345 > A.34340: sctp (1) [SACK] [cum ack 1096057102] [a_rwnd 3569] [#gap acks 0] [#dup tsns 0]
+
+Reproduction is straight forward, it is enough for sender to send packets of
+size less then sizeof(struct sk_buff) and receiver keeping them in its buffers.
+
+2) Minute size window for associations sharing the same socket buffer
+
+In case multiple associations share the same socket, and same socket buffer
+(sctp.rcvbuf_policy == 0), different scenarios exist in which congestion on one
+of the associations can permanently drop rwnd of other association(s).
+
+Situation will be typically observed as one association suddenly having rwnd
+dropped to size of last packet received and never recovering beyond that point.
+Different scenarios will lead to it, but all have in common that one of the
+associations (let it be association from 1)) nearly depleted socket buffer, and
+the other association blames socket buffer just for the amount enough to start
+the pressure. This association will enter pressure state, set rwnd_press and
+announce 0 rwnd.
+When data is read by userspace, similar situation as in 1) will occur, rwnd will
+increase just for the size read by userspace but rwnd_press will be high enough
+so that association doesn't have enough credit to reach rwnd_press and restore
+to previous state. This case is special case of 1), being worse as there is, in
+the worst case, only one packet in buffer for which size rwnd will be increased.
+Consequence is association which has very low maximum rwnd ('minute size', in
+our case down to 43B - size of packet which caused pressure) and as such
+unusable.
+
+Scenario happened in the field and labs frequently after congestion state (link
+breaks, different probabilities of packet drop, packet reordering) and with
+scenario 1) preceding. Here is given a deterministic scenario for reproduction:
+
+>From node A establish two associations on the same socket, with rcvbuf_policy
+being set to share one common buffer (sctp.rcvbuf_policy == 0). On association 1
+repeat scenario from 1), that is, bring it down to 0 and restore up. Observe
+scenario 1). Use small payload size (here we use 43). Once rwnd is 'recovered',
+bring it down close to 0, as in just one more packet would close it. This has as
+a consequence that association number 2 is able to receive (at least) one more
+packet which will bring it in pressure state. E.g. if association 2 had rwnd of
+10000, packet received was 43, and we enter at this point into pressure,
+rwnd_press will have 9957. Once payload is delivered to userspace, rwnd will
+increase for 43, but conditions to restore rwnd to original state, just as in
+1), will never be satisfied.
+
+--> Association 1, between A.y and B.12345
+
+IP A.55915 > B.12345: sctp (1) [INIT] [init tag: 836880897] [rwnd: 10000] [OS: 10] [MIS: 65535] [init TSN: 4032536569]
+IP B.12345 > A.55915: sctp (1) [INIT ACK] [init tag: 2873310749] [rwnd: 81920] [OS: 10] [MIS: 10] [init TSN: 3799315613]
+IP A.55915 > B.12345: sctp (1) [COOKIE ECHO]
+IP B.12345 > A.55915: sctp (1) [COOKIE ACK]
+
+--> Association 2, between A.z and B.12346
+
+IP A.55915 > B.12346: sctp (1) [INIT] [init tag: 534798321] [rwnd: 10000] [OS: 10] [MIS: 65535] [init TSN: 2099285173]
+IP B.12346 > A.55915: sctp (1) [INIT ACK] [init tag: 516668823] [rwnd: 81920] [OS: 10] [MIS: 10] [init TSN: 3676403240]
+IP A.55915 > B.12346: sctp (1) [COOKIE ECHO]
+IP B.12346 > A.55915: sctp (1) [COOKIE ACK]
+
+--> Deplete socket buffer by sending messages of size 43B over association 1
+
+IP B.12345 > A.55915: sctp (1) [DATA] (B)(E) [TSN: 3799315613] [SID: 0] [SSEQ 0] [PPID 0x18]
+IP A.55915 > B.12345: sctp (1) [SACK] [cum ack 3799315613] [a_rwnd 9957] [#gap acks 0] [#dup tsns 0]
+
+<...>
+
+IP A.55915 > B.12345: sctp (1) [SACK] [cum ack 3799315696] [a_rwnd 6388] [#gap acks 0] [#dup tsns 0]
+IP B.12345 > A.55915: sctp (1) [DATA] (B)(E) [TSN: 3799315697] [SID: 0] [SSEQ 84] [PPID 0x18]
+IP A.55915 > B.12345: sctp (1) [SACK] [cum ack 3799315697] [a_rwnd 6345] [#gap acks 0] [#dup tsns 0]
+
+--> Sudden drop on 1
+
+IP B.12345 > A.55915: sctp (1) [DATA] (B)(E) [TSN: 3799315698] [SID: 0] [SSEQ 85] [PPID 0x18]
+IP A.55915 > B.12345: sctp (1) [SACK] [cum ack 3799315698] [a_rwnd 0] [#gap acks 0] [#dup tsns 0]
+
+--> Here userspace read, rwnd 'recovered' to 3698, now deplete again using
+    association 1 so there is place in buffer for only one more packet
+
+IP B.12345 > A.55915: sctp (1) [DATA] (B)(E) [TSN: 3799315799] [SID: 0] [SSEQ 186] [PPID 0x18]
+IP A.55915 > B.12345: sctp (1) [SACK] [cum ack 3799315799] [a_rwnd 86] [#gap acks 0] [#dup tsns 0]
+IP B.12345 > A.55915: sctp (1) [DATA] (B)(E) [TSN: 3799315800] [SID: 0] [SSEQ 187] [PPID 0x18]
+IP A.55915 > B.12345: sctp (1) [SACK] [cum ack 3799315800] [a_rwnd 43] [#gap acks 0] [#dup tsns 0]
+
+--> Socket buffer is almost depleted, but there is space for one more packet,
+    send them over association 2, size 43B
+
+IP B.12346 > A.55915: sctp (1) [DATA] (B)(E) [TSN: 3676403240] [SID: 0] [SSEQ 0] [PPID 0x18]
+IP A.55915 > B.12346: sctp (1) [SACK] [cum ack 3676403240] [a_rwnd 0] [#gap acks 0] [#dup tsns 0]
+
+--> Immediate drop
+
+IP A.60995 > B.12346: sctp (1) [SACK] [cum ack 387491510] [a_rwnd 0] [#gap acks 0] [#dup tsns 0]
+
+--> Read everything from the socket, both association recover up to maximum rwnd
+    they are capable of reaching, note that association 1 recovered up to 3698,
+    and association 2 recovered only to 43
+
+IP A.55915 > B.12345: sctp (1) [SACK] [cum ack 3799315800] [a_rwnd 1548] [#gap acks 0] [#dup tsns 0]
+IP A.55915 > B.12345: sctp (1) [SACK] [cum ack 3799315800] [a_rwnd 3053] [#gap acks 0] [#dup tsns 0]
+IP B.12345 > A.55915: sctp (1) [DATA] (B)(E) [TSN: 3799315801] [SID: 0] [SSEQ 188] [PPID 0x18]
+IP A.55915 > B.12345: sctp (1) [SACK] [cum ack 3799315801] [a_rwnd 3698] [#gap acks 0] [#dup tsns 0]
+IP B.12346 > A.55915: sctp (1) [DATA] (B)(E) [TSN: 3676403241] [SID: 0] [SSEQ 1] [PPID 0x18]
+IP A.55915 > B.12346: sctp (1) [SACK] [cum ack 3676403241] [a_rwnd 43] [#gap acks 0] [#dup tsns 0]
+
+A careful reader might wonder why it is necessary to reproduce 1) prior
+reproduction of 2). It is simply easier to observe when to send packet over
+association 2 which will push association into the pressure state.
+
+Proposed solution:
+
+Both problems share the same root cause, and that is improper scaling of socket
+buffer with rwnd. Solution in which sizeof(sk_buff) is taken into concern while
+calculating rwnd is not possible due to fact that there is no linear
+relationship between amount of data blamed in increase/decrease with IP packet
+in which payload arrived. Even in case such solution would be followed,
+complexity of the code would increase. Due to nature of current rwnd handling,
+slow increase (in sctp_assoc_rwnd_increase) of rwnd after pressure state is
+entered is rationale, but it gives false representation to the sender of current
+buffer space. Furthermore, it implements additional congestion control mechanism
+which is defined on implementation, and not on standard basis.
+
+Proposed solution simplifies whole algorithm having on mind definition from rfc:
+
+o  Receiver Window (rwnd): This gives the sender an indication of the space
+   available in the receiver's inbound buffer.
+
+Core of the proposed solution is given with these lines:
+
+sctp_assoc_rwnd_update:
+	if ((asoc->base.sk->sk_rcvbuf - rx_count) > 0)
+		asoc->rwnd = (asoc->base.sk->sk_rcvbuf - rx_count) >> 1;
+	else
+		asoc->rwnd = 0;
+
+We advertise to sender (half of) actual space we have. Half is in the braces
+depending whether you would like to observe size of socket buffer as SO_RECVBUF
+or twice the amount, i.e. size is the one visible from userspace, that is,
+from kernelspace.
+In this way sender is given with good approximation of our buffer space,
+regardless of the buffer policy - we always advertise what we have. Proposed
+solution fixes described problems and removes necessity for rwnd restoration
+algorithm. Finally, as proposed solution is simplification, some lines of code,
+along with some bytes in struct sctp_association are saved.
+
+Version 2 of the patch addressed comments from Vlad. Name of the function is set
+to be more descriptive, and two parts of code are changed, in one removing the
+superfluous call to sctp_assoc_rwnd_update since call would not result in update
+of rwnd, and the other being reordering of the code in a way that call to
+sctp_assoc_rwnd_update updates rwnd. Version 3 corrected change introduced in v2
+in a way that existing function is not reordered/copied in line, but it is
+correctly called. Thanks Vlad for suggesting.
+
+Signed-off-by: Matija Glavinic Pecotic <matija.glavinic-pecotic.ext@nsn.com>
+Reviewed-by: Alexander Sverdlin <alexander.sverdlin@nsn.com>
+Acked-by: Vlad Yasevich <vyasevich@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

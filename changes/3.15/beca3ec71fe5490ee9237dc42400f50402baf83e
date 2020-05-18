@@ -1,0 +1,108 @@
+zram: add multi stream functionality
+
+Existing zram (zcomp) implementation has only one compression stream
+(buffer and algorithm private part), so in order to prevent data
+corruption only one write (compress operation) can use this compression
+stream, forcing all concurrent write operations to wait for stream lock
+to be released.  This patch changes zcomp to keep a compression streams
+list of user-defined size (via sysfs device attr).  Each write operation
+still exclusively holds compression stream, the difference is that we
+can have N write operations (depending on size of streams list)
+executing in parallel.  See TEST section later in commit message for
+performance data.
+
+Introduce struct zcomp_strm_multi and a set of functions to manage
+zcomp_strm stream access.  zcomp_strm_multi has a list of idle
+zcomp_strm structs, spinlock to protect idle list and wait queue, making
+it possible to perform parallel compressions.
+
+The following set of functions added:
+- zcomp_strm_multi_find()/zcomp_strm_multi_release()
+  find and release a compression stream, implement required locking
+- zcomp_strm_multi_create()/zcomp_strm_multi_destroy()
+  create and destroy zcomp_strm_multi
+
+zcomp ->strm_find() and ->strm_release() callbacks are set during
+initialisation to zcomp_strm_multi_find()/zcomp_strm_multi_release()
+correspondingly.
+
+Each time zcomp issues a zcomp_strm_multi_find() call, the following set
+of operations performed:
+
+- spin lock strm_lock
+- if idle list is not empty, remove zcomp_strm from idle list, spin
+  unlock and return zcomp stream pointer to caller
+- if idle list is empty, current adds itself to wait queue. it will be
+  awaken by zcomp_strm_multi_release() caller.
+
+zcomp_strm_multi_release():
+- spin lock strm_lock
+- add zcomp stream to idle list
+- spin unlock, wake up sleeper
+
+Minchan Kim reported that spinlock-based locking scheme has demonstrated
+a severe perfomance regression for single compression stream case,
+comparing to mutex-based (see https://lkml.org/lkml/2014/2/18/16)
+
+base                      spinlock                    mutex
+
+==Initial write           ==Initial write             ==Initial  write
+records:  5               records:  5                 records:   5
+avg:      1642424.35      avg:      699610.40         avg:       1655583.71
+std:      39890.95(2.43%) std:      232014.19(33.16%) std:       52293.96
+max:      1690170.94      max:      1163473.45        max:       1697164.75
+min:      1568669.52      min:      573429.88         min:       1553410.23
+==Rewrite                 ==Rewrite                   ==Rewrite
+records:  5               records:  5                 records:   5
+avg:      1611775.39      avg:      501406.64         avg:       1684419.11
+std:      17144.58(1.06%) std:      15354.41(3.06%)   std:       18367.42
+max:      1641800.95      max:      531356.78         max:       1706445.84
+min:      1593515.27      min:      488817.78         min:       1655335.73
+
+When only one compression stream available, mutex with spin on owner
+tends to perform much better than frequent wait_event()/wake_up().  This
+is why single stream implemented as a special case with mutex locking.
+
+Introduce and document zram device attribute max_comp_streams.  This
+attr shows and stores current zcomp's max number of zcomp streams
+(max_strm).  Extend zcomp's zcomp_create() with `max_strm' parameter.
+`max_strm' limits the number of zcomp_strm structs in compression
+backend's idle list (max_comp_streams).
+
+max_comp_streams used during initialisation as follows:
+-- passing to zcomp_create() max_strm equals to 1 will initialise zcomp
+using single compression stream zcomp_strm_single (mutex-based locking).
+-- passing to zcomp_create() max_strm greater than 1 will initialise zcomp
+using multi compression stream zcomp_strm_multi (spinlock-based locking).
+
+default max_comp_streams value is 1, meaning that zram with single stream
+will be initialised.
+
+Later patch will introduce configuration knob to change max_comp_streams
+on already initialised and used zcomp.
+
+TEST
+iozone -t 3 -R -r 16K -s 60M -I +Z
+
+       test           base       1 strm (mutex)     3 strm (spinlock)
+-----------------------------------------------------------------------
+ Initial write      589286.78       583518.39          718011.05
+       Rewrite      604837.97       596776.38         1515125.72
+  Random write      584120.11       595714.58         1388850.25
+        Pwrite      535731.17       541117.38          739295.27
+        Fwrite     1418083.88      1478612.72         1484927.06
+
+Usage example:
+set max_comp_streams to 4
+        echo 4 > /sys/block/zram0/max_comp_streams
+
+show current max_comp_streams (default value is 1).
+        cat /sys/block/zram0/max_comp_streams
+
+Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Acked-by: Minchan Kim <minchan@kernel.org>
+Cc: Jerome Marchand <jmarchan@redhat.com>
+Cc: Nitin Gupta <ngupta@vflare.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

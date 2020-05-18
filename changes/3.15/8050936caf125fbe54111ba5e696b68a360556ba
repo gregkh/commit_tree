@@ -1,0 +1,47 @@
+powerpc: irq work racing with timer interrupt can result in timer interrupt hang
+
+I am seeing an issue where a CPU running perf eventually hangs.
+Traces show timer interrupts happening every 4 seconds even
+when a userspace task is running on the CPU. /proc/timer_list
+also shows pending hrtimers have not run in over an hour,
+including the scheduler.
+
+Looking closer, decrementers_next_tb is getting set to
+0xffffffffffffffff, and at that point we will never take
+a timer interrupt again.
+
+In __timer_interrupt() we set decrementers_next_tb to
+0xffffffffffffffff and rely on ->event_handler to update it:
+
+        *next_tb = ~(u64)0;
+        if (evt->event_handler)
+                evt->event_handler(evt);
+
+In this case ->event_handler is hrtimer_interrupt. This will eventually
+call back through the clockevents code with the next event to be
+programmed:
+
+static int decrementer_set_next_event(unsigned long evt,
+                                      struct clock_event_device *dev)
+{
+        /* Don't adjust the decrementer if some irq work is pending */
+        if (test_irq_work_pending())
+                return 0;
+        __get_cpu_var(decrementers_next_tb) = get_tb_or_rtc() + evt;
+
+If irq work came in between these two points, we will return
+before updating decrementers_next_tb and we never process a timer
+interrupt again.
+
+This looks to have been introduced by 0215f7d8c53f (powerpc: Fix races
+with irq_work). Fix it by removing the early exit and relying on
+code later on in the function to force an early decrementer:
+
+       /* We may have raced with new irq work */
+       if (test_irq_work_pending())
+               set_dec(1);
+
+Signed-off-by: Anton Blanchard <anton@samba.org>
+Cc: stable@vger.kernel.org # 3.14+
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+

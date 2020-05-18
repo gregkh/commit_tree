@@ -1,0 +1,62 @@
+swap: make cluster allocation per-cpu
+
+swap cluster allocation is to get better request merge to improve
+performance.  But the cluster is shared globally, if multiple tasks are
+doing swap, this will cause interleave disk access.  While multiple tasks
+swap is quite common, for example, each numa node has a kswapd thread
+doing swap and multiple threads/processes doing direct page reclaim.
+
+ioscheduler can't help too much here, because tasks don't send swapout IO
+down to block layer in the meantime.  Block layer does merge some IOs, but
+a lot not, depending on how many tasks are doing swapout concurrently.  In
+practice, I've seen a lot of small size IO in swapout workloads.
+
+We makes the cluster allocation per-cpu here.  The interleave disk access
+issue goes away.  All tasks swapout to their own cluster, so swapout will
+become sequential, which can be easily merged to big size IO.  If one CPU
+can't get its per-cpu cluster (for example, there is no free cluster
+anymore in the swap), it will fallback to scan swap_map.  The CPU can
+still continue swap.  We don't need recycle free swap entries of other
+CPUs.
+
+In my test (swap to a 2-disk raid0 partition), this improves around 10%
+swapout throughput, and request size is increased significantly.
+
+How does this impact swap readahead is uncertain though.  On one side,
+page reclaim always isolates and swaps several adjancent pages, this will
+make page reclaim write the pages sequentially and benefit readahead.  On
+the other side, several CPU write pages interleave means the pages don't
+live _sequentially_ but relatively _near_.  In the per-cpu allocation
+case, if adjancent pages are written by different cpus, they will live
+relatively _far_.  So how this impacts swap readahead depends on how many
+pages page reclaim isolates and swaps one time.  If the number is big,
+this patch will benefit swap readahead.  Of course, this is about
+sequential access pattern.  The patch has no impact for random access
+pattern, because the new cluster allocation algorithm is just for SSD.
+
+Alternative solution is organizing swap layout to be per-mm instead of
+this per-cpu approach.  In the per-mm layout, we allocate a disk range for
+each mm, so pages of one mm live in swap disk adjacently.  per-mm layout
+has potential issues of lock contention if multiple reclaimers are swap
+pages from one mm.  For a sequential workload, per-mm layout is better to
+implement swap readahead, because pages from the mm are adjacent in disk.
+But per-cpu layout isn't very bad in this workload, as page reclaim always
+isolates and swaps several pages one time, such pages will still live in
+disk sequentially and readahead can utilize this.  For a random workload,
+per-mm layout isn't beneficial of request merge, because it's quite
+possible pages from different mm are swapout in the meantime and IO can't
+be merged in per-mm layout.  while with per-cpu layout we can merge
+requests from any mm.  Considering random workload is more popular in
+workloads with swap (and per-cpu approach isn't too bad for sequential
+workload too), I'm choosing per-cpu layout.
+
+[akpm@linux-foundation.org: coding-style fixes]
+Signed-off-by: Shaohua Li <shli@fusionio.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Kyungmin Park <kmpark@infradead.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Rafael Aquini <aquini@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

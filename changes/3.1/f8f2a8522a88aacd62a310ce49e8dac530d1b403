@@ -1,0 +1,126 @@
+ARM: vfp: fix a hole in VFP thread migration
+
+Fix a hole in the VFP thread migration.  Lets define two threads.
+
+Thread 1, we'll call 'interesting_thread' which is a thread which is
+running on CPU0, using VFP (so vfp_current_hw_state[0] =
+&interesting_thread->vfpstate) and gets migrated off to CPU1, where
+it continues execution of VFP instructions.
+
+Thread 2, we'll call 'new_cpu0_thread' which is the thread which takes
+over on CPU0.  This has also been using VFP, and last used VFP on CPU0,
+but doesn't use it again.
+
+The following code will be executed twice:
+
+		cpu = thread->cpu;
+
+		/*
+		 * On SMP, if VFP is enabled, save the old state in
+		 * case the thread migrates to a different CPU. The
+		 * restoring is done lazily.
+		 */
+		if ((fpexc & FPEXC_EN) && vfp_current_hw_state[cpu]) {
+			vfp_save_state(vfp_current_hw_state[cpu], fpexc);
+			vfp_current_hw_state[cpu]->hard.cpu = cpu;
+		}
+		/*
+		 * Thread migration, just force the reloading of the
+		 * state on the new CPU in case the VFP registers
+		 * contain stale data.
+		 */
+		if (thread->vfpstate.hard.cpu != cpu)
+			vfp_current_hw_state[cpu] = NULL;
+
+The first execution will be on CPU0 to switch away from 'interesting_thread'.
+interesting_thread->cpu will be 0.
+
+So, vfp_current_hw_state[0] points at interesting_thread->vfpstate.
+The hardware state will be saved, along with the CPU number (0) that
+it was executing on.
+
+'thread' will be 'new_cpu0_thread' with new_cpu0_thread->cpu = 0.
+Also, because it was executing on CPU0, new_cpu0_thread->vfpstate.hard.cpu = 0,
+and so the thread migration check is not triggered.
+
+This means that vfp_current_hw_state[0] remains pointing at interesting_thread.
+
+The second execution will be on CPU1 to switch _to_ 'interesting_thread'.
+So, 'thread' will be 'interesting_thread' and interesting_thread->cpu now
+will be 1.  The previous thread executing on CPU1 is not relevant to this
+so we shall ignore that.
+
+We get to the thread migration check.  Here, we discover that
+interesting_thread->vfpstate.hard.cpu = 0, yet interesting_thread->cpu is
+now 1, indicating thread migration.  We set vfp_current_hw_state[1] to
+NULL.
+
+So, at this point vfp_current_hw_state[] contains the following:
+
+[0] = &interesting_thread->vfpstate
+[1] = NULL
+
+Our interesting thread now executes a VFP instruction, takes a fault
+which loads the state into the VFP hardware.  Now, through the assembly
+we now have:
+
+[0] = &interesting_thread->vfpstate
+[1] = &interesting_thread->vfpstate
+
+CPU1 stops due to ptrace (and so saves its VFP state) using the thread
+switch code above), and CPU0 calls vfp_sync_hwstate().
+
+	if (vfp_current_hw_state[cpu] == &thread->vfpstate) {
+		vfp_save_state(&thread->vfpstate, fpexc | FPEXC_EN);
+
+BANG, we corrupt interesting_thread's VFP state by overwriting the
+more up-to-date state saved by CPU1 with the old VFP state from CPU0.
+
+Fix this by ensuring that we have sane semantics for the various state
+describing variables:
+
+1. vfp_current_hw_state[] points to the current owner of the context
+   information stored in each CPUs hardware, or NULL if that state
+   information is invalid.
+2. thread->vfpstate.hard.cpu always contains the most recent CPU number
+   which the state was loaded into or NR_CPUS if no CPU owns the state.
+
+So, for a particular CPU to be a valid owner of the VFP state for a
+particular thread t, two things must be true:
+
+ vfp_current_hw_state[cpu] == &t->vfpstate && t->vfpstate.hard.cpu == cpu.
+
+and that is valid from the moment a CPU loads the saved VFP context
+into the hardware.  This gives clear and consistent semantics to
+interpreting these variables.
+
+This patch also fixes thread copying, ensuring that t->vfpstate.hard.cpu
+is invalidated, otherwise CPU0 may believe it was the last owner.  The
+hole can happen thus:
+
+- thread1 runs on CPU2 using VFP, migrates to CPU3, exits and thread_info
+  freed.
+- New thread allocated from a previously running thread on CPU2, reusing
+  memory for thread1 and copying vfp.hard.cpu.
+
+At this point, the following are true:
+
+	new_thread1->vfpstate.hard.cpu == 2
+	&new_thread1->vfpstate == vfp_current_hw_state[2]
+
+Lastly, this also addresses thread flushing in a similar way to thread
+copying.  Hole is:
+
+- thread runs on CPU0, using VFP, migrates to CPU1 but does not use VFP.
+- thread calls execve(), so thread flush happens, leaving
+  vfp_current_hw_state[0] intact.  This vfpstate is memset to 0 causing
+  thread->vfpstate.hard.cpu = 0.
+- thread migrates back to CPU0 before using VFP.
+
+At this point, the following are true:
+
+	thread->vfpstate.hard.cpu == 0
+	&thread->vfpstate == vfp_current_hw_state[0]
+
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+

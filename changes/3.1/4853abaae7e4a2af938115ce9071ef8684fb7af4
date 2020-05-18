@@ -1,0 +1,78 @@
+block: fix flush machinery for stacking drivers with differring flush flags
+
+Commit ae1b1539622fb46e51b4d13b3f9e5f4c713f86ae, block: reimplement
+FLUSH/FUA to support merge, introduced a performance regression when
+running any sort of fsyncing workload using dm-multipath and certain
+storage (in our case, an HP EVA).  The test I ran was fs_mark, and it
+dropped from ~800 files/sec on ext4 to ~100 files/sec.  It turns out
+that dm-multipath always advertised flush+fua support, and passed
+commands on down the stack, where those flags used to get stripped off.
+The above commit changed that behavior:
+
+static inline struct request *__elv_next_request(struct request_queue *q)
+{
+        struct request *rq;
+
+        while (1) {
+-               while (!list_empty(&q->queue_head)) {
++               if (!list_empty(&q->queue_head)) {
+                        rq = list_entry_rq(q->queue_head.next);
+-                       if (!(rq->cmd_flags & (REQ_FLUSH | REQ_FUA)) ||
+-                           (rq->cmd_flags & REQ_FLUSH_SEQ))
+-                               return rq;
+-                       rq = blk_do_flush(q, rq);
+-                       if (rq)
+-                               return rq;
++                       return rq;
+                }
+
+Note that previously, a command would come in here, have
+REQ_FLUSH|REQ_FUA set, and then get handed off to blk_do_flush:
+
+struct request *blk_do_flush(struct request_queue *q, struct request *rq)
+{
+        unsigned int fflags = q->flush_flags; /* may change, cache it */
+        bool has_flush = fflags & REQ_FLUSH, has_fua = fflags & REQ_FUA;
+        bool do_preflush = has_flush && (rq->cmd_flags & REQ_FLUSH);
+        bool do_postflush = has_flush && !has_fua && (rq->cmd_flags &
+        REQ_FUA);
+        unsigned skip = 0;
+...
+        if (blk_rq_sectors(rq) && !do_preflush && !do_postflush) {
+                rq->cmd_flags &= ~REQ_FLUSH;
+		if (!has_fua)
+			rq->cmd_flags &= ~REQ_FUA;
+	        return rq;
+	}
+
+So, the flush machinery was bypassed in such cases (q->flush_flags == 0
+&& rq->cmd_flags & (REQ_FLUSH|REQ_FUA)).
+
+Now, however, we don't get into the flush machinery at all.  Instead,
+__elv_next_request just hands a request with flush and fua bits set to
+the scsi_request_fn, even if the underlying request_queue does not
+support flush or fua.
+
+The agreed upon approach is to fix the flush machinery to allow
+stacking.  While this isn't used in practice (since there is only one
+request-based dm target, and that target will now reflect the flush
+flags of the underlying device), it does future-proof the solution, and
+make it function as designed.
+
+In order to make this work, I had to add a field to the struct request,
+inside the flush structure (to store the original req->end_io).  Shaohua
+had suggested overloading the union with rb_node and completion_data,
+but the completion data is used by device mapper and can also be used by
+other drivers.  So, I didn't see a way around the additional field.
+
+I tested this patch on an HP EVA with both ext4 and xfs, and it recovers
+the lost performance.  Comments and other testers, as always, are
+appreciated.
+
+Cheers,
+Jeff
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jens Axboe <jaxboe@fusionio.com>
+

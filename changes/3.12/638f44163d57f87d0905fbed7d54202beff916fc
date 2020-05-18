@@ -1,0 +1,96 @@
+xfs: recovery of swap extents operations for CRC filesystems
+
+This is the recovery side of the btree block owner change operation
+performed by swapext on CRC enabled filesystems. We detect that an
+owner change is needed by the flag that has been placed on the inode
+log format flag field. Because the inode recovery is being replayed
+after the buffers that make up the BMBT in the given checkpoint, we
+can walk all the buffers and directly modify them when we see the
+flag set on an inode.
+
+Because the inode can be relogged and hence present in multiple
+chekpoints with the "change owner" flag set, we could do multiple
+passes across the inode to do this change. While this isn't optimal,
+we can't directly ignore the flag as there may be multiple
+independent swap extent operations being replayed on the same inode
+in different checkpoints so we can't ignore them.
+
+Further, because the owner change operation uses ordered buffers, we
+might have buffers that are newer on disk than the current
+checkpoint and so already have the owner changed in them. Hence we
+cannot just peek at a buffer in the tree and check that it has the
+correct owner and assume that the change was completed.
+
+So, for the moment just brute force the owner change every time we
+see an inode with the flag set. Note that we have to be careful here
+because the owner of the buffers may point to either the old owner
+or the new owner. Currently the verifier can't verify the owner
+directly, so there is no failure case here right now. If we verify
+the owner exactly in future, then we'll have to take this into
+account.
+
+This was tested in terms of normal operation via xfstests - all of
+the fsr tests now pass without failure. however, we really need to
+modify xfs/227 to stress v3 inodes correctly to ensure we fully
+cover this case for v5 filesystems.
+
+In terms of recovery testing, I used a hacked version of xfs_fsr
+that held the temp inode open for a few seconds before exiting so
+that the filesystem could be shut down with an open owner change
+recovery flags set on at least the temp inode. fsr leaves the temp
+inode unlinked and in btree format, so this was necessary for the
+owner change to be reliably replayed.
+
+logprint confirmed the tmp inode in the log had the correct flag set:
+
+INO: cnt:3 total:3 a:0x69e9e0 len:56 a:0x69ea20 len:176 a:0x69eae0 len:88
+        INODE: #regs:3   ino:0x44  flags:0x209   dsize:88
+	                                 ^^^^^
+
+0x200 is set, indicating a data fork owner change needed to be
+replayed on inode 0x44.  A printk in the revoery code confirmed that
+the inode change was recovered:
+
+XFS (vdc): Mounting Filesystem
+XFS (vdc): Starting recovery (logdev: internal)
+recovering owner change ino 0x44
+XFS (vdc): Version 5 superblock detected. This kernel L support enabled!
+Use of these features in this kernel is at your own risk!
+XFS (vdc): Ending recovery (logdev: internal)
+
+The script used to test this was:
+
+$ cat ./recovery-fsr.sh
+#!/bin/bash
+
+dev=/dev/vdc
+mntpt=/mnt/scratch
+testfile=$mntpt/testfile
+
+umount $mntpt
+mkfs.xfs -f -m crc=1 $dev
+mount $dev $mntpt
+chmod 777 $mntpt
+
+for i in `seq 10000 -1 0`; do
+        xfs_io -f -d -c "pwrite $(($i * 4096)) 4096" $testfile > /dev/null 2>&1
+done
+xfs_bmap -vp $testfile |head -20
+
+xfs_fsr -d -v $testfile &
+sleep 10
+/home/dave/src/xfstests-dev/src/godown -f $mntpt
+wait
+umount $mntpt
+
+xfs_logprint -t $dev |tail -20
+time mount $dev $mntpt
+xfs_bmap -vp $testfile
+umount $mntpt
+$
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Mark Tinguely <tinguely@sgi.com>
+Signed-off-by: Ben Myers <bpm@sgi.com>
+
+

@@ -1,0 +1,45 @@
+Btrfs: stop caching thread if extent_commit_sem is contended
+
+We can starve out the transaction commit with a bunch of caching threads all
+running at the same time.  This is because we will only drop the
+extent_commit_sem if we need_resched(), which isn't likely to happen since we
+will be reading a lot from the disk so have already schedule()'ed plenty.  Alex
+observed that he could starve out a transaction commit for up to a minute with
+32 caching threads all running at once.  This will allow us to drop the
+extent_commit_sem to allow the transaction commit to swap the commit_root out
+and then all the cachers will start back up. Here is an explanation provided by
+Igno
+
+So, just to fill in what happens in this loop:
+
+                                mutex_unlock(&caching_ctl->mutex);
+                                cond_resched();
+                                goto again;
+
+where 'again:' takes caching_ctl->mutex and fs_info->extent_commit_sem
+again:
+
+        again:
+                mutex_lock(&caching_ctl->mutex);
+                /* need to make sure the commit_root doesn't disappear */
+                down_read(&fs_info->extent_commit_sem);
+
+So, if I'm reading the code correct, there can be a fair amount of
+concurrency here: there may be multiple 'caching kthreads' per filesystem
+active, while there's one fs_info->extent_commit_sem per filesystem
+AFAICS.
+
+So, what happens if there are a lot of CPUs all busy holding the
+->extent_commit_sem rwsem read-locked and a writer arrives? They'd all
+rush to try to release the fs_info->extent_commit_sem, and they'd block in
+the down_read() because there's a writer waiting.
+
+So there's a guarantee of forward progress. This should answer akpm's
+concern I think.
+
+Thanks,
+
+Acked-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

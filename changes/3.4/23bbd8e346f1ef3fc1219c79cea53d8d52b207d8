@@ -1,0 +1,73 @@
+kgdbts: (2 of 2) fix single step awareness to work correctly with SMP
+
+The do_fork and sys_open tests have never worked properly on anything
+other than a UP configuration with the kgdb test suite.  This is
+because the test suite did not fully implement the behavior of a real
+debugger.  A real debugger tracks the state of what thread it asked to
+single step and can correctly continue other threads of execution or
+conditionally stop while waiting for the original thread single step
+request to return.
+
+Below is a simple method to cause a fatal kernel oops with the kgdb
+test suite on a 2 processor ARM system:
+
+while [ 1 ] ; do ls > /dev/null 2> /dev/null; done&
+while [ 1 ] ; do ls > /dev/null 2> /dev/null; done&
+echo V1I1F100 > /sys/module/kgdbts/parameters/kgdbts
+
+Very soon after starting the test the kernel will start warning with
+messages like:
+
+kgdbts: BP mismatch c002487c expected c0024878
+------------[ cut here ]------------
+WARNING: at drivers/misc/kgdbts.c:317 check_and_rewind_pc+0x9c/0xc4()
+[<c01f6520>] (check_and_rewind_pc+0x9c/0xc4)
+[<c01f595c>] (validate_simple_test+0x3c/0xc4)
+[<c01f60d4>] (run_simple_test+0x1e8/0x274)
+
+The kernel will eventually recovers, but the test suite has completely
+failed to test anything useful.
+
+This patch implements behavior similar to a real debugger that does
+not rely on hardware single stepping by using only software planted
+breakpoints.
+
+In order to mimic a real debugger, the kgdb test suite now tracks the
+most recent thread that was continued (cont_thread_id), with the
+intent to single step just this thread.  When the response to the
+single step request stops in a different thread that hit the original
+break point that thread will now get continued, while the debugger
+waits for the thread with the single step pending.  Here is a high
+level description of the sequence of events.
+
+   cont_instead_of_sstep = 0;
+
+1) set breakpoint at do_fork
+2) continue
+3)   Save the thread id where we stop to cont_thread_id
+4) Remove breakpoint at do_fork
+5) Reset the PC if needed depending on kernel exception type
+6) soft single step
+7)   Check where we stopped
+       if current thread != cont_thread_id {
+           if (here for more than 2 times for the same thead) {
+              ### must be a really busy system, start test again ###
+	      goto step 1
+           }
+           goto step 5
+       } else {
+           cont_instead_of_sstep = 0;
+       }
+8) clean up and run test again if needed
+9) Clear out any threads that were waiting on a break point at the
+   point in time the test is ended with get_cont_catch().  This
+   happens sometimes because breakpoints are used in place of single
+   stepping and some threads could have been in the debugger exception
+   handling queue because breakpoints were hit concurrently on
+   different CPUs.  This also means we wait at least one second before
+   unplumbing the debugger connection at the very end, so as respond
+   to any debug threads waiting to be serviced.
+
+Cc: stable@vger.kernel.org # >= 3.0
+Signed-off-by: Jason Wessel <jason.wessel@windriver.com>
+

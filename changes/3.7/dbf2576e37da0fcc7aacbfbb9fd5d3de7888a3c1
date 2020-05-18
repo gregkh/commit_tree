@@ -1,0 +1,74 @@
+workqueue: make all workqueues non-reentrant
+
+By default, each per-cpu part of a bound workqueue operates separately
+and a work item may be executing concurrently on different CPUs.  The
+behavior avoids some cross-cpu traffic but leads to subtle weirdities
+and not-so-subtle contortions in the API.
+
+* There's no sane usefulness in allowing a single work item to be
+  executed concurrently on multiple CPUs.  People just get the
+  behavior unintentionally and get surprised after learning about it.
+  Most either explicitly synchronize or use non-reentrant/ordered
+  workqueue but this is error-prone.
+
+* flush_work() can't wait for multiple instances of the same work item
+  on different CPUs.  If a work item is executing on cpu0 and then
+  queued on cpu1, flush_work() can only wait for the one on cpu1.
+
+  Unfortunately, work items can easily cross CPU boundaries
+  unintentionally when the queueing thread gets migrated.  This means
+  that if multiple queuers compete, flush_work() can't even guarantee
+  that the instance queued right before it is finished before
+  returning.
+
+* flush_work_sync() was added to work around some of the deficiencies
+  of flush_work().  In addition to the usual flushing, it ensures that
+  all currently executing instances are finished before returning.
+  This operation is expensive as it has to walk all CPUs and at the
+  same time fails to address competing queuer case.
+
+  Incorrectly using flush_work() when flush_work_sync() is necessary
+  is an easy error to make and can lead to bugs which are difficult to
+  reproduce.
+
+* Similar problems exist for flush_delayed_work[_sync]().
+
+Other than the cross-cpu access concern, there's no benefit in
+allowing parallel execution and it's plain silly to have this level of
+contortion for workqueue which is widely used from core code to
+extremely obscure drivers.
+
+This patch makes all workqueues non-reentrant.  If a work item is
+executing on a different CPU when queueing is requested, it is always
+queued to that CPU.  This guarantees that any given work item can be
+executing on one CPU at maximum and if a work item is queued and
+executing, both are on the same CPU.
+
+The only behavior change which may affect workqueue users negatively
+is that non-reentrancy overrides the affinity specified by
+queue_work_on().  On a reentrant workqueue, the affinity specified by
+queue_work_on() is always followed.  Now, if the work item is
+executing on one of the CPUs, the work item will be queued there
+regardless of the requested affinity.  I've reviewed all workqueue
+users which request explicit affinity, and, fortunately, none seems to
+be crazy enough to exploit parallel execution of the same work item.
+
+This adds an additional busy_hash lookup if the work item was
+previously queued on a different CPU.  This shouldn't be noticeable
+under any sane workload.  Work item queueing isn't a very
+high-frequency operation and they don't jump across CPUs all the time.
+In a micro benchmark to exaggerate this difference - measuring the
+time it takes for two work items to repeatedly jump between two CPUs a
+number (10M) of times with busy_hash table densely populated, the
+difference was around 3%.
+
+While the overhead is measureable, it is only visible in pathological
+cases and the difference isn't huge.  This change brings much needed
+sanity to workqueue and makes its behavior consistent with timer.  I
+think this is the right tradeoff to make.
+
+This enables significant simplification of workqueue API.
+Simplification patches will follow.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+

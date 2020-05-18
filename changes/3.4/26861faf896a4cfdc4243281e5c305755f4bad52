@@ -1,0 +1,67 @@
+rcu: Protect __rcu_read_unlock() against scheduler-using irq handlers
+
+This commit ports commit #10f39bb1b2 (rcu: protect __rcu_read_unlock()
+against scheduler-using irq handlers) from TREE_PREEMPT_RCU to
+TINY_PREEMPT_RCU.  The following is a corresponding port of that
+commit message.
+
+The addition of RCU read-side critical sections within runqueue and
+priority-inheritance critical sections introduced some deadlocks,
+for example, involving interrupts from __rcu_read_unlock() where the
+interrupt handlers call wake_up().  This situation can cause the
+instance of __rcu_read_unlock() invoked from interrupt to do some
+of the processing that would otherwise have been carried out by the
+task-level instance of __rcu_read_unlock().  When the interrupt-level
+instance of __rcu_read_unlock() is called with a scheduler lock held from
+interrupt-entry/exit situations where in_irq() returns false, deadlock can
+result.  Of course, in a UP kernel, there are not really any deadlocks,
+but the upper-level critical section can still be be fatally confused
+by the lower-level critical section changing things out from under it.
+
+This commit resolves these deadlocks by using negative values of the
+per-task ->rcu_read_lock_nesting counter to indicate that an instance of
+__rcu_read_unlock() is in flight, which in turn prevents instances from
+interrupt handlers from doing any special processing.  Note that nested
+rcu_read_lock()/rcu_read_unlock() pairs are still permitted, but they will
+never see ->rcu_read_lock_nesting go to zero, and will therefore never
+invoke rcu_read_unlock_special(), thus preventing them from seeing the
+RCU_READ_UNLOCK_BLOCKED bit should it be set in ->rcu_read_unlock_special.
+This patch also adds a check for ->rcu_read_unlock_special being negative
+in rcu_check_callbacks(), thus preventing the RCU_READ_UNLOCK_NEED_QS
+bit from being set should a scheduling-clock interrupt occur while
+__rcu_read_unlock() is exiting from an outermost RCU read-side critical
+section.
+
+Of course, __rcu_read_unlock() can be preempted during the time that
+->rcu_read_lock_nesting is negative.  This could result in the setting
+of the RCU_READ_UNLOCK_BLOCKED bit after __rcu_read_unlock() checks it,
+and would also result it this task being queued on the corresponding
+rcu_node structure's blkd_tasks list.  Therefore, some later RCU read-side
+critical section would enter rcu_read_unlock_special() to clean up --
+which could result in deadlock (OK, OK, fatal confusion) if that RCU
+read-side critical section happened to be in the scheduler where the
+runqueue or priority-inheritance locks were held.
+
+To prevent the possibility of fatal confusion that might result from
+preemption during the time that ->rcu_read_lock_nesting is negative,
+this commit also makes rcu_preempt_note_context_switch() check for
+negative ->rcu_read_lock_nesting, thus refraining from queuing the task
+(and from setting RCU_READ_UNLOCK_BLOCKED) if we are already exiting
+from the outermost RCU read-side critical section (in other words,
+we really are no longer actually in that RCU read-side critical
+section).  In addition, rcu_preempt_note_context_switch() invokes
+rcu_read_unlock_special() to carry out the cleanup in this case, which
+clears out the ->rcu_read_unlock_special bits and dequeues the task
+(if necessary), in turn avoiding needless delay of the current RCU grace
+period and needless RCU priority boosting.
+
+It is still illegal to call rcu_read_unlock() while holding a scheduler
+lock if the prior RCU read-side critical section has ever had both
+preemption and irqs enabled.  However, the common use case is legal,
+namely where then entire RCU read-side critical section executes with
+irqs disabled, for example, when the scheduler lock is held across the
+entire lifetime of the RCU read-side critical section.
+
+Signed-off-by: Paul E. McKenney <paul.mckenney@linaro.org>
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+

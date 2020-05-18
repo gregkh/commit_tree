@@ -1,0 +1,64 @@
+xfs: use NOIO contexts for vm_map_ram
+
+When we map pages in the buffer cache, we can do so in GFP_NOFS
+contexts. However, the vmap interfaces do not provide any method of
+communicating this information to memory reclaim, and hence we get
+lockdep complaining about it regularly and occassionally see hangs
+that may be vmap related reclaim deadlocks. We can also see these
+same problems from anywhere where we use vmalloc for a large buffer
+(e.g. attribute code) inside a transaction context.
+
+A typical lockdep report shows up as a reclaim state warning like so:
+
+[14046.101458] =================================
+[14046.102850] [ INFO: inconsistent lock state ]
+[14046.102850] 3.14.0-rc4+ #2 Not tainted
+[14046.102850] ---------------------------------
+[14046.102850] inconsistent {RECLAIM_FS-ON-W} -> {IN-RECLAIM_FS-W} usage.
+[14046.102850] kswapd0/14 [HC0[0]:SC0[0]:HE1:SE1] takes:
+[14046.102850]  (&xfs_dir_ilock_class){++++?+}, at: [<791a04bb>] xfs_ilock+0xff/0x16a
+[14046.102850] {RECLAIM_FS-ON-W} state was registered at:
+[14046.102850]   [<7904cdb1>] mark_held_locks+0x81/0xe7
+[14046.102850]   [<7904d390>] lockdep_trace_alloc+0x5c/0xb4
+[14046.102850]   [<790c2c28>] kmem_cache_alloc_trace+0x2b/0x11e
+[14046.102850]   [<790ba7f4>] vm_map_ram+0x119/0x3e6
+[14046.102850]   [<7914e124>] _xfs_buf_map_pages+0x5b/0xcf
+[14046.102850]   [<7914ed74>] xfs_buf_get_map+0x67/0x13f
+[14046.102850]   [<7917506f>] xfs_attr_rmtval_set+0x396/0x4d5
+[14046.102850]   [<7916e8bb>] xfs_attr_leaf_addname+0x18f/0x37d
+[14046.102850]   [<7916ed9e>] xfs_attr_set_int+0x2f5/0x3e8
+[14046.102850]   [<7916eefc>] xfs_attr_set+0x6b/0x74
+[14046.102850]   [<79168355>] xfs_xattr_set+0x61/0x81
+[14046.102850]   [<790e5b10>] generic_setxattr+0x59/0x68
+[14046.102850]   [<790e4c06>] __vfs_setxattr_noperm+0x58/0xce
+[14046.102850]   [<790e4d0a>] vfs_setxattr+0x8e/0x92
+[14046.102850]   [<790e4ddd>] setxattr+0xcf/0x159
+[14046.102850]   [<790e5423>] SyS_lsetxattr+0x88/0xbb
+[14046.102850]   [<79268438>] sysenter_do_call+0x12/0x36
+
+Now, we can't completely remove these traces - mainly because
+vm_map_ram() will do GFP_KERNEL allocation and that generates the
+above warning before we get into the reclaim code, but we can turn
+them all into false positive warnings.
+
+To do that, use the method that DM and other IO context code uses to
+avoid this problem: there is a process flag to tell memory reclaim
+not to do IO that we can set appropriately. That prevents GFP_KERNEL
+context reclaim being done from deep inside the vmalloc code in
+places we can't directly pass a GFP_NOFS context to. That interface
+has a pair of wrapper functions: memalloc_noio_save() and
+memalloc_noio_restore().
+
+Adding them around vm_map_ram and the vzalloc call in
+kmem_alloc_large() will prevent deadlocks and most lockdep reports
+for this issue. Also, convert the vzalloc() call in
+kmem_alloc_large() to use __vmalloc() so that we can pass the
+correct gfp context to the data page allocation routine inside
+__vmalloc() so that it is clear that GFP_NOFS context is important
+to this vmalloc call.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+

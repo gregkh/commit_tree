@@ -1,0 +1,101 @@
+ipv4: arp: fix a lockdep splat in arp_solicit()
+
+Yan Burman reported following lockdep warning :
+
+=============================================
+[ INFO: possible recursive locking detected ]
+3.7.0+ #24 Not tainted
+---------------------------------------------
+swapper/1/0 is trying to acquire lock:
+  (&n->lock){++--..}, at: [<ffffffff8139f56e>] __neigh_event_send
++0x2e/0x2f0
+
+but task is already holding lock:
+  (&n->lock){++--..}, at: [<ffffffff813f63f4>] arp_solicit+0x1d4/0x280
+
+other info that might help us debug this:
+  Possible unsafe locking scenario:
+
+        CPU0
+        ----
+   lock(&n->lock);
+   lock(&n->lock);
+
+  *** DEADLOCK ***
+
+  May be due to missing lock nesting notation
+
+4 locks held by swapper/1/0:
+  #0:  (((&n->timer))){+.-...}, at: [<ffffffff8104b350>]
+call_timer_fn+0x0/0x1c0
+  #1:  (&n->lock){++--..}, at: [<ffffffff813f63f4>] arp_solicit
++0x1d4/0x280
+  #2:  (rcu_read_lock_bh){.+....}, at: [<ffffffff81395400>]
+dev_queue_xmit+0x0/0x5d0
+  #3:  (rcu_read_lock_bh){.+....}, at: [<ffffffff813cb41e>]
+ip_finish_output+0x13e/0x640
+
+stack backtrace:
+Pid: 0, comm: swapper/1 Not tainted 3.7.0+ #24
+Call Trace:
+  <IRQ>  [<ffffffff8108c7ac>] validate_chain+0xdcc/0x11f0
+  [<ffffffff8108d570>] ? __lock_acquire+0x440/0xc30
+  [<ffffffff81120565>] ? kmem_cache_free+0xe5/0x1c0
+  [<ffffffff8108d570>] __lock_acquire+0x440/0xc30
+  [<ffffffff813c3570>] ? inet_getpeer+0x40/0x600
+  [<ffffffff8108d570>] ? __lock_acquire+0x440/0xc30
+  [<ffffffff8139f56e>] ? __neigh_event_send+0x2e/0x2f0
+  [<ffffffff8108ddf5>] lock_acquire+0x95/0x140
+  [<ffffffff8139f56e>] ? __neigh_event_send+0x2e/0x2f0
+  [<ffffffff8108d570>] ? __lock_acquire+0x440/0xc30
+  [<ffffffff81448d4b>] _raw_write_lock_bh+0x3b/0x50
+  [<ffffffff8139f56e>] ? __neigh_event_send+0x2e/0x2f0
+  [<ffffffff8139f56e>] __neigh_event_send+0x2e/0x2f0
+  [<ffffffff8139f99b>] neigh_resolve_output+0x16b/0x270
+  [<ffffffff813cb62d>] ip_finish_output+0x34d/0x640
+  [<ffffffff813cb41e>] ? ip_finish_output+0x13e/0x640
+  [<ffffffffa046f146>] ? vxlan_xmit+0x556/0xbec [vxlan]
+  [<ffffffff813cb9a0>] ip_output+0x80/0xf0
+  [<ffffffff813ca368>] ip_local_out+0x28/0x80
+  [<ffffffffa046f25a>] vxlan_xmit+0x66a/0xbec [vxlan]
+  [<ffffffffa046f146>] ? vxlan_xmit+0x556/0xbec [vxlan]
+  [<ffffffff81394a50>] ? skb_gso_segment+0x2b0/0x2b0
+  [<ffffffff81449355>] ? _raw_spin_unlock_irqrestore+0x65/0x80
+  [<ffffffff81394c57>] ? dev_queue_xmit_nit+0x207/0x270
+  [<ffffffff813950c8>] dev_hard_start_xmit+0x298/0x5d0
+  [<ffffffff813956f3>] dev_queue_xmit+0x2f3/0x5d0
+  [<ffffffff81395400>] ? dev_hard_start_xmit+0x5d0/0x5d0
+  [<ffffffff813f5788>] arp_xmit+0x58/0x60
+  [<ffffffff813f59db>] arp_send+0x3b/0x40
+  [<ffffffff813f6424>] arp_solicit+0x204/0x280
+  [<ffffffff813a1a70>] ? neigh_add+0x310/0x310
+  [<ffffffff8139f515>] neigh_probe+0x45/0x70
+  [<ffffffff813a1c10>] neigh_timer_handler+0x1a0/0x2a0
+  [<ffffffff8104b3cf>] call_timer_fn+0x7f/0x1c0
+  [<ffffffff8104b350>] ? detach_if_pending+0x120/0x120
+  [<ffffffff8104b748>] run_timer_softirq+0x238/0x2b0
+  [<ffffffff813a1a70>] ? neigh_add+0x310/0x310
+  [<ffffffff81043e51>] __do_softirq+0x101/0x280
+  [<ffffffff814518cc>] call_softirq+0x1c/0x30
+  [<ffffffff81003b65>] do_softirq+0x85/0xc0
+  [<ffffffff81043a7e>] irq_exit+0x9e/0xc0
+  [<ffffffff810264f8>] smp_apic_timer_interrupt+0x68/0xa0
+  [<ffffffff8145122f>] apic_timer_interrupt+0x6f/0x80
+  <EOI>  [<ffffffff8100a054>] ? mwait_idle+0xa4/0x1c0
+  [<ffffffff8100a04b>] ? mwait_idle+0x9b/0x1c0
+  [<ffffffff8100a6a9>] cpu_idle+0x89/0xe0
+  [<ffffffff81441127>] start_secondary+0x1b2/0x1b6
+
+Bug is from arp_solicit(), releasing the neigh lock after arp_send()
+In case of vxlan, we eventually need to write lock a neigh lock later.
+
+Its a false positive, but we can get rid of it without lockdep
+annotations.
+
+We can instead use neigh_ha_snapshot() helper.
+
+Reported-by: Yan Burman <yanb@mellanox.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Stephen Hemminger <shemminger@vyatta.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

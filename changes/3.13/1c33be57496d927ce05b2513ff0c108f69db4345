@@ -1,0 +1,98 @@
+ARM: b.L: core switcher code
+
+This is the core code implementing big.LITTLE switcher functionality.
+Rationale for this code is available here:
+
+http://lwn.net/Articles/481055/
+
+The main entry point for a switch request is:
+
+void bL_switch_request(unsigned int cpu, unsigned int new_cluster_id)
+
+If the calling CPU is not the wanted one, this wrapper takes care of
+sending the request to the appropriate CPU with schedule_work_on().
+
+At the moment the core switch operation is handled by bL_switch_to()
+which must be called on the CPU for which a switch is requested.
+
+What this code does:
+
+  * Return early if the current cluster is the wanted one.
+
+  * Close the gate in the kernel entry vector for both the inbound
+    and outbound CPUs.
+
+  * Wake up the inbound CPU so it can perform its reset sequence in
+    parallel up to the kernel entry vector gate.
+
+  * Migrate all interrupts in the GIC targeting the outbound CPU
+    interface to the inbound CPU interface, including SGIs. This is
+    performed by gic_migrate_target() in drivers/irqchip/irq-gic.c.
+
+  * Call cpu_pm_enter() which takes care of flushing the VFP state to
+    RAM and save the CPU interface config from the GIC to RAM.
+
+  * Modify the cpu_logical_map to refer to the inbound physical CPU.
+
+  * Call cpu_suspend() which saves the CPU state (general purpose
+    registers, page table address) onto the stack and store the
+    resulting stack pointer in an array indexed by the updated
+    cpu_logical_map, then call the provided shutdown function.
+    This happens in arch/arm/kernel/sleep.S.
+
+At this point, the provided shutdown function executed by the outbound
+CPU ungates the inbound CPU. Therefore the inbound CPU:
+
+  * Picks up the saved stack pointer in the array indexed by its MPIDR
+    in arch/arm/kernel/sleep.S.
+
+  * The MMU and caches are re-enabled using the saved state on the
+    provided stack, just like if this was a resume operation from a
+    suspended state.
+
+  * Then cpu_suspend() returns, although this is on the inbound CPU
+    rather than the outbound CPU which called it initially.
+
+  * The function cpu_pm_exit() is called which effect is to restore the
+    CPU interface state in the GIC using the state previously saved by
+    the outbound CPU.
+
+  * Exit of bL_switch_to() to resume normal kernel execution on the
+    new CPU.
+
+However, the outbound CPU is potentially still running in parallel while
+the inbound CPU is resuming normal kernel execution, hence we need
+per CPU stack isolation to execute bL_do_switch().  After the outbound
+CPU has ungated the inbound CPU, it calls mcpm_cpu_power_down() to:
+
+  * Clean its L1 cache.
+
+  * If it is the last CPU still alive in its cluster (last man standing),
+    it also cleans its L2 cache and disables cache snooping from the other
+    cluster.
+
+  * Power down the CPU (or whole cluster).
+
+Code called from bL_do_switch() might end up referencing 'current' for
+some reasons.  However, 'current' is derived from the stack pointer.
+With any arbitrary stack, the returned value for 'current' and any
+dereferenced values through it are just random garbage which may lead to
+segmentation faults.
+
+The active page table during the execution of bL_do_switch() is also a
+problem.  There is no guarantee that the inbound CPU won't destroy the
+corresponding task which would free the attached page table while the
+outbound CPU is still running and relying on it.
+
+To solve both issues, we borrow some of the task space belonging to
+the init/idle task which, by its nature, is lightly used and therefore
+is unlikely to clash with our usage.  The init task is also never going
+away.
+
+Right now the logical CPU number is assumed to be equivalent to the
+physical CPU number within each cluster. The kernel should also be
+booted with only one cluster active.  These limitations will be lifted
+eventually.
+
+Signed-off-by: Nicolas Pitre <nico@linaro.org>
+

@@ -1,0 +1,51 @@
+mm: memcg: fix race condition between memcg teardown and swapin
+
+There is a race condition between a memcg being torn down and a swapin
+triggered from a different memcg of a page that was recorded to belong
+to the exiting memcg on swapout (with CONFIG_MEMCG_SWAP extension).  The
+result is unreclaimable pages pointing to dead memcgs, which can lead to
+anything from endless loops in later memcg teardown (the page is charged
+to all hierarchical parents but is not on any LRU list) or crashes from
+following the dangling memcg pointer.
+
+Memcgs with tasks in them can not be torn down and usually charges don't
+show up in memcgs without tasks.  Swapin with the CONFIG_MEMCG_SWAP
+extension is the notable exception because it charges the cgroup that
+was recorded as owner during swapout, which may be empty and in the
+process of being torn down when a task in another memcg triggers the
+swapin:
+
+  teardown:                 swapin:
+
+                            lookup_swap_cgroup_id()
+                            rcu_read_lock()
+                            mem_cgroup_lookup()
+                            css_tryget()
+                            rcu_read_unlock()
+  disable css_tryget()
+  call_rcu()
+    offline_css()
+      reparent_charges()
+                            res_counter_charge() (hierarchical!)
+                            css_put()
+                              css_free()
+                            pc->mem_cgroup = dead memcg
+                            add page to dead lru
+
+Add a final reparenting step into css_free() to make sure any such raced
+charges are moved out of the memcg before it's finally freed.
+
+In the longer term it would be cleaner to have the css_tryget() and the
+res_counter charge under the same RCU lock section so that the charge
+reparenting is deferred until the last charge whose tryget succeeded is
+visible.  But this will require more invasive changes that will be
+harder to evaluate and backport into stable, so better defer them to a
+separate change set.
+
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Michal Hocko <mhocko@suse.cz>
+Cc: David Rientjes <rientjes@google.com>
+Cc: <stable@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

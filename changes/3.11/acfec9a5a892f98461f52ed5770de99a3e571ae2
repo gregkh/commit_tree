@@ -1,0 +1,33 @@
+livelock avoidance in sget()
+
+Eric Sandeen has found a nasty livelock in sget() - take a mount(2) about
+to fail.  The superblock is on ->fs_supers, ->s_umount is held exclusive,
+->s_active is 1.  Along comes two more processes, trying to mount the same
+thing; sget() in each is picking that superblock, bumping ->s_count and
+trying to grab ->s_umount.  ->s_active is 3 now.  Original mount(2)
+finally gets to deactivate_locked_super() on failure; ->s_active is 2,
+superblock is still ->fs_supers because shutdown will *not* happen until
+->s_active hits 0.  ->s_umount is dropped and now we have two processes
+chasing each other:
+s_active = 2, A acquired ->s_umount, B blocked
+A sees that the damn thing is stillborn, does deactivate_locked_super()
+s_active = 1, A drops ->s_umount, B gets it
+A restarts the search and finds the same superblock.  And bumps it ->s_active.
+s_active = 2, B holds ->s_umount, A blocked on trying to get it
+... and we are in the earlier situation with A and B switched places.
+
+The root cause, of course, is that ->s_active should not grow until we'd
+got MS_BORN.  Then failing ->mount() will have deactivate_locked_super()
+shut the damn thing down.  Fortunately, it's easy to do - the key point
+is that grab_super() is called only for superblocks currently on ->fs_supers,
+so it can bump ->s_count and grab ->s_umount first, then check MS_BORN and
+bump ->s_active; we must never increment ->s_count for superblocks past
+->kill_sb(), but grab_super() is never called for those.
+
+The bug is pretty old; we would've caught it by now, if not for accidental
+exclusion between sget() for block filesystems; the things like cgroup or
+e.g. mtd-based filesystems don't have anything of that sort, so they get
+bitten.  The right way to deal with that is obviously to fix sget()...
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

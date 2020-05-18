@@ -1,0 +1,68 @@
+sched: Move h_load calculation to task_h_load()
+
+The bad thing about update_h_load(), which computes hierarchical load
+factor for task groups, is that it is called for each task group in the
+system before every load balancer run, and since rebalance can be
+triggered very often, this function can eat really a lot of cpu time if
+there are many cpu cgroups in the system.
+
+Although the situation was improved significantly by commit a35b646
+('sched, cgroup: Reduce rq->lock hold times for large cgroup
+hierarchies'), the problem still can arise under some kinds of loads,
+e.g. when cpus are switching from idle to busy and back very frequently.
+
+For instance, when I start 1000 of processes that wake up every
+millisecond on my 8 cpus host, 'top' and 'perf top' show:
+
+Cpu(s): 17.8%us, 24.3%sy,  0.0%ni, 57.9%id,  0.0%wa,  0.0%hi,  0.0%si
+Events: 243K cycles
+  7.57%  [kernel]               [k] __schedule
+  7.08%  [kernel]               [k] timerqueue_add
+  6.13%  libc-2.12.so           [.] usleep
+
+Then if I create 10000 *idle* cpu cgroups (no processes in them), cpu
+usage increases significantly although the 'wakers' are still executing
+in the root cpu cgroup:
+
+Cpu(s): 19.1%us, 48.7%sy,  0.0%ni, 31.6%id,  0.0%wa,  0.0%hi,  0.7%si
+Events: 230K cycles
+ 24.56%  [kernel]            [k] tg_load_down
+  5.76%  [kernel]            [k] __schedule
+
+This happens because this particular kind of load triggers 'new idle'
+rebalance very frequently, which requires calling update_h_load(),
+which, in turn, calls tg_load_down() for every *idle* cpu cgroup even
+though it is absolutely useless, because idle cpu cgroups have no tasks
+to pull.
+
+This patch tries to improve the situation by making h_load calculation
+proceed only when h_load is really necessary. To achieve this, it
+substitutes update_h_load() with update_cfs_rq_h_load(), which computes
+h_load only for a given cfs_rq and all its ascendants, and makes the
+load balancer call this function whenever it considers if a task should
+be pulled, i.e. it moves h_load calculations directly to task_h_load().
+For h_load of the same cfs_rq not to be updated multiple times (in case
+several tasks in the same cgroup are considered during the same balance
+run), the patch keeps the time of the last h_load update for each cfs_rq
+and breaks calculation when it finds h_load to be uptodate.
+
+The benefit of it is that h_load is computed only for those cfs_rq's,
+which really need it, in particular all idle task groups are skipped.
+Although this, in fact, moves h_load calculation under rq lock, it
+should not affect latency much, because the amount of work done under rq
+lock while trying to pull tasks is limited by sched_nr_migrate.
+
+After the patch applied with the setup described above (1000 wakers in
+the root cgroup and 10000 idle cgroups), I get:
+
+Cpu(s): 16.9%us, 24.8%sy,  0.0%ni, 58.4%id,  0.0%wa,  0.0%hi,  0.0%si
+Events: 242K cycles
+  7.57%  [kernel]                  [k] __schedule
+  6.70%  [kernel]                  [k] timerqueue_add
+  5.93%  libc-2.12.so              [.] usleep
+
+Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/1373896159-1278-1-git-send-email-vdavydov@parallels.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

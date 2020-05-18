@@ -1,0 +1,107 @@
+tty/vt: Fix vc_deallocate() lock order
+
+Now that the tty port owns the flip buffers and i/o is allowed
+from the driver even when no tty is attached, the destruction
+of the tty port (and the flip buffers) must ensure that no
+outstanding work is pending.
+
+Unfortunately, this creates a lock order problem with the
+console_lock (see attached lockdep report [1] below).
+
+For single console deallocation, drop the console_lock prior
+to port destruction. When multiple console deallocation,
+defer port destruction until the consoles have been
+deallocated.
+
+tty_port_destroy() is not required if the port has not
+been used; remove from vc_allocate() failure path.
+
+[1] lockdep report from Dave Jones <davej@redhat.com>
+
+ ======================================================
+ [ INFO: possible circular locking dependency detected ]
+ 3.9.0+ #16 Not tainted
+ -------------------------------------------------------
+ (agetty)/26163 is trying to acquire lock:
+ blocked:  ((&buf->work)){+.+...}, instance: ffff88011c8b0020, at: [<ffffffff81062065>] flush_work+0x5/0x2e0
+
+ but task is already holding lock:
+ blocked:  (console_lock){+.+.+.}, instance: ffffffff81c2fde0, at: [<ffffffff813bc201>] vt_ioctl+0xb61/0x1230
+
+ which lock already depends on the new lock.
+
+ the existing dependency chain (in reverse order) is:
+
+ -> #1 (console_lock){+.+.+.}:
+        [<ffffffff810b3f74>] lock_acquire+0xa4/0x210
+        [<ffffffff810416c7>] console_lock+0x77/0x80
+        [<ffffffff813c3dcd>] con_flush_chars+0x2d/0x50
+        [<ffffffff813b32b2>] n_tty_receive_buf+0x122/0x14d0
+        [<ffffffff813b7709>] flush_to_ldisc+0x119/0x170
+        [<ffffffff81064381>] process_one_work+0x211/0x700
+        [<ffffffff8106498b>] worker_thread+0x11b/0x3a0
+        [<ffffffff8106ce5d>] kthread+0xed/0x100
+        [<ffffffff81601cac>] ret_from_fork+0x7c/0xb0
+
+ -> #0 ((&buf->work)){+.+...}:
+        [<ffffffff810b349a>] __lock_acquire+0x193a/0x1c00
+        [<ffffffff810b3f74>] lock_acquire+0xa4/0x210
+        [<ffffffff810620ae>] flush_work+0x4e/0x2e0
+        [<ffffffff81065305>] __cancel_work_timer+0x95/0x130
+        [<ffffffff810653b0>] cancel_work_sync+0x10/0x20
+        [<ffffffff813b8212>] tty_port_destroy+0x12/0x20
+        [<ffffffff813c65e8>] vc_deallocate+0xf8/0x110
+        [<ffffffff813bc20c>] vt_ioctl+0xb6c/0x1230
+        [<ffffffff813b01a5>] tty_ioctl+0x285/0xd50
+        [<ffffffff811ba825>] do_vfs_ioctl+0x305/0x530
+        [<ffffffff811baad1>] sys_ioctl+0x81/0xa0
+        [<ffffffff81601d59>] system_call_fastpath+0x16/0x1b
+
+ other info that might help us debug this:
+
+ [ 6760.076175]  Possible unsafe locking scenario:
+
+        CPU0                    CPU1
+        ----                    ----
+   lock(console_lock);
+                                lock((&buf->work));
+                                lock(console_lock);
+   lock((&buf->work));
+
+  *** DEADLOCK ***
+
+ 1 lock on stack by (agetty)/26163:
+  #0: blocked:  (console_lock){+.+.+.}, instance: ffffffff81c2fde0, at: [<ffffffff813bc201>] vt_ioctl+0xb61/0x1230
+ stack backtrace:
+ Pid: 26163, comm: (agetty) Not tainted 3.9.0+ #16
+ Call Trace:
+  [<ffffffff815edb14>] print_circular_bug+0x200/0x20e
+  [<ffffffff810b349a>] __lock_acquire+0x193a/0x1c00
+  [<ffffffff8100a269>] ? sched_clock+0x9/0x10
+  [<ffffffff8100a269>] ? sched_clock+0x9/0x10
+  [<ffffffff8100a200>] ? native_sched_clock+0x20/0x80
+  [<ffffffff810b3f74>] lock_acquire+0xa4/0x210
+  [<ffffffff81062065>] ? flush_work+0x5/0x2e0
+  [<ffffffff810620ae>] flush_work+0x4e/0x2e0
+  [<ffffffff81062065>] ? flush_work+0x5/0x2e0
+  [<ffffffff810b15db>] ? mark_held_locks+0xbb/0x140
+  [<ffffffff8113c8a3>] ? __free_pages_ok.part.57+0x93/0xc0
+  [<ffffffff810b15db>] ? mark_held_locks+0xbb/0x140
+  [<ffffffff810652f2>] ? __cancel_work_timer+0x82/0x130
+  [<ffffffff81065305>] __cancel_work_timer+0x95/0x130
+  [<ffffffff810653b0>] cancel_work_sync+0x10/0x20
+  [<ffffffff813b8212>] tty_port_destroy+0x12/0x20
+  [<ffffffff813c65e8>] vc_deallocate+0xf8/0x110
+  [<ffffffff813bc20c>] vt_ioctl+0xb6c/0x1230
+  [<ffffffff810aec41>] ? lock_release_holdtime.part.30+0xa1/0x170
+  [<ffffffff813b01a5>] tty_ioctl+0x285/0xd50
+  [<ffffffff812b00f6>] ? inode_has_perm.isra.46.constprop.61+0x56/0x80
+  [<ffffffff811ba825>] do_vfs_ioctl+0x305/0x530
+  [<ffffffff812b04db>] ? selinux_file_ioctl+0x5b/0x110
+  [<ffffffff811baad1>] sys_ioctl+0x81/0xa0
+  [<ffffffff81601d59>] system_call_fastpath+0x16/0x1b
+
+Cc: Dave Jones <davej@redhat.com>
+Signed-off-by: Peter Hurley <peter@hurleysoftware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

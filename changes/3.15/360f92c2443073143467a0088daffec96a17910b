@@ -1,0 +1,86 @@
+block: fix regression with block enabled tagging
+
+Martin reported that his test system would not boot with
+current git, it oopsed with this:
+
+BUG: unable to handle kernel paging request at ffff88046c6c9e80
+IP: [<ffffffff812971e0>] blk_queue_start_tag+0x90/0x150
+PGD 1ddf067 PUD 1de2067 PMD 47fc7d067 PTE 800000046c6c9060
+Oops: 0002 [#1] SMP DEBUG_PAGEALLOC
+Modules linked in: sd_mod lpfc(+) scsi_transport_fc scsi_tgt oracleasm
+rpcsec_gss_krb5 ipv6 igb dca i2c_algo_bit i2c_core hwmon
+CPU: 3 PID: 87 Comm: kworker/u17:1 Not tainted 3.14.0+ #246
+Hardware name: Supermicro X9DRX+-F/X9DRX+-F, BIOS 3.00 07/09/2013
+Workqueue: events_unbound async_run_entry_fn
+task: ffff8802743c2150 ti: ffff880273d02000 task.ti: ffff880273d02000
+RIP: 0010:[<ffffffff812971e0>]  [<ffffffff812971e0>]
+blk_queue_start_tag+0x90/0x150
+RSP: 0018:ffff880273d03a58  EFLAGS: 00010092
+RAX: ffff88046c6c9e78 RBX: ffff880077208e78 RCX: 00000000fffc8da6
+RDX: 00000000fffc186d RSI: 0000000000000009 RDI: 00000000fffc8d9d
+RBP: ffff880273d03a88 R08: 0000000000000001 R09: ffff8800021c2410
+R10: 0000000000000005 R11: 0000000000015b30 R12: ffff88046c5bb8a0
+R13: ffff88046c5c0890 R14: 000000000000001e R15: 000000000000001e
+FS:  0000000000000000(0000) GS:ffff880277b00000(0000)
+knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: ffff88046c6c9e80 CR3: 00000000018f6000 CR4: 00000000000407e0
+Stack:
+ ffff880273d03a98 ffff880474b18800 0000000000000000 ffff880474157000
+ ffff88046c5c0890 ffff880077208e78 ffff880273d03ae8 ffffffff813b9e62
+ ffff880200000010 ffff880474b18968 ffff880474b18848 ffff88046c5c0cd8
+Call Trace:
+ [<ffffffff813b9e62>] scsi_request_fn+0xf2/0x510
+ [<ffffffff81293167>] __blk_run_queue+0x37/0x50
+ [<ffffffff8129ac43>] blk_execute_rq_nowait+0xb3/0x130
+ [<ffffffff8129ad24>] blk_execute_rq+0x64/0xf0
+ [<ffffffff8108d2b0>] ? bit_waitqueue+0xd0/0xd0
+ [<ffffffff813bba35>] scsi_execute+0xe5/0x180
+ [<ffffffff813bbe4a>] scsi_execute_req_flags+0x9a/0x110
+ [<ffffffffa01b1304>] sd_spinup_disk+0x94/0x460 [sd_mod]
+ [<ffffffff81160000>] ? __unmap_hugepage_range+0x200/0x2f0
+ [<ffffffffa01b2b9a>] sd_revalidate_disk+0xaa/0x3f0 [sd_mod]
+ [<ffffffffa01b2fb8>] sd_probe_async+0xd8/0x200 [sd_mod]
+ [<ffffffff8107703f>] async_run_entry_fn+0x3f/0x140
+ [<ffffffff8106a1c5>] process_one_work+0x175/0x410
+ [<ffffffff8106b373>] worker_thread+0x123/0x400
+ [<ffffffff8106b250>] ? manage_workers+0x160/0x160
+ [<ffffffff8107104e>] kthread+0xce/0xf0
+ [<ffffffff81070f80>] ? kthread_freezable_should_stop+0x70/0x70
+ [<ffffffff815f0bac>] ret_from_fork+0x7c/0xb0
+ [<ffffffff81070f80>] ? kthread_freezable_should_stop+0x70/0x70
+Code: 48 0f ab 11 72 db 48 81 4b 40 00 00 10 00 89 83 08 01 00 00 48 89
+df 49 8b 04 24 48 89 1c d0 e8 f7 a8 ff ff 49 8b 85 28 05 00 00 <48> 89
+58 08 48 89 03 49 8d 85 28 05 00 00 48 89 43 08 49 89 9d
+RIP  [<ffffffff812971e0>] blk_queue_start_tag+0x90/0x150
+ RSP <ffff880273d03a58>
+CR2: ffff88046c6c9e80
+
+Martin bisected and found this to be the problem patch;
+
+	commit 6d113398dcf4dfcd9787a4ead738b186f7b7ff0f
+	Author: Jan Kara <jack@suse.cz>
+	Date:   Mon Feb 24 16:39:54 2014 +0100
+
+	    block: Stop abusing rq->csd.list in blk-softirq
+
+and the problem was immediately apparent. The patch states that
+it is safe to reuse queuelist at completion time, since it is
+no longer used. However, that is not true if a device is using
+block enabled tagging. If that is the case, then the queuelist
+is reused to keep track of busy tags. If a device also ended
+up using softirq completions, we'd reuse ->queuelist for the
+IPI handling while block tagging was still using it. Boom.
+
+Fix this by adding a new ipi_list list head, and share the
+memory used with the request hash table. The hash table is
+never used after the request is moved to the dispatch list,
+which happens long before any potential completion of the
+request. Add a new request bit for this, so we don't have
+cases that check rq->hash while it could potentially have
+been reused for the IPI completion.
+
+Reported-by: Martin K. Petersen <martin.petersen@oracle.com>
+Tested-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+

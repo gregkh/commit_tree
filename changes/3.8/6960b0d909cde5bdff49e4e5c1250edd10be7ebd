@@ -1,0 +1,68 @@
+fsnotify: change locking order
+
+On Mon, Aug 01, 2011 at 04:38:22PM -0400, Eric Paris wrote:
+>
+> I finally built and tested a v3.0 kernel with these patches (I know I'm
+> SOOOOOO far behind).  Not what I hoped for:
+>
+> > [  150.937798] VFS: Busy inodes after unmount of tmpfs. Self-destruct in 5 seconds.  Have a nice day...
+> > [  150.945290] BUG: unable to handle kernel NULL pointer dereference at 0000000000000070
+> > [  150.946012] IP: [<ffffffff810ffd58>] shmem_free_inode+0x18/0x50
+> > [  150.946012] PGD 2bf9e067 PUD 2bf9f067 PMD 0
+> > [  150.946012] Oops: 0000 [#1] PREEMPT SMP DEBUG_PAGEALLOC
+> > [  150.946012] CPU 0
+> > [  150.946012] Modules linked in: nfs lockd fscache auth_rpcgss nfs_acl sunrpc ip6t_REJECT nf_conntrack_ipv6 nf_defrag_ipv6 ip6table_filter ip6_tables ext4 jbd2 crc16 joydev ata_piix i2c_piix4 pcspkr uinput ipv6 autofs4 usbhid [last unloaded: scsi_wait_scan]
+> > [  150.946012]
+> > [  150.946012] Pid: 2764, comm: syscall_thrash Not tainted 3.0.0+ #1 Red Hat KVM
+> > [  150.946012] RIP: 0010:[<ffffffff810ffd58>]  [<ffffffff810ffd58>] shmem_free_inode+0x18/0x50
+> > [  150.946012] RSP: 0018:ffff88002c2e5df8  EFLAGS: 00010282
+> > [  150.946012] RAX: 000000004e370d9f RBX: 0000000000000000 RCX: ffff88003a029438
+> > [  150.946012] RDX: 0000000033630a5f RSI: 0000000000000000 RDI: ffff88003491c240
+> > [  150.946012] RBP: ffff88002c2e5e08 R08: 0000000000000000 R09: 0000000000000000
+> > [  150.946012] R10: 0000000000000000 R11: 0000000000000000 R12: ffff88003a029428
+> > [  150.946012] R13: ffff88003a029428 R14: ffff88003a029428 R15: ffff88003499a610
+> > [  150.946012] FS:  00007f5a05420700(0000) GS:ffff88003f600000(0000) knlGS:0000000000000000
+> > [  150.946012] CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
+> > [  150.946012] CR2: 0000000000000070 CR3: 000000002a662000 CR4: 00000000000006f0
+> > [  150.946012] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+> > [  150.946012] DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
+> > [  150.946012] Process syscall_thrash (pid: 2764, threadinfo ffff88002c2e4000, task ffff88002bfbc760)
+> > [  150.946012] Stack:
+> > [  150.946012]  ffff88003a029438 ffff88003a029428 ffff88002c2e5e38 ffffffff81102f76
+> > [  150.946012]  ffff88003a029438 ffff88003a029598 ffffffff8160f9c0 ffff88002c221250
+> > [  150.946012]  ffff88002c2e5e68 ffffffff8115e9be ffff88002c2e5e68 ffff88003a029438
+> > [  150.946012] Call Trace:
+> > [  150.946012]  [<ffffffff81102f76>] shmem_evict_inode+0x76/0x130
+> > [  150.946012]  [<ffffffff8115e9be>] evict+0x7e/0x170
+> > [  150.946012]  [<ffffffff8115ee40>] iput_final+0xd0/0x190
+> > [  150.946012]  [<ffffffff8115ef33>] iput+0x33/0x40
+> > [  150.946012]  [<ffffffff81180205>] fsnotify_destroy_mark_locked+0x145/0x160
+> > [  150.946012]  [<ffffffff81180316>] fsnotify_destroy_mark+0x36/0x50
+> > [  150.946012]  [<ffffffff81181937>] sys_inotify_rm_watch+0x77/0xd0
+> > [  150.946012]  [<ffffffff815aca52>] system_call_fastpath+0x16/0x1b
+> > [  150.946012] Code: 67 4a 00 b8 e4 ff ff ff eb aa 66 0f 1f 84 00 00 00 00 00 55 48 89 e5 48 83 ec 10 48 89 1c 24 4c 89 64 24 08 48 8b 9f 40 05 00 00
+> > [  150.946012]  83 7b 70 00 74 1c 4c 8d a3 80 00 00 00 4c 89 e7 e8 d2 5d 4a
+> > [  150.946012] RIP  [<ffffffff810ffd58>] shmem_free_inode+0x18/0x50
+> > [  150.946012]  RSP <ffff88002c2e5df8>
+> > [  150.946012] CR2: 0000000000000070
+>
+> Looks at aweful lot like the problem from:
+> http://www.spinics.net/lists/linux-fsdevel/msg46101.html
+>
+
+I tried to reproduce this bug with your test program, but without success.
+However, if I understand correctly, this occurs since we dont hold any locks when
+we call iput() in mark_destroy(), right?
+With the patches you tested, iput() is also not called within any lock, since the
+groups mark_mutex is released temporarily before iput() is called.  This is, since
+the original codes behaviour is similar.
+However since we now have a mutex as the biggest lock, we can do what you
+suggested (http://www.spinics.net/lists/linux-fsdevel/msg46107.html) and
+call iput() with the mutex held to avoid the race.
+The patch below implements this. It uses nested locking to avoid deadlock in case
+we do the final iput() on an inode which still holds marks and thus would take
+the mutex again when calling fsnotify_inode_delete() in destroy_inode().
+
+Signed-off-by: Lino Sanfilippo <LinoSanfilippo@gmx.de>
+Signed-off-by: Eric Paris <eparis@redhat.com>
+

@@ -1,0 +1,62 @@
+mempool: fix and document synchronization and memory barrier usage
+
+mempool_alloc/free() use undocumented smp_mb()'s.  The code is slightly
+broken and misleading.
+
+The lockless part is in mempool_free().  It wants to determine whether the
+item being freed needs to be returned to the pool or backing allocator
+without grabbing pool->lock.  Two things need to be guaranteed for correct
+operation.
+
+1. pool->curr_nr + #allocated should never dip below pool->min_nr.
+2. Waiters shouldn't be left dangling.
+
+For #1, The only necessary condition is that curr_nr visible at free is
+from after the allocation of the element being freed (details in the
+comment).  For most cases, this is true without any barrier but there can
+be fringe cases where the allocated pointer is passed to the freeing task
+without going through memory barriers.  To cover this case, wmb is
+necessary before returning from allocation and rmb is necessary before
+reading curr_nr.  IOW,
+
+	ALLOCATING TASK			FREEING TASK
+
+	update pool state after alloc;
+	wmb();
+	pass pointer to freeing task;
+					read pointer;
+					rmb();
+					read pool state to free;
+
+The current code doesn't have wmb after pool update during allocation and
+may theoretically, on machines where unlock doesn't behave as full wmb,
+lead to pool depletion and deadlock.  smp_wmb() needs to be added after
+successful allocation from reserved elements and smp_mb() in
+mempool_free() can be replaced with smp_rmb().
+
+For #2, the waiter needs to add itself to waitqueue and then check the
+wait condition and the waker needs to update the wait condition and then
+wake up.  Because waitqueue operations always go through full spinlock
+synchronization, there is no need for extra memory barriers.
+
+Furthermore, mempool_alloc() is already holding pool->lock when it decides
+that it needs to wait.  There is no reason to do unlock - add waitqueue -
+test condition again.  It can simply add itself to waitqueue while holding
+pool->lock and then unlock and sleep.
+
+This patch adds smp_wmb() after successful allocation from reserved pool,
+replaces smp_mb() in mempool_free() with smp_rmb() and extend pool->lock
+over waitqueue addition.  More importantly, it explains what memory
+barriers do and how the lockless testing is correct.
+
+-v2: Oleg pointed out that unlock doesn't imply wmb.  Added explicit
+     smp_wmb() after successful allocation from reserved pool and
+     updated comments accordingly.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Cc: David Howells <dhowells@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

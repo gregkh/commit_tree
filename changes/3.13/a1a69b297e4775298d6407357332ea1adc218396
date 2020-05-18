@@ -1,0 +1,54 @@
+ACPI / IPMI: Fix race caused by the unprotected ACPI IPMI user
+
+This patch uses reference counting to fix the race caused by the
+unprotected ACPI IPMI user.
+
+There are two rules for using the ipmi_si APIs:
+ 1. In ipmi_si, ipmi_destroy_user() can ensure that no ipmi_recv_msg will
+    be passed to ipmi_msg_handler(), but ipmi_request_settime() can not
+    use an invalid ipmi_user_t.  This means the ipmi_si users must ensure
+    that there won't be any local references on ipmi_user_t before invoking
+    ipmi_destroy_user().
+ 2. In ipmi_si, the smi_gone()/new_smi() callbacks are protected by
+    smi_watchers_mutex, so their execution is serialized.  But as a
+    new smi can re-use a freed intf_num, it requires that the callback
+    implementation must not use intf_num as an identification mean or it
+    must ensure all references to the previous smi are all dropped before
+    exiting smi_gone() callback.
+
+As the acpi_ipmi_device->user_interface check in acpi_ipmi_space_handler()
+can happen before setting user_interface to NULL and codes after the check
+in acpi_ipmi_space_handler() can happen after user_interface becomes NULL,
+the on-going acpi_ipmi_space_handler() still can pass an invalid
+acpi_ipmi_device->user_interface to ipmi_request_settime().  Such race
+conditions are not allowed by the IPMI layer's API design as a crash will
+happen in ipmi_request_settime() if something like that happens.
+
+This patch follows the ipmi_devintf.c design:
+ 1. Invoke ipmi_destroy_user() after the reference count of
+    acpi_ipmi_device drops to 0.  References of acpi_ipmi_device dropping
+    to 0 also means tx_msg related to this acpi_ipmi_device are all freed.
+    This matches the IPMI layer's API calling rule on ipmi_destroy_user()
+    and ipmi_request_settime().
+ 2. ipmi_flush_tx_msg() is performed so that no on-going tx_msg can still be
+    running in acpi_ipmi_space_handler().  And it is invoked after invoking
+    __ipmi_dev_kill() where acpi_ipmi_device is deleted from the list with a
+    "dead" flag set, and the "dead" flag check is also introduced to the
+    point where a tx_msg is going to be added to the tx_msg_list so that no
+    new tx_msg can be created after returning from the __ipmi_dev_kill().
+ 3. The waiting codes in ipmi_flush_tx_msg() is deleted because it is not
+    required since this patch ensures no acpi_ipmi reference is still held
+    for ipmi_user_t before calling ipmi_destroy_user() and
+    ipmi_destroy_user() can ensure no more ipmi_msg_handler() can happen
+    after returning from ipmi_destroy_user().
+ 4. The flushing of tx_msg is also moved out of ipmi_lock in this patch.
+
+The forthcoming IPMI operation region handler installation changes also
+requires acpi_ipmi_device be handled in this style.
+
+The header comment of the file is also updated due to this design change.
+
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Reviewed-by: Huang Ying <ying.huang@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

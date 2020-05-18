@@ -1,0 +1,112 @@
+ptrace: implement PTRACE_LISTEN
+
+The previous patch implemented async notification for ptrace but it
+only worked while trace is running.  This patch introduces
+PTRACE_LISTEN which is suggested by Oleg Nestrov.
+
+It's allowed iff tracee is in STOP trap and puts tracee into
+quasi-running state - tracee never really runs but wait(2) and
+ptrace(2) consider it to be running.  While ptracer is listening,
+tracee is allowed to re-enter STOP to notify an async event.
+Listening state is cleared on the first notification.  Ptracer can
+also clear it by issuing INTERRUPT - tracee will re-trap into STOP
+with listening state cleared.
+
+This allows ptracer to monitor group stop state without running tracee
+- use INTERRUPT to put tracee into STOP trap, issue LISTEN and then
+wait(2) to wait for the next group stop event.  When it happens,
+PTRACE_GETSIGINFO provides information to determine the current state.
+
+Test program follows.
+
+  #define PTRACE_SEIZE		0x4206
+  #define PTRACE_INTERRUPT	0x4207
+  #define PTRACE_LISTEN		0x4208
+
+  #define PTRACE_SEIZE_DEVEL	0x80000000
+
+  static const struct timespec ts1s = { .tv_sec = 1 };
+
+  int main(int argc, char **argv)
+  {
+	  pid_t tracee, tracer;
+	  int i;
+
+	  tracee = fork();
+	  if (!tracee)
+		  while (1)
+			  pause();
+
+	  tracer = fork();
+	  if (!tracer) {
+		  siginfo_t si;
+
+		  ptrace(PTRACE_SEIZE, tracee, NULL,
+			 (void *)(unsigned long)PTRACE_SEIZE_DEVEL);
+		  ptrace(PTRACE_INTERRUPT, tracee, NULL, NULL);
+	  repeat:
+		  waitid(P_PID, tracee, NULL, WSTOPPED);
+
+		  ptrace(PTRACE_GETSIGINFO, tracee, NULL, &si);
+		  if (!si.si_code) {
+			  printf("tracer: SIG %d\n", si.si_signo);
+			  ptrace(PTRACE_CONT, tracee, NULL,
+				 (void *)(unsigned long)si.si_signo);
+			  goto repeat;
+		  }
+		  printf("tracer: stopped=%d signo=%d\n",
+			 si.si_signo != SIGTRAP, si.si_signo);
+		  if (si.si_signo != SIGTRAP)
+			  ptrace(PTRACE_LISTEN, tracee, NULL, NULL);
+		  else
+			  ptrace(PTRACE_CONT, tracee, NULL, NULL);
+		  goto repeat;
+	  }
+
+	  for (i = 0; i < 3; i++) {
+		  nanosleep(&ts1s, NULL);
+		  printf("mother: SIGSTOP\n");
+		  kill(tracee, SIGSTOP);
+		  nanosleep(&ts1s, NULL);
+		  printf("mother: SIGCONT\n");
+		  kill(tracee, SIGCONT);
+	  }
+	  nanosleep(&ts1s, NULL);
+
+	  kill(tracer, SIGKILL);
+	  kill(tracee, SIGKILL);
+	  return 0;
+  }
+
+This is identical to the program to test TRAP_NOTIFY except that
+tracee is PTRACE_LISTEN'd instead of PTRACE_CONT'd when group stopped.
+This allows ptracer to monitor when group stop ends without running
+tracee.
+
+  # ./test-listen
+  tracer: stopped=0 signo=5
+  mother: SIGSTOP
+  tracer: SIG 19
+  tracer: stopped=1 signo=19
+  mother: SIGCONT
+  tracer: stopped=0 signo=5
+  tracer: SIG 18
+  mother: SIGSTOP
+  tracer: SIG 19
+  tracer: stopped=1 signo=19
+  mother: SIGCONT
+  tracer: stopped=0 signo=5
+  tracer: SIG 18
+  mother: SIGSTOP
+  tracer: SIG 19
+  tracer: stopped=1 signo=19
+  mother: SIGCONT
+  tracer: stopped=0 signo=5
+  tracer: SIG 18
+
+-v2: Moved JOBCTL_LISTENING check in wait_task_stopped() into
+     task_stopped_code() as suggested by Oleg.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+

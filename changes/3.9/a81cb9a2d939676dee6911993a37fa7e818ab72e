@@ -1,0 +1,49 @@
+clear chunk_alloc flag on retryable failure
+
+I've experienced filesystem freezes with permanent spikes in the active
+process count for quite a while, particularly on filesystems whose
+available raw space has already been fully allocated to chunks.
+
+While looking into this, I found a pretty obvious error in
+do_chunk_alloc: it sets space_info->chunk_alloc, but if
+btrfs_alloc_chunk returns an error other than ENOSPC, it returns leaving
+that flag set, which causes any other threads waiting for
+space_info->chunk_alloc to become zero to spin indefinitely.
+
+I haven't double-checked that this patch fixes the failure I've observed
+fully (it's not exactly trivial to trigger), but it surely is a bug and
+the fix is trivial, so...  Please put it in :-)
+
+What I saw in that function also happens to explain why in some cases I
+see filesystems allocate a huge number of chunks that remain unused
+(leading to the scenario above, of not having more chunks to allocate).
+It happens for data and metadata, but not necessarily both.  I'm
+guessing some thread sets the force_alloc flag on the corresponding
+space_info, and then several threads trying to get disk space end up
+attempting to allocate a new chunk concurrently.  All of them will see
+the force_alloc flag and bump their local copy of force up to the level
+they see first, and they won't clear it even if another thread succeeds
+in allocating a chunk, thus clearing the force flag.  Then each thread
+that observed the force flag will, on its turn, force the allocation of
+a new chunk.  And any threads that come in while it does that will see
+the force flag still set and pick it up, and so on.  This sounds like a
+problem to me, but...  what should the correct behavior be?  Clear
+force_flag once we copy it to a local force?  Reset force to the
+incoming value on every loop?  Set the flag to our incoming force if we
+have it at first, clear our local flag, and move it from the space_info
+when we determined that we are the thread that's going to perform the
+allocation?
+
+btrfs: clear chunk_alloc flag on retryable failure
+
+From: Alexandre Oliva <oliva@gnu.org>
+
+If btrfs_alloc_chunk fails with e.g. ENOMEM, we exit do_chunk_alloc
+without clearing chunk_alloc in space_info.  As a result, any further
+calls to do_chunk_alloc on that filesystem will start busy-waiting for
+chunk_alloc to be cleared, but it never will be.  This patch adjusts
+do_chunk_alloc so that it clears this flag in case of an error.
+
+Signed-off-by: Alexandre Oliva <oliva@gnu.org>
+Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+

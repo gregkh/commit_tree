@@ -1,0 +1,81 @@
+mm: memcg: do not trap chargers with full callstack on OOM
+
+The memcg OOM handling is incredibly fragile and can deadlock.  When a
+task fails to charge memory, it invokes the OOM killer and loops right
+there in the charge code until it succeeds.  Comparably, any other task
+that enters the charge path at this point will go to a waitqueue right
+then and there and sleep until the OOM situation is resolved.  The problem
+is that these tasks may hold filesystem locks and the mmap_sem; locks that
+the selected OOM victim may need to exit.
+
+For example, in one reported case, the task invoking the OOM killer was
+about to charge a page cache page during a write(), which holds the
+i_mutex.  The OOM killer selected a task that was just entering truncate()
+and trying to acquire the i_mutex:
+
+OOM invoking task:
+  mem_cgroup_handle_oom+0x241/0x3b0
+  mem_cgroup_cache_charge+0xbe/0xe0
+  add_to_page_cache_locked+0x4c/0x140
+  add_to_page_cache_lru+0x22/0x50
+  grab_cache_page_write_begin+0x8b/0xe0
+  ext3_write_begin+0x88/0x270
+  generic_file_buffered_write+0x116/0x290
+  __generic_file_aio_write+0x27c/0x480
+  generic_file_aio_write+0x76/0xf0           # takes ->i_mutex
+  do_sync_write+0xea/0x130
+  vfs_write+0xf3/0x1f0
+  sys_write+0x51/0x90
+  system_call_fastpath+0x18/0x1d
+
+OOM kill victim:
+  do_truncate+0x58/0xa0              # takes i_mutex
+  do_last+0x250/0xa30
+  path_openat+0xd7/0x440
+  do_filp_open+0x49/0xa0
+  do_sys_open+0x106/0x240
+  sys_open+0x20/0x30
+  system_call_fastpath+0x18/0x1d
+
+The OOM handling task will retry the charge indefinitely while the OOM
+killed task is not releasing any resources.
+
+A similar scenario can happen when the kernel OOM killer for a memcg is
+disabled and a userspace task is in charge of resolving OOM situations.
+In this case, ALL tasks that enter the OOM path will be made to sleep on
+the OOM waitqueue and wait for userspace to free resources or increase
+the group's limit.  But a userspace OOM handler is prone to deadlock
+itself on the locks held by the waiting tasks.  For example one of the
+sleeping tasks may be stuck in a brk() call with the mmap_sem held for
+writing but the userspace handler, in order to pick an optimal victim,
+may need to read files from /proc/<pid>, which tries to acquire the same
+mmap_sem for reading and deadlocks.
+
+This patch changes the way tasks behave after detecting a memcg OOM and
+makes sure nobody loops or sleeps with locks held:
+
+1. When OOMing in a user fault, invoke the OOM killer and restart the
+   fault instead of looping on the charge attempt.  This way, the OOM
+   victim can not get stuck on locks the looping task may hold.
+
+2. When OOMing in a user fault but somebody else is handling it
+   (either the kernel OOM killer or a userspace handler), don't go to
+   sleep in the charge context.  Instead, remember the OOMing memcg in
+   the task struct and then fully unwind the page fault stack with
+   -ENOMEM.  pagefault_out_of_memory() will then call back into the
+   memcg code to check if the -ENOMEM came from the memcg, and then
+   either put the task to sleep on the memcg's OOM waitqueue or just
+   restart the fault.  The OOM victim can no longer get stuck on any
+   lock a sleeping task may hold.
+
+Debugged by Michal Hocko.
+
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reported-by: azurIt <azurit@pobox.sk>
+Acked-by: Michal Hocko <mhocko@suse.cz>
+Cc: David Rientjes <rientjes@google.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

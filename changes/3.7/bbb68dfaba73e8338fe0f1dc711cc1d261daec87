@@ -1,0 +1,55 @@
+workqueue: mark a work item being canceled as such
+
+There can be two reasons try_to_grab_pending() can fail with -EAGAIN.
+One is when someone else is queueing or deqeueing the work item.  With
+the previous patches, it is guaranteed that PENDING and queued state
+will soon agree making it safe to busy-retry in this case.
+
+The other is if multiple __cancel_work_timer() invocations are racing
+one another.  __cancel_work_timer() grabs PENDING and then waits for
+running instances of the target work item on all CPUs while holding
+PENDING and !queued.  try_to_grab_pending() invoked from another task
+will keep returning -EAGAIN while the current owner is waiting.
+
+Not distinguishing the two cases is okay because __cancel_work_timer()
+is the only user of try_to_grab_pending() and it invokes
+wait_on_work() whenever grabbing fails.  For the first case, busy
+looping should be fine but wait_on_work() doesn't cause any critical
+problem.  For the latter case, the new contender usually waits for the
+same condition as the current owner, so no unnecessarily extended
+busy-looping happens.  Combined, these make __cancel_work_timer()
+technically correct even without irq protection while grabbing PENDING
+or distinguishing the two different cases.
+
+While the current code is technically correct, not distinguishing the
+two cases makes it difficult to use try_to_grab_pending() for other
+purposes than canceling because it's impossible to tell whether it's
+safe to busy-retry grabbing.
+
+This patch adds a mechanism to mark a work item being canceled.
+try_to_grab_pending() now disables irq on success and returns -EAGAIN
+to indicate that grabbing failed but PENDING and queued states are
+gonna agree soon and it's safe to busy-loop.  It returns -ENOENT if
+the work item is being canceled and it may stay PENDING && !queued for
+arbitrary amount of time.
+
+__cancel_work_timer() is modified to mark the work canceling with
+WORK_OFFQ_CANCELING after grabbing PENDING, thus making
+try_to_grab_pending() fail with -ENOENT instead of -EAGAIN.  Also, it
+invokes wait_on_work() iff grabbing failed with -ENOENT.  This isn't
+necessary for correctness but makes it consistent with other future
+users of try_to_grab_pending().
+
+v2: try_to_grab_pending() was testing preempt_count() to ensure that
+    the caller has disabled preemption.  This triggers spuriously if
+    !CONFIG_PREEMPT_COUNT.  Use preemptible() instead.  Reported by
+    Fengguang Wu.
+
+v3: Updated so that try_to_grab_pending() disables irq on success
+    rather than requiring preemption disabled by the caller.  This
+    makes busy-looping easier and will allow try_to_grap_pending() to
+    be used from bh/irq contexts.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Fengguang Wu <fengguang.wu@intel.com>
+

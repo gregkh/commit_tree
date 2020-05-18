@@ -1,0 +1,95 @@
+mm: remap_file_pages() fixes
+
+We have many vma manipulation functions that are fast in the typical
+case, but can optionally be instructed to populate an unbounded number
+of ptes within the region they work on:
+
+ - mmap with MAP_POPULATE or MAP_LOCKED flags;
+ - remap_file_pages() with MAP_NONBLOCK not set or when working on a
+   VM_LOCKED vma;
+ - mmap_region() and all its wrappers when mlock(MCL_FUTURE) is in
+   effect;
+ - brk() when mlock(MCL_FUTURE) is in effect.
+
+Current code handles these pte operations locally, while the
+sourrounding code has to hold the mmap_sem write side since it's
+manipulating vmas.  This means we're doing an unbounded amount of pte
+population work with mmap_sem held, and this causes problems as Andy
+Lutomirski reported (we've hit this at Google as well, though it's not
+entirely clear why people keep trying to use mlock(MCL_FUTURE) in the
+first place).
+
+I propose introducing a new mm_populate() function to do this pte
+population work after the mmap_sem has been released.  mm_populate()
+does need to acquire the mmap_sem read side, but critically, it doesn't
+need to hold it continuously for the entire duration of the operation -
+it can drop it whenever things take too long (such as when hitting disk
+for a file read) and re-acquire it later on.
+
+The following patches are included
+
+- Patches 1 fixes some issues I noticed while working on the existing code.
+  If needed, they could potentially go in before the rest of the patches.
+
+- Patch 2 introduces the new mm_populate() function and changes
+  mmap_region() call sites to use it after they drop mmap_sem. This is
+  inspired from Andy Lutomirski's proposal and is built as an extension
+  of the work I had previously done for mlock() and mlockall() around
+  v2.6.38-rc1. I had tried doing something similar at the time but had
+  given up as there were so many do_mmap() call sites; the recent cleanups
+  by Linus and Viro are a tremendous help here.
+
+- Patches 3-5 convert some of the less-obvious places doing unbounded
+  pte populates to the new mm_populate() mechanism.
+
+- Patches 6-7 are code cleanups that are made possible by the
+  mm_populate() work. In particular, they remove more code than the
+  entire patch series added, which should be a good thing :)
+
+- Patch 8 is optional to this entire series. It only helps to deal more
+  nicely with racy userspace programs that might modify their mappings
+  while we're trying to populate them. It adds a new VM_POPULATE flag
+  on the mappings we do want to populate, so that if userspace replaces
+  them with mappings it doesn't want populated, mm_populate() won't
+  populate those replacement mappings.
+
+This patch:
+
+Assorted small fixes. The first two are quite small:
+
+- Move check for vma->vm_private_data && !(vma->vm_flags & VM_NONLINEAR)
+  within existing if (!(vma->vm_flags & VM_NONLINEAR)) block.
+  Purely cosmetic.
+
+- In the VM_LOCKED case, when dropping PG_Mlocked for the over-mapped
+  range, make sure we own the mmap_sem write lock around the
+  munlock_vma_pages_range call as this manipulates the vma's vm_flags.
+
+Last fix requires a longer explanation. remap_file_pages() can do its work
+either through VM_NONLINEAR manipulation or by creating extra vmas.
+These two cases were inconsistent with each other (and ultimately, both wrong)
+as to exactly when did they fault in the newly mapped file pages:
+
+- In the VM_NONLINEAR case, new file pages would be populated if
+  the MAP_NONBLOCK flag wasn't passed. If MAP_NONBLOCK was passed,
+  new file pages wouldn't be populated even if the vma is already
+  marked as VM_LOCKED.
+
+- In the linear (emulated) case, the work is passed to the mmap_region()
+  function which would populate the pages if the vma is marked as
+  VM_LOCKED, and would not otherwise - regardless of the value of the
+  MAP_NONBLOCK flag, because MAP_POPULATE wasn't being passed to
+  mmap_region().
+
+The desired behavior is that we want the pages to be populated and locked
+if the vma is marked as VM_LOCKED, or to be populated if the MAP_NONBLOCK
+flag is not passed to remap_file_pages().
+
+Signed-off-by: Michel Lespinasse <walken@google.com>
+Acked-by: Rik van Riel <riel@redhat.com>
+Tested-by: Andy Lutomirski <luto@amacapital.net>
+Cc: Greg Ungerer <gregungerer@westnet.com.au>
+Cc: David Howells <dhowells@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

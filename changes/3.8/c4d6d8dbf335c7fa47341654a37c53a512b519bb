@@ -1,0 +1,59 @@
+CacheFiles: Fix the marking of cached pages
+
+Under some circumstances CacheFiles defers the marking of pages with PG_fscache
+so that it can take advantage of pagevecs to reduce the number of calls to
+fscache_mark_pages_cached() and the netfs's hook to keep track of this.
+
+There are, however, two problems with this:
+
+ (1) It can lead to the PG_fscache mark being applied _after_ the page is set
+     PG_uptodate and unlocked (by the call to fscache_end_io()).
+
+ (2) CacheFiles's ref on the page is dropped immediately following
+     fscache_end_io() - and so may not still be held when the mark is applied.
+     This can lead to the page being passed back to the allocator before the
+     mark is applied.
+
+Fix this by, where appropriate, marking the page before calling
+fscache_end_io() and releasing the page.  This means that we can't take
+advantage of pagevecs and have to make a separate call for each page to the
+marking routines.
+
+The symptoms of this are Bad Page state errors cropping up under memory
+pressure, for example:
+
+BUG: Bad page state in process tar  pfn:002da
+page:ffffea0000009fb0 count:0 mapcount:0 mapping:          (null) index:0x1447
+page flags: 0x1000(private_2)
+Pid: 4574, comm: tar Tainted: G        W   3.1.0-rc4-fsdevel+ #1064
+Call Trace:
+ [<ffffffff8109583c>] ? dump_page+0xb9/0xbe
+ [<ffffffff81095916>] bad_page+0xd5/0xea
+ [<ffffffff81095d82>] get_page_from_freelist+0x35b/0x46a
+ [<ffffffff810961f3>] __alloc_pages_nodemask+0x362/0x662
+ [<ffffffff810989da>] __do_page_cache_readahead+0x13a/0x267
+ [<ffffffff81098942>] ? __do_page_cache_readahead+0xa2/0x267
+ [<ffffffff81098d7b>] ra_submit+0x1c/0x20
+ [<ffffffff8109900a>] ondemand_readahead+0x28b/0x29a
+ [<ffffffff81098ee2>] ? ondemand_readahead+0x163/0x29a
+ [<ffffffff810990ce>] page_cache_sync_readahead+0x38/0x3a
+ [<ffffffff81091d8a>] generic_file_aio_read+0x2ab/0x67e
+ [<ffffffffa008cfbe>] nfs_file_read+0xa4/0xc9 [nfs]
+ [<ffffffff810c22c4>] do_sync_read+0xba/0xfa
+ [<ffffffff81177a47>] ? security_file_permission+0x7b/0x84
+ [<ffffffff810c25dd>] ? rw_verify_area+0xab/0xc8
+ [<ffffffff810c29a4>] vfs_read+0xaa/0x13a
+ [<ffffffff810c2a79>] sys_read+0x45/0x6c
+ [<ffffffff813ac37b>] system_call_fastpath+0x16/0x1b
+
+As can be seen, PG_private_2 (== PG_fscache) is set in the page flags.
+
+Instrumenting fscache_mark_pages_cached() to verify whether page->mapping was
+set appropriately showed that sometimes it wasn't.  This led to the discovery
+that sometimes the page has apparently been reclaimed by the time the marker
+got to see it.
+
+Reported-by: M. Stevens <m@tippett.com>
+Signed-off-by: David Howells <dhowells@redhat.com>
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+

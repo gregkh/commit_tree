@@ -1,0 +1,50 @@
+xhci: Fix failed enqueue in the middle of isoch TD.
+
+When an isochronous transfer is enqueued, xhci_queue_isoc_tx_prepare()
+will ensure that there is enough room on the transfer rings for all of the
+isochronous TDs for that URB.  However, when xhci_queue_isoc_tx() is
+enqueueing individual isoc TDs, the prepare_transfer() function can fail
+if the endpoint state has changed to disabled, error, or some other
+unknown state.
+
+With the current code, if Nth TD (not the first TD) fails, the ring is
+left in a sorry state.  The partially enqueued TDs are left on the ring,
+and the first TRB of the TD is not given back to the hardware.  The
+enqueue pointer is left on the TRB after the last successfully enqueued
+TD.  This means the ring is basically useless.  Any new transfers will be
+enqueued after the failed TDs, which the hardware will never read because
+the cycle bit indicates it does not own them.  The ring will fill up with
+untransferred TDs, and the endpoint will be basically unusable.
+
+The untransferred TDs will also remain on the TD list.  Since the td_list
+is a FIFO, this basically means the ring handler will be waiting on TDs
+that will never be completed (or worse, dereference memory that doesn't
+exist any more).
+
+Change the code to clean up the isochronous ring after a failed transfer.
+If the first TD failed, simply return and allow the xhci_urb_enqueue
+function to free the urb_priv.  If the Nth TD failed, first remove the TDs
+from the td_list.  Then convert the TRBs that were enqueued into No-op
+TRBs.  Make sure to flip the cycle bit on all enqueued TRBs (including any
+link TRBs in the middle or between TDs), but leave the cycle bit of the
+first TRB (which will show software-owned) intact.  Then move the ring
+enqueue pointer back to the first TRB and make sure to change the
+xhci_ring's cycle state to what is appropriate for that ring segment.
+
+This ensures that the No-op TRBs will be overwritten by subsequent TDs,
+and the hardware will not start executing random TRBs because the cycle
+bit was left as hardware-owned.
+
+This bug is unlikely to be hit, but it was something I noticed while
+tracking down the watchdog timer issue.  I verified that the fix works by
+injecting some errors on the 250th isochronous URB queued, although I
+could not verify that the ring is in the correct state because uvcvideo
+refused to talk to the device after the first usb_submit_urb() failed.
+Ring debugging shows that the ring looks correct, however.
+
+This patch should be backported to kernels as old as 2.6.36.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Cc: Andiry Xu <andiry.xu@amd.com>
+Cc: stable@kernel.org
+

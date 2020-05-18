@@ -1,0 +1,128 @@
+xfs: punch new delalloc blocks out of failed writes inside EOF.
+
+When a partial write inside EOF fails, it can leave delayed
+allocation blocks lying around because they don't get punched back
+out. This leads to assert failures like:
+
+XFS: Assertion failed: XFS_FORCED_SHUTDOWN(ip->i_mount) || ip->i_delayed_blks == 0, file: fs/xfs/xfs_super.c, line: 847
+
+when evicting inodes from the cache. This can be trivially triggered
+by xfstests 083, which takes between 5 and 15 executions on a 512
+byte block size filesystem to trip over this. Debugging shows a
+failed write due to ENOSPC calling xfs_vm_write_failed such as:
+
+[ 5012.329024] ino 0xa0026: vwf to 0x17000, sze 0x1c85ae
+
+and no action is taken on it. This leaves behind a delayed
+allocation extent that has no page covering it and no data in it:
+
+[ 5015.867162] ino 0xa0026: blks: 0x83 delay blocks 0x1, size 0x2538c0
+[ 5015.868293] ext 0: off 0x4a, fsb 0x50306, len 0x1
+[ 5015.869095] ext 1: off 0x4b, fsb 0x7899, len 0x6b
+[ 5015.869900] ext 2: off 0xb6, fsb 0xffffffffe0008, len 0x1
+                                    ^^^^^^^^^^^^^^^
+[ 5015.871027] ext 3: off 0x36e, fsb 0x7a27, len 0xd
+[ 5015.872206] ext 4: off 0x4cf, fsb 0x7a1d, len 0xa
+
+So the delayed allocation extent is one block long at offset
+0x16c00. Tracing shows that a bigger write:
+
+xfs_file_buffered_write: size 0x1c85ae offset 0x959d count 0x1ca3f ioflags
+
+allocates the block, and then fails with ENOSPC trying to allocate
+the last block on the page, leading to a failed write with stale
+delalloc blocks on it.
+
+Because we've had an ENOSPC when trying to allocate 0x16e00, it
+means that we are never goinge to call ->write_end on the page and
+so the allocated new buffer will not get marked dirty or have the
+buffer_new state cleared. In other works, what the above write is
+supposed to end up with is this mapping for the page:
+
+    +------+------+------+------+------+------+------+------+
+      UMA    UMA    UMA    UMA    UMA    UMA    UND    FAIL
+
+where:  U = uptodate
+        M = mapped
+        N = new
+        A = allocated
+        D = delalloc
+        FAIL = block we ENOSPC'd on.
+
+and the key point being the buffer_new() state for the newly
+allocated delayed allocation block. Except it doesn't - we're not
+marking buffers new correctly.
+
+That buffer_new() problem goes back to the xfs_iomap removal days,
+where xfs_iomap() used to return a "new" status for any map with
+newly allocated blocks, so that __xfs_get_blocks() could call
+set_buffer_new() on it. We still have the "new" variable and the
+check for it in the set_buffer_new() logic - except we never set it
+now!
+
+Hence that newly allocated delalloc block doesn't have the new flag
+set on it, so when the write fails we cannot tell which blocks we
+are supposed to punch out. WHy do we need the buffer_new flag? Well,
+that's because we can have this case:
+
+    +------+------+------+------+------+------+------+------+
+      UMD    UMD    UMD    UMD    UMD    UMD    UND    FAIL
+
+where all the UMD buffers contain valid data from a previously
+successful write() system call. We only want to punch the UND buffer
+because that's the only one that we added in this write and it was
+only this write that failed.
+
+That implies that even the old buffer_new() logic was wrong -
+because it would result in all those UMD buffers on the page having
+set_buffer_new() called on them even though they aren't new. Hence
+we shoul donly be calling set_buffer_new() for delalloc buffers that
+were allocated (i.e. were a hole before xfs_iomap_write_delay() was
+called).
+
+So, fix this set_buffer_new logic according to how we need it to
+work for handling failed writes correctly. Also, restore the new
+buffer logic handling for blocks allocated via
+xfs_iomap_write_direct(), because it should still set the buffer_new
+flag appropriately for newly allocated blocks, too.
+
+SO, now we have the buffer_new() being set appropriately in
+__xfs_get_blocks(), we can detect the exact delalloc ranges that
+we allocated in a failed write, and hence can now do a walk of the
+buffers on a page to find them.
+
+Except, it's not that easy. When block_write_begin() fails, it
+unlocks and releases the page that we just had an error on, so we
+can't use that page to handle errors anymore. We have to get access
+to the page while it is still locked to walk the buffers. Hence we
+have to open code block_write_begin() in xfs_vm_write_begin() to be
+able to insert xfs_vm_write_failed() is the right place.
+
+With that, we can pass the page and write range to
+xfs_vm_write_failed() and walk the buffers on the page, looking for
+delalloc buffers that are either new or beyond EOF and punch them
+out. Handling buffers beyond EOF ensures we still handle the
+existing case that xfs_vm_write_failed() handles.
+
+Of special note is the truncate_pagecache() handling - that only
+should be done for pages outside EOF - pages within EOF can still
+contain valid, dirty data so we must not punch them out of the
+cache.
+
+That just leaves the xfs_vm_write_end() failure handling.
+The only failure case here is that we didn't copy the entire range,
+and generic_write_end() handles that by zeroing the region of the
+page that wasn't copied, we don't have to punch out blocks within
+the file because they are guaranteed to contain zeros. Hence we only
+have to handle the existing "beyond EOF" case and don't need access
+to the buffers on the page. Hence it remains largely unchanged.
+
+Note that xfs_getbmap() can still trip over delalloc blocks beyond
+EOF that are left there by speculative delayed allocation. Hence
+this bug fix does not solve all known issues with bmap vs delalloc,
+but it does fix all the the known accidental occurances of the
+problem.
+
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Ben Myers <bpm@sgi.com>
+

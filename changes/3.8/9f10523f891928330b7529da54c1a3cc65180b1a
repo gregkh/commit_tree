@@ -1,0 +1,113 @@
+FS-Cache: Fix operation state management and accounting
+
+Fix the state management of internal fscache operations and the accounting of
+what operations are in what states.
+
+This is done by:
+
+ (1) Give struct fscache_operation a enum variable that directly represents the
+     state it's currently in, rather than spreading this knowledge over a bunch
+     of flags, who's processing the operation at the moment and whether it is
+     queued or not.
+
+     This makes it easier to write assertions to check the state at various
+     points and to prevent invalid state transitions.
+
+ (2) Add an 'operation complete' state and supply a function to indicate the
+     completion of an operation (fscache_op_complete()) and make things call
+     it.  The final call to fscache_put_operation() can then check that an op
+     in the appropriate state (complete or cancelled).
+
+ (3) Adjust the use of object->n_ops, ->n_in_progress, ->n_exclusive to better
+     govern the state of an object:
+
+	(a) The ->n_ops is now the number of extant operations on the object
+	    and is now decremented by fscache_put_operation() only.
+
+	(b) The ->n_in_progress is simply the number of objects that have been
+	    taken off of the object's pending queue for the purposes of being
+	    run.  This is decremented by fscache_op_complete() only.
+
+	(c) The ->n_exclusive is the number of exclusive ops that have been
+	    submitted and queued or are in progress.  It is decremented by
+	    fscache_op_complete() and by fscache_cancel_op().
+
+     fscache_put_operation() and fscache_operation_gc() now no longer try to
+     clean up ->n_exclusive and ->n_in_progress.  That was leading to double
+     decrements against fscache_cancel_op().
+
+     fscache_cancel_op() now no longer decrements ->n_ops.  That was leading to
+     double decrements against fscache_put_operation().
+
+     fscache_submit_exclusive_op() now decides whether it has to queue an op
+     based on ->n_in_progress being > 0 rather than ->n_ops > 0 as the latter
+     will persist in being true even after all preceding operations have been
+     cancelled or completed.  Furthermore, if an object is active and there are
+     runnable ops against it, there must be at least one op running.
+
+ (4) Add a remaining-pages counter (n_pages) to struct fscache_retrieval and
+     provide a function to record completion of the pages as they complete.
+
+     When n_pages reaches 0, the operation is deemed to be complete and
+     fscache_op_complete() is called.
+
+     Add calls to fscache_retrieval_complete() anywhere we've finished with a
+     page we've been given to read or allocate for.  This includes places where
+     we just return pages to the netfs for reading from the server and where
+     accessing the cache fails and we discard the proposed netfs page.
+
+The bugs in the unfixed state management manifest themselves as oopses like the
+following where the operation completion gets out of sync with return of the
+cookie by the netfs.  This is possible because the cache unlocks and returns
+all the netfs pages before recording its completion - which means that there's
+nothing to stop the netfs discarding them and returning the cookie.
+
+
+FS-Cache: Cookie 'NFS.fh' still has outstanding reads
+------------[ cut here ]------------
+kernel BUG at fs/fscache/cookie.c:519!
+invalid opcode: 0000 [#1] SMP
+CPU 1
+Modules linked in: cachefiles nfs fscache auth_rpcgss nfs_acl lockd sunrpc
+
+Pid: 400, comm: kswapd0 Not tainted 3.1.0-rc7-fsdevel+ #1090                  /DG965RY
+RIP: 0010:[<ffffffffa007050a>]  [<ffffffffa007050a>] __fscache_relinquish_cookie+0x170/0x343 [fscache]
+RSP: 0018:ffff8800368cfb00  EFLAGS: 00010282
+RAX: 000000000000003c RBX: ffff880023cc8790 RCX: 0000000000000000
+RDX: 0000000000002f2e RSI: 0000000000000001 RDI: ffffffff813ab86c
+RBP: ffff8800368cfb50 R08: 0000000000000002 R09: 0000000000000000
+R10: ffff88003a1b7890 R11: ffff88001df6e488 R12: ffff880023d8ed98
+R13: ffff880023cc8798 R14: 0000000000000004 R15: ffff88003b8bf370
+FS:  0000000000000000(0000) GS:ffff88003bd00000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
+CR2: 00000000008ba008 CR3: 0000000023d93000 CR4: 00000000000006e0
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
+Process kswapd0 (pid: 400, threadinfo ffff8800368ce000, task ffff88003b8bf040)
+Stack:
+ ffff88003b8bf040 ffff88001df6e528 ffff88001df6e528 ffffffffa00b46b0
+ ffff88003b8bf040 ffff88001df6e488 ffff88001df6e620 ffffffffa00b46b0
+ ffff88001ebd04c8 0000000000000004 ffff8800368cfb70 ffffffffa00b2c91
+Call Trace:
+ [<ffffffffa00b2c91>] nfs_fscache_release_inode_cookie+0x3b/0x47 [nfs]
+ [<ffffffffa008f25f>] nfs_clear_inode+0x3c/0x41 [nfs]
+ [<ffffffffa0090df1>] nfs4_evict_inode+0x2f/0x33 [nfs]
+ [<ffffffff810d8d47>] evict+0xa1/0x15c
+ [<ffffffff810d8e2e>] dispose_list+0x2c/0x38
+ [<ffffffff810d9ebd>] prune_icache_sb+0x28c/0x29b
+ [<ffffffff810c56b7>] prune_super+0xd5/0x140
+ [<ffffffff8109b615>] shrink_slab+0x102/0x1ab
+ [<ffffffff8109d690>] balance_pgdat+0x2f2/0x595
+ [<ffffffff8103e009>] ? process_timeout+0xb/0xb
+ [<ffffffff8109dba3>] kswapd+0x270/0x289
+ [<ffffffff8104c5ea>] ? __init_waitqueue_head+0x46/0x46
+ [<ffffffff8109d933>] ? balance_pgdat+0x595/0x595
+ [<ffffffff8104bf7a>] kthread+0x7f/0x87
+ [<ffffffff813ad6b4>] kernel_thread_helper+0x4/0x10
+ [<ffffffff81026b98>] ? finish_task_switch+0x45/0xc0
+ [<ffffffff813abcdd>] ? retint_restore_args+0xe/0xe
+ [<ffffffff8104befb>] ? __init_kthread_worker+0x53/0x53
+ [<ffffffff813ad6b0>] ? gs_change+0xb/0xb
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+

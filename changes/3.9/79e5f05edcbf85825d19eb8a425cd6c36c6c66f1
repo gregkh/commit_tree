@@ -1,0 +1,71 @@
+ARC: Add implicit compiler barrier to raw_local_irq* functions
+
+ARC irqsave/restore macros were missing the compiler barrier, causing a
+stale load in irq-enabled region be used in irq-safe region, despite
+being changed, because the register holding the value was still live.
+
+The problem manifested as random crashes in timer code when stress
+testing ARCLinux (3.9-rc3) on a !SMP && !PREEMPT_COUNT
+
+Here's the exact sequence which caused this:
+ (0). tv1[x] <----> t1 <---> t2
+ (1). mod_timer(t1) interrupted after it calls timer_pending()
+ (2). mod_timer(t2) completes
+ (3). mod_timer(t1) resumes but messes up the list
+ (4). __runt_timers( ) uses bogus timer_list entry / crashes in
+      timer->function
+
+Essentially mod_timer() was racing against itself and while the spinlock
+serialized the tv1[] timer link list, timer_pending() called outside the
+spinlock, cached timer link list element in a register.
+With low register pressure (and a deep register file), lack of barrier
+in raw_local_irqsave() as well as preempt_disable (!PREEMPT_COUNT
+version), there was nothing to force gcc to reload across the spinlock,
+causing a stale value in reg be used for link list manipulation - ensuing
+a corruption.
+
+ARcompact disassembly which shows the culprit generated code:
+
+mod_timer:
+    push_s blink
+    mov_s r13,r0	# timer, timer
+..
+    ###### timer_pending( )
+    ld_s r3,[r13]       # <------ <variable>.entry.next LOADED
+    brne r3, 0, @.L163
+
+.L163:
+..
+    ###### spin_lock_irq( )
+    lr  r5, [status32]  # flags
+    bic r4, r5, 6       # temp, flags,
+    and.f 0, r5, 6      # flags,
+    flag.nz r4
+
+    ###### detach_if_pending( ) begins
+
+    tst_s r3,r3  <--------------
+			# timer_pending( ) checks timer->entry.next
+                        # r3 is NOT reloaded by gcc, using stale value
+    beq.d @.L169
+    mov.eq r0,0
+
+    #####  detach_timer( ): __list_del( )
+
+    ld r4,[r13,4]    	# <variable>.entry.prev, D.31439
+    st r4,[r3,4]     	# <variable>.prev, D.31439
+    st r3,[r4]       	# <variable>.next, D.30246
+
+We initially tried to fix this by adding barrier() to preempt_* macros
+for !PREEMPT_COUNT but Linus clarified that it was anything but wrong.
+http://www.spinics.net/lists/kernel/msg1512709.html
+
+[vgupta: updated commitlog]
+
+Reported-by/Signed-off-by: Christian Ruppert <christian.ruppert@abilis.com>
+Cc: Christian Ruppert <christian.ruppert@abilis.com>
+Cc: Pierrick Hascoet <pierrick.hascoet@abilis.com>
+Debugged-by/Signed-off-by: Vineet Gupta <vgupta@synopsys.com>
+
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

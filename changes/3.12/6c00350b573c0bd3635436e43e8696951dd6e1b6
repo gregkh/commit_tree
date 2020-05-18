@@ -1,0 +1,56 @@
+ARC: Workaround spinlock livelock in SMP SystemC simulation
+
+Some ARC SMP systems lack native atomic R-M-W (LLOCK/SCOND) insns and
+can only use atomic EX insn (reg with mem) to build higher level R-M-W
+primitives. This includes a SystemC based SMP simulation model.
+
+So rwlocks need to use a protecting spinlock for atomic cmp-n-exchange
+operation to update reader(s)/writer count.
+
+The spinlock operation itself looks as follows:
+
+	mov reg, 1		; 1=locked, 0=unlocked
+retry:
+	EX reg, [lock]		; load existing, store 1, atomically
+	BREQ reg, 1, rety	; if already locked, retry
+
+In single-threaded simulation, SystemC alternates between the 2 cores
+with "N" insn each based scheduling. Additionally for insn with global
+side effect, such as EX writing to shared mem, a core switch is
+enforced too.
+
+Given that, 2 cores doing a repeated EX on same location, Linux often
+got into a livelock e.g. when both cores were fiddling with tasklist
+lock (gdbserver / hackbench) for read/write respectively as the
+sequence diagram below shows:
+
+           core1                                   core2
+         --------                                --------
+1. spin lock [EX r=0, w=1] - LOCKED
+2. rwlock(Read)            - LOCKED
+3. spin unlock  [ST 0]     - UNLOCKED
+                                         spin lock [EX r=0,w=1] - LOCKED
+                      -- resched core 1----
+
+5. spin lock [EX r=1] - ALREADY-LOCKED
+
+                      -- resched core 2----
+6.                                       rwlock(Write) - READER-LOCKED
+7.                                       spin unlock [ST 0]
+8.                                       rwlock failed, retry again
+
+9.                                       spin lock  [EX r=0, w=1]
+                      -- resched core 1----
+
+10  spinlock locked in #9, retry #5
+11. spin lock [EX gets 1]
+                      -- resched core 2----
+...
+...
+
+The fix was to unlock using the EX insn too (step 7), to trigger another
+SystemC scheduling pass which would let core1 proceed, eliding the
+livelock.
+
+Signed-off-by: Vineet Gupta <vgupta@synopsys.com>
+

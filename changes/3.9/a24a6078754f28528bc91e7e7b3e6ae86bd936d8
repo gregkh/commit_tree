@@ -1,0 +1,68 @@
+USB: Rip out recursive call on warm port reset.
+
+When a hot reset fails on a USB 3.0 port, the current port reset code
+recursively calls hub_port_reset inside hub_port_wait_reset.  This isn't
+ideal, since we should avoid recursive calls in the kernel, and it also
+doesn't allow us to issue multiple warm resets on reset failures.
+
+Rip out the recursive call.  Instead, add code to hub_port_reset to
+issue a warm reset if the hot reset fails, and try multiple warm resets
+before giving up on the port.
+
+In hub_port_wait_reset, remove the recursive call and re-indent.  The
+code is basically the same, except:
+
+1. It bails out early if the port has transitioned to Inactive or
+Compliance Mode after the reset completed.
+
+2. It doesn't consider a connect status change to be a failed reset.  If
+multiple warm resets needed to be issued, the connect status may have
+changed, so we need to ignore that and look at the port link state
+instead.  hub_port_reset will now do that.
+
+3. It unconditionally sets udev->speed on all types of successful
+resets.  The old recursive code would set the port speed when the second
+hub_port_reset returned.
+
+The old code did not handle connected devices needing a warm reset well.
+There were only two situations that the old code handled correctly: an
+empty port needing a warm reset, and a hot reset that migrated to a warm
+reset.
+
+When an empty port needed a warm reset, hub_port_reset was called with
+the warm variable set.  The code in hub_port_finish_reset would skip
+telling the USB core and the xHC host that the device was reset, because
+otherwise that would result in a NULL pointer dereference.
+
+When a USB 3.0 device reset migrated to a warm reset, the recursive call
+made the call stack look like this:
+
+hub_port_reset(warm = false)
+        hub_wait_port_reset(warm = false)
+                hub_port_reset(warm = true)
+                        hub_wait_port_reset(warm = true)
+                        hub_port_finish_reset(warm = true)
+                        (return up the call stack to the first wait)
+
+        hub_port_finish_reset(warm = false)
+
+The old code didn't want to notify the USB core or the xHC host of device reset
+twice, so it only did it in the second call to hub_port_finish_reset,
+when warm was set to false.  This was necessary because
+before patch two ("USB: Ignore xHCI Reset Device status."), the USB core
+would pay attention to the xHC Reset Device command error status, and
+the second call would always fail.
+
+Now that we no longer have the recursive call, and warm can change from
+false to true in hub_port_reset, we need to have hub_port_finish_reset
+unconditionally notify the USB core and the xHC of the device reset.
+
+In hub_port_finish_reset, unconditionally clear the connect status
+change (CSC) bit for USB 3.0 hubs when the port reset is done.  If we
+had to issue multiple warm resets for a device, that bit may have been
+set if the device went into SS.Inactive and then was successfully warm
+reset.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+

@@ -1,0 +1,51 @@
+xfs: avoid AGI/AGF deadlock scenario for inode chunk allocation
+
+The inode chunk allocation path can lead to deadlock conditions if
+a transaction is dirtied with an AGF (to fix up the freelist) for
+an AG that cannot satisfy the actual allocation request. This code
+path is written to try and avoid this scenario, but it can be
+reproduced by running xfstests generic/270 in a loop on a 512b fs.
+
+An example situation is:
+- process A attempts an inode allocation on AG 3, modifies
+  the freelist, fails the allocation and ultimately moves on to
+  AG 0 with the AG 3 AGF held
+- process B is doing a free space operation (i.e., truncate) and
+  acquires the AG 0 AGF, waits on the AG 3 AGF
+- process A acquires the AG 0 AGI, waits on the AG 0 AGF (deadlock)
+
+The problem here is that process A acquired the AG 3 AGF while
+moving on to AG 0 (and releasing the AG 3 AGI with the AG 3 AGF
+held). xfs_dialloc() makes one pass through each of the AGs when
+attempting to allocate an inode chunk. The expectation is a clean
+transaction if a particular AG cannot satisfy the allocation
+request. xfs_ialloc_ag_alloc() is written to support this through
+use of the minalignslop allocation args field.
+
+When using the agi->agi_newino optimization, we attempt an exact
+bno allocation request based on the location of the previously
+allocated chunk. minalignslop is set to inform the allocator that
+we will require alignment on this chunk, and thus to not allow the
+request for this AG if the extra space is not available. Suppose
+that the AG in question has just enough space for this request, but
+not at the requested bno. xfs_alloc_fix_freelist() will proceed as
+normal as it determines the request should succeed, and thus it is
+allowed to modify the agf. xfs_alloc_ag_vextent() ultimately fails
+because the requested bno is not available. In response, the caller
+moves on to a NEAR_BNO allocation request for the same AG. The
+alignment is set, but the minalignslop field is never reset. This
+increases the overall requirement of the request from the first
+attempt. If this delta is the difference between allocation success
+and failure for the AG, xfs_alloc_fix_freelist() rejects this
+request outright the second time around and causes the allocation
+request to unnecessarily fail for this AG.
+
+To address this situation, reset the minalignslop field immediately
+after use and prevent it from leaking into subsequent requests.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Mark Tinguely <tinguely@sgi.com>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+

@@ -1,0 +1,67 @@
+mm: thp: tail page refcounting fix
+
+Michel while working on the working set estimation code, noticed that
+calling get_page_unless_zero() on a random pfn_to_page(random_pfn)
+wasn't safe, if the pfn ended up being a tail page of a transparent
+hugepage under splitting by __split_huge_page_refcount().
+
+He then found the problem could also theoretically materialize with
+page_cache_get_speculative() during the speculative radix tree lookups
+that uses get_page_unless_zero() in SMP if the radix tree page is freed
+and reallocated and get_user_pages is called on it before
+page_cache_get_speculative has a chance to call get_page_unless_zero().
+
+So the best way to fix the problem is to keep page_tail->_count zero at
+all times.  This will guarantee that get_page_unless_zero() can never
+succeed on any tail page.  page_tail->_mapcount is guaranteed zero and
+is unused for all tail pages of a compound page, so we can simply
+account the tail page references there and transfer them to
+tail_page->_count in __split_huge_page_refcount() (in addition to the
+head_page->_mapcount).
+
+While debugging this s/_count/_mapcount/ change I also noticed get_page is
+called by direct-io.c on pages returned by get_user_pages.  That wasn't
+entirely safe because the two atomic_inc in get_page weren't atomic.  As
+opposed to other get_user_page users like secondary-MMU page fault to
+establish the shadow pagetables would never call any superflous get_page
+after get_user_page returns.  It's safer to make get_page universally safe
+for tail pages and to use get_page_foll() within follow_page (inside
+get_user_pages()).  get_page_foll() is safe to do the refcounting for tail
+pages without taking any locks because it is run within PT lock protected
+critical sections (PT lock for pte and page_table_lock for
+pmd_trans_huge).
+
+The standard get_page() as invoked by direct-io instead will now take
+the compound_lock but still only for tail pages.  The direct-io paths
+are usually I/O bound and the compound_lock is per THP so very
+finegrined, so there's no risk of scalability issues with it.  A simple
+direct-io benchmarks with all lockdep prove locking and spinlock
+debugging infrastructure enabled shows identical performance and no
+overhead.  So it's worth it.  Ideally direct-io should stop calling
+get_page() on pages returned by get_user_pages().  The spinlock in
+get_page() is already optimized away for no-THP builds but doing
+get_page() on tail pages returned by GUP is generally a rare operation
+and usually only run in I/O paths.
+
+This new refcounting on page_tail->_mapcount in addition to avoiding new
+RCU critical sections will also allow the working set estimation code to
+work without any further complexity associated to the tail page
+refcounting with THP.
+
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Reported-by: Michel Lespinasse <walken@google.com>
+Reviewed-by: Michel Lespinasse <walken@google.com>
+Reviewed-by: Minchan Kim <minchan.kim@gmail.com>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Johannes Weiner <jweiner@redhat.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: David Gibson <david@gibson.dropbear.id.au>
+Cc: <stable@kernel.org>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

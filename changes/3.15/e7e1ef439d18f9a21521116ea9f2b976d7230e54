@@ -1,0 +1,95 @@
+zram: introduce compressing backend abstraction
+
+ZRAM performs direct LZO compression algorithm calls, making it the one
+and only option.  While LZO is generally performs well, LZ4 algorithm
+tends to have a faster decompression (see http://code.google.com/p/lz4/
+for full report)
+
+	Name            Ratio  C.speed D.speed
+	                        MB/s    MB/s
+	LZ4 (r101)      2.084    422    1820
+	LZO 2.06        2.106    414     600
+
+Thus, users who have mostly read (decompress) usage scenarious or mixed
+workflow (writes with relatively high read ops number) will benefit from
+using LZ4 compression backend.
+
+Introduce compressing backend abstraction zcomp in order to support
+multiple compression algorithms with the following set of operations:
+
+        .create
+        .destroy
+        .compress
+        .decompress
+
+Schematically zram write() usually contains the following steps:
+0) preparation (decompression of partioal IO, etc.)
+1) lock buffer_lock mutex (protects meta compress buffers)
+2) compress (using meta compress buffers)
+3) alloc and map zs_pool object
+4) copy compressed data (from meta compress buffers) to object allocated by 3)
+5) free previous pool page, assign a new one
+6) unlock buffer_lock mutex
+
+As we can see, compressing buffers must remain untouched from 1) to 4),
+because, otherwise, concurrent write() can overwrite data.  At the same
+time, zram_meta must be aware of a) specific compression algorithm memory
+requirements and b) necessary locking to protect compression buffers.  To
+remove requirement a) new struct zcomp_strm introduced, which contains a
+compress/decompress `buffer' and compression algorithm `private' part.
+While struct zcomp implements zcomp_strm stream handling and locking and
+removes requirement b) from zram meta.  zcomp ->create() and ->destroy(),
+respectively, allocate and deallocate algorithm specific zcomp_strm
+`private' part.
+
+Every zcomp has zcomp stream and mutex to protect its compression stream.
+Stream usage semantics remains the same -- only one write can hold stream
+lock and use its buffers.  zcomp_strm_find() turns caller into exclusive
+user of a stream (holding stream mutex until zram release stream), and
+zcomp_strm_release() makes zcomp stream available (unlock the stream
+mutex).  Hence no concurrent write (compression) operations possible at
+the moment.
+
+iozone -t 3 -R -r 16K -s 60M -I +Z
+
+       test            base           patched
+--------------------------------------------------
+  Initial write      597992.91       591660.58
+        Rewrite      609674.34       616054.97
+           Read     2404771.75      2452909.12
+        Re-read     2459216.81      2470074.44
+   Reverse Read     1652769.66      1589128.66
+    Stride read     2202441.81      2202173.31
+    Random read     2236311.47      2276565.31
+ Mixed workload     1423760.41      1709760.06
+   Random write      579584.08       615933.86
+         Pwrite      597550.02       594933.70
+          Pread     1703672.53      1718126.72
+         Fwrite     1330497.06      1461054.00
+          Fread     3922851.00      3957242.62
+
+Usage examples:
+
+	comp = zcomp_create(NAME) /* NAME e.g. "lzo" */
+
+which initialises compressing backend if requested algorithm is supported.
+
+Compress:
+	zstrm = zcomp_strm_find(comp)
+	zcomp_compress(comp, zstrm, src, &dst_len)
+	[..] /* copy compressed data */
+	zcomp_strm_release(comp, zstrm)
+
+Decompress:
+	zcomp_decompress(comp, src, src_len, dst);
+
+Free compessing backend and its zcomp stream:
+	zcomp_destroy(comp)
+
+Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Acked-by: Minchan Kim <minchan@kernel.org>
+Cc: Jerome Marchand <jmarchan@redhat.com>
+Cc: Nitin Gupta <ngupta@vflare.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

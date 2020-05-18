@@ -1,0 +1,90 @@
+CPU hotplug: Provide lockless versions of callback registration functions
+
+The following method of CPU hotplug callback registration is not safe
+due to the possibility of an ABBA deadlock involving the cpu_add_remove_lock
+and the cpu_hotplug.lock.
+
+	get_online_cpus();
+
+	for_each_online_cpu(cpu)
+		init_cpu(cpu);
+
+	register_cpu_notifier(&foobar_cpu_notifier);
+
+	put_online_cpus();
+
+The deadlock is shown below:
+
+          CPU 0                                         CPU 1
+          -----                                         -----
+
+   Acquire cpu_hotplug.lock
+   [via get_online_cpus()]
+
+                                              CPU online/offline operation
+                                              takes cpu_add_remove_lock
+                                              [via cpu_maps_update_begin()]
+
+   Try to acquire
+   cpu_add_remove_lock
+   [via register_cpu_notifier()]
+
+                                              CPU online/offline operation
+                                              tries to acquire cpu_hotplug.lock
+                                              [via cpu_hotplug_begin()]
+
+                            *** DEADLOCK! ***
+
+The problem here is that callback registration takes the locks in one order
+whereas the CPU hotplug operations take the same locks in the opposite order.
+To avoid this issue and to provide a race-free method to register CPU hotplug
+callbacks (along with initialization of already online CPUs), introduce new
+variants of the callback registration APIs that simply register the callbacks
+without holding the cpu_add_remove_lock during the registration. That way,
+we can avoid the ABBA scenario. However, we will need to hold the
+cpu_add_remove_lock throughout the entire critical section, to protect updates
+to the callback/notifier chain.
+
+This can be achieved by writing the callback registration code as follows:
+
+	cpu_maps_update_begin(); [ or cpu_notifier_register_begin(); see below ]
+
+	for_each_online_cpu(cpu)
+		init_cpu(cpu);
+
+	/* This doesn't take the cpu_add_remove_lock */
+	__register_cpu_notifier(&foobar_cpu_notifier);
+
+	cpu_maps_update_done();  [ or cpu_notifier_register_done(); see below ]
+
+Note that we can't use get_online_cpus() here instead of cpu_maps_update_begin()
+because the cpu_hotplug.lock is dropped during the invocation of CPU_POST_DEAD
+notifiers, and hence get_online_cpus() cannot provide the necessary
+synchronization to protect the callback/notifier chains against concurrent
+reads and writes. On the other hand, since the cpu_add_remove_lock protects
+the entire hotplug operation (including CPU_POST_DEAD), we can use
+cpu_maps_update_begin/done() to guarantee proper synchronization.
+
+Also, since cpu_maps_update_begin/done() is like a super-set of
+get/put_online_cpus(), the former naturally protects the critical sections
+from concurrent hotplug operations.
+
+Since the names cpu_maps_update_begin/done() don't make much sense in CPU
+hotplug callback registration scenarios, we'll introduce new APIs named
+cpu_notifier_register_begin/done() and map them to cpu_maps_update_begin/done().
+
+In summary, introduce the lockless variants of un/register_cpu_notifier() and
+also export the cpu_notifier_register_begin/done() APIs for use by modules.
+This way, we provide a race-free way to register hotplug callbacks as well as
+perform initialization for the CPUs that are already online.
+
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Ingo Molnar <mingo@kernel.org>
+Acked-by: Oleg Nesterov <oleg@redhat.com>
+Acked-by: Toshi Kani <toshi.kani@hp.com>
+Reviewed-by: Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

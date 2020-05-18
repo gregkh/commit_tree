@@ -1,0 +1,102 @@
+cgroup: Assign subsystem IDs during compile time
+
+WARNING: With this change it is impossible to load external built
+controllers anymore.
+
+In case where CONFIG_NETPRIO_CGROUP=m and CONFIG_NET_CLS_CGROUP=m is
+set, corresponding subsys_id should also be a constant. Up to now,
+net_prio_subsys_id and net_cls_subsys_id would be of the type int and
+the value would be assigned during runtime.
+
+By switching the macro definition IS_SUBSYS_ENABLED from IS_BUILTIN
+to IS_ENABLED, all *_subsys_id will have constant value. That means we
+need to remove all the code which assumes a value can be assigned to
+net_prio_subsys_id and net_cls_subsys_id.
+
+A close look is necessary on the RCU part which was introduces by
+following patch:
+
+  commit f845172531fb7410c7fb7780b1a6e51ee6df7d52
+  Author:	Herbert Xu <herbert@gondor.apana.org.au>  Mon May 24 09:12:34 2010
+  Committer:	David S. Miller <davem@davemloft.net>  Mon May 24 09:12:34 2010
+
+  cls_cgroup: Store classid in struct sock
+
+  Tis code was added to init_cgroup_cls()
+
+	  /* We can't use rcu_assign_pointer because this is an int. */
+	  smp_wmb();
+	  net_cls_subsys_id = net_cls_subsys.subsys_id;
+
+  respectively to exit_cgroup_cls()
+
+	  net_cls_subsys_id = -1;
+	  synchronize_rcu();
+
+  and in module version of task_cls_classid()
+
+	  rcu_read_lock();
+	  id = rcu_dereference(net_cls_subsys_id);
+	  if (id >= 0)
+		  classid = container_of(task_subsys_state(p, id),
+					 struct cgroup_cls_state, css)->classid;
+	  rcu_read_unlock();
+
+Without an explicit explaination why the RCU part is needed. (The
+rcu_deference was fixed by exchanging it to rcu_derefence_index_check()
+in a later commit, but that is a minor detail.)
+
+So here is my pondering why it was introduced and why it safe to
+remove it now. Note that this code was copied over to net_prio the
+reasoning holds for that subsystem too.
+
+The idea behind the RCU use for net_cls_subsys_id is to make sure we
+get a valid pointer back from task_subsys_state(). task_subsys_state()
+is just blindly accessing the subsys array and returning the
+pointer. Obviously, passing in -1 as id into task_subsys_state()
+returns an invalid value (out of lower bound).
+
+So this code makes sure that only after module is loaded and the
+subsystem registered, the id is assigned.
+
+Before unregistering the module all old readers must have left the
+critical section. This is done by assigning -1 to the id and issuing a
+synchronized_rcu(). Any new readers wont call task_subsys_state()
+anymore and therefore it is safe to unregister the subsystem.
+
+The new code relies on the same trick, but it looks at the subsys
+pointer return by task_subsys_state() (remember the id is constant
+and therefore we allways have a valid index into the subsys
+array).
+
+No precautions need to be taken during module loading
+module. Eventually, all CPUs will get a valid pointer back from
+task_subsys_state() because rebind_subsystem() which is called after
+the module init() function will assigned subsys[net_cls_subsys_id] the
+newly loaded module subsystem pointer.
+
+When the subsystem is about to be removed, rebind_subsystem() will
+called before the module exit() function. In this case,
+rebind_subsys() will assign subsys[net_cls_subsys_id] a NULL pointer
+and then it calls synchronize_rcu(). All old readers have left by then
+the critical section. Any new reader wont access the subsystem
+anymore.  At this point we are safe to unregister the subsystem. No
+synchronize_rcu() call is needed.
+
+Signed-off-by: Daniel Wagner <daniel.wagner@bmw-carit.de>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Acked-by: Li Zefan <lizefan@huawei.com>
+Acked-by: Neil Horman <nhorman@tuxdriver.com>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Gao feng <gaofeng@cn.fujitsu.com>
+Cc: Glauber Costa <glommer@parallels.com>
+Cc: Herbert Xu <herbert@gondor.apana.org.au>
+Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+Cc: John Fastabend <john.r.fastabend@intel.com>
+Cc: Kamezawa Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: netdev@vger.kernel.org
+Cc: cgroups@vger.kernel.org
+

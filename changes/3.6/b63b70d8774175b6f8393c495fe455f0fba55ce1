@@ -1,0 +1,81 @@
+IPoIB: Use a private hash table for path lookup in xmit path
+
+Dave Miller <davem@davemloft.net> provided a detailed description of
+why the way IPoIB is using neighbours for its own ipoib_neigh struct
+is buggy:
+
+    Any time an ipoib_neigh is changed, a sequence like the following is made:
+
+    			spin_lock_irqsave(&priv->lock, flags);
+    			/*
+    			 * It's safe to call ipoib_put_ah() inside
+    			 * priv->lock here, because we know that
+    			 * path->ah will always hold one more reference,
+    			 * so ipoib_put_ah() will never do more than
+    			 * decrement the ref count.
+    			 */
+    			if (neigh->ah)
+    				ipoib_put_ah(neigh->ah);
+    			list_del(&neigh->list);
+    			ipoib_neigh_free(dev, neigh);
+    			spin_unlock_irqrestore(&priv->lock, flags);
+    			ipoib_path_lookup(skb, n, dev);
+
+    This doesn't work, because you're leaving a stale pointer to the freed up
+    ipoib_neigh in the special neigh->ha pointer cookie.  Yes, it even fails
+    with all the locking done to protect _changes_ to *ipoib_neigh(n), and
+    with the code in ipoib_neigh_free() that NULLs out the pointer.
+
+    The core issue is that read side calls to *to_ipoib_neigh(n) are not
+    being synchronized at all, they are performed without any locking.  So
+    whether we hold the lock or not when making changes to *ipoib_neigh(n)
+    you still can have threads see references to freed up ipoib_neigh
+    objects.
+
+    	cpu 1			cpu 2
+    	n = *ipoib_neigh()
+    				*ipoib_neigh() = NULL
+    				kfree(n)
+    	n->foo == OOPS
+
+    [..]
+
+    Perhaps the ipoib code can have a private path database it manages
+    entirely itself, which holds all the necessary information and is
+    looked up by some generic key which is available easily at transmit
+    time and does not involve generic neighbour entries.
+
+See <http://marc.info/?l=linux-rdma&m=132812793105624&w=2> and
+<http://marc.info/?l=linux-rdma&w=2&r=1&s=allows+references+to+freed+memory&q=b>
+for the full discussion.
+
+This patch aims to solve the race conditions found in the IPoIB driver.
+
+The patch removes the connection between the core networking neighbour
+structure and the ipoib_neigh structure.  In addition to avoiding the
+race described above, it allows us to handle SKBs carrying IP packets
+that don't have any associated neighbour.
+
+We add an ipoib_neigh hash table with N buckets where the key is the
+destination hardware address.  The ipoib_neigh is fetched from the
+hash table and instead of the stashed location in the neighbour
+structure. The hash table uses both RCU and reference counting to
+guarantee that no ipoib_neigh instance is ever deleted while in use.
+
+Fetching the ipoib_neigh structure instance from the hash also makes
+the special code in ipoib_start_xmit that handles remote and local
+bonding failover redundant.
+
+Aged ipoib_neigh instances are deleted by a garbage collection task
+that runs every M seconds and deletes every ipoib_neigh instance that
+was idle for at least 2*M seconds. The deletion is safe since the
+ipoib_neigh instances are protected using RCU and reference count
+mechanisms.
+
+The number of buckets (N) and frequency of running the GC thread (M),
+are taken from the exported arb_tbl.
+
+Signed-off-by: Shlomo Pongratz <shlomop@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+

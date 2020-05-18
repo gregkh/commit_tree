@@ -1,0 +1,62 @@
+memory-hotplug: fix kswapd looping forever problem
+
+When hotplug offlining happens on zone A, it starts to mark freed page as
+MIGRATE_ISOLATE type in buddy for preventing further allocation.
+(MIGRATE_ISOLATE is very irony type because it's apparently on buddy but
+we can't allocate them).
+
+When the memory shortage happens during hotplug offlining, current task
+starts to reclaim, then wake up kswapd.  Kswapd checks watermark, then go
+sleep because current zone_watermark_ok_safe doesn't consider
+MIGRATE_ISOLATE freed page count.  Current task continue to reclaim in
+direct reclaim path without kswapd's helping.  The problem is that
+zone->all_unreclaimable is set by only kswapd so that current task would
+be looping forever like below.
+
+__alloc_pages_slowpath
+restart:
+	wake_all_kswapd
+rebalance:
+	__alloc_pages_direct_reclaim
+		do_try_to_free_pages
+			if global_reclaim && !all_unreclaimable
+				return 1; /* It means we did did_some_progress */
+	skip __alloc_pages_may_oom
+	should_alloc_retry
+		goto rebalance;
+
+If we apply KOSAKI's patch[1] which doesn't depends on kswapd about
+setting zone->all_unreclaimable, we can solve this problem by killing some
+task in direct reclaim path.  But it doesn't wake up kswapd, still.  It
+could be a problem still if other subsystem needs GFP_ATOMIC request.  So
+kswapd should consider MIGRATE_ISOLATE when it calculate free pages BEFORE
+going sleep.
+
+This patch counts the number of MIGRATE_ISOLATE page block and
+zone_watermark_ok_safe will consider it if the system has such blocks
+(fortunately, it's very rare so no problem in POV overhead and kswapd is
+never hotpath).
+
+Copy/modify from Mel's quote
+"
+Ideal solution would be "allocating" the pageblock.
+It would keep the free space accounting as it is but historically,
+memory hotplug didn't allocate pages because it would be difficult to
+detect if a pageblock was isolated or if part of some balloon.
+Allocating just full pageblocks would work around this, However,
+it would play very badly with CMA.
+"
+
+[1] http://lkml.org/lkml/2012/6/14/74
+
+[akpm@linux-foundation.org: simplify nr_zone_isolate_freepages(), rework zone_watermark_ok_safe() comment, simplify set_pageblock_isolate() and restore_pageblock_isolate()]
+[akpm@linux-foundation.org: fix CONFIG_MEMORY_ISOLATION=n build]
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Suggested-by: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+Tested-by: Aaditya Kumar <aaditya.kumar.30@gmail.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Michal Hocko <mhocko@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

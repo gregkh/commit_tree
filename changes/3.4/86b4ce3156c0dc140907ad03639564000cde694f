@@ -1,0 +1,101 @@
+x86/kprobes: Fix instruction recovery on optimized path
+
+Current probed-instruction recovery expects that only breakpoint
+instruction modifies instruction. However, since kprobes jump
+optimization can replace original instructions with a jump,
+that expectation is not enough. And it may cause instruction
+decoding failure on the function where an optimized probe
+already exists.
+
+This bug can reproduce easily as below:
+
+1) find a target function address (any kprobe-able function is OK)
+
+ $ grep __secure_computing /proc/kallsyms
+   ffffffff810c19d0 T __secure_computing
+
+2) decode the function
+   $ objdump -d vmlinux --start-address=0xffffffff810c19d0 --stop-address=0xffffffff810c19eb
+
+  vmlinux:     file format elf64-x86-64
+
+Disassembly of section .text:
+
+ffffffff810c19d0 <__secure_computing>:
+ffffffff810c19d0:       55                      push   %rbp
+ffffffff810c19d1:       48 89 e5                mov    %rsp,%rbp
+ffffffff810c19d4:       e8 67 8f 72 00          callq
+ffffffff817ea940 <mcount>
+ffffffff810c19d9:       65 48 8b 04 25 40 b8    mov    %gs:0xb840,%rax
+ffffffff810c19e0:       00 00
+ffffffff810c19e2:       83 b8 88 05 00 00 01    cmpl $0x1,0x588(%rax)
+ffffffff810c19e9:       74 05                   je     ffffffff810c19f0 <__secure_computing+0x20>
+
+3) put a kprobe-event at an optimize-able place, where no
+ call/jump places within the 5 bytes.
+ $ su -
+ # cd /sys/kernel/debug/tracing
+ # echo p __secure_computing+0x9 > kprobe_events
+
+4) enable it and check it is optimized.
+ # echo 1 > events/kprobes/p___secure_computing_9/enable
+ # cat ../kprobes/list
+ ffffffff810c19d9  k  __secure_computing+0x9    [OPTIMIZED]
+
+5) put another kprobe on an instruction after previous probe in
+  the same function.
+ # echo p __secure_computing+0x12 >> kprobe_events
+ bash: echo: write error: Invalid argument
+ # dmesg | tail -n 1
+ [ 1666.500016] Probing address(0xffffffff810c19e2) is not an instruction boundary.
+
+6) however, if the kprobes optimization is disabled, it works.
+ # echo 0 > /proc/sys/debug/kprobes-optimization
+ # cat ../kprobes/list
+ ffffffff810c19d9  k  __secure_computing+0x9
+ # echo p __secure_computing+0x12 >> kprobe_events
+ (no error)
+
+This is because kprobes doesn't recover the instruction
+which is overwritten with a relative jump by another kprobe
+when finding instruction boundary.
+It only recovers the breakpoint instruction.
+
+This patch fixes kprobes to recover such instructions.
+
+With this fix:
+
+ # echo p __secure_computing+0x9 > kprobe_events
+ # echo 1 > events/kprobes/p___secure_computing_9/enable
+ # cat ../kprobes/list
+ ffffffff810c1aa9  k  __secure_computing+0x9    [OPTIMIZED]
+ # echo p __secure_computing+0x12 >> kprobe_events
+ # cat ../kprobes/list
+ ffffffff810c1aa9  k  __secure_computing+0x9    [OPTIMIZED]
+ ffffffff810c1ab2  k  __secure_computing+0x12    [DISABLED]
+
+Changes in v4:
+ - Fix a bug to ensure optimized probe is really optimized
+   by jump.
+ - Remove kprobe_optready() dependency.
+ - Cleanup code for preparing optprobe separation.
+
+Changes in v3:
+ - Fix a build error when CONFIG_OPTPROBE=n. (Thanks, Ingo!)
+   To fix the error, split optprobe instruction recovering
+   path from kprobes path.
+ - Cleanup comments/styles.
+
+Changes in v2:
+ - Fix a bug to recover original instruction address in
+   RIP-relative instruction fixup.
+ - Moved on tip/master.
+
+Signed-off-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Cc: Ananth N Mavinakayanahalli <ananth@in.ibm.com>
+Cc: yrl.pp-manager.tt@hitachi.com
+Cc: systemtap@sourceware.org
+Cc: anderson@redhat.com
+Link: http://lkml.kernel.org/r/20120305133209.5982.36568.stgit@localhost.localdomain
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
