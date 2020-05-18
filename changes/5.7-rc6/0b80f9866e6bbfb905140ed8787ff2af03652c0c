@@ -1,0 +1,44 @@
+iocost: protect iocg->abs_vdebt with iocg->waitq.lock
+
+abs_vdebt is an atomic_64 which tracks how much over budget a given cgroup
+is and controls the activation of use_delay mechanism. Once a cgroup goes
+over budget from forced IOs, it has to pay it back with its future budget.
+The progress guarantee on debt paying comes from the iocg being active -
+active iocgs are processed by the periodic timer, which ensures that as time
+passes the debts dissipate and the iocg returns to normal operation.
+
+However, both iocg activation and vdebt handling are asynchronous and a
+sequence like the following may happen.
+
+1. The iocg is in the process of being deactivated by the periodic timer.
+
+2. A bio enters ioc_rqos_throttle(), calls iocg_activate() which returns
+   without anything because it still sees that the iocg is already active.
+
+3. The iocg is deactivated.
+
+4. The bio from #2 is over budget but needs to be forced. It increases
+   abs_vdebt and goes over the threshold and enables use_delay.
+
+5. IO control is enabled for the iocg's subtree and now IOs are attributed
+   to the descendant cgroups and the iocg itself no longer issues IOs.
+
+This leaves the iocg with stuck abs_vdebt - it has debt but inactive and no
+further IOs which can activate it. This can end up unduly punishing all the
+descendants cgroups.
+
+The usual throttling path has the same issue - the iocg must be active while
+throttled to ensure that future event will wake it up - and solves the
+problem by synchronizing the throttling path with a spinlock. abs_vdebt
+handling is another form of overage handling and shares a lot of
+characteristics including the fact that it isn't in the hottest path.
+
+This patch fixes the above and other possible races by strictly
+synchronizing abs_vdebt and use_delay handling with iocg->waitq.lock.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Vlad Dmitriev <vvd@fb.com>
+Cc: stable@vger.kernel.org # v5.4+
+Fixes: e1518f63f246 ("blk-iocost: Don't let merges push vtime into the future")
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

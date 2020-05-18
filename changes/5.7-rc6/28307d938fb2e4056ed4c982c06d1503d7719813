@@ -1,0 +1,192 @@
+percpu: make pcpu_alloc() aware of current gfp context
+
+Since 5.7-rc1, on btrfs we have a percpu counter initialization for
+which we always pass a GFP_KERNEL gfp_t argument (this happens since
+commit 2992df73268f78 ("btrfs: Implement DREW lock")).
+
+That is safe in some contextes but not on others where allowing fs
+reclaim could lead to a deadlock because we are either holding some
+btrfs lock needed for a transaction commit or holding a btrfs
+transaction handle open.  Because of that we surround the call to the
+function that initializes the percpu counter with a NOFS context using
+memalloc_nofs_save() (this is done at btrfs_init_fs_root()).
+
+However it turns out that this is not enough to prevent a possible
+deadlock because percpu_alloc() determines if it is in an atomic context
+by looking exclusively at the gfp flags passed to it (GFP_KERNEL in this
+case) and it is not aware that a NOFS context is set.
+
+Because percpu_alloc() thinks it is in a non atomic context it locks the
+pcpu_alloc_mutex.  This can result in a btrfs deadlock when
+pcpu_balance_workfn() is running, has acquired that mutex and is waiting
+for reclaim, while the btrfs task that called percpu_counter_init() (and
+therefore percpu_alloc()) is holding either the btrfs commit_root
+semaphore or a transaction handle (done fs/btrfs/backref.c:
+iterate_extent_inodes()), which prevents reclaim from finishing as an
+attempt to commit the current btrfs transaction will deadlock.
+
+Lockdep reports this issue with the following trace:
+
+  ======================================================
+  WARNING: possible circular locking dependency detected
+  5.6.0-rc7-btrfs-next-77 #1 Not tainted
+  ------------------------------------------------------
+  kswapd0/91 is trying to acquire lock:
+  ffff8938a3b3fdc8 (&delayed_node->mutex){+.+.}, at: __btrfs_release_delayed_node.part.0+0x3f/0x320 [btrfs]
+
+  but task is already holding lock:
+  ffffffffb4f0dbc0 (fs_reclaim){+.+.}, at: __fs_reclaim_acquire+0x5/0x30
+
+  which lock already depends on the new lock.
+
+  the existing dependency chain (in reverse order) is:
+
+  -> #4 (fs_reclaim){+.+.}:
+         fs_reclaim_acquire.part.0+0x25/0x30
+         __kmalloc+0x5f/0x3a0
+         pcpu_create_chunk+0x19/0x230
+         pcpu_balance_workfn+0x56a/0x680
+         process_one_work+0x235/0x5f0
+         worker_thread+0x50/0x3b0
+         kthread+0x120/0x140
+         ret_from_fork+0x3a/0x50
+
+  -> #3 (pcpu_alloc_mutex){+.+.}:
+         __mutex_lock+0xa9/0xaf0
+         pcpu_alloc+0x480/0x7c0
+         __percpu_counter_init+0x50/0xd0
+         btrfs_drew_lock_init+0x22/0x70 [btrfs]
+         btrfs_get_fs_root+0x29c/0x5c0 [btrfs]
+         resolve_indirect_refs+0x120/0xa30 [btrfs]
+         find_parent_nodes+0x50b/0xf30 [btrfs]
+         btrfs_find_all_leafs+0x60/0xb0 [btrfs]
+         iterate_extent_inodes+0x139/0x2f0 [btrfs]
+         iterate_inodes_from_logical+0xa1/0xe0 [btrfs]
+         btrfs_ioctl_logical_to_ino+0xb4/0x190 [btrfs]
+         btrfs_ioctl+0x165a/0x3130 [btrfs]
+         ksys_ioctl+0x87/0xc0
+         __x64_sys_ioctl+0x16/0x20
+         do_syscall_64+0x5c/0x260
+         entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+  -> #2 (&fs_info->commit_root_sem){++++}:
+         down_write+0x38/0x70
+         btrfs_cache_block_group+0x2ec/0x500 [btrfs]
+         find_free_extent+0xc6a/0x1600 [btrfs]
+         btrfs_reserve_extent+0x9b/0x180 [btrfs]
+         btrfs_alloc_tree_block+0xc1/0x350 [btrfs]
+         alloc_tree_block_no_bg_flush+0x4a/0x60 [btrfs]
+         __btrfs_cow_block+0x122/0x5a0 [btrfs]
+         btrfs_cow_block+0x106/0x240 [btrfs]
+         commit_cowonly_roots+0x55/0x310 [btrfs]
+         btrfs_commit_transaction+0x509/0xb20 [btrfs]
+         sync_filesystem+0x74/0x90
+         generic_shutdown_super+0x22/0x100
+         kill_anon_super+0x14/0x30
+         btrfs_kill_super+0x12/0x20 [btrfs]
+         deactivate_locked_super+0x31/0x70
+         cleanup_mnt+0x100/0x160
+         task_work_run+0x93/0xc0
+         exit_to_usermode_loop+0xf9/0x100
+         do_syscall_64+0x20d/0x260
+         entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+  -> #1 (&space_info->groups_sem){++++}:
+         down_read+0x3c/0x140
+         find_free_extent+0xef6/0x1600 [btrfs]
+         btrfs_reserve_extent+0x9b/0x180 [btrfs]
+         btrfs_alloc_tree_block+0xc1/0x350 [btrfs]
+         alloc_tree_block_no_bg_flush+0x4a/0x60 [btrfs]
+         __btrfs_cow_block+0x122/0x5a0 [btrfs]
+         btrfs_cow_block+0x106/0x240 [btrfs]
+         btrfs_search_slot+0x50c/0xd60 [btrfs]
+         btrfs_lookup_inode+0x3a/0xc0 [btrfs]
+         __btrfs_update_delayed_inode+0x90/0x280 [btrfs]
+         __btrfs_commit_inode_delayed_items+0x81f/0x870 [btrfs]
+         __btrfs_run_delayed_items+0x8e/0x180 [btrfs]
+         btrfs_commit_transaction+0x31b/0xb20 [btrfs]
+         iterate_supers+0x87/0xf0
+         ksys_sync+0x60/0xb0
+         __ia32_sys_sync+0xa/0x10
+         do_syscall_64+0x5c/0x260
+         entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+  -> #0 (&delayed_node->mutex){+.+.}:
+         __lock_acquire+0xef0/0x1c80
+         lock_acquire+0xa2/0x1d0
+         __mutex_lock+0xa9/0xaf0
+         __btrfs_release_delayed_node.part.0+0x3f/0x320 [btrfs]
+         btrfs_evict_inode+0x40d/0x560 [btrfs]
+         evict+0xd9/0x1c0
+         dispose_list+0x48/0x70
+         prune_icache_sb+0x54/0x80
+         super_cache_scan+0x124/0x1a0
+         do_shrink_slab+0x176/0x440
+         shrink_slab+0x23a/0x2c0
+         shrink_node+0x188/0x6e0
+         balance_pgdat+0x31d/0x7f0
+         kswapd+0x238/0x550
+         kthread+0x120/0x140
+         ret_from_fork+0x3a/0x50
+
+  other info that might help us debug this:
+
+  Chain exists of:
+    &delayed_node->mutex --> pcpu_alloc_mutex --> fs_reclaim
+
+   Possible unsafe locking scenario:
+
+         CPU0                    CPU1
+         ----                    ----
+    lock(fs_reclaim);
+                                 lock(pcpu_alloc_mutex);
+                                 lock(fs_reclaim);
+    lock(&delayed_node->mutex);
+
+   *** DEADLOCK ***
+
+  3 locks held by kswapd0/91:
+   #0: (fs_reclaim){+.+.}, at: __fs_reclaim_acquire+0x5/0x30
+   #1: (shrinker_rwsem){++++}, at: shrink_slab+0x12f/0x2c0
+   #2: (&type->s_umount_key#43){++++}, at: trylock_super+0x16/0x50
+
+  stack backtrace:
+  CPU: 1 PID: 91 Comm: kswapd0 Not tainted 5.6.0-rc7-btrfs-next-77 #1
+  Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.12.0-0-ga698c8995f-prebuilt.qemu.org 04/01/2014
+  Call Trace:
+   dump_stack+0x8f/0xd0
+   check_noncircular+0x170/0x190
+   __lock_acquire+0xef0/0x1c80
+   lock_acquire+0xa2/0x1d0
+   __mutex_lock+0xa9/0xaf0
+   __btrfs_release_delayed_node.part.0+0x3f/0x320 [btrfs]
+   btrfs_evict_inode+0x40d/0x560 [btrfs]
+   evict+0xd9/0x1c0
+   dispose_list+0x48/0x70
+   prune_icache_sb+0x54/0x80
+   super_cache_scan+0x124/0x1a0
+   do_shrink_slab+0x176/0x440
+   shrink_slab+0x23a/0x2c0
+   shrink_node+0x188/0x6e0
+   balance_pgdat+0x31d/0x7f0
+   kswapd+0x238/0x550
+   kthread+0x120/0x140
+   ret_from_fork+0x3a/0x50
+
+This could be fixed by making btrfs pass GFP_NOFS instead of GFP_KERNEL
+to percpu_counter_init() in contextes where it is not reclaim safe,
+however that type of approach is discouraged since
+memalloc_[nofs|noio]_save() were introduced.  Therefore this change
+makes pcpu_alloc() look up into an existing nofs/noio context before
+deciding whether it is in an atomic context or not.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Tejun Heo <tj@kernel.org>
+Acked-by: Dennis Zhou <dennis@kernel.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Christoph Lameter <cl@linux.com>
+Link: http://lkml.kernel.org/r/20200430164356.15543-1-fdmanana@kernel.org
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

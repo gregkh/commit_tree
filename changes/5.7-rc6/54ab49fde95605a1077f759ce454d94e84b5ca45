@@ -1,0 +1,53 @@
+netfilter: conntrack: fix infinite loop on rmmod
+
+'rmmod nf_conntrack' can hang forever, because the netns exit
+gets stuck in nf_conntrack_cleanup_net_list():
+
+i_see_dead_people:
+ busy = 0;
+ list_for_each_entry(net, net_exit_list, exit_list) {
+  nf_ct_iterate_cleanup(kill_all, net, 0, 0);
+  if (atomic_read(&net->ct.count) != 0)
+   busy = 1;
+ }
+ if (busy) {
+  schedule();
+  goto i_see_dead_people;
+ }
+
+When nf_ct_iterate_cleanup iterates the conntrack table, all nf_conn
+structures can be found twice:
+once for the original tuple and once for the conntracks reply tuple.
+
+get_next_corpse() only calls the iterator when the entry is
+in original direction -- the idea was to avoid unneeded invocations
+of the iterator callback.
+
+When support for clashing entries was added, the assumption that
+all nf_conn objects are added twice, once in original, once for reply
+tuple no longer holds -- NF_CLASH_BIT entries are only added in
+the non-clashing reply direction.
+
+Thus, if at least one NF_CLASH entry is in the list then
+nf_conntrack_cleanup_net_list() always skips it completely.
+
+During normal netns destruction, this causes a hang of several
+seconds, until the gc worker removes the entry (NF_CLASH entries
+always have a 1 second timeout).
+
+But in the rmmod case, the gc worker has already been stopped, so
+ct.count never becomes 0.
+
+We can fix this in two ways:
+
+1. Add a second test for CLASH_BIT and call iterator for those
+   entries as well, or:
+2. Skip the original tuple direction and use the reply tuple.
+
+2) is simpler, so do that.
+
+Fixes: 6a757c07e51f80ac ("netfilter: conntrack: allow insertion of clashing entries")
+Reported-by: Chen Yi <yiche@redhat.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
