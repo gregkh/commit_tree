@@ -1,0 +1,2348 @@
+commit f6101957e6e019e69b62e20d1f59c082068c9ca7
+Author: Jiri Slaby <jslaby@suse.cz>
+Date:   Thu Jan 8 12:52:02 2015 +0100
+
+    Linux 3.12.36
+
+commit 198717b635ef0d51525f7b2c8282a05a00a42c51
+Author: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Date:   Fri Apr 18 15:07:25 2014 -0700
+
+    thp: close race between split and zap huge pages
+    
+    commit b5a8cad376eebbd8598642697e92a27983aee802 upstream.
+    
+    [stable 3.12 note]
+    This commit was supposed to fix a completely other issue. But in 3.12,
+    with commit f72e7dcdd25229446b102e587ef2f826f76bff28 (mm: let
+    mm_find_pmd fix buggy race with THP fault), we need this commit as
+    well (it fixes the issue as a by-product). Hugh Dickins writes:
+    <== citation starts here>
+    Fine for this to go in, but there is one catch, which I discovered
+    when backporting to v3.11: it needed one more hunk.  I haven't checked
+    your base tree, but if this applies then I believe you need it - most
+    of the time no problem, but it can case page migration to fail to find
+    a migration entry it inserted earlier, then BUG_ON(!PageLocked(p)) in
+    migration_entry_to_page() soon after.  Here's what I wrote back then:
+    
+    Note on rebase to v3.11: added a hunk to replace the use of
+    mm_find_pmd() in page_check_address_pmd().  This call had been
+    similarly replaced by the time of my v3.16 commit, in Kirill
+    Shutemov's v3.15 b5a8cad376ee ("thp: close race between split and zap
+    huge pages"): which we do not need as such, since it's fixing v3.13
+    117b0791ac42 ("mm, thp: move ptl taking inside
+    page_check_address_pmd()"), from a split page-table-lock series we are
+    not backporting.  But without this additional hunk, rmap sometimes
+    broke when the new semantic for mm_find_pmd() was used here.
+    <== end of citation>
+    
+    But instead of appending hunks to commits, I am taking a full,
+    backported version of commit b5a8cad376ee with this note prepended.
+    
+    So the changelog of b5a8cad376ee is left below, but does not apply to
+    3.12 yet.
+    [=== stable 3.12 note ends here]
+    
+    Sasha Levin has reported two THP BUGs[1][2].  I believe both of them
+    have the same root cause.  Let's look to them one by one.
+    
+    The first bug[1] is "kernel BUG at mm/huge_memory.c:1829!".  It's
+    BUG_ON(mapcount != page_mapcount(page)) in __split_huge_page().  From my
+    testing I see that page_mapcount() is higher than mapcount here.
+    
+    I think it happens due to race between zap_huge_pmd() and
+    page_check_address_pmd().  page_check_address_pmd() misses PMD which is
+    under zap:
+    
+            CPU0                                            CPU1
+                                                    zap_huge_pmd()
+                                                      pmdp_get_and_clear()
+    __split_huge_page()
+      anon_vma_interval_tree_foreach()
+        __split_huge_page_splitting()
+          page_check_address_pmd()
+            mm_find_pmd()
+              /*
+               * We check if PMD present without taking ptl: no
+               * serialization against zap_huge_pmd(). We miss this PMD,
+               * it's not accounted to 'mapcount' in __split_huge_page().
+               */
+              pmd_present(pmd) == 0
+    
+      BUG_ON(mapcount != page_mapcount(page)) // CRASH!!!
+    
+                                                      page_remove_rmap(page)
+                                                        atomic_add_negative(-1, &page->_mapcount)
+    
+    The second bug[2] is "kernel BUG at mm/huge_memory.c:1371!".
+    It's VM_BUG_ON_PAGE(!PageHead(page), page) in zap_huge_pmd().
+    
+    This happens in similar way:
+    
+            CPU0                                            CPU1
+                                                    zap_huge_pmd()
+                                                      pmdp_get_and_clear()
+                                                      page_remove_rmap(page)
+                                                        atomic_add_negative(-1, &page->_mapcount)
+    __split_huge_page()
+      anon_vma_interval_tree_foreach()
+        __split_huge_page_splitting()
+          page_check_address_pmd()
+            mm_find_pmd()
+              pmd_present(pmd) == 0 /* The same comment as above */
+      /*
+       * No crash this time since we already decremented page->_mapcount in
+       * zap_huge_pmd().
+       */
+      BUG_ON(mapcount != page_mapcount(page))
+    
+      /*
+       * We split the compound page here into small pages without
+       * serialization against zap_huge_pmd()
+       */
+      __split_huge_page_refcount()
+                                                    VM_BUG_ON_PAGE(!PageHead(page), page); // CRASH!!!
+    
+    So my understanding the problem is pmd_present() check in mm_find_pmd()
+    without taking page table lock.
+    
+    The bug was introduced by me commit with commit 117b0791ac42. Sorry for
+    that. :(
+    
+    Let's open code mm_find_pmd() in page_check_address_pmd() and do the
+    check under page table lock.
+    
+    Note that __page_check_address() does the same for PTE entires
+    if sync != 0.
+    
+    I've stress tested split and zap code paths for 36+ hours by now and
+    don't see crashes with the patch applied. Before it took <20 min to
+    trigger the first bug and few hours for second one (if we ignore
+    first).
+    
+    [1] https://lkml.kernel.org/g/<53440991.9090001@oracle.com>
+    [2] https://lkml.kernel.org/g/<5310C56C.60709@oracle.com>
+    
+    Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+    Reported-by: Sasha Levin <sasha.levin@oracle.com>
+    Tested-by: Sasha Levin <sasha.levin@oracle.com>
+    Cc: Bob Liu <lliubbo@gmail.com>
+    Cc: Andrea Arcangeli <aarcange@redhat.com>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Mel Gorman <mgorman@suse.de>
+    Cc: Michel Lespinasse <walken@google.com>
+    Cc: Dave Jones <davej@redhat.com>
+    Cc: Vlastimil Babka <vbabka@suse.cz>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 05d75f8aa3a9227b5180354671dff77c9a72d0bf
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Mon Feb 3 14:29:03 2014 +0100
+
+    perf/x86: Correctly use FEATURE_PDCM
+    
+    commit c9b08884c9c98929ec2d8abafd78e89062d01ee7 upstream.
+    
+    The current code simply assumes Intel Arch PerfMon v2+ to have
+    the IA32_PERF_CAPABILITIES MSR; the SDM specifies that we should check
+    CPUID[1].ECX[15] (aka, FEATURE_PDCM) instead.
+    
+    This was found by KVM which implements v2+ but didn't provide the
+    capabilities MSR. Change the code to DTRT; KVM will also implement the
+    MSR and return 0.
+    
+    Cc: pbonzini@redhat.com
+    Reported-by: "Michael S. Tsirkin" <mst@redhat.com>
+    Suggested-by: Eduardo Habkost <ehabkost@redhat.com>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Link: http://lkml.kernel.org/r/20140203132903.GI8874@twins.programming.kicks-ass.net
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit e1c34dac913e87ee8d03c06d7a328a7c2137cafb
+Author: Hugh Dickins <hughd@google.com>
+Date:   Mon Jun 23 13:22:05 2014 -0700
+
+    mm: let mm_find_pmd fix buggy race with THP fault
+    
+    commit f72e7dcdd25229446b102e587ef2f826f76bff28 upstream.
+    
+    Trinity has reported:
+    
+        BUG: unable to handle kernel NULL pointer dereference at 0000000000000018
+        IP: __lock_acquire (kernel/locking/lockdep.c:3070 (discriminator 1))
+        CPU: 6 PID: 16173 Comm: trinity-c364 Tainted: G        W
+                                3.15.0-rc1-next-20140415-sasha-00020-gaa90d09 #398
+        lock_acquire (arch/x86/include/asm/current.h:14
+                      kernel/locking/lockdep.c:3602)
+        _raw_spin_lock (include/linux/spinlock_api_smp.h:143
+                        kernel/locking/spinlock.c:151)
+        remove_migration_pte (mm/migrate.c:137)
+        rmap_walk (mm/rmap.c:1628 mm/rmap.c:1699)
+        remove_migration_ptes (mm/migrate.c:224)
+        migrate_pages (mm/migrate.c:922 mm/migrate.c:960 mm/migrate.c:1126)
+        migrate_misplaced_page (mm/migrate.c:1733)
+        __handle_mm_fault (mm/memory.c:3762 mm/memory.c:3812 mm/memory.c:3925)
+        handle_mm_fault (mm/memory.c:3948)
+        __get_user_pages (mm/memory.c:1851)
+        __mlock_vma_pages_range (mm/mlock.c:255)
+        __mm_populate (mm/mlock.c:711)
+        SyS_mlockall (include/linux/mm.h:1799 mm/mlock.c:817 mm/mlock.c:791)
+    
+    I believe this comes about because, whereas collapsing and splitting THP
+    functions take anon_vma lock in write mode (which excludes concurrent
+    rmap walks), faulting THP functions (write protection and misplaced
+    NUMA) do not - and mostly they do not need to.
+    
+    But they do use a pmdp_clear_flush(), set_pmd_at() sequence which, for
+    an instant (indeed, for a long instant, given the inter-CPU TLB flush in
+    there), leaves *pmd neither present not trans_huge.
+    
+    Which can confuse a concurrent rmap walk, as when removing migration
+    ptes, seen in the dumped trace.  Although that rmap walk has a 4k page
+    to insert, anon_vmas containing THPs are in no way segregated from
+    4k-page anon_vmas, so the 4k-intent mm_find_pmd() does need to cope with
+    that instant when a trans_huge pmd is temporarily absent.
+    
+    I don't think we need strengthen the locking at the THP end: it's easily
+    handled with an ACCESS_ONCE() before testing both conditions.
+    
+    And since mm_find_pmd() had only one caller who wanted a THP rather than
+    a pmd, let's slightly repurpose it to fail when it hits a THP or
+    non-present pmd, and open code split_huge_page_address() again.
+    
+    Signed-off-by: Hugh Dickins <hughd@google.com>
+    Reported-by: Sasha Levin <sasha.levin@oracle.com>
+    Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+    Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+    Cc: Mel Gorman <mgorman@suse.de>
+    Cc: Bob Liu <bob.liu@oracle.com>
+    Cc: Christoph Lameter <cl@gentwo.org>
+    Cc: Dave Jones <davej@redhat.com>
+    Cc: David Rientjes <rientjes@google.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 0702a76da972aa3a3a7091a4e3abe833017a2904
+Author: Johan Hovold <johan@kernel.org>
+Date:   Fri Sep 26 12:55:28 2014 +0200
+
+    mfd: viperboard: Fix platform-device id collision
+    
+    commit b6684228726cc25551a43f5c0bd9c5f977f10f48 upstream.
+    
+    Allow more than one viperboard to be connected by registering with
+    PLATFORM_DEVID_AUTO instead of PLATFORM_DEVID_NONE.
+    
+    The subdevices are currently registered with PLATFORM_DEVID_NONE, which
+    will cause a name collision on the platform bus when a second viperboard
+    is plugged in:
+    
+    viperboard 1-2.4:1.0: version 0.00 found at bus 001 address 004
+    ------------[ cut here ]------------
+    WARNING: CPU: 0 PID: 181 at /home/johan/work/omicron/src/linux/fs/sysfs/dir.c:31 sysfs_warn_dup+0x74/0x84()
+    sysfs: cannot create duplicate filename '/bus/platform/devices/viperboard-gpio'
+    Modules linked in: i2c_viperboard viperboard netconsole [last unloaded: viperboard]
+    CPU: 0 PID: 181 Comm: bash Tainted: G        W      3.17.0-rc6 #1
+    [<c0016bf4>] (unwind_backtrace) from [<c0013860>] (show_stack+0x20/0x24)
+    [<c0013860>] (show_stack) from [<c04305f8>] (dump_stack+0x24/0x28)
+    [<c04305f8>] (dump_stack) from [<c0040fb4>] (warn_slowpath_common+0x80/0x98)
+    [<c0040fb4>] (warn_slowpath_common) from [<c004100c>] (warn_slowpath_fmt+0x40/0x48)
+    [<c004100c>] (warn_slowpath_fmt) from [<c016f1bc>] (sysfs_warn_dup+0x74/0x84)
+    [<c016f1bc>] (sysfs_warn_dup) from [<c016f548>] (sysfs_do_create_link_sd.isra.2+0xcc/0xd0)
+    [<c016f548>] (sysfs_do_create_link_sd.isra.2) from [<c016f588>] (sysfs_create_link+0x3c/0x48)
+    [<c016f588>] (sysfs_create_link) from [<c02867ec>] (bus_add_device+0x12c/0x1e0)
+    [<c02867ec>] (bus_add_device) from [<c0284820>] (device_add+0x410/0x584)
+    [<c0284820>] (device_add) from [<c0289440>] (platform_device_add+0xd8/0x26c)
+    [<c0289440>] (platform_device_add) from [<c02a5ae4>] (mfd_add_device+0x240/0x344)
+    [<c02a5ae4>] (mfd_add_device) from [<c02a5ce0>] (mfd_add_devices+0xb8/0x110)
+    [<c02a5ce0>] (mfd_add_devices) from [<bf00d1c8>] (vprbrd_probe+0x160/0x1b0 [viperboard])
+    [<bf00d1c8>] (vprbrd_probe [viperboard]) from [<c030c000>] (usb_probe_interface+0x1bc/0x2a8)
+    [<c030c000>] (usb_probe_interface) from [<c028768c>] (driver_probe_device+0x14c/0x3ac)
+    [<c028768c>] (driver_probe_device) from [<c02879e4>] (__driver_attach+0xa4/0xa8)
+    [<c02879e4>] (__driver_attach) from [<c0285698>] (bus_for_each_dev+0x70/0xa4)
+    [<c0285698>] (bus_for_each_dev) from [<c0287030>] (driver_attach+0x2c/0x30)
+    [<c0287030>] (driver_attach) from [<c030a288>] (usb_store_new_id+0x170/0x1ac)
+    [<c030a288>] (usb_store_new_id) from [<c030a2f8>] (new_id_store+0x34/0x3c)
+    [<c030a2f8>] (new_id_store) from [<c02853ec>] (drv_attr_store+0x30/0x3c)
+    [<c02853ec>] (drv_attr_store) from [<c016eaa8>] (sysfs_kf_write+0x5c/0x60)
+    [<c016eaa8>] (sysfs_kf_write) from [<c016dc68>] (kernfs_fop_write+0xd4/0x194)
+    [<c016dc68>] (kernfs_fop_write) from [<c010fe40>] (vfs_write+0xb4/0x1c0)
+    [<c010fe40>] (vfs_write) from [<c01104a8>] (SyS_write+0x4c/0xa0)
+    [<c01104a8>] (SyS_write) from [<c000f900>] (ret_fast_syscall+0x0/0x48)
+    ---[ end trace 98e8603c22d65817 ]---
+    viperboard 1-2.4:1.0: Failed to add mfd devices to core.
+    viperboard: probe of 1-2.4:1.0 failed with error -17
+    
+    Signed-off-by: Johan Hovold <johan@kernel.org>
+    Signed-off-by: Lee Jones <lee.jones@linaro.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 83ee596143c7f78fec7c8f36f92be2223d9a8bad
+Author: Linus Walleij <linus.walleij@linaro.org>
+Date:   Sat Oct 4 16:02:27 2014 +0200
+
+    mfd: stmpe: Fix STMPE24xx GPMR LSB
+    
+    commit 871c3cf4ea7d5baf58e0a40bce7431ca5525aa2a upstream.
+    
+    The least significat byte of the GPIO value read register
+    on the STMPE24xx series is on addres 0xA4 not 0xA5. Correct
+    against datasheet and tested on the STMPE2401 hardware.
+    
+    Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+    Signed-off-by: Lee Jones <lee.jones@linaro.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit bc5e18c1dc407bd245a190076d362ecf7975e64a
+Author: Filipe Manana <fdmanana@suse.com>
+Date:   Sun Dec 7 21:31:47 2014 +0000
+
+    Btrfs: fix fs corruption on transaction abort if device supports discard
+    
+    commit 678886bdc6378c1cbd5072da2c5a3035000214e3 upstream.
+    
+    When we abort a transaction we iterate over all the ranges marked as dirty
+    in fs_info->freed_extents[0] and fs_info->freed_extents[1], clear them
+    from those trees, add them back (unpin) to the free space caches and, if
+    the fs was mounted with "-o discard", perform a discard on those regions.
+    Also, after adding the regions to the free space caches, a fitrim ioctl call
+    can see those ranges in a block group's free space cache and perform a discard
+    on the ranges, so the same issue can happen without "-o discard" as well.
+    
+    This causes corruption, affecting one or multiple btree nodes (in the worst
+    case leaving the fs unmountable) because some of those ranges (the ones in
+    the fs_info->pinned_extents tree) correspond to btree nodes/leafs that are
+    referred by the last committed super block - breaking the rule that anything
+    that was committed by a transaction is untouched until the next transaction
+    commits successfully.
+    
+    I ran into this while running in a loop (for several hours) the fstest that
+    I recently submitted:
+    
+      [PATCH] fstests: add btrfs test to stress chunk allocation/removal and fstrim
+    
+    The corruption always happened when a transaction aborted and then fsck complained
+    like this:
+    
+       _check_btrfs_filesystem: filesystem on /dev/sdc is inconsistent
+       *** fsck.btrfs output ***
+       Check tree block failed, want=94945280, have=0
+       Check tree block failed, want=94945280, have=0
+       Check tree block failed, want=94945280, have=0
+       Check tree block failed, want=94945280, have=0
+       Check tree block failed, want=94945280, have=0
+       read block failed check_tree_block
+       Couldn't open file system
+    
+    In this case 94945280 corresponded to the root of a tree.
+    Using frace what I observed was the following sequence of steps happened:
+    
+       1) transaction N started, fs_info->pinned_extents pointed to
+          fs_info->freed_extents[0];
+    
+       2) node/eb 94945280 is created;
+    
+       3) eb is persisted to disk;
+    
+       4) transaction N commit starts, fs_info->pinned_extents now points to
+          fs_info->freed_extents[1], and transaction N completes;
+    
+       5) transaction N + 1 starts;
+    
+       6) eb is COWed, and btrfs_free_tree_block() called for this eb;
+    
+       7) eb range (94945280 to 94945280 + 16Kb) is added to
+          fs_info->pinned_extents (fs_info->freed_extents[1]);
+    
+       8) Something goes wrong in transaction N + 1, like hitting ENOSPC
+          for example, and the transaction is aborted, turning the fs into
+          readonly mode. The stack trace I got for example:
+    
+          [112065.253935]  [<ffffffff8140c7b6>] dump_stack+0x4d/0x66
+          [112065.254271]  [<ffffffff81042984>] warn_slowpath_common+0x7f/0x98
+          [112065.254567]  [<ffffffffa0325990>] ? __btrfs_abort_transaction+0x50/0x10b [btrfs]
+          [112065.261674]  [<ffffffff810429e5>] warn_slowpath_fmt+0x48/0x50
+          [112065.261922]  [<ffffffffa032949e>] ? btrfs_free_path+0x26/0x29 [btrfs]
+          [112065.262211]  [<ffffffffa0325990>] __btrfs_abort_transaction+0x50/0x10b [btrfs]
+          [112065.262545]  [<ffffffffa036b1d6>] btrfs_remove_chunk+0x537/0x58b [btrfs]
+          [112065.262771]  [<ffffffffa033840f>] btrfs_delete_unused_bgs+0x1de/0x21b [btrfs]
+          [112065.263105]  [<ffffffffa0343106>] cleaner_kthread+0x100/0x12f [btrfs]
+          (...)
+          [112065.264493] ---[ end trace dd7903a975a31a08 ]---
+          [112065.264673] BTRFS: error (device sdc) in btrfs_remove_chunk:2625: errno=-28 No space left
+          [112065.264997] BTRFS info (device sdc): forced readonly
+    
+       9) The clear kthread sees that the BTRFS_FS_STATE_ERROR bit is set in
+          fs_info->fs_state and calls btrfs_cleanup_transaction(), which in
+          turn calls btrfs_destroy_pinned_extent();
+    
+       10) Then btrfs_destroy_pinned_extent() iterates over all the ranges
+           marked as dirty in fs_info->freed_extents[], and for each one
+           it calls discard, if the fs was mounted with "-o discard", and
+           adds the range to the free space cache of the respective block
+           group;
+    
+       11) btrfs_trim_block_group(), invoked from the fitrim ioctl code path,
+           sees the free space entries and performs a discard;
+    
+       12) After an umount and mount (or fsck), our eb's location on disk was full
+           of zeroes, and it should have been untouched, because it was marked as
+           dirty in the fs_info->pinned_extents tree, and therefore used by the
+           trees that the last committed superblock points to.
+    
+    Fix this by not performing a discard and not adding the ranges to the free space
+    caches - it's useless from this point since the fs is now in readonly mode and
+    we won't write free space caches to disk anymore (otherwise we would leak space)
+    nor any new superblock. By not adding the ranges to the free space caches, it
+    prevents other code paths from allocating that space and write to it as well,
+    therefore being safer and simpler.
+    
+    This isn't a new problem, as it's been present since 2011 (git commit
+    acce952b0263825da32cf10489413dec78053347).
+    
+    Signed-off-by: Filipe Manana <fdmanana@suse.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit f25952649585cdd0643741a50d02d600fcc28ef2
+Author: Josef Bacik <jbacik@fb.com>
+Date:   Fri Nov 14 16:16:30 2014 -0500
+
+    Btrfs: do not move em to modified list when unpinning
+    
+    commit a28046956c71985046474283fa3bcd256915fb72 upstream.
+    
+    We use the modified list to keep track of which extents have been modified so we
+    know which ones are candidates for logging at fsync() time.  Newly modified
+    extents are added to the list at modification time, around the same time the
+    ordered extent is created.  We do this so that we don't have to wait for ordered
+    extents to complete before we know what we need to log.  The problem is when
+    something like this happens
+    
+    log extent 0-4k on inode 1
+    copy csum for 0-4k from ordered extent into log
+    sync log
+    commit transaction
+    log some other extent on inode 1
+    ordered extent for 0-4k completes and adds itself onto modified list again
+    log changed extents
+    see ordered extent for 0-4k has already been logged
+            at this point we assume the csum has been copied
+    sync log
+    crash
+    
+    On replay we will see the extent 0-4k in the log, drop the original 0-4k extent
+    which is the same one that we are replaying which also drops the csum, and then
+    we won't find the csum in the log for that bytenr.  This of course causes us to
+    have errors about not having csums for certain ranges of our inode.  So remove
+    the modified list manipulation in unpin_extent_cache, any modified extents
+    should have been added well before now, and we don't want them re-logged.  This
+    fixes my test that I could reliably reproduce this problem with.  Thanks,
+    
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 8ffea99d6f2be99790611282f326da95a84a8cab
+Author: Michael Halcrow <mhalcrow@google.com>
+Date:   Wed Nov 26 09:09:16 2014 -0800
+
+    eCryptfs: Remove buggy and unnecessary write in file name decode routine
+    
+    commit 942080643bce061c3dd9d5718d3b745dcb39a8bc upstream.
+    
+    Dmitry Chernenkov used KASAN to discover that eCryptfs writes past the
+    end of the allocated buffer during encrypted filename decoding. This
+    fix corrects the issue by getting rid of the unnecessary 0 write when
+    the current bit offset is 2.
+    
+    Signed-off-by: Michael Halcrow <mhalcrow@google.com>
+    Reported-by: Dmitry Chernenkov <dmitryc@google.com>
+    Suggested-by: Kees Cook <keescook@chromium.org>
+    Signed-off-by: Tyler Hicks <tyhicks@canonical.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit c1b5e3f84f560038d9a71b19d6b0db933140a613
+Author: Tyler Hicks <tyhicks@canonical.com>
+Date:   Tue Oct 7 15:51:55 2014 -0500
+
+    eCryptfs: Force RO mount when encrypted view is enabled
+    
+    commit 332b122d39c9cbff8b799007a825d94b2e7c12f2 upstream.
+    
+    The ecryptfs_encrypted_view mount option greatly changes the
+    functionality of an eCryptfs mount. Instead of encrypting and decrypting
+    lower files, it provides a unified view of the encrypted files in the
+    lower filesystem. The presence of the ecryptfs_encrypted_view mount
+    option is intended to force a read-only mount and modifying files is not
+    supported when the feature is in use. See the following commit for more
+    information:
+    
+      e77a56d [PATCH] eCryptfs: Encrypted passthrough
+    
+    This patch forces the mount to be read-only when the
+    ecryptfs_encrypted_view mount option is specified by setting the
+    MS_RDONLY flag on the superblock. Additionally, this patch removes some
+    broken logic in ecryptfs_open() that attempted to prevent modifications
+    of files when the encrypted view feature was in use. The check in
+    ecryptfs_open() was not sufficient to prevent file modifications using
+    system calls that do not operate on a file descriptor.
+    
+    Signed-off-by: Tyler Hicks <tyhicks@canonical.com>
+    Reported-by: Priya Bansal <p.bansal@samsung.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 2bf2e3b94225c76d7990acc7579fecd6306d0a3a
+Author: Jan Kara <jack@suse.cz>
+Date:   Fri Dec 19 12:21:47 2014 +0100
+
+    udf: Verify symlink size before loading it
+    
+    commit a1d47b262952a45aae62bd49cfaf33dd76c11a2c upstream.
+    
+    UDF specification allows arbitrarily large symlinks. However we support
+    only symlinks at most one block large. Check the length of the symlink
+    so that we don't access memory beyond end of the symlink block.
+    
+    Reported-by: Carl Henrik Lunde <chlunde@gmail.com>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 259c1c876ea03d24f0d8eaccb122a7733607bd34
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Wed Dec 10 15:55:25 2014 -0800
+
+    exit: pidns: alloc_pid() leaks pid_namespace if child_reaper is exiting
+    
+    commit 24c037ebf5723d4d9ab0996433cee4f96c292a4d upstream.
+    
+    alloc_pid() does get_pid_ns() beforehand but forgets to put_pid_ns() if it
+    fails because disable_pid_allocation() was called by the exiting
+    child_reaper.
+    
+    We could simply move get_pid_ns() down to successful return, but this fix
+    tries to be as trivial as possible.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Reviewed-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Cc: Aaron Tomlin <atomlin@redhat.com>
+    Cc: Pavel Emelyanov <xemul@parallels.com>
+    Cc: Serge Hallyn <serge.hallyn@ubuntu.com>
+    Cc: Sterling Alexander <stalexan@redhat.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 6186e5361e7cfdc13545f468fe65d195fcf08e5f
+Author: Jan Kara <jack@suse.cz>
+Date:   Wed Dec 10 15:52:22 2014 -0800
+
+    ncpfs: return proper error from NCP_IOC_SETROOT ioctl
+    
+    commit a682e9c28cac152e6e54c39efcf046e0c8cfcf63 upstream.
+    
+    If some error happens in NCP_IOC_SETROOT ioctl, the appropriate error
+    return value is then (in most cases) just overwritten before we return.
+    This can result in reporting success to userspace although error happened.
+    
+    This bug was introduced by commit 2e54eb96e2c8 ("BKL: Remove BKL from
+    ncpfs").  Propagate the errors correctly.
+    
+    Coverity id: 1226925.
+    
+    Fixes: 2e54eb96e2c80 ("BKL: Remove BKL from ncpfs")
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Cc: Petr Vandrovec <petr@vandrovec.name>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 4f62b27e2776ea102579e9d2fbcc9660b89caa53
+Author: Rabin Vincent <rabin.vincent@axis.com>
+Date:   Fri Dec 19 13:36:08 2014 +0100
+
+    crypto: af_alg - fix backlog handling
+    
+    commit 7e77bdebff5cb1e9876c561f69710b9ab8fa1f7e upstream.
+    
+    If a request is backlogged, it's complete() handler will get called
+    twice: once with -EINPROGRESS, and once with the final error code.
+    
+    af_alg's complete handler, unlike other users, does not handle the
+    -EINPROGRESS but instead always completes the completion that recvmsg()
+    is waiting on.  This can lead to a return to user space while the
+    request is still pending in the driver.  If userspace closes the sockets
+    before the requests are handled by the driver, this will lead to
+    use-after-frees (and potential crashes) in the kernel due to the tfm
+    having been freed.
+    
+    The crashes can be easily reproduced (for example) by reducing the max
+    queue length in cryptod.c and running the following (from
+    http://www.chronox.de/libkcapi.html) on AES-NI capable hardware:
+    
+     $ while true; do kcapi -x 1 -e -c '__ecb-aes-aesni' \
+        -k 00000000000000000000000000000000 \
+        -p 00000000000000000000000000000000 >/dev/null & done
+    
+    Signed-off-by: Rabin Vincent <rabin.vincent@axis.com>
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 5055918c73271c6c52aadeae2adf1920a13e1e36
+Author: Richard Guy Briggs <rgb@redhat.com>
+Date:   Tue Dec 23 13:02:04 2014 -0500
+
+    audit: restore AUDIT_LOGINUID unset ABI
+    
+    commit 041d7b98ffe59c59fdd639931dea7d74f9aa9a59 upstream.
+    
+    A regression was caused by commit 780a7654cee8:
+             audit: Make testing for a valid loginuid explicit.
+    (which in turn attempted to fix a regression caused by e1760bd)
+    
+    When audit_krule_to_data() fills in the rules to get a listing, there was a
+    missing clause to convert back from AUDIT_LOGINUID_SET to AUDIT_LOGINUID.
+    
+    This broke userspace by not returning the same information that was sent and
+    expected.
+    
+    The rule:
+            auditctl -a exit,never -F auid=-1
+    gives:
+            auditctl -l
+                    LIST_RULES: exit,never f24=0 syscall=all
+    when it should give:
+                    LIST_RULES: exit,never auid=-1 (0xffffffff) syscall=all
+    
+    Tag it so that it is reported the same way it was set.  Create a new
+    private flags audit_krule field (pflags) to store it that won't interact with
+    the public one from the API.
+    
+    Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+    Signed-off-by: Paul Moore <pmoore@redhat.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit dc7a80cc0095cd6d8a69d79eace72b2c6ed48364
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Tue Dec 2 13:56:30 2014 -0600
+
+    userns: Unbreak the unprivileged remount tests
+    
+    commit db86da7cb76f797a1a8b445166a15cb922c6ff85 upstream.
+    
+    A security fix in caused the way the unprivileged remount tests were
+    using user namespaces to break.  Tweak the way user namespaces are
+    being used so the test works again.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 90aca415b2917dbb16512b5299f0d5118cf0748c
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 19:36:04 2014 -0600
+
+    userns: Allow setting gid_maps without privilege when setgroups is disabled
+    
+    commit 66d2f338ee4c449396b6f99f5e75cd18eb6df272 upstream.
+    
+    Now that setgroups can be disabled and not reenabled, setting gid_map
+    without privielge can now be enabled when setgroups is disabled.
+    
+    This restores most of the functionality that was lost when unprivileged
+    setting of gid_map was removed.  Applications that use this functionality
+    will need to check to see if they use setgroups or init_groups, and if they
+    don't they can be fixed by simply disabling setgroups before writing to
+    gid_map.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 84c4e718c006d4e37e1d0a8d1928dd80927e1127
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Tue Dec 2 12:27:26 2014 -0600
+
+    userns: Add a knob to disable setgroups on a per user namespace basis
+    
+    commit 9cc46516ddf497ea16e8d7cb986ae03a0f6b92f8 upstream.
+    
+    - Expose the knob to user space through a proc file /proc/<pid>/setgroups
+    
+      A value of "deny" means the setgroups system call is disabled in the
+      current processes user namespace and can not be enabled in the
+      future in this user namespace.
+    
+      A value of "allow" means the segtoups system call is enabled.
+    
+    - Descendant user namespaces inherit the value of setgroups from
+      their parents.
+    
+    - A proc file is used (instead of a sysctl) as sysctls currently do
+      not allow checking the permissions at open time.
+    
+    - Writing to the proc file is restricted to before the gid_map
+      for the user namespace is set.
+    
+      This ensures that disabling setgroups at a user namespace
+      level will never remove the ability to call setgroups
+      from a process that already has that ability.
+    
+      A process may opt in to the setgroups disable for itself by
+      creating, entering and configuring a user namespace or by calling
+      setns on an existing user namespace with setgroups disabled.
+      Processes without privileges already can not call setgroups so this
+      is a noop.  Prodcess with privilege become processes without
+      privilege when entering a user namespace and as with any other path
+      to dropping privilege they would not have the ability to call
+      setgroups.  So this remains within the bounds of what is possible
+      without a knob to disable setgroups permanently in a user namespace.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 8af7f1447f86763c7c7d8bff54f58030723d9abb
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Tue Dec 9 14:03:14 2014 -0600
+
+    userns: Rename id_map_mutex to userns_state_mutex
+    
+    commit f0d62aec931e4ae3333c797d346dc4f188f454ba upstream.
+    
+    Generalize id_map_mutex so it can be used for more state of a user namespace.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 42eec84f58cde5309a5dd770c42f3e364f05f3e0
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Wed Nov 26 23:22:14 2014 -0600
+
+    userns: Only allow the creator of the userns unprivileged mappings
+    
+    commit f95d7918bd1e724675de4940039f2865e5eec5fe upstream.
+    
+    If you did not create the user namespace and are allowed
+    to write to uid_map or gid_map you should already have the necessary
+    privilege in the parent user namespace to establish any mapping
+    you want so this will not affect userspace in practice.
+    
+    Limiting unprivileged uid mapping establishment to the creator of the
+    user namespace makes it easier to verify all credentials obtained with
+    the uid mapping can be obtained without the uid mapping without
+    privilege.
+    
+    Limiting unprivileged gid mapping establishment (which is temporarily
+    absent) to the creator of the user namespace also ensures that the
+    combination of uid and gid can already be obtained without privilege.
+    
+    This is part of the fix for CVE-2014-8989.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 6cffb2520aba06a0df8ddbe0917175e07475431a
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 18:26:30 2014 -0600
+
+    userns: Check euid no fsuid when establishing an unprivileged uid mapping
+    
+    commit 80dd00a23784b384ccea049bfb3f259d3f973b9d upstream.
+    
+    setresuid allows the euid to be set to any of uid, euid, suid, and
+    fsuid.  Therefor it is safe to allow an unprivileged user to map
+    their euid and use CAP_SETUID privileged with exactly that uid,
+    as no new credentials can be obtained.
+    
+    I can not find a combination of existing system calls that allows setting
+    uid, euid, suid, and fsuid from the fsuid making the previous use
+    of fsuid for allowing unprivileged mappings a bug.
+    
+    This is part of a fix for CVE-2014-8989.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit c75f0d0b9621f9654fcfb7cab7d7c13ed3898f3d
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 18:14:19 2014 -0600
+
+    userns: Don't allow unprivileged creation of gid mappings
+    
+    commit be7c6dba2332cef0677fbabb606e279ae76652c3 upstream.
+    
+    As any gid mapping will allow and must allow for backwards
+    compatibility dropping groups don't allow any gid mappings to be
+    established without CAP_SETGID in the parent user namespace.
+    
+    For a small class of applications this change breaks userspace
+    and removes useful functionality.  This small class of applications
+    includes tools/testing/selftests/mount/unprivilged-remount-test.c
+    
+    Most of the removed functionality will be added back with the addition
+    of a one way knob to disable setgroups.  Once setgroups is disabled
+    setting the gid_map becomes as safe as setting the uid_map.
+    
+    For more common applications that set the uid_map and the gid_map
+    with privilege this change will have no affect.
+    
+    This is part of a fix for CVE-2014-8989.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit ae254fcf53097d6d83502c1a75366c7e4eface8b
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 18:01:11 2014 -0600
+
+    userns: Don't allow setgroups until a gid mapping has been setablished
+    
+    commit 273d2c67c3e179adb1e74f403d1e9a06e3f841b5 upstream.
+    
+    setgroups is unique in not needing a valid mapping before it can be called,
+    in the case of setgroups(0, NULL) which drops all supplemental groups.
+    
+    The design of the user namespace assumes that CAP_SETGID can not actually
+    be used until a gid mapping is established.  Therefore add a helper function
+    to see if the user namespace gid mapping has been established and call
+    that function in the setgroups permission check.
+    
+    This is part of the fix for CVE-2014-8989, being able to drop groups
+    without privilege using user namespaces.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit eddcd0249342e9e723a7bd5571f2f2fca2fde065
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 17:51:47 2014 -0600
+
+    userns: Document what the invariant required for safe unprivileged mappings.
+    
+    commit 0542f17bf2c1f2430d368f44c8fcf2f82ec9e53e upstream.
+    
+    The rule is simple.  Don't allow anything that wouldn't be allowed
+    without unprivileged mappings.
+    
+    It was previously overlooked that establishing gid mappings would
+    allow dropping groups and potentially gaining permission to files and
+    directories that had lesser permissions for a specific group than for
+    all other users.
+    
+    This is the rule needed to fix CVE-2014-8989 and prevent any other
+    security issues with new_idmap_permitted.
+    
+    The reason for this rule is that the unix permission model is old and
+    there are programs out there somewhere that take advantage of every
+    little corner of it.  So allowing a uid or gid mapping to be
+    established without privielge that would allow anything that would not
+    be allowed without that mapping will result in expectations from some
+    code somewhere being violated.  Violated expectations about the
+    behavior of the OS is a long way to say a security issue.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 281cac74a213639fa7a4d1b60553d011a4a11d6f
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 17:19:27 2014 -0600
+
+    groups: Consolidate the setgroups permission checks
+    
+    commit 7ff4d90b4c24a03666f296c3d4878cd39001e81e upstream.
+    
+    Today there are 3 instances of setgroups and due to an oversight their
+    permission checking has diverged.  Add a common function so that
+    they may all share the same permission checking code.
+    
+    This corrects the current oversight in the current permission checks
+    and adds a helper to avoid this in the future.
+    
+    A user namespace security fix will update this new helper, shortly.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit e3783a9e6f416ee140ac4ca7184f269c537593f1
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Sat Oct 4 14:44:03 2014 -0700
+
+    umount: Disallow unprivileged mount force
+    
+    commit b2f5d4dc38e034eecb7987e513255265ff9aa1cf upstream.
+    
+    Forced unmount affects not just the mount namespace but the underlying
+    superblock as well.  Restrict forced unmount to the global root user
+    for now.  Otherwise it becomes possible a user in a less privileged
+    mount namespace to force the shutdown of a superblock of a filesystem
+    in a more privileged mount namespace, allowing a DOS attack on root.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit c7c5d7123d0b13ed4f4631061080f7b1d6dcfd98
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Aug 22 16:39:03 2014 -0500
+
+    mnt: Update unprivileged remount test
+    
+    commit 4a44a19b470a886997d6647a77bb3e38dcbfa8c5 upstream.
+    
+    - MNT_NODEV should be irrelevant except when reading back mount flags,
+      no longer specify MNT_NODEV on remount.
+    
+    - Test MNT_NODEV on devpts where it is meaningful even for unprivileged mounts.
+    
+    - Add a test to verify that remount of a prexisting mount with the same flags
+      is allowed and does not change those flags.
+    
+    - Cleanup up the definitions of MS_REC, MS_RELATIME, MS_STRICTATIME that are used
+      when the code is built in an environment without them.
+    
+    - Correct the test error messages when tests fail.  There were not 5 tests
+      that tested MS_RELATIME.
+    
+    Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit a4c2b660f35a1f1201cea27d5fbad41482b191fc
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Wed Aug 13 01:33:38 2014 -0700
+
+    mnt: Implicitly add MNT_NODEV on remount when it was implicitly added by mount
+    
+    commit 3e1866410f11356a9fd869beb3e95983dc79c067 upstream.
+    
+    Now that remount is properly enforcing the rule that you can't remove
+    nodev at least sandstorm.io is breaking when performing a remount.
+    
+    It turns out that there is an easy intuitive solution implicitly
+    add nodev on remount when nodev was implicitly added on mount.
+    
+    Tested-by: Cedric Bosdonnat <cbosdonnat@suse.com>
+    Tested-by: Richard Weinberger <richard@nod.at>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit f7c68a1aa5d3bf2e94c548c8d77de50640a11209
+Author: Luis Henriques <luis.henriques@canonical.com>
+Date:   Wed Dec 3 21:20:21 2014 +0000
+
+    thermal: Fix error path in thermal_init()
+    
+    commit 9d367e5e7b05c71a8c1ac4e9b6e00ba45a79f2fc upstream.
+    
+    thermal_unregister_governors() and class_unregister() were being called in
+    the wrong order.
+    
+    Fixes: 80a26a5c22b9 ("Thermal: build thermal governors into thermal_sys module")
+    Signed-off-by: Luis Henriques <luis.henriques@canonical.com>
+    Signed-off-by: Zhang Rui <rui.zhang@intel.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit d5c70d8fdcea383449a4ca6b25e3ec16d73e83ba
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Wed Dec 17 13:55:49 2014 +0100
+
+    mac80211: free management frame keys when removing station
+    
+    commit 28a9bc68124c319b2b3dc861e80828a8865fd1ba upstream.
+    
+    When writing the code to allow per-station GTKs, I neglected to
+    take into account the management frame keys (index 4 and 5) when
+    freeing the station and only added code to free the first four
+    data frame keys.
+    
+    Fix this by iterating the array of keys over the right length.
+    
+    Fixes: e31b82136d1a ("cfg80211/mac80211: allow per-station GTKs")
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit a4346dd0a57d96e9f7c3d0cfafeda2a5568eb685
+Author: Andreas Müller <goo@stapelspeicher.org>
+Date:   Fri Dec 12 12:11:11 2014 +0100
+
+    mac80211: fix multicast LED blinking and counter
+    
+    commit d025933e29872cb1fe19fc54d80e4dfa4ee5779c upstream.
+    
+    As multicast-frames can't be fragmented, "dot11MulticastReceivedFrameCount"
+    stopped being incremented after the use-after-free fix. Furthermore, the
+    RX-LED will be triggered by every multicast frame (which wouldn't happen
+    before) which wouldn't allow the LED to rest at all.
+    
+    Fixes https://bugzilla.kernel.org/show_bug.cgi?id=89431 which also had the
+    patch.
+    
+    Fixes: b8fff407a180 ("mac80211: fix use-after-free in defragmentation")
+    Signed-off-by: Andreas Müller <goo@stapelspeicher.org>
+    [rewrite commit message]
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit d9135d9e6aa11beb51b98342efb1a87987269622
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Thu Dec 4 18:25:19 2014 +0100
+
+    KEYS: Fix stale key registration at error path
+    
+    commit b26bdde5bb27f3f900e25a95e33a0c476c8c2c48 upstream.
+    
+    When loading encrypted-keys module, if the last check of
+    aes_get_sizes() in init_encrypted() fails, the driver just returns an
+    error without unregistering its key type.  This results in the stale
+    entry in the list.  In addition to memory leaks, this leads to a kernel
+    crash when registering a new key type later.
+    
+    This patch fixes the problem by swapping the calls of aes_get_sizes()
+    and register_key_type(), and releasing resources properly at the error
+    paths.
+    
+    Bugzilla: https://bugzilla.opensuse.org/show_bug.cgi?id=908163
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 2329c797a9dc66982946026cbc1783e072ab8e33
+Author: Jan Kara <jack@suse.cz>
+Date:   Thu Dec 18 17:26:10 2014 +0100
+
+    isofs: Fix unchecked printing of ER records
+    
+    commit 4e2024624e678f0ebb916e6192bd23c1f9fdf696 upstream.
+    
+    We didn't check length of rock ridge ER records before printing them.
+    Thus corrupted isofs image can cause us to access and print some memory
+    behind the buffer with obvious consequences.
+    
+    Reported-and-tested-by: Carl Henrik Lunde <chlunde@ping.uio.no>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit a49482467c6a9a2dbf13a3a002379bc07d983b23
+Author: Richard Guy Briggs <rgb@redhat.com>
+Date:   Mon May 20 15:08:18 2013 -0400
+
+    audit: change decimal constant to macro for invalid uid
+    
+    commit 42f74461a5b60cf6b42887e6d2ff5b7be4abf1ca upstream.
+    
+    SFR reported this 2013-05-15:
+    
+    > After merging the final tree, today's linux-next build (i386 defconfig)
+    > produced this warning:
+    >
+    > kernel/auditfilter.c: In function 'audit_data_to_entry':
+    > kernel/auditfilter.c:426:3: warning: this decimal constant is unsigned only
+    > in ISO C90 [enabled by default]
+    >
+    > Introduced by commit 780a7654cee8 ("audit: Make testing for a valid
+    > loginuid explicit") from Linus' tree.
+    
+    Replace this decimal constant in the code with a macro to make it more readable
+    (add to the unsigned cast to quiet the warning).
+    
+    Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+    Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+    Signed-off-by: Eric Paris <eparis@redhat.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit f057db59a1566548d192ab6ce7c311cffb285a30
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Wed Dec 17 14:48:30 2014 -0800
+
+    x86/tls: Don't validate lm in set_thread_area() after all
+    
+    commit 3fb2f4237bb452eb4e98f6a5dbd5a445b4fed9d0 upstream.
+    
+    It turns out that there's a lurking ABI issue.  GCC, when
+    compiling this in a 32-bit program:
+    
+    struct user_desc desc = {
+            .entry_number    = idx,
+            .base_addr       = base,
+            .limit           = 0xfffff,
+            .seg_32bit       = 1,
+            .contents        = 0, /* Data, grow-up */
+            .read_exec_only  = 0,
+            .limit_in_pages  = 1,
+            .seg_not_present = 0,
+            .useable         = 0,
+    };
+    
+    will leave .lm uninitialized.  This means that anything in the
+    kernel that reads user_desc.lm for 32-bit tasks is unreliable.
+    
+    Revert the .lm check in set_thread_area().  The value never did
+    anything in the first place.
+    
+    Fixes: 0e58af4e1d21 ("x86/tls: Disallow unusual TLS segments")
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Acked-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Link: http://lkml.kernel.org/r/d7875b60e28c512f6a6fc0baf5714d58e7eaadbb.1418856405.git.luto@amacapital.net
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit f55c16cdf8a425447bf529756e3b5d895fc2d1e9
+Author: Dan Carpenter <dan.carpenter@oracle.com>
+Date:   Sat Nov 29 15:50:21 2014 +0300
+
+    dm space map metadata: fix sm_bootstrap_get_nr_blocks()
+    
+    commit c1c6156fe4d4577444b769d7edd5dd503e57bbc9 upstream.
+    
+    This function isn't right and it causes a static checker warning:
+    
+            drivers/md/dm-thin.c:3016 maybe_resize_data_dev()
+            error: potentially using uninitialized 'sb_data_size'.
+    
+    It should set "*count" and return zero on success the same as the
+    sm_metadata_get_nr_blocks() function does earlier.
+    
+    Fixes: 3241b1d3e0aa ('dm: add persistent data library')
+    Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+    Acked-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 4c0c560de59bf1f8a97bf76086c15c70dd3181db
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Tue Nov 25 17:45:15 2014 -0800
+
+    dm bufio: fix memleak when using a dm_buffer's inline bio
+    
+    commit 445559cdcb98a141f5de415b94fd6eaccab87e6d upstream.
+    
+    When dm-bufio sets out to use the bio built into a struct dm_buffer to
+    issue an IO, it needs to call bio_reset after it's done with the bio
+    so that we can free things attached to the bio such as the integrity
+    payload.  Therefore, inject our own endio callback to take care of
+    the bio_reset after calling submit_io's end_io callback.
+    
+    Test case:
+    1. modprobe scsi_debug delay=0 dif=1 dix=199 ato=1 dev_size_mb=300
+    2. Set up a dm-bufio client, e.g. dm-verity, on the scsi_debug device
+    3. Repeatedly read metadata and watch kmalloc-192 leak!
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit ebccfce81acf2c023ae5adeddd7612ef2351c421
+Author: Peng Tao <tao.peng@primarydata.com>
+Date:   Mon Nov 17 11:05:17 2014 +0800
+
+    nfs41: fix nfs4_proc_layoutget error handling
+    
+    commit 4bd5a980de87d2b5af417485bde97b8eb3d6cf6a upstream.
+    
+    nfs4_layoutget_release() drops layout hdr refcnt. Grab the refcnt
+    early so that it is safe to call .release in case nfs4_alloc_pages
+    fails.
+    
+    Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+    Fixes: a47970ff78147 ("NFSv4.1: Hold reference to layout hdr in layoutget")
+    Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit d9927e47772f49909075b62a3c1cffcee35a687c
+Author: Hannes Reinecke <hare@suse.de>
+Date:   Thu Oct 30 09:44:36 2014 +0100
+
+    scsi: correct return values for .eh_abort_handler implementations
+    
+    commit b6c92b7e0af575e2b8b05bdf33633cf9e1661cbf upstream.
+    
+    The .eh_abort_handler needs to return SUCCESS, FAILED, or
+    FAST_IO_FAIL. So fixup all callers to adhere to this requirement.
+    
+    Reviewed-by: Robert Elliott <elliott@hp.com>
+    Signed-off-by: Hannes Reinecke <hare@suse.de>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit fe882bbc67689d331bf45fd3b77f63a989b25d3b
+Author: Sumit.Saxena@avagotech.com <Sumit.Saxena@avagotech.com>
+Date:   Mon Nov 17 15:24:23 2014 +0530
+
+    megaraid_sas: corrected return of wait_event from abort frame path
+    
+    commit 170c238701ec38b1829321b17c70671c101bac55 upstream.
+    
+    Corrected wait_event() call which was waiting for wrong completion
+    status (0xFF).
+    
+    Signed-off-by: Sumit Saxena <sumit.saxena@avagotech.com>
+    Signed-off-by: Kashyap Desai <kashyap.desai@avagotech.com>
+    Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 50bd4857c6a000f0da4bc4b144baf111910f6a46
+Author: Baruch Siach <baruch@tkos.co.il>
+Date:   Mon Sep 22 10:12:51 2014 +0300
+
+    mmc: block: add newline to sysfs display of force_ro
+    
+    commit 0031a98a85e9fca282624bfc887f9531b2768396 upstream.
+    
+    Make force_ro consistent with other sysfs entries.
+    
+    Fixes: 371a689f64b0d ('mmc: MMC boot partitions support')
+    Cc: Andrei Warkentin <andrey.warkentin@gmail.com>
+    Signed-off-by: Baruch Siach <baruch@tkos.co.il>
+    Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 5e5e43db1e1a87168db5e5f2692dd78845f89caf
+Author: Dmitry Eremin-Solenikov <dbaryshkov@gmail.com>
+Date:   Fri Oct 24 21:19:57 2014 +0400
+
+    mfd: tc6393xb: Fail ohci suspend if full state restore is required
+    
+    commit 1a5fb99de4850cba710d91becfa2c65653048589 upstream.
+    
+    Some boards with TC6393XB chip require full state restore during system
+    resume thanks to chip's VCC being cut off during suspend (Sharp SL-6000
+    tosa is one of them). Failing to do so would result in ohci Oops on
+    resume due to internal memory contentes being changed. Fail ohci suspend
+    on tc6393xb is full state restore is required.
+    
+    Recommended workaround is to unbind tmio-ohci driver before suspend and
+    rebind it after resume.
+    
+    Signed-off-by: Dmitry Eremin-Solenikov <dbaryshkov@gmail.com>
+    Signed-off-by: Lee Jones <lee.jones@linaro.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit a82297838bb23d83795661c55a6b9494c05ac68d
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Fri Dec 5 19:03:28 2014 -0800
+
+    x86, kvm: Clear paravirt_enabled on KVM guests for espfix32's benefit
+    
+    commit 29fa6825463c97e5157284db80107d1bfac5d77b upstream.
+    
+    paravirt_enabled has the following effects:
+    
+     - Disables the F00F bug workaround warning.  There is no F00F bug
+       workaround any more because Linux's standard IDT handling already
+       works around the F00F bug, but the warning still exists.  This
+       is only cosmetic, and, in any event, there is no such thing as
+       KVM on a CPU with the F00F bug.
+    
+     - Disables 32-bit APM BIOS detection.  On a KVM paravirt system,
+       there should be no APM BIOS anyway.
+    
+     - Disables tboot.  I think that the tboot code should check the
+       CPUID hypervisor bit directly if it matters.
+    
+     - paravirt_enabled disables espfix32.  espfix32 should *not* be
+       disabled under KVM paravirt.
+    
+    The last point is the purpose of this patch.  It fixes a leak of the
+    high 16 bits of the kernel stack address on 32-bit KVM paravirt
+    guests.  Fixes CVE-2014-8134.
+    
+    Suggested-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 3be3bc12d15c49969b8d81e89cb191e62813a15e
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Thu Dec 4 16:48:17 2014 -0800
+
+    x86/tls: Disallow unusual TLS segments
+    
+    commit 0e58af4e1d2166e9e33375a0f121e4867010d4f8 upstream.
+    
+    Users have no business installing custom code segments into the
+    GDT, and segments that are not present but are otherwise valid
+    are a historical source of interesting attacks.
+    
+    For completeness, block attempts to set the L bit.  (Prior to
+    this patch, the L bit would have been silently dropped.)
+    
+    This is an ABI break.  I've checked glibc, musl, and Wine, and
+    none of them look like they'll have any trouble.
+    
+    Note to stable maintainers: this is a hardening patch that fixes
+    no known bugs.  Given the possibility of ABI issues, this
+    probably shouldn't be backported quickly.
+    
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Acked-by: H. Peter Anvin <hpa@zytor.com>
+    Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Willy Tarreau <w@1wt.eu>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 107436a25547580118fd93e5aaf808f6b533b639
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Thu Dec 4 16:48:16 2014 -0800
+
+    x86/tls: Validate TLS entries to protect espfix
+    
+    commit 41bdc78544b8a93a9c6814b8bbbfef966272abbe upstream.
+    
+    Installing a 16-bit RW data segment into the GDT defeats espfix.
+    AFAICT this will not affect glibc, Wine, or dosemu at all.
+    
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Acked-by: H. Peter Anvin <hpa@zytor.com>
+    Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Willy Tarreau <w@1wt.eu>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit fbce0d7dc8965c9fb8d411862040239d4a768c71
+Author: Jan Kara <jack@suse.cz>
+Date:   Mon Dec 15 14:22:46 2014 +0100
+
+    isofs: Fix infinite looping over CE entries
+    
+    commit f54e18f1b831c92f6512d2eedb224cd63d607d3d upstream.
+    
+    Rock Ridge extensions define so called Continuation Entries (CE) which
+    define where is further space with Rock Ridge data. Corrupted isofs
+    image can contain arbitrarily long chain of these, including a one
+    containing loop and thus causing kernel to end in an infinite loop when
+    traversing these entries.
+    
+    Limit the traversal to 32 entries which should be more than enough space
+    to store all the Rock Ridge data.
+    
+    Reported-by: P J P <ppandit@redhat.com>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 4c8cb0ee48a5e126b14cd2c957e20bc0722c0258
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Sat Dec 6 18:02:55 2014 +0100
+
+    ALSA: usb-audio: Don't resubmit pending URBs at MIDI error recovery
+    
+    commit 66139a48cee1530c91f37c145384b4ee7043f0b7 upstream.
+    
+    In snd_usbmidi_error_timer(), the driver tries to resubmit MIDI input
+    URBs to reactivate the MIDI stream, but this causes the error when
+    some of URBs are still pending like:
+    
+     WARNING: CPU: 0 PID: 0 at ../drivers/usb/core/urb.c:339 usb_submit_urb+0x5f/0x70()
+     URB ef705c40 submitted while active
+     CPU: 0 PID: 0 Comm: swapper/0 Not tainted 3.16.6-2-desktop #1
+     Hardware name: FOXCONN TPS01/TPS01, BIOS 080015  03/23/2010
+      c0984bfa f4009ed4 c078deaf f4009ee4 c024c884 c09a135c f4009f00 00000000
+      c0984bfa 00000153 c061ac4f c061ac4f 00000009 00000001 ef705c40 e854d1c0
+      f4009eec c024c8d3 00000009 f4009ee4 c09a135c f4009f00 f4009f04 c061ac4f
+     Call Trace:
+      [<c0205df6>] try_stack_unwind+0x156/0x170
+      [<c020482a>] dump_trace+0x5a/0x1b0
+      [<c0205e56>] show_trace_log_lvl+0x46/0x50
+      [<c02049d1>] show_stack_log_lvl+0x51/0xe0
+      [<c0205eb7>] show_stack+0x27/0x50
+      [<c078deaf>] dump_stack+0x45/0x65
+      [<c024c884>] warn_slowpath_common+0x84/0xa0
+      [<c024c8d3>] warn_slowpath_fmt+0x33/0x40
+      [<c061ac4f>] usb_submit_urb+0x5f/0x70
+      [<f7974104>] snd_usbmidi_submit_urb+0x14/0x60 [snd_usbmidi_lib]
+      [<f797483a>] snd_usbmidi_error_timer+0x6a/0xa0 [snd_usbmidi_lib]
+      [<c02570c0>] call_timer_fn+0x30/0x130
+      [<c0257442>] run_timer_softirq+0x1c2/0x260
+      [<c0251493>] __do_softirq+0xc3/0x270
+      [<c0204732>] do_softirq_own_stack+0x22/0x30
+      [<c025186d>] irq_exit+0x8d/0xa0
+      [<c0795228>] smp_apic_timer_interrupt+0x38/0x50
+      [<c0794a3c>] apic_timer_interrupt+0x34/0x3c
+      [<c0673d9e>] cpuidle_enter_state+0x3e/0xd0
+      [<c028bb8d>] cpu_idle_loop+0x29d/0x3e0
+      [<c028bd23>] cpu_startup_entry+0x53/0x60
+      [<c0bfac1e>] start_kernel+0x415/0x41a
+    
+    For avoiding these errors, check the pending URBs and skip
+    resubmitting such ones.
+    
+    Reported-and-tested-by: Stefan Seyfried <stefan.seyfried@googlemail.com>
+    Acked-by: Clemens Ladisch <clemens@ladisch.de>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 79864defd7264151ece663eed424a71d5450db4b
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Thu Nov 13 07:11:38 2014 +0100
+
+    ALSA: hda - Fix built-in mic at resume on Lenovo Ideapad S210
+    
+    commit fedb2245cbb8d823e449ebdd48ba9bb35c071ce0 upstream.
+    
+    The built-in mic boost volume gets almost muted after suspend/resume
+    on Lenovo Ideapad S210.
+    
+    Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=88121
+    Reported-and-tested-by: Roman Kagan <rkagan@mail.ru>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit c93808a19c2d8820b1323519e7d8627eac885e88
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Tue Dec 9 19:58:53 2014 +0100
+
+    ALSA: hda - Add EAPD fixup for ASUS Z99He laptop
+    
+    commit f62f5eff3d40a56ad1cf0d81a6cac8dd8743e8a1 upstream.
+    
+    The same fixup to enable EAPD is needed for ASUS Z99He with AD1986A
+    codec like another ASUS machine.
+    
+    Reported-and-tested-by: Dmitry V. Zimin <pfzim@mail.ru>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 96c357037c54fd77a729ec7370c6a80dd477e844
+Author: Anton Blanchard <anton@samba.org>
+Date:   Thu Nov 27 08:11:28 2014 +1100
+
+    powerpc: 32 bit getcpu VDSO function uses 64 bit instructions
+    
+    commit 152d44a853e42952f6c8a504fb1f8eefd21fd5fd upstream.
+    
+    I used some 64 bit instructions when adding the 32 bit getcpu VDSO
+    function. Fix it.
+    
+    Fixes: 18ad51dd342a ("powerpc: Add VDSO version of getcpu")
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit aa63bf3db43a2722d8706733af71ac3642b1e804
+Author: Todd Fujinaka <todd.fujinaka@intel.com>
+Date:   Tue Jun 17 06:58:11 2014 +0000
+
+    igb: bring link up when PHY is powered up
+    
+    commit aec653c43b0c55667355e26d7de1236bda9fb4e3 upstream.
+    
+    Call igb_setup_link() when the PHY is powered up.
+    
+    Signed-off-by: Todd Fujinaka <todd.fujinaka@intel.com>
+    Reported-by: Jeff Westfahl <jeff.westfahl@ni.com>
+    Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+    Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+    Cc: Vincent Donnefort <vdonnefort@gmail.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 59cfe390359995687a6eeb0754cc1a3d1074181c
+Author: Dmitry Torokhov <dtor@chromium.org>
+Date:   Fri Nov 14 13:39:05 2014 -0800
+
+    sata_fsl: fix error handling of irq_of_parse_and_map
+    
+    commit aad0b624129709c94c2e19e583b6053520353fa8 upstream.
+    
+    irq_of_parse_and_map() returns 0 on error (the result is unsigned int),
+    so testing for negative result never works.
+    
+    Signed-off-by: Dmitry Torokhov <dtor@chromium.org>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit d7f79e0e3fe95a973e4047474c6c7bf3246b7a0f
+Author: Tejun Heo <tj@kernel.org>
+Date:   Thu Dec 4 13:13:28 2014 -0500
+
+    ahci: disable MSI on SAMSUNG 0xa800 SSD
+    
+    commit 2b21ef0aae65f22f5ba86b13c4588f6f0c2dbefb upstream.
+    
+    Just like 0x1600 which got blacklisted by 66a7cbc303f4 ("ahci: disable
+    MSI instead of NCQ on Samsung pci-e SSDs on macbooks"), 0xa800 chokes
+    on NCQ commands if MSI is enabled.  Disable MSI.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Reported-by: Dominik Mierzejewski <dominik@greysector.net>
+    Link: https://bugzilla.kernel.org/show_bug.cgi?id=89171
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit e2d0f4a73075e54cfb1a91b3d9b0a216eced6a44
+Author: Devin Ryles <devin.ryles@intel.com>
+Date:   Fri Nov 7 17:59:05 2014 -0500
+
+    AHCI: Add DeviceIDs for Sunrise Point-LP SATA controller
+    
+    commit 249cd0a187ed4ef1d0af7f74362cc2791ec5581b upstream.
+    
+    This patch adds DeviceIDs for Sunrise Point-LP.
+    
+    Signed-off-by: Devin Ryles <devin.ryles@intel.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 0b71fc5fa4e7b22d022f3ebe0652f7ddabc1e41d
+Author: Mathias Nyman <mathias.nyman@linux.intel.com>
+Date:   Tue Nov 18 11:27:12 2014 +0200
+
+    USB: xhci: Reset a halted endpoint immediately when we encounter a stall.
+    
+    commit 8e71a322fdb127814bcba423a512914ca5bc6cf5 upstream.
+    
+    If a device is halted and reuturns a STALL, then the halted endpoint
+    needs to be cleared both on the host and device side. The host
+    side halt is cleared by issueing a xhci reset endpoint command. The device side
+    is cleared with a ClearFeature(ENDPOINT_HALT) request, which should
+    be issued by the device driver if a URB reruen -EPIPE.
+    
+    Previously we cleared the host side halt after the device side was cleared.
+    To make sure the host side halt is cleared in time we want to issue the
+    reset endpoint command immedialtely when a STALL status is encountered.
+    
+    Otherwise we end up not following the specs and not returning -EPIPE
+    several times in a row when trying to transfer data to a halted endpoint.
+    
+    Fixes: bcef3fd (USB: xhci: Handle errors that cause endpoint halts.)
+    Tested-by: Felipe Balbi <balbi@ti.com>
+    Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit fd120bec1cfd1e12f996081c367a6600832fa811
+Author: Sakari Ailus <sakari.ailus@linux.intel.com>
+Date:   Thu Nov 6 17:49:45 2014 -0300
+
+    media: smiapp: Only some selection targets are settable
+    
+    commit b31eb901c4e5eeef4c83c43dfbc7fe0d4348cb21 upstream.
+    
+    Setting a non-settable selection target caused BUG() to be called. The check
+    for valid selections only takes the selection target into account, but does
+    not tell whether it may be set, or only get. Fix the issue by simply
+    returning an error to the user.
+    
+    Signed-off-by: Sakari Ailus <sakari.ailus@iki.fi>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab@osg.samsung.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit aa4e539e52e4a364cc599b69240c473fd6e9f445
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Mon Dec 1 17:56:54 2014 +0100
+
+    drm/i915: Unlock panel even when LVDS is disabled
+    
+    commit b0616c5306b342ceca07044dbc4f917d95c4f825 upstream.
+    
+    Otherwise we'll have backtraces in assert_panel_unlocked because the
+    BIOS locks the register. In the reporter's case this regression was
+    introduced in
+    
+    commit c31407a3672aaebb4acddf90944a114fa5c8af7b
+    Author: Chris Wilson <chris@chris-wilson.co.uk>
+    Date:   Thu Oct 18 21:07:01 2012 +0100
+    
+        drm/i915: Add no-lvds quirk for Supermicro X7SPA-H
+    
+    Reported-by: Alexey Orishko <alexey.orishko@gmail.com>
+    Cc: Alexey Orishko <alexey.orishko@gmail.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Francois Tigeot <ftigeot@wolfpond.org>
+    Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+    Tested-by: Alexey Orishko <alexey.orishko@gmail.com>
+    Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 6baff9ed39547e4dba50a0687871937660446370
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Mon Nov 24 17:02:45 2014 +0100
+
+    drm/i915: More cautious with pch fifo underruns
+    
+    commit b68362278af94e1171f5be9d4e44988601fb0439 upstream.
+    
+    Apparently PCH fifo underruns are tricky, we have plenty reports that
+    we see the occasional underrun (especially at boot-up).
+    
+    So for a change let's see what happens when we don't re-enable pch
+    fifo underrun reporting when the pipe is disabled. This means that the
+    kernel can't catch pch fifo underruns when they happen (except when
+    all pipes are on on the pch). But we'll still catch underruns when
+    disabling the pipe again. So not a terrible reduction in test
+    coverage.
+    
+    Since the DRM_ERROR is new and hence a regression plan B would be to
+    revert it back to a debug output. Which would be a lot worse than this
+    hack for underrun test coverage in the wild. See the referenced
+    discussions for more.
+    
+    References: http://mid.gmane.org/CA+gsUGRfGe3t4NcjdeA=qXysrhLY3r4CEu7z4bjTwxi1uOfy+g@mail.gmail.com
+    Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=85898
+    References: https://bugs.freedesktop.org/show_bug.cgi?id=85898
+    References: https://bugs.freedesktop.org/show_bug.cgi?id=86233
+    References: https://bugs.freedesktop.org/show_bug.cgi?id=86478
+    Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+    Tested-by: lu hua <huax.lu@intel.com>
+    Reviewed-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+    Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 56cd18acd5ea6764d48aff67fabedd01440d5b8a
+Author: Petr Mladek <pmladek@suse.cz>
+Date:   Thu Nov 27 16:57:21 2014 +0100
+
+    drm/radeon: kernel panic in drm_calc_vbltimestamp_from_scanoutpos with 3.18.0-rc6
+    
+    commit f5475cc43c899e33098d4db44b7c5e710f16589d upstream.
+    
+    I was unable too boot 3.18.0-rc6 because of the following kernel
+    panic in drm_calc_vbltimestamp_from_scanoutpos():
+    
+        [drm] Initialized drm 1.1.0 20060810
+        [drm] radeon kernel modesetting enabled.
+        [drm] initializing kernel modesetting (RV100 0x1002:0x515E 0x15D9:0x8080).
+        [drm] register mmio base: 0xC8400000
+        [drm] register mmio size: 65536
+        radeon 0000:0b:01.0: VRAM: 128M 0x00000000D0000000 - 0x00000000D7FFFFFF (16M used)
+        radeon 0000:0b:01.0: GTT: 512M 0x00000000B0000000 - 0x00000000CFFFFFFF
+        [drm] Detected VRAM RAM=128M, BAR=128M
+        [drm] RAM width 16bits DDR
+        [TTM] Zone  kernel: Available graphics memory: 3829346 kiB
+        [TTM] Zone   dma32: Available graphics memory: 2097152 kiB
+        [TTM] Initializing pool allocator
+        [TTM] Initializing DMA pool allocator
+        [drm] radeon: 16M of VRAM memory ready
+        [drm] radeon: 512M of GTT memory ready.
+        [drm] GART: num cpu pages 131072, num gpu pages 131072
+        [drm] PCI GART of 512M enabled (table at 0x0000000037880000).
+        radeon 0000:0b:01.0: WB disabled
+        radeon 0000:0b:01.0: fence driver on ring 0 use gpu addr 0x00000000b0000000 and cpu addr 0xffff8800bbbfa000
+        [drm] Supports vblank timestamp caching Rev 2 (21.10.2013).
+        [drm] Driver supports precise vblank timestamp query.
+        [drm] radeon: irq initialized.
+        [drm] Loading R100 Microcode
+        radeon 0000:0b:01.0: Direct firmware load for radeon/R100_cp.bin failed with error -2
+        radeon_cp: Failed to load firmware "radeon/R100_cp.bin"
+        [drm:r100_cp_init] *ERROR* Failed to load firmware!
+        radeon 0000:0b:01.0: failed initializing CP (-2).
+        radeon 0000:0b:01.0: Disabling GPU acceleration
+        [drm] radeon: cp finalized
+        BUG: unable to handle kernel NULL pointer dereference at 000000000000025c
+        IP: [<ffffffff8150423b>] drm_calc_vbltimestamp_from_scanoutpos+0x4b/0x320
+        PGD 0
+        Oops: 0000 [#1] SMP
+        Modules linked in:
+        CPU: 1 PID: 1 Comm: swapper/0 Not tainted 3.18.0-rc6-4-default #2649
+        Hardware name: Supermicro X7DB8/X7DB8, BIOS 6.00 07/26/2006
+        task: ffff880234da2010 ti: ffff880234da4000 task.ti: ffff880234da4000
+        RIP: 0010:[<ffffffff8150423b>]  [<ffffffff8150423b>] drm_calc_vbltimestamp_from_scanoutpos+0x4b/0x320
+        RSP: 0000:ffff880234da7918  EFLAGS: 00010086
+        RAX: ffffffff81557890 RBX: 0000000000000000 RCX: ffff880234da7a48
+        RDX: ffff880234da79f4 RSI: 0000000000000000 RDI: ffff880232e15000
+        RBP: ffff880234da79b8 R08: 0000000000000000 R09: 0000000000000000
+        R10: 000000000000000a R11: 0000000000000001 R12: ffff880232dda1c0
+        R13: ffff880232e1518c R14: 0000000000000292 R15: ffff880232e15000
+        FS:  0000000000000000(0000) GS:ffff88023fc40000(0000) knlGS:0000000000000000
+        CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
+        CR2: 000000000000025c CR3: 0000000002014000 CR4: 00000000000007e0
+        Stack:
+         ffff880234da79d8 0000000000000286 ffff880232dcbc00 0000000000002480
+         ffff880234da7958 0000000000000296 ffff880234da7998 ffffffff8151b51d
+         ffff880234da7a48 0000000032dcbeb0 ffff880232dcbc00 ffff880232dcbc58
+        Call Trace:
+         [<ffffffff8151b51d>] ? drm_vma_offset_remove+0x1d/0x110
+         [<ffffffff8152dc98>] radeon_get_vblank_timestamp_kms+0x38/0x60
+         [<ffffffff8152076a>] ? ttm_bo_release_list+0xba/0x180
+         [<ffffffff81503751>] drm_get_last_vbltimestamp+0x41/0x70
+         [<ffffffff81503933>] vblank_disable_and_save+0x73/0x1d0
+         [<ffffffff81106b2f>] ? try_to_del_timer_sync+0x4f/0x70
+         [<ffffffff81505245>] drm_vblank_cleanup+0x65/0xa0
+         [<ffffffff815604fa>] radeon_irq_kms_fini+0x1a/0x70
+         [<ffffffff8156c07e>] r100_init+0x26e/0x410
+         [<ffffffff8152ae3e>] radeon_device_init+0x7ae/0xb50
+         [<ffffffff8152d57f>] radeon_driver_load_kms+0x8f/0x210
+         [<ffffffff81506965>] drm_dev_register+0xb5/0x110
+         [<ffffffff8150998f>] drm_get_pci_dev+0x8f/0x200
+         [<ffffffff815291cd>] radeon_pci_probe+0xad/0xe0
+         [<ffffffff8141a365>] local_pci_probe+0x45/0xa0
+         [<ffffffff8141b741>] pci_device_probe+0xd1/0x130
+         [<ffffffff81633dad>] driver_probe_device+0x12d/0x3e0
+         [<ffffffff8163413b>] __driver_attach+0x9b/0xa0
+         [<ffffffff816340a0>] ? __device_attach+0x40/0x40
+         [<ffffffff81631cd3>] bus_for_each_dev+0x63/0xa0
+         [<ffffffff8163378e>] driver_attach+0x1e/0x20
+         [<ffffffff81633390>] bus_add_driver+0x180/0x240
+         [<ffffffff81634914>] driver_register+0x64/0xf0
+         [<ffffffff81419cac>] __pci_register_driver+0x4c/0x50
+         [<ffffffff81509bf5>] drm_pci_init+0xf5/0x120
+         [<ffffffff821dc871>] ? ttm_init+0x6a/0x6a
+         [<ffffffff821dc908>] radeon_init+0x97/0xb5
+         [<ffffffff810002fc>] do_one_initcall+0xbc/0x1f0
+         [<ffffffff810e3278>] ? __wake_up+0x48/0x60
+         [<ffffffff8218e256>] kernel_init_freeable+0x18a/0x215
+         [<ffffffff8218d983>] ? initcall_blacklist+0xc0/0xc0
+         [<ffffffff818a78f0>] ? rest_init+0x80/0x80
+         [<ffffffff818a78fe>] kernel_init+0xe/0xf0
+         [<ffffffff818c0c3c>] ret_from_fork+0x7c/0xb0
+         [<ffffffff818a78f0>] ? rest_init+0x80/0x80
+        Code: 45 ac 0f 88 a8 01 00 00 3b b7 d0 01 00 00 49 89 ff 0f 83 99 01 00 00 48 8b 47 20 48 8b 80 88 00 00 00 48 85 c0 0f 84 cd 01 00 00 <41> 8b b1 5c 02 00 00 41 8b 89 58 02 00 00 89 75 98 41 8b b1 60
+        RIP  [<ffffffff8150423b>] drm_calc_vbltimestamp_from_scanoutpos+0x4b/0x320
+         RSP <ffff880234da7918>
+        CR2: 000000000000025c
+        ---[ end trace ad2c0aadf48e2032 ]---
+        Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000009
+    
+    It has helped me to add a NULL pointer check that was suggested at
+    http://lists.freedesktop.org/archives/dri-devel/2014-October/070663.html
+    
+    I am not familiar with the code. But the change looks sane
+    and we need something fast at this stage of 3.18 development.
+    
+    Suggested-by: Helge Deller <deller@gmx.de>
+    Signed-off-by: Petr Mladek <pmladek@suse.cz>
+    Tested-by: Petr Mladek <pmladek@suse.cz>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit f5482f332c424e01785f4020bac0ea073f17d0a6
+Author: Grygorii Strashko <grygorii.strashko@ti.com>
+Date:   Mon Dec 1 17:34:04 2014 +0200
+
+    i2c: davinci: generate STP always when NACK is received
+    
+    commit 9ea359f7314132cbcb5a502d2d8ef095be1f45e4 upstream.
+    
+    According to I2C specification the NACK should be handled as follows:
+    "When SDA remains HIGH during this ninth clock pulse, this is defined as the Not
+    Acknowledge signal. The master can then generate either a STOP condition to
+    abort the transfer, or a repeated START condition to start a new transfer."
+    [I2C spec Rev. 6, 3.1.6: http://www.nxp.com/documents/user_manual/UM10204.pdf]
+    
+    Currently the Davinci i2c driver interrupts the transfer on receipt of a
+    NACK but fails to send a STOP in some situations and so makes the bus
+    stuck until next I2C IP reset (idle/enable).
+    
+    For example, the issue will happen during SMBus read transfer which
+    consists from two i2c messages write command/address and read data:
+    
+    S Slave Address Wr A Command Code A Sr Slave Address Rd A D1..Dn A P
+    <--- write -----------------------> <--- read --------------------->
+    
+    The I2C client device will send NACK if it can't recognize "Command Code"
+    and it's expected from I2C master to generate STP in this case.
+    But now, Davinci i2C driver will just exit with -EREMOTEIO and STP will
+    not be generated.
+    
+    Hence, fix it by generating Stop condition (STP) always when NACK is received.
+    
+    This patch fixes Davinci I2C in the same way it was done for OMAP I2C
+    commit cda2109a26eb ("i2c: omap: query STP always when NACK is received").
+    
+    Reviewed-by: Uwe Kleine-König <u.kleine-koenig@pengutronix.de>
+    Reported-by: Hein Tibosch <hein_tibosch@yahoo.es>
+    Signed-off-by: Grygorii Strashko <grygorii.strashko@ti.com>
+    Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 3fb5d5ea0088b0f9a5bab6a5c565bb105de94588
+Author: Alexander Kochetkov <al.kochet@gmail.com>
+Date:   Fri Nov 21 04:16:51 2014 +0400
+
+    i2c: omap: fix i207 errata handling
+    
+    commit ccfc866356674cb3a61829d239c685af6e85f197 upstream.
+    
+    commit 6d9939f651419a63e091105663821f9c7d3fec37 (i2c: omap: split out [XR]DR
+    and [XR]RDY) changed the way how errata i207 (I2C: RDR Flag May Be Incorrectly
+    Set) get handled. 6d9939f6514 code doesn't correspond to workaround provided by
+    errata.
+    
+    According to errata ISR must filter out spurious RDR before data read not after.
+    ISR must read RXSTAT to get number of bytes available to read. Because RDR
+    could be set while there could no data in the receive FIFO.
+    
+    Restored pre 6d9939f6514 way of handling errata.
+    
+    Found by code review. Real impact haven't seen.
+    Tested on Beagleboard XM C.
+    
+    Signed-off-by: Alexander Kochetkov <al.kochet@gmail.com>
+    Fixes: 6d9939f651419a63e09110 i2c: omap: split out [XR]DR and [XR]RDY
+    Tested-by: Felipe Balbi <balbi@ti.com>
+    Reviewed-by: Felipe Balbi <balbi@ti.com>
+    Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit f8d459cdc1a00eb16e934682bb52fef231fec2bd
+Author: Alexander Kochetkov <al.kochet@gmail.com>
+Date:   Tue Nov 18 21:00:58 2014 +0400
+
+    i2c: omap: fix NACK and Arbitration Lost irq handling
+    
+    commit 27caca9d2e01c92b26d0690f065aad093fea01c7 upstream.
+    
+    commit 1d7afc95946487945cc7f5019b41255b72224b70 (i2c: omap: ack IRQ in parts)
+    changed the interrupt handler to complete transfers without clearing
+    XRDY (AL case) and ARDY (NACK case) flags. XRDY or ARDY interrupts will be
+    fired again. As a result, ISR keep processing transfer after it was already
+    complete (from the driver code point of view).
+    
+    A didn't see real impacts of the 1d7afc9, but it is really bad idea to
+    have ISR running on user data after transfer was complete.
+    
+    It looks, what 1d7afc9 violate TI specs in what how AL and NACK should be
+    handled (see Note 1, sprugn4r, Figure 17-31 and Figure 17-32).
+    
+    According to specs (if I understood correctly), in case of NACK and AL driver
+    must reset NACK, AL, ARDY, RDR, and RRDY (Master Receive Mode), and
+    NACK, AL, ARDY, and XDR (Master Transmitter Mode).
+    
+    All that is done down the code under the if condition:
+    if (stat & (OMAP_I2C_STAT_ARDY | OMAP_I2C_STAT_NACK | OMAP_I2C_STAT_AL)) ...
+    
+    The patch restore pre 1d7afc9 logic of handling NACK and AL interrupts, so
+    no interrupts is fired after ISR informs the rest of driver what transfer
+    complete.
+    
+    Note: instead of removing break under NACK case, we could just replace 'break'
+    with 'continue' and allow NACK transfer to finish using ARDY event. I found
+    that NACK and ARDY bits usually set together. That case confirm TI wiki:
+    http://processors.wiki.ti.com/index.php/I2C_Tips#Detecting_and_handling_NACK
+    
+    In order if someone interested in the event traces for NACK and AL cases,
+    I sent them to mailing list.
+    
+    Tested on Beagleboard XM C.
+    
+    Signed-off-by: Alexander Kochetkov <al.kochet@gmail.com>
+    Fixes: 1d7afc9 i2c: omap: ack IRQ in parts
+    Acked-by: Felipe Balbi <balbi@ti.com>
+    Tested-by: Aaro Koskinen <aaro.koskinen@iki.fi>
+    Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit cdc026315954a8d1fda21de1b21edfad39cbef5c
+Author: Daniel Forrest <dan.forrest@ssec.wisc.edu>
+Date:   Tue Dec 2 15:59:42 2014 -0800
+
+    mm: fix anon_vma_clone() error treatment
+    
+    commit c4ea95d7cd08d9ffd7fa75e6c5e0332d596dd11e upstream.
+    
+    Andrew Morton noticed that the error return from anon_vma_clone() was
+    being dropped and replaced with -ENOMEM (which is not itself a bug
+    because the only error return value from anon_vma_clone() is -ENOMEM).
+    
+    I did an audit of callers of anon_vma_clone() and discovered an actual
+    bug where the error return was being lost.  In __split_vma(), between
+    Linux 3.11 and 3.12 the code was changed so the err variable is used
+    before the call to anon_vma_clone() and the default initial value of
+    -ENOMEM is overwritten.  So a failure of anon_vma_clone() will return
+    success since err at this point is now zero.
+    
+    Below is a patch which fixes this bug and also propagates the error
+    return value from anon_vma_clone() in all cases.
+    
+    Fixes: ef0855d334e1 ("mm: mempolicy: turn vma_set_policy() into vma_dup_policy()")
+    Signed-off-by: Daniel Forrest <dan.forrest@ssec.wisc.edu>
+    Reviewed-by: Michal Hocko <mhocko@suse.cz>
+    Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+    Cc: Andrea Arcangeli <aarcange@redhat.com>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Tim Hartrick <tim@edgecast.com>
+    Cc: Hugh Dickins <hughd@google.com>
+    Cc: Michel Lespinasse <walken@google.com>
+    Cc: Vlastimil Babka <vbabka@suse.cz>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 0315eaed91c9cbf0e26aa0bdcef213e45e9c44a3
+Author: Hugh Dickins <hughd@google.com>
+Date:   Tue Dec 2 15:59:39 2014 -0800
+
+    mm: fix swapoff hang after page migration and fork
+    
+    commit 2022b4d18a491a578218ce7a4eca8666db895a73 upstream.
+    
+    I've been seeing swapoff hangs in recent testing: it's cycling around
+    trying unsuccessfully to find an mm for some remaining pages of swap.
+    
+    I have been exercising swap and page migration more heavily recently,
+    and now notice a long-standing error in copy_one_pte(): it's trying to
+    add dst_mm to swapoff's mmlist when it finds a swap entry, but is doing
+    so even when it's a migration entry or an hwpoison entry.
+    
+    Which wouldn't matter much, except it adds dst_mm next to src_mm,
+    assuming src_mm is already on the mmlist: which may not be so.  Then if
+    pages are later swapped out from dst_mm, swapoff won't be able to find
+    where to replace them.
+    
+    There's already a !non_swap_entry() test for stats: move that up before
+    the swap_duplicate() and the addition to mmlist.
+    
+    Signed-off-by: Hugh Dickins <hughd@google.com>
+    Cc: Kelley Nielsen <kelleynnn@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 5a40e10cc3479a28bac0d4ca3134df7052cb46df
+Author: Andrew Morton <akpm@linux-foundation.org>
+Date:   Tue Dec 2 15:59:28 2014 -0800
+
+    mm/vmpressure.c: fix race in vmpressure_work_fn()
+    
+    commit 91b57191cfd152c02ded0745250167d0263084f8 upstream.
+    
+    In some android devices, there will be a "divide by zero" exception.
+    vmpr->scanned could be zero before spin_lock(&vmpr->sr_lock).
+    
+    Addresses https://bugzilla.kernel.org/show_bug.cgi?id=88051
+    
+    [akpm@linux-foundation.org: neaten]
+    Reported-by: ji_ang <ji_ang@163.com>
+    Cc: Anton Vorontsov <anton.vorontsov@linaro.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 94724f27bf02e417629d93101a3fbb0dcfe86c28
+Author: Weijie Yang <weijie.yang@samsung.com>
+Date:   Tue Dec 2 15:59:25 2014 -0800
+
+    mm: frontswap: invalidate expired data on a dup-store failure
+    
+    commit fb993fa1a2f669215fa03a09eed7848f2663e336 upstream.
+    
+    If a frontswap dup-store failed, it should invalidate the expired page
+    in the backend, or it could trigger some data corruption issue.
+    Such as:
+     1. use zswap as the frontswap backend with writeback feature
+     2. store a swap page(version_1) to entry A, success
+     3. dup-store a newer page(version_2) to the same entry A, fail
+     4. use __swap_writepage() write version_2 page to swapfile, success
+     5. zswap do shrink, writeback version_1 page to swapfile
+     6. version_2 page is overwrited by version_1, data corrupt.
+    
+    This patch fixes this issue by invalidating expired data immediately
+    when meet a dup-store failure.
+    
+    Signed-off-by: Weijie Yang <weijie.yang@samsung.com>
+    Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Cc: Seth Jennings <sjennings@variantweb.net>
+    Cc: Dan Streetman <ddstreet@ieee.org>
+    Cc: Minchan Kim <minchan@kernel.org>
+    Cc: Bob Liu <bob.liu@oracle.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 6b96727be58559264f7288461022f32444e85303
+Author: Francesco Ruggeri <fruggeri@aristanetworks.com>
+Date:   Fri Oct 10 13:09:53 2014 -0700
+
+    tty: Fix pty master poll() after slave closes v2
+    
+    commit c4dc304677e8d566572c4738d95c48be150c6606 upstream.
+    
+    Commit f95499c3030f ("n_tty: Don't wait for buffer work in read() loop")
+    introduces a race window where a pty master can be signalled that the pty
+    slave was closed before all the data that the slave wrote is delivered.
+    Commit f8747d4a466a ("tty: Fix pty master read() after slave closes") fixed the
+    problem in case of n_tty_read, but the problem still exists for n_tty_poll.
+    This can be seen by running 'for ((i=0; i<100;i++));do ./test.py ;done'
+    where test.py is:
+    
+    import os, select, pty
+    
+    (pid, pty_fd) = pty.fork()
+    
+    if pid == 0:
+       os.write(1, 'This string should be received by parent')
+    else:
+       poller = select.epoll()
+       poller.register( pty_fd, select.EPOLLIN )
+       ready = poller.poll( 1 * 1000 )
+       for fd, events in ready:
+          if not events & select.EPOLLIN:
+             print 'missed POLLIN event'
+          else:
+             print os.read(fd, 100)
+       poller.close()
+    
+    The string from the slave is missed several times.
+    This patch takes the same approach as the fix for read and special cases
+    this condition for poll.
+    Tested on 3.16.
+    
+    Signed-off-by: Francesco Ruggeri <fruggeri@arista.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit f9a0da24705a166ea76c1a74cf3c4a77d22d8cc5
+Author: Ronald Wahl <ronald.wahl@raritan.com>
+Date:   Wed Nov 19 16:37:27 2014 +0100
+
+    usb: gadget: at91_udc: move prepare clk into process context
+    
+    commit b2ba27a5c56ff7204d8a8684893d64d4afe2cee5 upstream.
+    
+    Commit 7628083227b6bc4a7e33d7c381d7a4e558424b6b (usb: gadget: at91_udc:
+    prepare clk before calling enable) added clock preparation in interrupt
+    context. This is not allowed as it might sleep. Also setting the clock
+    rate is unsafe to call from there for the same reason. Move clock
+    preparation and setting clock rate into process context (at91udc_probe).
+    
+    Signed-off-by: Ronald Wahl <ronald.wahl@raritan.com>
+    Acked-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
+    Acked-by: Boris Brezillon <boris.brezillon@free-electrons.com>
+    Acked-by: Nicolas Ferre <nicolas.ferre@atmel.com>
+    Cc: Felipe Balbi <balbi@ti.com>
+    Signed-off-by: Felipe Balbi <balbi@ti.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit a611d4e3b0f5aace35a0c2577548f0e46d46910e
+Author: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Date:   Wed Aug 13 12:01:30 2014 +0200
+
+    s390/3215: fix tty output containing tabs
+    
+    commit e512d56c799517f33b301d81e9a5e0ebf30c2d1e upstream.
+    
+    git commit 37f81fa1f63ad38e16125526bb2769ae0ea8d332
+    "n_tty: do O_ONLCR translation as a single write"
+    surfaced a bug in the 3215 device driver. In combination this
+    broke tab expansion for tty ouput.
+    
+    The cause is an asymmetry in the behaviour of tty3215_ops->write
+    vs tty3215_ops->put_char. The put_char function scans for '\t'
+    but the write function does not.
+    
+    As the driver has logic for the '\t' expansion remove XTABS
+    from c_oflag of the initial termios as well.
+    
+    Reported-by: Stephen Powell <zlinuxman@wowway.com>
+    Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 22c60914c060fc8c62f52526411b73ea29eef46f
+Author: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Date:   Tue Jul 15 17:53:12 2014 +0200
+
+    s390/3215: fix hanging console issue
+    
+    commit 26d766c60f4ea08cd14f0f3435a6db3d6cc2ae96 upstream.
+    
+    The ccw_device_start in raw3215_start_io can fail. raw3215_try_io
+    does not check if the request could be started and removes any
+    pending timer. This can leave the system in a hanging state.
+    Check for pending request after raw3215_start_io and start a
+    timer if necessary.
+    
+    Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 304ed40ae03a8e72934efc935247780d1b0ada66
+Author: Kan Liang <kan.liang@intel.com>
+Date:   Mon Jul 14 12:25:56 2014 -0700
+
+    perf/x86/intel: Protect LBR and extra_regs against KVM lying
+    
+    commit 338b522ca43cfd32d11a370f4203bcd089c6c877 upstream.
+    
+    With -cpu host, KVM reports LBR and extra_regs support, if the host has
+    support.
+    
+    When the guest perf driver tries to access LBR or extra_regs MSR,
+    it #GPs all MSR accesses,since KVM doesn't handle LBR and extra_regs support.
+    So check the related MSRs access right once at initialization time to avoid
+    the error access at runtime.
+    
+    For reproducing the issue, please build the kernel with CONFIG_KVM_INTEL = y
+    (for host kernel).
+    And CONFIG_PARAVIRT = n and CONFIG_KVM_GUEST = n (for guest kernel).
+    Start the guest with -cpu host.
+    Run perf record with --branch-any or --branch-filter in guest to trigger LBR
+    Run perf stat offcore events (E.g. LLC-loads/LLC-load-misses ...) in guest to
+    trigger offcore_rsp #GP
+    
+    Signed-off-by: Kan Liang <kan.liang@intel.com>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Cc: Andi Kleen <ak@linux.intel.com>
+    Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Maria Dimakopoulou <maria.n.dimakopoulou@gmail.com>
+    Cc: Mark Davies <junk@eslaf.co.uk>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Stephane Eranian <eranian@google.com>
+    Cc: Yan, Zheng <zheng.z.yan@intel.com>
+    Link: http://lkml.kernel.org/r/1405365957-20202-1-git-send-email-kan.liang@intel.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit fda703283f5e154cb64928e66f3898505e7b4d1c
+Author: Yan, Zheng <zheng.z.yan@intel.com>
+Date:   Mon Mar 24 09:56:43 2014 +0800
+
+    ceph: fix null pointer dereference in discard_cap_releases()
+    
+    commit 00bd8edb861eb41d274938cfc0338999d9c593a3 upstream.
+    
+    send_mds_reconnect() may call discard_cap_releases() after all
+    release messages have been dropped by cleanup_cap_releases()
+    
+    Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+    Reviewed-by: Sage Weil <sage@inktank.com>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 72237d47c78ab849c55c6cc0211315db1f1f324b
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Wed Dec 3 12:13:58 2014 +0100
+
+    net: sctp: use MAX_HEADER for headroom reserve in output path
+    
+    [ Upstream commit 9772b54c55266ce80c639a80aa68eeb908f8ecf5 ]
+    
+    To accomodate for enough headroom for tunnels, use MAX_HEADER instead
+    of LL_MAX_HEADER. Robert reported that he has hit after roughly 40hrs
+    of trinity an skb_under_panic() via SCTP output path (see reference).
+    I couldn't reproduce it from here, but not using MAX_HEADER as elsewhere
+    in other protocols might be one possible cause for this.
+    
+    In any case, it looks like accounting on chunks themself seems to look
+    good as the skb already passed the SCTP output path and did not hit
+    any skb_over_panic(). Given tunneling was enabled in his .config, the
+    headroom would have been expanded by MAX_HEADER in this case.
+    
+    Reported-by: Robert Święcki <robert@swiecki.net>
+    Reference: https://lkml.org/lkml/2014/12/1/507
+    Fixes: 594ccc14dfe4d ("[SCTP] Replace incorrect use of dev_alloc_skb with alloc_skb in sctp_packet_transmit().")
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Acked-by: Vlad Yasevich <vyasevich@gmail.com>
+    Acked-by: Neil Horman <nhorman@tuxdriver.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 2ffe53f9735a9fb7be8a2a1f78487db8bd603f53
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Tue Dec 2 04:30:59 2014 -0800
+
+    net: mvneta: fix race condition in mvneta_tx()
+    
+    [ Upstream commit 5f478b41033606d325e420df693162e2524c2b94 ]
+    
+    mvneta_tx() dereferences skb to get skb->len too late,
+    as hardware might have completed the transmit and TX completion
+    could have freed the skb from another cpu.
+    
+    Fixes: 71f6d1b31fb1 ("net: mvneta: replace Tx timer with a real interrupt")
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 844969652b9b11b8b33779c35c1ae11d8cb30a96
+Author: willy tarreau <w@1wt.eu>
+Date:   Tue Dec 2 08:13:04 2014 +0100
+
+    net: mvneta: fix Tx interrupt delay
+    
+    [ Upstream commit aebea2ba0f7495e1a1c9ea5e753d146cb2f6b845 ]
+    
+    The mvneta driver sets the amount of Tx coalesce packets to 16 by
+    default. Normally that does not cause any trouble since the driver
+    uses a much larger Tx ring size (532 packets). But some sockets
+    might run with very small buffers, much smaller than the equivalent
+    of 16 packets. This is what ping is doing for example, by setting
+    SNDBUF to 324 bytes rounded up to 2kB by the kernel.
+    
+    The problem is that there is no documented method to force a specific
+    packet to emit an interrupt (eg: the last of the ring) nor is it
+    possible to make the NIC emit an interrupt after a given delay.
+    
+    In this case, it causes trouble, because when ping sends packets over
+    its raw socket, the few first packets leave the system, and the first
+    15 packets will be emitted without an IRQ being generated, so without
+    the skbs being freed. And since the socket's buffer is small, there's
+    no way to reach that amount of packets, and the ping ends up with
+    "send: no buffer available" after sending 6 packets. Running with 3
+    instances of ping in parallel is enough to hide the problem, because
+    with 6 packets per instance, that's 18 packets total, which is enough
+    to grant a Tx interrupt before all are sent.
+    
+    The original driver in the LSP kernel worked around this design flaw
+    by using a software timer to clean up the Tx descriptors. This timer
+    was slow and caused terrible network performance on some Tx-bound
+    workloads (such as routing) but was enough to make tools like ping
+    work correctly.
+    
+    Instead here, we simply set the packet counts before interrupt to 1.
+    This ensures that each packet sent will produce an interrupt. NAPI
+    takes care of coalescing interrupts since the interrupt is disabled
+    once generated.
+    
+    No measurable performance impact nor CPU usage were observed on small
+    nor large packets, including when saturating the link on Tx, and this
+    fixes tools like ping which rely on too small a send buffer. If one
+    wants to increase this value for certain workloads where it is safe
+    to do so, "ethtool -C $dev tx-frames" will override this default
+    setting.
+    
+    This fix needs to be applied to stable kernels starting with 3.10.
+    
+    Tested-By: Maggie Mae Roxas <maggie.mae.roxas@gmail.com>
+    Signed-off-by: Willy Tarreau <w@1wt.eu>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 7493962219d95121cf95214db07df51373020363
+Author: Seth Forshee <seth.forshee@canonical.com>
+Date:   Tue Nov 25 20:28:24 2014 -0600
+
+    xen-netfront: Remove BUGs on paged skb data which crosses a page boundary
+    
+    [ Upstream commit 8d609725d4357f499e2103e46011308b32f53513 ]
+    
+    These BUGs can be erroneously triggered by frags which refer to
+    tail pages within a compound page. The data in these pages may
+    overrun the hardware page while still being contained within the
+    compound page, but since compound_order() evaluates to 0 for tail
+    pages the assertion fails. The code already iterates through
+    subsequent pages correctly in this scenario, so the BUGs are
+    unnecessary and can be removed.
+    
+    Fixes: f36c374782e4 ("xen/netfront: handle compound page fragments on transmit")
+    Cc: <stable@vger.kernel.org> # 3.7+
+    Signed-off-by: Seth Forshee <seth.forshee@canonical.com>
+    Reviewed-by: David Vrabel <david.vrabel@citrix.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 6f6204584a51a9c36732d289cc037c256208b20e
+Author: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+Date:   Thu Nov 27 10:16:15 2014 +0100
+
+    rtnetlink: release net refcnt on error in do_setlink()
+    
+    [ Upstream commit e0ebde0e131b529fd721b24f62872def5ec3718c ]
+    
+    rtnl_link_get_net() holds a reference on the 'struct net', we need to release
+    it in case of error.
+    
+    CC: Eric W. Biederman <ebiederm@xmission.com>
+    Fixes: b51642f6d77b ("net: Enable a userns root rtnl calls that are safe for unprivilged users")
+    Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+    Reviewed-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 0b79861fc455782afb8f490d9e2e9102fa196bc2
+Author: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Date:   Tue Nov 25 11:54:31 2014 +0200
+
+    net/mlx4_core: Limit count field to 24 bits in qp_alloc_res
+    
+    [ Upstream commit 2d5c57d7fbfaa642fb7f0673df24f32b83d9066c ]
+    
+    Some VF drivers use the upper byte of "param1" (the qp count field)
+    in mlx4_qp_reserve_range() to pass flags which are used to optimize
+    the range allocation.
+    
+    Under the current code, if any of these flags are set, the 32-bit
+    count field yields a count greater than 2^24, which is out of range,
+    and this VF fails.
+    
+    As these flags represent a "best-effort" allocation hint anyway, they may
+    safely be ignored. Therefore, the PF driver may simply mask out the bits.
+    
+    Fixes: c82e9aa0a8 "mlx4_core: resource tracking for HCA resources used by guests"
+    Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit ae45dd08b4655300f5f119248a6f51aed7df53f6
+Author: Thadeu Lima de Souza Cascardo <cascardo@linux.vnet.ibm.com>
+Date:   Tue Nov 25 14:21:11 2014 -0200
+
+    tg3: fix ring init when there are more TX than RX channels
+    
+    [ Upstream commit a620a6bc1c94c22d6c312892be1e0ae171523125 ]
+    
+    If TX channels are set to 4 and RX channels are set to less than 4,
+    using ethtool -L, the driver will try to initialize more RX channels
+    than it has allocated, causing an oops.
+    
+    This fix only initializes the RX ring if it has been allocated.
+    
+    Signed-off-by: Thadeu Lima de Souza Cascardo <cascardo@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 555533176833d396f82cdcc131e9188286a74b0d
+Author: Marcelo Leitner <mleitner@redhat.com>
+Date:   Thu Dec 11 10:02:22 2014 -0200
+
+    Fix race condition between vxlan_sock_add and vxlan_sock_release
+    
+    [ Upstream commit 00c83b01d58068dfeb2e1351cca6fccf2a83fa8f ]
+    
+    Currently, when trying to reuse a socket, vxlan_sock_add will grab
+    vn->sock_lock, locate a reusable socket, inc refcount and release
+    vn->sock_lock.
+    
+    But vxlan_sock_release() will first decrement refcount, and then grab
+    that lock. refcnt operations are atomic but as currently we have
+    deferred works which hold vs->refcnt each, this might happen, leading to
+    a use after free (specially after vxlan_igmp_leave):
+    
+      CPU 1                            CPU 2
+    
+    deferred work                    vxlan_sock_add
+      ...                              ...
+                                       spin_lock(&vn->sock_lock)
+                                       vs = vxlan_find_sock();
+      vxlan_sock_release
+        dec vs->refcnt, reaches 0
+        spin_lock(&vn->sock_lock)
+                                       vxlan_sock_hold(vs), refcnt=1
+                                       spin_unlock(&vn->sock_lock)
+        hlist_del_rcu(&vs->hlist);
+        vxlan_notify_del_rx_port(vs)
+        spin_unlock(&vn->sock_lock)
+    
+    So when we look for a reusable socket, we check if it wasn't freed
+    already before reusing it.
+    
+    Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+    Fixes: 7c47cedf43a8b3 ("vxlan: move IGMP join/leave to work queue")
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+
+commit 72002f1f248c28d1715d10454190e209d5a20fe1
+Author: Yuri Chislov <yuri.chislov@gmail.com>
+Date:   Mon Nov 24 11:25:15 2014 +0100
+
+    ipv6: gre: fix wrong skb->protocol in WCCP
+    
+    [ Upstream commit be6572fdb1bfbe23b2624d477de50af50b02f5d6 ]
+    
+    When using GRE redirection in WCCP, it sets the wrong skb->protocol,
+    that is, ETH_P_IP instead of ETH_P_IPV6 for the encapuslated traffic.
+    
+    Fixes: c12b395a4664 ("gre: Support GRE over IPv6")
+    Cc: Dmitry Kozlov <xeb@mail.ru>
+    Signed-off-by: Yuri Chislov <yuri.chislov@gmail.com>
+    Tested-by: Yuri Chislov <yuri.chislov@gmail.com>
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Jiri Slaby <jslaby@suse.cz>

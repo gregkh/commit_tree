@@ -1,0 +1,811 @@
+commit 8f8ee9706b0a64a3506b9d9789ace7c44f3d817d
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Sat Apr 8 09:53:53 2017 +0200
+
+    Linux 4.4.60
+
+commit 84bd21a708b83a24d26cd0010ea94106c96557de
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Thu Mar 23 12:24:43 2017 +0100
+
+    padata: avoid race in reordering
+    
+    commit de5540d088fe97ad583cc7d396586437b32149a5 upstream.
+    
+    Under extremely heavy uses of padata, crashes occur, and with list
+    debugging turned on, this happens instead:
+    
+    [87487.298728] WARNING: CPU: 1 PID: 882 at lib/list_debug.c:33
+    __list_add+0xae/0x130
+    [87487.301868] list_add corruption. prev->next should be next
+    (ffffb17abfc043d0), but was ffff8dba70872c80. (prev=ffff8dba70872b00).
+    [87487.339011]  [<ffffffff9a53d075>] dump_stack+0x68/0xa3
+    [87487.342198]  [<ffffffff99e119a1>] ? console_unlock+0x281/0x6d0
+    [87487.345364]  [<ffffffff99d6b91f>] __warn+0xff/0x140
+    [87487.348513]  [<ffffffff99d6b9aa>] warn_slowpath_fmt+0x4a/0x50
+    [87487.351659]  [<ffffffff9a58b5de>] __list_add+0xae/0x130
+    [87487.354772]  [<ffffffff9add5094>] ? _raw_spin_lock+0x64/0x70
+    [87487.357915]  [<ffffffff99eefd66>] padata_reorder+0x1e6/0x420
+    [87487.361084]  [<ffffffff99ef0055>] padata_do_serial+0xa5/0x120
+    
+    padata_reorder calls list_add_tail with the list to which its adding
+    locked, which seems correct:
+    
+    spin_lock(&squeue->serial.lock);
+    list_add_tail(&padata->list, &squeue->serial.list);
+    spin_unlock(&squeue->serial.lock);
+    
+    This therefore leaves only place where such inconsistency could occur:
+    if padata->list is added at the same time on two different threads.
+    This pdata pointer comes from the function call to
+    padata_get_next(pd), which has in it the following block:
+    
+    next_queue = per_cpu_ptr(pd->pqueue, cpu);
+    padata = NULL;
+    reorder = &next_queue->reorder;
+    if (!list_empty(&reorder->list)) {
+           padata = list_entry(reorder->list.next,
+                               struct padata_priv, list);
+           spin_lock(&reorder->lock);
+           list_del_init(&padata->list);
+           atomic_dec(&pd->reorder_objects);
+           spin_unlock(&reorder->lock);
+    
+           pd->processed++;
+    
+           goto out;
+    }
+    out:
+    return padata;
+    
+    I strongly suspect that the problem here is that two threads can race
+    on reorder list. Even though the deletion is locked, call to
+    list_entry is not locked, which means it's feasible that two threads
+    pick up the same padata object and subsequently call list_add_tail on
+    them at the same time. The fix is thus be hoist that lock outside of
+    that block.
+    
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Acked-by: Steffen Klassert <steffen.klassert@secunet.com>
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5cca175b6cda16b68b18967210872327b1cadf4f
+Author: NeilBrown <neilb@suse.com>
+Date:   Fri Mar 10 17:00:47 2017 +1100
+
+    blk: Ensure users for current->bio_list can see the full list.
+    
+    commit f5fe1b51905df7cfe4fdfd85c5fb7bc5b71a094f upstream.
+    
+    Commit 79bd99596b73 ("blk: improve order of bio handling in generic_make_request()")
+    changed current->bio_list so that it did not contain *all* of the
+    queued bios, but only those submitted by the currently running
+    make_request_fn.
+    
+    There are two places which walk the list and requeue selected bios,
+    and others that check if the list is empty.  These are no longer
+    correct.
+    
+    So redefine current->bio_list to point to an array of two lists, which
+    contain all queued bios, and adjust various code to test or walk both
+    lists.
+    
+    Signed-off-by: NeilBrown <neilb@suse.com>
+    Fixes: 79bd99596b73 ("blk: improve order of bio handling in generic_make_request()")
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+    [jwang: backport to 4.4]
+    Signed-off-by: Jack Wang <jinpu.wang@profitbricks.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    [bwh: Restore changes in device-mapper from upstream version]
+    Signed-off-by: Ben Hutchings <ben.hutchings@codethink.co.uk>
+
+commit 2cbd78f4239bd28b86c6ff8e3b7867db72762f1a
+Author: NeilBrown <neilb@suse.com>
+Date:   Wed Mar 8 07:38:05 2017 +1100
+
+    blk: improve order of bio handling in generic_make_request()
+    
+    commit 79bd99596b7305ab08109a8bf44a6a4511dbf1cd upstream.
+    
+    To avoid recursion on the kernel stack when stacked block devices
+    are in use, generic_make_request() will, when called recursively,
+    queue new requests for later handling.  They will be handled when the
+    make_request_fn for the current bio completes.
+    
+    If any bios are submitted by a make_request_fn, these will ultimately
+    be handled seqeuntially.  If the handling of one of those generates
+    further requests, they will be added to the end of the queue.
+    
+    This strict first-in-first-out behaviour can lead to deadlocks in
+    various ways, normally because a request might need to wait for a
+    previous request to the same device to complete.  This can happen when
+    they share a mempool, and can happen due to interdependencies
+    particular to the device.  Both md and dm have examples where this happens.
+    
+    These deadlocks can be erradicated by more selective ordering of bios.
+    Specifically by handling them in depth-first order.  That is: when the
+    handling of one bio generates one or more further bios, they are
+    handled immediately after the parent, before any siblings of the
+    parent.  That way, when generic_make_request() calls make_request_fn
+    for some particular device, we can be certain that all previously
+    submited requests for that device have been completely handled and are
+    not waiting for anything in the queue of requests maintained in
+    generic_make_request().
+    
+    An easy way to achieve this would be to use a last-in-first-out stack
+    instead of a queue.  However this will change the order of consecutive
+    bios submitted by a make_request_fn, which could have unexpected consequences.
+    Instead we take a slightly more complex approach.
+    A fresh queue is created for each call to a make_request_fn.  After it completes,
+    any bios for a different device are placed on the front of the main queue, followed
+    by any bios for the same device, followed by all bios that were already on
+    the queue before the make_request_fn was called.
+    This provides the depth-first approach without reordering bios on the same level.
+    
+    This, by itself, it not enough to remove all deadlocks.  It just makes
+    it possible for drivers to take the extra step required themselves.
+    
+    To avoid deadlocks, drivers must never risk waiting for a request
+    after submitting one to generic_make_request.  This includes never
+    allocing from a mempool twice in the one call to a make_request_fn.
+    
+    A common pattern in drivers is to call bio_split() in a loop, handling
+    the first part and then looping around to possibly split the next part.
+    Instead, a driver that finds it needs to split a bio should queue
+    (with generic_make_request) the second part, handle the first part,
+    and then return.  The new code in generic_make_request will ensure the
+    requests to underlying bios are processed first, then the second bio
+    that was split off.  If it splits again, the same process happens.  In
+    each case one bio will be completely handled before the next one is attempted.
+    
+    With this is place, it should be possible to disable the
+    punt_bios_to_recover() recovery thread for many block devices, and
+    eventually it may be possible to remove it completely.
+    
+    Ref: http://www.spinics.net/lists/raid/msg54680.html
+    Tested-by: Jinpu Wang <jinpu.wang@profitbricks.com>
+    Inspired-by: Lars Ellenberg <lars.ellenberg@linbit.com>
+    Signed-off-by: NeilBrown <neilb@suse.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+    [jwang: backport to 4.4]
+    Signed-off-by: Jack Wang <jinpu.wang@profitbricks.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 063d30f187f5c492aa4a6cca88b8afa08f5a170c
+Author: Alexandre Belloni <alexandre.belloni@bootlin.com>
+Date:   Tue Oct 25 11:37:59 2016 +0200
+
+    power: reset: at91-poweroff: timely shutdown LPDDR memories
+    
+    commit 0b0408745e7ff24757cbfd571d69026c0ddb803c upstream.
+    
+    LPDDR memories can only handle up to 400 uncontrolled power off. Ensure the
+    proper power off sequence is used before shutting down the platform.
+    
+    Signed-off-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
+    Signed-off-by: Sebastian Reichel <sre@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 42462d23e60b89a3c2f7d8d63f5f4e464ba77727
+Author: David Hildenbrand <david@redhat.com>
+Date:   Thu Mar 23 18:24:19 2017 +0100
+
+    KVM: kvm_io_bus_unregister_dev() should never fail
+    
+    commit 90db10434b163e46da413d34db8d0e77404cc645 upstream.
+    
+    No caller currently checks the return value of
+    kvm_io_bus_unregister_dev(). This is evil, as all callers silently go on
+    freeing their device. A stale reference will remain in the io_bus,
+    getting at least used again, when the iobus gets teared down on
+    kvm_destroy_vm() - leading to use after free errors.
+    
+    There is nothing the callers could do, except retrying over and over
+    again.
+    
+    So let's simply remove the bus altogether, print an error and make
+    sure no one can access this broken bus again (returning -ENOMEM on any
+    attempt to access it).
+    
+    Fixes: e93f8a0f821e ("KVM: convert io_bus to SRCU")
+    Reported-by: Dmitry Vyukov <dvyukov@google.com>
+    Reviewed-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+    Signed-off-by: David Hildenbrand <david@redhat.com>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3a1246b46df5210164ee43d4c5c560d0dc9ed2ce
+Author: Uwe Kleine-König <uwe@kleine-koenig.org>
+Date:   Sat Jul 2 17:28:10 2016 +0200
+
+    rtc: s35390a: improve irq handling
+    
+    commit 3bd32722c827d00eafe8e6d5b83e9f3148ea7c7e upstream.
+    
+    On some QNAP NAS devices the rtc can wake the machine. Several people
+    noticed that once the machine was woken this way it fails to shut down.
+    That's because the driver fails to acknowledge the interrupt and so it
+    keeps active and restarts the machine immediatly after shutdown. See
+    https://bugs.debian.org/794266 for a bug report.
+    
+    Doing this correctly requires to interpret the INT2 flag of the first read
+    of the STATUS1 register because this bit is cleared by read.
+    
+    Note this is not maximally robust though because a pending irq isn't
+    detected when the STATUS1 register was already read (and so INT2 is not
+    set) but the irq was not disabled. But that is a hardware imposed problem
+    that cannot easily be fixed by software.
+    
+    Signed-off-by: Uwe Kleine-König <uwe@kleine-koenig.org>
+    Signed-off-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a55ae9d1937b0bf4004e5416cfa15750cd6d2b22
+Author: Uwe Kleine-König <uwe@kleine-koenig.org>
+Date:   Sat Jul 2 17:28:09 2016 +0200
+
+    rtc: s35390a: implement reset routine as suggested by the reference
+    
+    commit 8e6583f1b5d1f5f129b873f1428b7e414263d847 upstream.
+    
+    There were two deviations from the reference manual: you have to wait
+    half a second when POC is active and you might have to repeat
+    initialization when POC or BLD are still set after the sequence.
+    
+    Note however that as POC and BLD are cleared by read the driver might
+    not be able to detect that a reset is necessary. I don't have a good
+    idea how to fix this.
+    
+    Additionally report the value read from STATUS1 to the caller. This
+    prepares the next patch.
+    
+    Signed-off-by: Uwe Kleine-König <uwe@kleine-koenig.org>
+    Signed-off-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit fdd4bc9313e59a1757cfc8ac5836cff55ec03eeb
+Author: Uwe Kleine-König <uwe@kleine-koenig.org>
+Date:   Mon Apr 3 23:32:38 2017 +0200
+
+    rtc: s35390a: make sure all members in the output are set
+    
+    The rtc core calls the .read_alarm with all fields initialized to 0. As
+    the s35390a driver doesn't touch some fields the returned date is
+    interpreted as a date in January 1900. So make sure all fields are set
+    to -1; some of them are then overwritten with the right data depending
+    on the hardware state.
+    
+    In mainline this is done by commit d68778b80dd7 ("rtc: initialize output
+    parameter for read alarm to "uninitialized"") in the core. This is
+    considered to dangerous for stable as it might have side effects for
+    other rtc drivers that might for example rely on alarm->time.tm_sec
+    being initialized to 0.
+    
+    Signed-off-by: Uwe Kleine-König <uwe@kleine-koenig.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit b3ed3864912e8809e228ddea259e8e0fa1deadf5
+Author: Uwe Kleine-König <uwe@kleine-koenig.org>
+Date:   Sat Jul 2 17:28:08 2016 +0200
+
+    rtc: s35390a: fix reading out alarm
+    
+    commit f87e904ddd8f0ef120e46045b0addeb1cc88354e upstream.
+    
+    There are several issues fixed in this patch:
+    
+     - When alarm isn't enabled, set .enabled to zero instead of returning
+       -EINVAL.
+     - Ignore how IRQ1 is configured when determining if IRQ2 is on.
+     - The three alarm registers have an enable flag which must be
+       evaluated.
+     - The chip always triggers when the seconds register gets 0.
+    
+    Note that the rtc framework however doesn't handle the result correctly
+    because it doesn't check wday being initialized and so interprets an
+    alarm being set for 10:00 AM in three days as 10:00 AM tomorrow (or
+    today if that's not over yet).
+    
+    Signed-off-by: Uwe Kleine-König <uwe@kleine-koenig.org>
+    Signed-off-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 6280ac931a23d3fa40cd26057576abcf90a4f22d
+Author: Felix Fietkau <nbd@nbd.name>
+Date:   Thu Jan 19 12:28:22 2017 +0100
+
+    MIPS: Lantiq: Fix cascaded IRQ setup
+    
+    commit 6c356eda225e3ee134ed4176b9ae3a76f793f4dd upstream.
+    
+    With the IRQ stack changes integrated, the XRX200 devices started
+    emitting a constant stream of kernel messages like this:
+    
+    [  565.415310] Spurious IRQ: CAUSE=0x1100c300
+    
+    This is caused by IP0 getting handled by plat_irq_dispatch() rather than
+    its vectored interrupt handler, which is fixed by commit de856416e714
+    ("MIPS: IRQ Stack: Fix erroneous jal to plat_irq_dispatch").
+    
+    Fix plat_irq_dispatch() to handle non-vectored IPI interrupts correctly
+    by setting up IP2-6 as proper chained IRQ handlers and calling do_IRQ
+    for all MIPS CPU interrupts.
+    
+    Signed-off-by: Felix Fietkau <nbd@nbd.name>
+    Acked-by: John Crispin <john@phrozen.org>
+    Cc: linux-mips@linux-mips.org
+    Patchwork: https://patchwork.linux-mips.org/patch/15077/
+    [james.hogan@imgtec.com: tweaked commit message]
+    Signed-off-by: James Hogan <james.hogan@imgtec.com>
+    Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 47e2fe17d14d1a7da3a405b1f364c094c271d35c
+Author: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Date:   Fri Mar 31 15:11:55 2017 -0700
+
+    mm, hugetlb: use pte_present() instead of pmd_present() in follow_huge_pmd()
+    
+    commit c9d398fa237882ea07167e23bcfc5e6847066518 upstream.
+    
+    I found the race condition which triggers the following bug when
+    move_pages() and soft offline are called on a single hugetlb page
+    concurrently.
+    
+        Soft offlining page 0x119400 at 0x700000000000
+        BUG: unable to handle kernel paging request at ffffea0011943820
+        IP: follow_huge_pmd+0x143/0x190
+        PGD 7ffd2067
+        PUD 7ffd1067
+        PMD 0
+            [61163.582052] Oops: 0000 [#1] SMP
+        Modules linked in: binfmt_misc ppdev virtio_balloon parport_pc pcspkr i2c_piix4 parport i2c_core acpi_cpufreq ip_tables xfs libcrc32c ata_generic pata_acpi virtio_blk 8139too crc32c_intel ata_piix serio_raw libata virtio_pci 8139cp virtio_ring virtio mii floppy dm_mirror dm_region_hash dm_log dm_mod [last unloaded: cap_check]
+        CPU: 0 PID: 22573 Comm: iterate_numa_mo Tainted: P           OE   4.11.0-rc2-mm1+ #2
+        Hardware name: Red Hat KVM, BIOS 0.5.1 01/01/2011
+        RIP: 0010:follow_huge_pmd+0x143/0x190
+        RSP: 0018:ffffc90004bdbcd0 EFLAGS: 00010202
+        RAX: 0000000465003e80 RBX: ffffea0004e34d30 RCX: 00003ffffffff000
+        RDX: 0000000011943800 RSI: 0000000000080001 RDI: 0000000465003e80
+        RBP: ffffc90004bdbd18 R08: 0000000000000000 R09: ffff880138d34000
+        R10: ffffea0004650000 R11: 0000000000c363b0 R12: ffffea0011943800
+        R13: ffff8801b8d34000 R14: ffffea0000000000 R15: 000077ff80000000
+        FS:  00007fc977710740(0000) GS:ffff88007dc00000(0000) knlGS:0000000000000000
+        CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+        CR2: ffffea0011943820 CR3: 000000007a746000 CR4: 00000000001406f0
+        Call Trace:
+         follow_page_mask+0x270/0x550
+         SYSC_move_pages+0x4ea/0x8f0
+         SyS_move_pages+0xe/0x10
+         do_syscall_64+0x67/0x180
+         entry_SYSCALL64_slow_path+0x25/0x25
+        RIP: 0033:0x7fc976e03949
+        RSP: 002b:00007ffe72221d88 EFLAGS: 00000246 ORIG_RAX: 0000000000000117
+        RAX: ffffffffffffffda RBX: 0000000000000000 RCX: 00007fc976e03949
+        RDX: 0000000000c22390 RSI: 0000000000001400 RDI: 0000000000005827
+        RBP: 00007ffe72221e00 R08: 0000000000c2c3a0 R09: 0000000000000004
+        R10: 0000000000c363b0 R11: 0000000000000246 R12: 0000000000400650
+        R13: 00007ffe72221ee0 R14: 0000000000000000 R15: 0000000000000000
+        Code: 81 e4 ff ff 1f 00 48 21 c2 49 c1 ec 0c 48 c1 ea 0c 4c 01 e2 49 bc 00 00 00 00 00 ea ff ff 48 c1 e2 06 49 01 d4 f6 45 bc 04 74 90 <49> 8b 7c 24 20 40 f6 c7 01 75 2b 4c 89 e7 8b 47 1c 85 c0 7e 2a
+        RIP: follow_huge_pmd+0x143/0x190 RSP: ffffc90004bdbcd0
+        CR2: ffffea0011943820
+        ---[ end trace e4f81353a2d23232 ]---
+        Kernel panic - not syncing: Fatal exception
+        Kernel Offset: disabled
+    
+    This bug is triggered when pmd_present() returns true for non-present
+    hugetlb, so fixing the present check in follow_huge_pmd() prevents it.
+    Using pmd_present() to determine present/non-present for hugetlb is not
+    correct, because pmd_present() checks multiple bits (not only
+    _PAGE_PRESENT) for historical reason and it can misjudge hugetlb state.
+    
+    Fixes: e66f17ff7177 ("mm/hugetlb: take page table lock in follow_huge_pmd()")
+    Link: http://lkml.kernel.org/r/1490149898-20231-1-git-send-email-n-horiguchi@ah.jp.nec.com
+    Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+    Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+    Cc: Hugh Dickins <hughd@google.com>
+    Cc: Michal Hocko <mhocko@kernel.org>
+    Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+    Cc: Mike Kravetz <mike.kravetz@oracle.com>
+    Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+    Cc: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ef55c3df5dbd60eb3daab7797feac850bd1e6fe3
+Author: Michel Dänzer <michel.daenzer@amd.com>
+Date:   Fri Mar 24 19:01:09 2017 +0900
+
+    drm/radeon: Override fpfn for all VRAM placements in radeon_evict_flags
+    
+    commit ce4b4f228e51219b0b79588caf73225b08b5b779 upstream.
+    
+    We were accidentally only overriding the first VRAM placement. For BOs
+    with the RADEON_GEM_NO_CPU_ACCESS flag set,
+    radeon_ttm_placement_from_domain creates a second VRAM placment with
+    fpfn == 0. If VRAM is almost full, the first VRAM placement with
+    fpfn > 0 may not work, but the second one with fpfn == 0 always will
+    (the BO's current location trivially satisfies it). Because "moving"
+    the BO to its current location puts it back on the LRU list, this
+    results in an infinite loop.
+    
+    Fixes: 2a85aedd117c ("drm/radeon: Try evicting from CPU accessible to
+                          inaccessible VRAM first")
+    Reported-by: Zachary Michaels <zmichaels@oblong.com>
+    Reported-and-Tested-by: Julien Isorce <jisorce@oblong.com>
+    Reviewed-by: Christian König <christian.koenig@amd.com>
+    Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+    Signed-off-by: Michel Dänzer <michel.daenzer@amd.com>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3eb392056aeb4a0beca5fcead9ad3d6b6ff0816e
+Author: Peter Xu <peterx@redhat.com>
+Date:   Wed Mar 15 16:01:17 2017 +0800
+
+    KVM: x86: clear bus pointer when destroyed
+    
+    commit df630b8c1e851b5e265dc2ca9c87222e342c093b upstream.
+    
+    When releasing the bus, let's clear the bus pointers to mark it out. If
+    any further device unregister happens on this bus, we know that we're
+    done if we found the bus being released already.
+    
+    Signed-off-by: Peter Xu <peterx@redhat.com>
+    Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit eac3ab3e69151c21a0a71ec8711600022cc12fa3
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Fri Mar 24 13:38:28 2017 -0400
+
+    USB: fix linked-list corruption in rh_call_control()
+    
+    commit 1633682053a7ee8058e10c76722b9b28e97fb73f upstream.
+    
+    Using KASAN, Dmitry found a bug in the rh_call_control() routine: If
+    buffer allocation fails, the routine returns immediately without
+    unlinking its URB from the control endpoint, eventually leading to
+    linked-list corruption.
+    
+    This patch fixes the problem by jumping to the end of the routine
+    (where the URB is unlinked) when an allocation failure occurs.
+    
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    Reported-and-tested-by: Dmitry Vyukov <dvyukov@google.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 0a1757cfa5ba3b46f6ee7a74ddb7a5c0bd5d7c2f
+Author: Nicolas Ferre <nicolas.ferre@microchip.com>
+Date:   Mon Mar 20 16:38:57 2017 +0100
+
+    tty/serial: atmel: fix TX path in atmel_console_write()
+    
+    commit 497e1e16f45c70574dc9922c7f75c642c2162119 upstream.
+    
+    A side effect of 89d8232411a8 ("tty/serial: atmel_serial: BUG: stop DMA
+    from transmitting in stop_tx") is that the console can be called with
+    TX path disabled. Then the system would hang trying to push charecters
+    out in atmel_console_putchar().
+    
+    Signed-off-by: Nicolas Ferre <nicolas.ferre@microchip.com>
+    Fixes: 89d8232411a8 ("tty/serial: atmel_serial: BUG: stop DMA from transmitting in stop_tx")
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 74b8fc017d7689d1a60c9e234b2cfe3550b7f414
+Author: Richard Genoud <richard.genoud@gmail.com>
+Date:   Mon Mar 20 11:52:41 2017 +0100
+
+    tty/serial: atmel: fix race condition (TX+DMA)
+    
+    commit 31ca2c63fdc0aee725cbd4f207c1256f5deaabde upstream.
+    
+    If uart_flush_buffer() is called between atmel_tx_dma() and
+    atmel_complete_tx_dma(), the circular buffer has been cleared, but not
+    atmel_port->tx_len.
+    That leads to a circular buffer overflow (dumping (UART_XMIT_SIZE -
+    atmel_port->tx_len) bytes).
+    
+    Tested-by: Nicolas Ferre <nicolas.ferre@microchip.com>
+    Signed-off-by: Richard Genoud <richard.genoud@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 566a8711a7dd11960fa0bf3a4fd89c742eb359f3
+Author: Joerg Roedel <jroedel@suse.de>
+Date:   Wed Mar 22 18:33:25 2017 +0100
+
+    ACPI: Do not create a platform_device for IOAPIC/IOxAPIC
+    
+    commit 08f63d97749185fab942a3a47ed80f5bd89b8b7d upstream.
+    
+    No platform-device is required for IO(x)APICs, so don't even
+    create them.
+    
+    [ rjw: This fixes a problem with leaking platform device objects
+      after IOAPIC/IOxAPIC hot-removal events.]
+    
+    Signed-off-by: Joerg Roedel <jroedel@suse.de>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3342857ac074768e14e361392ac09fbbd70d840e
+Author: Josh Poimboeuf <jpoimboe@redhat.com>
+Date:   Thu Mar 16 08:56:28 2017 -0500
+
+    ACPI: Fix incompatibility with mcount-based function graph tracing
+    
+    commit 61b79e16c68d703dde58c25d3935d67210b7d71b upstream.
+    
+    Paul Menzel reported a warning:
+    
+      WARNING: CPU: 0 PID: 774 at /build/linux-ROBWaj/linux-4.9.13/kernel/trace/trace_functions_graph.c:233 ftrace_return_to_handler+0x1aa/0x1e0
+      Bad frame pointer: expected f6919d98, received f6919db0
+        from func acpi_pm_device_sleep_wake return to c43b6f9d
+    
+    The warning means that function graph tracing is broken for the
+    acpi_pm_device_sleep_wake() function.  That's because the ACPI Makefile
+    unconditionally sets the '-Os' gcc flag to optimize for size.  That's an
+    issue because mcount-based function graph tracing is incompatible with
+    '-Os' on x86, thanks to the following gcc bug:
+    
+      https://gcc.gnu.org/bugzilla/show_bug.cgi?id=42109
+    
+    I have another patch pending which will ensure that mcount-based
+    function graph tracing is never used with CONFIG_CC_OPTIMIZE_FOR_SIZE on
+    x86.
+    
+    But this patch is needed in addition to that one because the ACPI
+    Makefile overrides that config option for no apparent reason.  It has
+    had this flag since the beginning of git history, and there's no related
+    comment, so I don't know why it's there.  As far as I can tell, there's
+    no reason for it to be there.  The appropriate behavior is for it to
+    honor CONFIG_CC_OPTIMIZE_FOR_{SIZE,PERFORMANCE} like the rest of the
+    kernel.
+    
+    Reported-by: Paul Menzel <pmenzel@molgen.mpg.de>
+    Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+    Acked-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ab48ab614b8c83f3a3b0f83f7882b1d2766962d3
+Author: Songjun Wu <songjun.wu@microchip.com>
+Date:   Fri Feb 24 15:10:43 2017 +0800
+
+    ASoC: atmel-classd: fix audio clock rate
+    
+    commit cd3ac9affc43b44f49d7af70d275f0bd426ba643 upstream.
+    
+    Fix the audio clock rate according to the datasheet.
+    
+    Reported-by: Dushara Jayasinghe <dushara@successful.com.au>
+    Signed-off-by: Songjun Wu <songjun.wu@microchip.com>
+    Acked-by: Nicolas Ferre <nicolas.ferre@microchip.com>
+    Signed-off-by: Mark Brown <broonie@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ce3dcfdbff04bab023806ef7a342c657ec08915d
+Author: Hui Wang <hui.wang@canonical.com>
+Date:   Fri Mar 31 10:31:40 2017 +0800
+
+    ALSA: hda - fix a problem for lineout on a Dell AIO machine
+    
+    commit 2f726aec19a9d2c63bec9a8a53a3910ffdcd09f8 upstream.
+    
+    On this Dell AIO machine, the lineout jack does not work.
+    
+    We found the pin 0x1a is assigned to lineout on this machine, and in
+    the past, we applied ALC298_FIXUP_DELL1_MIC_NO_PRESENCE to fix the
+    heaset-set mic problem for this machine, this fixup will redefine
+    the pin 0x1a to headphone-mic, as a result the lineout doesn't
+    work anymore.
+    
+    After consulting with Dell, they told us this machine doesn't support
+    microphone via headset jack, so we add a new fixup which only defines
+    the pin 0x18 as the headset-mic.
+    
+    [rearranged the fixup insertion position by tiwai in order to make the
+     merge with other branches easier -- tiwai]
+    
+    Fixes: 59ec4b57bcae ("ALSA: hda - Fix headset mic detection problem for two dell machines")
+    Signed-off-by: Hui Wang <hui.wang@canonical.com>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a90d7447e4a154ad26e3b9e09a0878680be49339
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Fri Mar 24 17:07:57 2017 +0100
+
+    ALSA: seq: Fix race during FIFO resize
+    
+    commit 2d7d54002e396c180db0c800c1046f0a3c471597 upstream.
+    
+    When a new event is queued while processing to resize the FIFO in
+    snd_seq_fifo_clear(), it may lead to a use-after-free, as the old pool
+    that is being queued gets removed.  For avoiding this race, we need to
+    close the pool to be deleted and sync its usage before actually
+    deleting it.
+    
+    The issue was spotted by syzkaller.
+    
+    Reported-by: Dmitry Vyukov <dvyukov@google.com>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 75a03869c93a443ae068eae9aca0c0df8b33dff5
+Author: John Garry <john.garry@huawei.com>
+Date:   Thu Mar 16 23:07:28 2017 +0800
+
+    scsi: libsas: fix ata xfer length
+    
+    commit 9702c67c6066f583b629cf037d2056245bb7a8e6 upstream.
+    
+    The total ata xfer length may not be calculated properly, in that we do
+    not use the proper method to get an sg element dma length.
+    
+    According to the code comment, sg_dma_len() should be used after
+    dma_map_sg() is called.
+    
+    This issue was found by turning on the SMMUv3 in front of the hisi_sas
+    controller in hip07. Multiple sg elements were being combined into a
+    single element, but the original first element length was being use as
+    the total xfer length.
+    
+    Fixes: ff2aeb1eb64c8a4770a6 ("libata: convert to chained sg")
+    Signed-off-by: John Garry <john.garry@huawei.com>
+    Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a92f411914cad6532e82e4607bc4075a5ffaa366
+Author: peter chang <dpf@google.com>
+Date:   Wed Feb 15 14:11:54 2017 -0800
+
+    scsi: sg: check length passed to SG_NEXT_CMD_LEN
+    
+    commit bf33f87dd04c371ea33feb821b60d63d754e3124 upstream.
+    
+    The user can control the size of the next command passed along, but the
+    value passed to the ioctl isn't checked against the usable max command
+    size.
+    
+    Signed-off-by: Peter Chang <dpf@google.com>
+    Acked-by: Douglas Gilbert <dgilbert@interlog.com>
+    Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 18639c4bad72218954e728e9ca65c33b13ba673a
+Author: James Bottomley <James.Bottomley@HansenPartnership.com>
+Date:   Sun Jan 1 09:39:24 2017 -0800
+
+    scsi: mpt3sas: fix hang on ata passthrough commands
+    
+    commit ffb58456589443ca572221fabbdef3db8483a779 upstream.
+    
+    mpt3sas has a firmware failure where it can only handle one pass through
+    ATA command at a time.  If another comes in, contrary to the SAT
+    standard, it will hang until the first one completes (causing long
+    commands like secure erase to timeout).  The original fix was to block
+    the device when an ATA command came in, but this caused a regression
+    with
+    
+    commit 669f044170d8933c3d66d231b69ea97cb8447338
+    Author: Bart Van Assche <bart.vanassche@sandisk.com>
+    Date:   Tue Nov 22 16:17:13 2016 -0800
+    
+        scsi: srp_transport: Move queuecommand() wait code to SCSI core
+    
+    So fix the original fix of the secure erase timeout by properly
+    returning SAM_STAT_BUSY like the SAT recommends.  The original patch
+    also had a concurrency problem since scsih_qcmd is lockless at that
+    point (this is fixed by using atomic bitops to set and test the flag).
+    
+    [mkp: addressed feedback wrt. test_bit and fixed whitespace]
+    
+    Fixes: 18f6084a989ba1b (mpt3sas: Fix secure erase premature termination)
+    Signed-off-by: James Bottomley <James.Bottomley@HansenPartnership.com>
+    Acked-by: Sreekanth Reddy <Sreekanth.Reddy@broadcom.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reported-by: Ingo Molnar <mingo@kernel.org>
+    Tested-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Cc: Joe Korty <joe.korty@ccur.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 1eed198ce16b6e05c05ee381e5d90fac35ea67a7
+Author: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date:   Mon Dec 12 14:35:13 2016 +0000
+
+    xen/setup: Don't relocate p2m over existing one
+    
+    commit 7ecec8503af37de6be4f96b53828d640a968705f upstream.
+    
+    When relocating the p2m, take special care not to relocate it so
+    that is overlaps with the current location of the p2m/initrd. This is
+    needed since the full extent of the current location is not marked as a
+    reserved region in the e820.
+    
+    This was seen to happen to a dom0 with a large initial p2m and a small
+    reserved region in the middle of the initial p2m.
+    
+    Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+    Reviewed-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ba46d8fab00a8e1538df241681d9161c8ec85778
+Author: Ilya Dryomov <idryomov@gmail.com>
+Date:   Tue Mar 21 13:44:28 2017 +0100
+
+    libceph: force GFP_NOIO for socket allocations
+    
+    commit 633ee407b9d15a75ac9740ba9d3338815e1fcb95 upstream.
+    
+    sock_alloc_inode() allocates socket+inode and socket_wq with
+    GFP_KERNEL, which is not allowed on the writeback path:
+    
+        Workqueue: ceph-msgr con_work [libceph]
+        ffff8810871cb018 0000000000000046 0000000000000000 ffff881085d40000
+        0000000000012b00 ffff881025cad428 ffff8810871cbfd8 0000000000012b00
+        ffff880102fc1000 ffff881085d40000 ffff8810871cb038 ffff8810871cb148
+        Call Trace:
+        [<ffffffff816dd629>] schedule+0x29/0x70
+        [<ffffffff816e066d>] schedule_timeout+0x1bd/0x200
+        [<ffffffff81093ffc>] ? ttwu_do_wakeup+0x2c/0x120
+        [<ffffffff81094266>] ? ttwu_do_activate.constprop.135+0x66/0x70
+        [<ffffffff816deb5f>] wait_for_completion+0xbf/0x180
+        [<ffffffff81097cd0>] ? try_to_wake_up+0x390/0x390
+        [<ffffffff81086335>] flush_work+0x165/0x250
+        [<ffffffff81082940>] ? worker_detach_from_pool+0xd0/0xd0
+        [<ffffffffa03b65b1>] xlog_cil_force_lsn+0x81/0x200 [xfs]
+        [<ffffffff816d6b42>] ? __slab_free+0xee/0x234
+        [<ffffffffa03b4b1d>] _xfs_log_force_lsn+0x4d/0x2c0 [xfs]
+        [<ffffffff811adc1e>] ? lookup_page_cgroup_used+0xe/0x30
+        [<ffffffffa039a723>] ? xfs_reclaim_inode+0xa3/0x330 [xfs]
+        [<ffffffffa03b4dcf>] xfs_log_force_lsn+0x3f/0xf0 [xfs]
+        [<ffffffffa039a723>] ? xfs_reclaim_inode+0xa3/0x330 [xfs]
+        [<ffffffffa03a62c6>] xfs_iunpin_wait+0xc6/0x1a0 [xfs]
+        [<ffffffff810aa250>] ? wake_atomic_t_function+0x40/0x40
+        [<ffffffffa039a723>] xfs_reclaim_inode+0xa3/0x330 [xfs]
+        [<ffffffffa039ac07>] xfs_reclaim_inodes_ag+0x257/0x3d0 [xfs]
+        [<ffffffffa039bb13>] xfs_reclaim_inodes_nr+0x33/0x40 [xfs]
+        [<ffffffffa03ab745>] xfs_fs_free_cached_objects+0x15/0x20 [xfs]
+        [<ffffffff811c0c18>] super_cache_scan+0x178/0x180
+        [<ffffffff8115912e>] shrink_slab_node+0x14e/0x340
+        [<ffffffff811afc3b>] ? mem_cgroup_iter+0x16b/0x450
+        [<ffffffff8115af70>] shrink_slab+0x100/0x140
+        [<ffffffff8115e425>] do_try_to_free_pages+0x335/0x490
+        [<ffffffff8115e7f9>] try_to_free_pages+0xb9/0x1f0
+        [<ffffffff816d56e4>] ? __alloc_pages_direct_compact+0x69/0x1be
+        [<ffffffff81150cba>] __alloc_pages_nodemask+0x69a/0xb40
+        [<ffffffff8119743e>] alloc_pages_current+0x9e/0x110
+        [<ffffffff811a0ac5>] new_slab+0x2c5/0x390
+        [<ffffffff816d71c4>] __slab_alloc+0x33b/0x459
+        [<ffffffff815b906d>] ? sock_alloc_inode+0x2d/0xd0
+        [<ffffffff8164bda1>] ? inet_sendmsg+0x71/0xc0
+        [<ffffffff815b906d>] ? sock_alloc_inode+0x2d/0xd0
+        [<ffffffff811a21f2>] kmem_cache_alloc+0x1a2/0x1b0
+        [<ffffffff815b906d>] sock_alloc_inode+0x2d/0xd0
+        [<ffffffff811d8566>] alloc_inode+0x26/0xa0
+        [<ffffffff811da04a>] new_inode_pseudo+0x1a/0x70
+        [<ffffffff815b933e>] sock_alloc+0x1e/0x80
+        [<ffffffff815ba855>] __sock_create+0x95/0x220
+        [<ffffffff815baa04>] sock_create_kern+0x24/0x30
+        [<ffffffffa04794d9>] con_work+0xef9/0x2050 [libceph]
+        [<ffffffffa04aa9ec>] ? rbd_img_request_submit+0x4c/0x60 [rbd]
+        [<ffffffff81084c19>] process_one_work+0x159/0x4f0
+        [<ffffffff8108561b>] worker_thread+0x11b/0x530
+        [<ffffffff81085500>] ? create_worker+0x1d0/0x1d0
+        [<ffffffff8108b6f9>] kthread+0xc9/0xe0
+        [<ffffffff8108b630>] ? flush_kthread_worker+0x90/0x90
+        [<ffffffff816e1b98>] ret_from_fork+0x58/0x90
+        [<ffffffff8108b630>] ? flush_kthread_worker+0x90/0x90
+    
+    Use memalloc_noio_{save,restore}() to temporarily force GFP_NOIO here.
+    
+    Link: http://tracker.ceph.com/issues/19309
+    Reported-by: Sergey Jerusalimov <wintchester@gmail.com>
+    Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+    Reviewed-by: Jeff Layton <jlayton@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>

@@ -1,0 +1,1414 @@
+commit c3b70f0bbb6a883f4afa639286043d3f71fbbddf
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Thu Jan 8 10:01:03 2015 -0800
+
+    Linux 3.14.28
+
+commit b91261aa8a0d40783b41439b3b27c68ca5f4fd5e
+Author: Filipe Manana <fdmanana@suse.com>
+Date:   Sun Dec 7 21:31:47 2014 +0000
+
+    Btrfs: fix fs corruption on transaction abort if device supports discard
+    
+    commit 678886bdc6378c1cbd5072da2c5a3035000214e3 upstream.
+    
+    When we abort a transaction we iterate over all the ranges marked as dirty
+    in fs_info->freed_extents[0] and fs_info->freed_extents[1], clear them
+    from those trees, add them back (unpin) to the free space caches and, if
+    the fs was mounted with "-o discard", perform a discard on those regions.
+    Also, after adding the regions to the free space caches, a fitrim ioctl call
+    can see those ranges in a block group's free space cache and perform a discard
+    on the ranges, so the same issue can happen without "-o discard" as well.
+    
+    This causes corruption, affecting one or multiple btree nodes (in the worst
+    case leaving the fs unmountable) because some of those ranges (the ones in
+    the fs_info->pinned_extents tree) correspond to btree nodes/leafs that are
+    referred by the last committed super block - breaking the rule that anything
+    that was committed by a transaction is untouched until the next transaction
+    commits successfully.
+    
+    I ran into this while running in a loop (for several hours) the fstest that
+    I recently submitted:
+    
+      [PATCH] fstests: add btrfs test to stress chunk allocation/removal and fstrim
+    
+    The corruption always happened when a transaction aborted and then fsck complained
+    like this:
+    
+       _check_btrfs_filesystem: filesystem on /dev/sdc is inconsistent
+       *** fsck.btrfs output ***
+       Check tree block failed, want=94945280, have=0
+       Check tree block failed, want=94945280, have=0
+       Check tree block failed, want=94945280, have=0
+       Check tree block failed, want=94945280, have=0
+       Check tree block failed, want=94945280, have=0
+       read block failed check_tree_block
+       Couldn't open file system
+    
+    In this case 94945280 corresponded to the root of a tree.
+    Using frace what I observed was the following sequence of steps happened:
+    
+       1) transaction N started, fs_info->pinned_extents pointed to
+          fs_info->freed_extents[0];
+    
+       2) node/eb 94945280 is created;
+    
+       3) eb is persisted to disk;
+    
+       4) transaction N commit starts, fs_info->pinned_extents now points to
+          fs_info->freed_extents[1], and transaction N completes;
+    
+       5) transaction N + 1 starts;
+    
+       6) eb is COWed, and btrfs_free_tree_block() called for this eb;
+    
+       7) eb range (94945280 to 94945280 + 16Kb) is added to
+          fs_info->pinned_extents (fs_info->freed_extents[1]);
+    
+       8) Something goes wrong in transaction N + 1, like hitting ENOSPC
+          for example, and the transaction is aborted, turning the fs into
+          readonly mode. The stack trace I got for example:
+    
+          [112065.253935]  [<ffffffff8140c7b6>] dump_stack+0x4d/0x66
+          [112065.254271]  [<ffffffff81042984>] warn_slowpath_common+0x7f/0x98
+          [112065.254567]  [<ffffffffa0325990>] ? __btrfs_abort_transaction+0x50/0x10b [btrfs]
+          [112065.261674]  [<ffffffff810429e5>] warn_slowpath_fmt+0x48/0x50
+          [112065.261922]  [<ffffffffa032949e>] ? btrfs_free_path+0x26/0x29 [btrfs]
+          [112065.262211]  [<ffffffffa0325990>] __btrfs_abort_transaction+0x50/0x10b [btrfs]
+          [112065.262545]  [<ffffffffa036b1d6>] btrfs_remove_chunk+0x537/0x58b [btrfs]
+          [112065.262771]  [<ffffffffa033840f>] btrfs_delete_unused_bgs+0x1de/0x21b [btrfs]
+          [112065.263105]  [<ffffffffa0343106>] cleaner_kthread+0x100/0x12f [btrfs]
+          (...)
+          [112065.264493] ---[ end trace dd7903a975a31a08 ]---
+          [112065.264673] BTRFS: error (device sdc) in btrfs_remove_chunk:2625: errno=-28 No space left
+          [112065.264997] BTRFS info (device sdc): forced readonly
+    
+       9) The clear kthread sees that the BTRFS_FS_STATE_ERROR bit is set in
+          fs_info->fs_state and calls btrfs_cleanup_transaction(), which in
+          turn calls btrfs_destroy_pinned_extent();
+    
+       10) Then btrfs_destroy_pinned_extent() iterates over all the ranges
+           marked as dirty in fs_info->freed_extents[], and for each one
+           it calls discard, if the fs was mounted with "-o discard", and
+           adds the range to the free space cache of the respective block
+           group;
+    
+       11) btrfs_trim_block_group(), invoked from the fitrim ioctl code path,
+           sees the free space entries and performs a discard;
+    
+       12) After an umount and mount (or fsck), our eb's location on disk was full
+           of zeroes, and it should have been untouched, because it was marked as
+           dirty in the fs_info->pinned_extents tree, and therefore used by the
+           trees that the last committed superblock points to.
+    
+    Fix this by not performing a discard and not adding the ranges to the free space
+    caches - it's useless from this point since the fs is now in readonly mode and
+    we won't write free space caches to disk anymore (otherwise we would leak space)
+    nor any new superblock. By not adding the ranges to the free space caches, it
+    prevents other code paths from allocating that space and write to it as well,
+    therefore being safer and simpler.
+    
+    This isn't a new problem, as it's been present since 2011 (git commit
+    acce952b0263825da32cf10489413dec78053347).
+    
+    Signed-off-by: Filipe Manana <fdmanana@suse.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit d61b7a2df6653713d87ee3fcdba3f4a1600bfe22
+Author: Josef Bacik <jbacik@fb.com>
+Date:   Fri Nov 14 16:16:30 2014 -0500
+
+    Btrfs: do not move em to modified list when unpinning
+    
+    commit a28046956c71985046474283fa3bcd256915fb72 upstream.
+    
+    We use the modified list to keep track of which extents have been modified so we
+    know which ones are candidates for logging at fsync() time.  Newly modified
+    extents are added to the list at modification time, around the same time the
+    ordered extent is created.  We do this so that we don't have to wait for ordered
+    extents to complete before we know what we need to log.  The problem is when
+    something like this happens
+    
+    log extent 0-4k on inode 1
+    copy csum for 0-4k from ordered extent into log
+    sync log
+    commit transaction
+    log some other extent on inode 1
+    ordered extent for 0-4k completes and adds itself onto modified list again
+    log changed extents
+    see ordered extent for 0-4k has already been logged
+            at this point we assume the csum has been copied
+    sync log
+    crash
+    
+    On replay we will see the extent 0-4k in the log, drop the original 0-4k extent
+    which is the same one that we are replaying which also drops the csum, and then
+    we won't find the csum in the log for that bytenr.  This of course causes us to
+    have errors about not having csums for certain ranges of our inode.  So remove
+    the modified list manipulation in unpin_extent_cache, any modified extents
+    should have been added well before now, and we don't want them re-logged.  This
+    fixes my test that I could reliably reproduce this problem with.  Thanks,
+    
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a306ae6aaca17d46f63143c0c8a5f1c9cfe75b4b
+Author: Michael Halcrow <mhalcrow@google.com>
+Date:   Wed Nov 26 09:09:16 2014 -0800
+
+    eCryptfs: Remove buggy and unnecessary write in file name decode routine
+    
+    commit 942080643bce061c3dd9d5718d3b745dcb39a8bc upstream.
+    
+    Dmitry Chernenkov used KASAN to discover that eCryptfs writes past the
+    end of the allocated buffer during encrypted filename decoding. This
+    fix corrects the issue by getting rid of the unnecessary 0 write when
+    the current bit offset is 2.
+    
+    Signed-off-by: Michael Halcrow <mhalcrow@google.com>
+    Reported-by: Dmitry Chernenkov <dmitryc@google.com>
+    Suggested-by: Kees Cook <keescook@chromium.org>
+    Signed-off-by: Tyler Hicks <tyhicks@canonical.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 2f531cca1203219fe2fcdfe3ec93af1407cc7d94
+Author: Tyler Hicks <tyhicks@canonical.com>
+Date:   Tue Oct 7 15:51:55 2014 -0500
+
+    eCryptfs: Force RO mount when encrypted view is enabled
+    
+    commit 332b122d39c9cbff8b799007a825d94b2e7c12f2 upstream.
+    
+    The ecryptfs_encrypted_view mount option greatly changes the
+    functionality of an eCryptfs mount. Instead of encrypting and decrypting
+    lower files, it provides a unified view of the encrypted files in the
+    lower filesystem. The presence of the ecryptfs_encrypted_view mount
+    option is intended to force a read-only mount and modifying files is not
+    supported when the feature is in use. See the following commit for more
+    information:
+    
+      e77a56d [PATCH] eCryptfs: Encrypted passthrough
+    
+    This patch forces the mount to be read-only when the
+    ecryptfs_encrypted_view mount option is specified by setting the
+    MS_RDONLY flag on the superblock. Additionally, this patch removes some
+    broken logic in ecryptfs_open() that attempted to prevent modifications
+    of files when the encrypted view feature was in use. The check in
+    ecryptfs_open() was not sufficient to prevent file modifications using
+    system calls that do not operate on a file descriptor.
+    
+    Signed-off-by: Tyler Hicks <tyhicks@canonical.com>
+    Reported-by: Priya Bansal <p.bansal@samsung.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5c90d036281629fc55ea46d063d4a7c3c10b02d6
+Author: Jan Kara <jack@suse.cz>
+Date:   Fri Dec 19 12:21:47 2014 +0100
+
+    udf: Verify symlink size before loading it
+    
+    commit a1d47b262952a45aae62bd49cfaf33dd76c11a2c upstream.
+    
+    UDF specification allows arbitrarily large symlinks. However we support
+    only symlinks at most one block large. Check the length of the symlink
+    so that we don't access memory beyond end of the symlink block.
+    
+    Reported-by: Carl Henrik Lunde <chlunde@gmail.com>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 1a1f1f00e633d04aea35f391fbd226d99120655b
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Wed Dec 10 15:55:25 2014 -0800
+
+    exit: pidns: alloc_pid() leaks pid_namespace if child_reaper is exiting
+    
+    commit 24c037ebf5723d4d9ab0996433cee4f96c292a4d upstream.
+    
+    alloc_pid() does get_pid_ns() beforehand but forgets to put_pid_ns() if it
+    fails because disable_pid_allocation() was called by the exiting
+    child_reaper.
+    
+    We could simply move get_pid_ns() down to successful return, but this fix
+    tries to be as trivial as possible.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Reviewed-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Cc: Aaron Tomlin <atomlin@redhat.com>
+    Cc: Pavel Emelyanov <xemul@parallels.com>
+    Cc: Serge Hallyn <serge.hallyn@ubuntu.com>
+    Cc: Sterling Alexander <stalexan@redhat.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit b16b840371d73baa0206000c489a7078db1c1b66
+Author: Jan Kara <jack@suse.cz>
+Date:   Wed Dec 10 15:52:22 2014 -0800
+
+    ncpfs: return proper error from NCP_IOC_SETROOT ioctl
+    
+    commit a682e9c28cac152e6e54c39efcf046e0c8cfcf63 upstream.
+    
+    If some error happens in NCP_IOC_SETROOT ioctl, the appropriate error
+    return value is then (in most cases) just overwritten before we return.
+    This can result in reporting success to userspace although error happened.
+    
+    This bug was introduced by commit 2e54eb96e2c8 ("BKL: Remove BKL from
+    ncpfs").  Propagate the errors correctly.
+    
+    Coverity id: 1226925.
+    
+    Fixes: 2e54eb96e2c80 ("BKL: Remove BKL from ncpfs")
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Cc: Petr Vandrovec <petr@vandrovec.name>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3f62b3ed08611edc3b68ad7534c991cf0a62c135
+Author: Rabin Vincent <rabin.vincent@axis.com>
+Date:   Fri Dec 19 13:36:08 2014 +0100
+
+    crypto: af_alg - fix backlog handling
+    
+    commit 7e77bdebff5cb1e9876c561f69710b9ab8fa1f7e upstream.
+    
+    If a request is backlogged, it's complete() handler will get called
+    twice: once with -EINPROGRESS, and once with the final error code.
+    
+    af_alg's complete handler, unlike other users, does not handle the
+    -EINPROGRESS but instead always completes the completion that recvmsg()
+    is waiting on.  This can lead to a return to user space while the
+    request is still pending in the driver.  If userspace closes the sockets
+    before the requests are handled by the driver, this will lead to
+    use-after-frees (and potential crashes) in the kernel due to the tfm
+    having been freed.
+    
+    The crashes can be easily reproduced (for example) by reducing the max
+    queue length in cryptod.c and running the following (from
+    http://www.chronox.de/libkcapi.html) on AES-NI capable hardware:
+    
+     $ while true; do kcapi -x 1 -e -c '__ecb-aes-aesni' \
+        -k 00000000000000000000000000000000 \
+        -p 00000000000000000000000000000000 >/dev/null & done
+    
+    Signed-off-by: Rabin Vincent <rabin.vincent@axis.com>
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 1cfececcbcae561716f5996078bbe505ee1b741a
+Author: Richard Guy Briggs <rgb@redhat.com>
+Date:   Tue Dec 23 13:02:04 2014 -0500
+
+    audit: restore AUDIT_LOGINUID unset ABI
+    
+    commit 041d7b98ffe59c59fdd639931dea7d74f9aa9a59 upstream.
+    
+    A regression was caused by commit 780a7654cee8:
+             audit: Make testing for a valid loginuid explicit.
+    (which in turn attempted to fix a regression caused by e1760bd)
+    
+    When audit_krule_to_data() fills in the rules to get a listing, there was a
+    missing clause to convert back from AUDIT_LOGINUID_SET to AUDIT_LOGINUID.
+    
+    This broke userspace by not returning the same information that was sent and
+    expected.
+    
+    The rule:
+            auditctl -a exit,never -F auid=-1
+    gives:
+            auditctl -l
+                    LIST_RULES: exit,never f24=0 syscall=all
+    when it should give:
+                    LIST_RULES: exit,never auid=-1 (0xffffffff) syscall=all
+    
+    Tag it so that it is reported the same way it was set.  Create a new
+    private flags audit_krule field (pflags) to store it that won't interact with
+    the public one from the API.
+    
+    Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+    Signed-off-by: Paul Moore <pmoore@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 64701c8a329d516189cae53cd87b988b6c5e92fe
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Tue Dec 2 13:56:30 2014 -0600
+
+    userns: Unbreak the unprivileged remount tests
+    
+    commit db86da7cb76f797a1a8b445166a15cb922c6ff85 upstream.
+    
+    A security fix in caused the way the unprivileged remount tests were
+    using user namespaces to break.  Tweak the way user namespaces are
+    being used so the test works again.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a7785a8cf8734468cd46c65c8c10b0aeb13ff5b0
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 19:36:04 2014 -0600
+
+    userns: Allow setting gid_maps without privilege when setgroups is disabled
+    
+    commit 66d2f338ee4c449396b6f99f5e75cd18eb6df272 upstream.
+    
+    Now that setgroups can be disabled and not reenabled, setting gid_map
+    without privielge can now be enabled when setgroups is disabled.
+    
+    This restores most of the functionality that was lost when unprivileged
+    setting of gid_map was removed.  Applications that use this functionality
+    will need to check to see if they use setgroups or init_groups, and if they
+    don't they can be fixed by simply disabling setgroups before writing to
+    gid_map.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit cbc4266efecca3fc3d078d9a28465757b6f629ec
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Tue Dec 2 12:27:26 2014 -0600
+
+    userns: Add a knob to disable setgroups on a per user namespace basis
+    
+    commit 9cc46516ddf497ea16e8d7cb986ae03a0f6b92f8 upstream.
+    
+    - Expose the knob to user space through a proc file /proc/<pid>/setgroups
+    
+      A value of "deny" means the setgroups system call is disabled in the
+      current processes user namespace and can not be enabled in the
+      future in this user namespace.
+    
+      A value of "allow" means the segtoups system call is enabled.
+    
+    - Descendant user namespaces inherit the value of setgroups from
+      their parents.
+    
+    - A proc file is used (instead of a sysctl) as sysctls currently do
+      not allow checking the permissions at open time.
+    
+    - Writing to the proc file is restricted to before the gid_map
+      for the user namespace is set.
+    
+      This ensures that disabling setgroups at a user namespace
+      level will never remove the ability to call setgroups
+      from a process that already has that ability.
+    
+      A process may opt in to the setgroups disable for itself by
+      creating, entering and configuring a user namespace or by calling
+      setns on an existing user namespace with setgroups disabled.
+      Processes without privileges already can not call setgroups so this
+      is a noop.  Prodcess with privilege become processes without
+      privilege when entering a user namespace and as with any other path
+      to dropping privilege they would not have the ability to call
+      setgroups.  So this remains within the bounds of what is possible
+      without a knob to disable setgroups permanently in a user namespace.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 6f3bf1edd0bf3a397b6732583472f0cdfe9a5f03
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Tue Dec 9 14:03:14 2014 -0600
+
+    userns: Rename id_map_mutex to userns_state_mutex
+    
+    commit f0d62aec931e4ae3333c797d346dc4f188f454ba upstream.
+    
+    Generalize id_map_mutex so it can be used for more state of a user namespace.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 7faecd49fcc937d1ea700a8dc46bbc90b88f4ff4
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Wed Nov 26 23:22:14 2014 -0600
+
+    userns: Only allow the creator of the userns unprivileged mappings
+    
+    commit f95d7918bd1e724675de4940039f2865e5eec5fe upstream.
+    
+    If you did not create the user namespace and are allowed
+    to write to uid_map or gid_map you should already have the necessary
+    privilege in the parent user namespace to establish any mapping
+    you want so this will not affect userspace in practice.
+    
+    Limiting unprivileged uid mapping establishment to the creator of the
+    user namespace makes it easier to verify all credentials obtained with
+    the uid mapping can be obtained without the uid mapping without
+    privilege.
+    
+    Limiting unprivileged gid mapping establishment (which is temporarily
+    absent) to the creator of the user namespace also ensures that the
+    combination of uid and gid can already be obtained without privilege.
+    
+    This is part of the fix for CVE-2014-8989.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ea7c8d3da1bd9b90fd96d4b357c869b93552ee21
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 18:26:30 2014 -0600
+
+    userns: Check euid no fsuid when establishing an unprivileged uid mapping
+    
+    commit 80dd00a23784b384ccea049bfb3f259d3f973b9d upstream.
+    
+    setresuid allows the euid to be set to any of uid, euid, suid, and
+    fsuid.  Therefor it is safe to allow an unprivileged user to map
+    their euid and use CAP_SETUID privileged with exactly that uid,
+    as no new credentials can be obtained.
+    
+    I can not find a combination of existing system calls that allows setting
+    uid, euid, suid, and fsuid from the fsuid making the previous use
+    of fsuid for allowing unprivileged mappings a bug.
+    
+    This is part of a fix for CVE-2014-8989.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 804733ad85b1ab68812fa438b3b4133d1d85581a
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 18:14:19 2014 -0600
+
+    userns: Don't allow unprivileged creation of gid mappings
+    
+    commit be7c6dba2332cef0677fbabb606e279ae76652c3 upstream.
+    
+    As any gid mapping will allow and must allow for backwards
+    compatibility dropping groups don't allow any gid mappings to be
+    established without CAP_SETGID in the parent user namespace.
+    
+    For a small class of applications this change breaks userspace
+    and removes useful functionality.  This small class of applications
+    includes tools/testing/selftests/mount/unprivilged-remount-test.c
+    
+    Most of the removed functionality will be added back with the addition
+    of a one way knob to disable setgroups.  Once setgroups is disabled
+    setting the gid_map becomes as safe as setting the uid_map.
+    
+    For more common applications that set the uid_map and the gid_map
+    with privilege this change will have no affect.
+    
+    This is part of a fix for CVE-2014-8989.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit f077e88fc9f0befcf0441be2fed9516881ab02ef
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 18:01:11 2014 -0600
+
+    userns: Don't allow setgroups until a gid mapping has been setablished
+    
+    commit 273d2c67c3e179adb1e74f403d1e9a06e3f841b5 upstream.
+    
+    setgroups is unique in not needing a valid mapping before it can be called,
+    in the case of setgroups(0, NULL) which drops all supplemental groups.
+    
+    The design of the user namespace assumes that CAP_SETGID can not actually
+    be used until a gid mapping is established.  Therefore add a helper function
+    to see if the user namespace gid mapping has been established and call
+    that function in the setgroups permission check.
+    
+    This is part of the fix for CVE-2014-8989, being able to drop groups
+    without privilege using user namespaces.
+    
+    Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 096b0c8d7033ef56d4c0eb13a29865a021eedea5
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 17:51:47 2014 -0600
+
+    userns: Document what the invariant required for safe unprivileged mappings.
+    
+    commit 0542f17bf2c1f2430d368f44c8fcf2f82ec9e53e upstream.
+    
+    The rule is simple.  Don't allow anything that wouldn't be allowed
+    without unprivileged mappings.
+    
+    It was previously overlooked that establishing gid mappings would
+    allow dropping groups and potentially gaining permission to files and
+    directories that had lesser permissions for a specific group than for
+    all other users.
+    
+    This is the rule needed to fix CVE-2014-8989 and prevent any other
+    security issues with new_idmap_permitted.
+    
+    The reason for this rule is that the unix permission model is old and
+    there are programs out there somewhere that take advantage of every
+    little corner of it.  So allowing a uid or gid mapping to be
+    established without privielge that would allow anything that would not
+    be allowed without that mapping will result in expectations from some
+    code somewhere being violated.  Violated expectations about the
+    behavior of the OS is a long way to say a security issue.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 00fcd1ceab6c42f7facfa0168b207fe70ee198c2
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Dec 5 17:19:27 2014 -0600
+
+    groups: Consolidate the setgroups permission checks
+    
+    commit 7ff4d90b4c24a03666f296c3d4878cd39001e81e upstream.
+    
+    Today there are 3 instances of setgroups and due to an oversight their
+    permission checking has diverged.  Add a common function so that
+    they may all share the same permission checking code.
+    
+    This corrects the current oversight in the current permission checks
+    and adds a helper to avoid this in the future.
+    
+    A user namespace security fix will update this new helper, shortly.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5f20adeafce6d4a6d8dd132acddfb4edf57f08de
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Sat Oct 4 14:44:03 2014 -0700
+
+    umount: Disallow unprivileged mount force
+    
+    commit b2f5d4dc38e034eecb7987e513255265ff9aa1cf upstream.
+    
+    Forced unmount affects not just the mount namespace but the underlying
+    superblock as well.  Restrict forced unmount to the global root user
+    for now.  Otherwise it becomes possible a user in a less privileged
+    mount namespace to force the shutdown of a superblock of a filesystem
+    in a more privileged mount namespace, allowing a DOS attack on root.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ebdd0940bb83aa0bf16acbbf3ea7b89d325880cc
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Aug 22 16:39:03 2014 -0500
+
+    mnt: Update unprivileged remount test
+    
+    commit 4a44a19b470a886997d6647a77bb3e38dcbfa8c5 upstream.
+    
+    - MNT_NODEV should be irrelevant except when reading back mount flags,
+      no longer specify MNT_NODEV on remount.
+    
+    - Test MNT_NODEV on devpts where it is meaningful even for unprivileged mounts.
+    
+    - Add a test to verify that remount of a prexisting mount with the same flags
+      is allowed and does not change those flags.
+    
+    - Cleanup up the definitions of MS_REC, MS_RELATIME, MS_STRICTATIME that are used
+      when the code is built in an environment without them.
+    
+    - Correct the test error messages when tests fail.  There were not 5 tests
+      that tested MS_RELATIME.
+    
+    Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit aad34f76b15f8bd2597f41933bc604e0b6e3c211
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Wed Aug 13 01:33:38 2014 -0700
+
+    mnt: Implicitly add MNT_NODEV on remount when it was implicitly added by mount
+    
+    commit 3e1866410f11356a9fd869beb3e95983dc79c067 upstream.
+    
+    Now that remount is properly enforcing the rule that you can't remove
+    nodev at least sandstorm.io is breaking when performing a remount.
+    
+    It turns out that there is an easy intuitive solution implicitly
+    add nodev on remount when nodev was implicitly added on mount.
+    
+    Tested-by: Cedric Bosdonnat <cbosdonnat@suse.com>
+    Tested-by: Richard Weinberger <richard@nod.at>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 46b4fd75fc6619352d8909c424a99cebb42b4ac5
+Author: Luis Henriques <luis.henriques@canonical.com>
+Date:   Wed Dec 3 21:20:21 2014 +0000
+
+    thermal: Fix error path in thermal_init()
+    
+    commit 9d367e5e7b05c71a8c1ac4e9b6e00ba45a79f2fc upstream.
+    
+    thermal_unregister_governors() and class_unregister() were being called in
+    the wrong order.
+    
+    Fixes: 80a26a5c22b9 ("Thermal: build thermal governors into thermal_sys module")
+    Signed-off-by: Luis Henriques <luis.henriques@canonical.com>
+    Signed-off-by: Zhang Rui <rui.zhang@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit d7fa057cda8a1c3601de206f723901d400a857f6
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Thu Dec 18 10:57:19 2014 -0600
+
+    mnt: Fix a memory stomp in umount
+    
+    commit c297abfdf15b4480704d6b566ca5ca9438b12456 upstream.
+    
+    While reviewing the code of umount_tree I realized that when we append
+    to a preexisting unmounted list we do not change pprev of the former
+    first item in the list.
+    
+    Which means later in namespace_unlock hlist_del_init(&mnt->mnt_hash) on
+    the former first item of the list will stomp unmounted.first leaving
+    it set to some random mount point which we are likely to free soon.
+    
+    This isn't likely to hit, but if it does I don't know how anyone could
+    track it down.
+    
+    [ This happened because we don't have all the same operations for
+      hlist's as we do for normal doubly-linked lists. In particular,
+      list_splice() is easy on our standard doubly-linked lists, while
+      hlist_splice() doesn't exist and needs both start/end entries of the
+      hlist.  And commit 38129a13e6e7 incorrectly open-coded that missing
+      hlist_splice().
+    
+      We should think about making these kinds of "mindless" conversions
+      easier to get right by adding the missing hlist helpers   - Linus ]
+    
+    Fixes: 38129a13e6e71f666e0468e99fdd932a687b4d7e switch mnt_hash to hlist
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 194172f158878ee1008cd8d244f1378b9649776e
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Wed Dec 17 13:55:49 2014 +0100
+
+    mac80211: free management frame keys when removing station
+    
+    commit 28a9bc68124c319b2b3dc861e80828a8865fd1ba upstream.
+    
+    When writing the code to allow per-station GTKs, I neglected to
+    take into account the management frame keys (index 4 and 5) when
+    freeing the station and only added code to free the first four
+    data frame keys.
+    
+    Fix this by iterating the array of keys over the right length.
+    
+    Fixes: e31b82136d1a ("cfg80211/mac80211: allow per-station GTKs")
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 57caf9bdf9d529e0c1100a0d04dc60e63d8472b1
+Author: Andreas Müller <goo@stapelspeicher.org>
+Date:   Fri Dec 12 12:11:11 2014 +0100
+
+    mac80211: fix multicast LED blinking and counter
+    
+    commit d025933e29872cb1fe19fc54d80e4dfa4ee5779c upstream.
+    
+    As multicast-frames can't be fragmented, "dot11MulticastReceivedFrameCount"
+    stopped being incremented after the use-after-free fix. Furthermore, the
+    RX-LED will be triggered by every multicast frame (which wouldn't happen
+    before) which wouldn't allow the LED to rest at all.
+    
+    Fixes https://bugzilla.kernel.org/show_bug.cgi?id=89431 which also had the
+    patch.
+    
+    Fixes: b8fff407a180 ("mac80211: fix use-after-free in defragmentation")
+    Signed-off-by: Andreas Müller <goo@stapelspeicher.org>
+    [rewrite commit message]
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 26090b176d22a611d8b0e7526f5aafd78b2f77d7
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Thu Dec 4 18:25:19 2014 +0100
+
+    KEYS: Fix stale key registration at error path
+    
+    commit b26bdde5bb27f3f900e25a95e33a0c476c8c2c48 upstream.
+    
+    When loading encrypted-keys module, if the last check of
+    aes_get_sizes() in init_encrypted() fails, the driver just returns an
+    error without unregistering its key type.  This results in the stale
+    entry in the list.  In addition to memory leaks, this leads to a kernel
+    crash when registering a new key type later.
+    
+    This patch fixes the problem by swapping the calls of aes_get_sizes()
+    and register_key_type(), and releasing resources properly at the error
+    paths.
+    
+    Bugzilla: https://bugzilla.opensuse.org/show_bug.cgi?id=908163
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a3d4f59634f38d5236b182b403df74bbceeac7c9
+Author: Jan Kara <jack@suse.cz>
+Date:   Thu Dec 18 17:26:10 2014 +0100
+
+    isofs: Fix unchecked printing of ER records
+    
+    commit 4e2024624e678f0ebb916e6192bd23c1f9fdf696 upstream.
+    
+    We didn't check length of rock ridge ER records before printing them.
+    Thus corrupted isofs image can cause us to access and print some memory
+    behind the buffer with obvious consequences.
+    
+    Reported-and-tested-by: Carl Henrik Lunde <chlunde@ping.uio.no>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit e990e54996c037f654f5016c78bc03efd6e65e8b
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Wed Dec 17 14:48:30 2014 -0800
+
+    x86/tls: Don't validate lm in set_thread_area() after all
+    
+    commit 3fb2f4237bb452eb4e98f6a5dbd5a445b4fed9d0 upstream.
+    
+    It turns out that there's a lurking ABI issue.  GCC, when
+    compiling this in a 32-bit program:
+    
+    struct user_desc desc = {
+            .entry_number    = idx,
+            .base_addr       = base,
+            .limit           = 0xfffff,
+            .seg_32bit       = 1,
+            .contents        = 0, /* Data, grow-up */
+            .read_exec_only  = 0,
+            .limit_in_pages  = 1,
+            .seg_not_present = 0,
+            .useable         = 0,
+    };
+    
+    will leave .lm uninitialized.  This means that anything in the
+    kernel that reads user_desc.lm for 32-bit tasks is unreliable.
+    
+    Revert the .lm check in set_thread_area().  The value never did
+    anything in the first place.
+    
+    Fixes: 0e58af4e1d21 ("x86/tls: Disallow unusual TLS segments")
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Acked-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Link: http://lkml.kernel.org/r/d7875b60e28c512f6a6fc0baf5714d58e7eaadbb.1418856405.git.luto@amacapital.net
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 32fa2e66de386e8a41dd8775216ccf8a73002b6b
+Author: Uwe Kleine-König <u.kleine-koenig@pengutronix.de>
+Date:   Fri Nov 14 21:43:33 2014 +0100
+
+    ARM: mvebu: fix ordering in Armada 370 .dtsi
+    
+    commit ab1e85372168892387dd1ac171158fc8c3119be4 upstream.
+    
+    Commit a095b1c78a35 ("ARM: mvebu: sort DT nodes by address")
+    missed placing the system-controller in the correct order.
+    
+    Fixes: a095b1c78a35 ("ARM: mvebu: sort DT nodes by address")
+    Signed-off-by: Uwe Kleine-König <u.kleine-koenig@pengutronix.de>
+    Acked-by: Andrew Lunn <andrew@lunn.ch>
+    Link: https://lkml.kernel.org/r/20141114204333.GS27002@pengutronix.de
+    Signed-off-by: Jason Cooper <jason@lakedaemon.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 1801ead6f421db1272d7479ebc9467ccdf5eb90a
+Author: Dmitry Osipenko <digetx@gmail.com>
+Date:   Fri Oct 10 17:24:47 2014 +0400
+
+    ARM: tegra: Re-add removed SoC id macro to tegra_resume()
+    
+    commit e4a680099a6e97ecdbb81081cff9e4a489a4dc44 upstream.
+    
+    Commit d127e9c ("ARM: tegra: make tegra_resume can work with current and later
+    chips") removed tegra_get_soc_id macro leaving used cpu register corrupted after
+    branching to v7_invalidate_l1() and as result causing execution of unintended
+    code on tegra20. Possibly it was expected that r6 would be SoC id func argument
+    since common cpu reset handler is setting r6 before branching to tegra_resume(),
+    but neither tegra20_lp1_reset() nor tegra30_lp1_reset() aren't setting r6
+    register before jumping to resume function. Fix it by re-adding macro.
+    
+    Fixes: d127e9c (ARM: tegra: make tegra_resume can work with current and later chips)
+    Reviewed-by: Felipe Balbi <balbi@ti.com>
+    Signed-off-by: Dmitry Osipenko <digetx@gmail.com>
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a4cb200d878ea1b622477a9890815157f004c61c
+Author: Catalin Marinas <catalin.marinas@arm.com>
+Date:   Mon Nov 17 10:37:40 2014 +0000
+
+    arm64: Add COMPAT_HWCAP_LPAE
+    
+    commit 7d57511d2dba03a8046c8b428dd9192a4bfc1e73 upstream.
+    
+    Commit a469abd0f868 (ARM: elf: add new hwcap for identifying atomic
+    ldrd/strd instructions) introduces HWCAP_ELF for 32-bit ARM
+    applications. As LPAE is always present on arm64, report the
+    corresponding compat HWCAP to user space.
+    
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 1b210c873eba5ef3b84f46e1a51c360b7ffa9156
+Author: Joe Thornber <ejt@redhat.com>
+Date:   Thu Dec 11 11:12:19 2014 +0000
+
+    dm thin: fix missing out-of-data-space to write mode transition if blocks are released
+    
+    commit 2c43fd26e46734430122b8d2ad3024bb532df3ef upstream.
+    
+    Discard bios and thin device deletion have the potential to release data
+    blocks.  If the thin-pool is in out-of-data-space mode, and blocks were
+    released, transition the thin-pool back to full write mode.
+    
+    The correct time to do this is just after the thin-pool metadata commit.
+    It cannot be done before the commit because the space maps will not
+    allow immediate reuse of the data blocks in case there's a rollback
+    following power failure.
+    
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3b2caa87bacb066e5c27228032c3aa9738692061
+Author: Joe Thornber <ejt@redhat.com>
+Date:   Wed Dec 10 17:06:57 2014 +0000
+
+    dm thin: fix inability to discard blocks when in out-of-data-space mode
+    
+    commit 45ec9bd0fd7abf8705e7cf12205ff69fe9d51181 upstream.
+    
+    When the pool was in PM_OUT_OF_SPACE mode its process_prepared_discard
+    function pointer was incorrectly being set to
+    process_prepared_discard_passdown rather than process_prepared_discard.
+    
+    This incorrect function pointer meant the discard was being passed down,
+    but not effecting the mapping.  As such any discard that was issued, in
+    an attempt to reclaim blocks, would not successfully free data space.
+    
+    Reported-by: Eric Sandeen <sandeen@redhat.com>
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5c400242592e0b077b462b28ec1f20a72f8e4cbc
+Author: Dan Carpenter <dan.carpenter@oracle.com>
+Date:   Sat Nov 29 15:50:21 2014 +0300
+
+    dm space map metadata: fix sm_bootstrap_get_nr_blocks()
+    
+    commit c1c6156fe4d4577444b769d7edd5dd503e57bbc9 upstream.
+    
+    This function isn't right and it causes a static checker warning:
+    
+            drivers/md/dm-thin.c:3016 maybe_resize_data_dev()
+            error: potentially using uninitialized 'sb_data_size'.
+    
+    It should set "*count" and return zero on success the same as the
+    sm_metadata_get_nr_blocks() function does earlier.
+    
+    Fixes: 3241b1d3e0aa ('dm: add persistent data library')
+    Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+    Acked-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 4623687667875ce12fbce95b8f6ec89494e2fb52
+Author: Joe Thornber <ejt@redhat.com>
+Date:   Thu Nov 27 12:26:46 2014 +0000
+
+    dm cache: dirty flag was mistakenly being cleared when promoting via overwrite
+    
+    commit 1e32134a5a404e80bfb47fad8a94e9bbfcbdacc5 upstream.
+    
+    If the incoming bio is a WRITE and completely covers a block then we
+    don't bother to do any copying for a promotion operation.  Once this is
+    done the cache block and origin block will be different, so we need to
+    set it to 'dirty'.
+    
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 624f917e5a7123e794486df12ed779f50b0e2706
+Author: Joe Thornber <ejt@redhat.com>
+Date:   Thu Nov 27 12:21:08 2014 +0000
+
+    dm cache: only use overwrite optimisation for promotion when in writeback mode
+    
+    commit f29a3147e251d7ae20d3194ff67f109d71e501b4 upstream.
+    
+    Overwrite causes the cache block and origin blocks to diverge, which
+    is only allowed in writeback mode.
+    
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a6e37a9dcf822402ad1f9afc5a7bca0c98a486a1
+Author: Milan Broz <gmazyland@gmail.com>
+Date:   Sat Nov 22 09:36:04 2014 +0100
+
+    dm crypt: use memzero_explicit for on-stack buffer
+    
+    commit 1a71d6ffe18c0d0f03fc8531949cc8ed41d702ee upstream.
+    
+    Use memzero_explicit to cleanup sensitive data allocated on stack
+    to prevent the compiler from optimizing and removing memset() calls.
+    
+    Signed-off-by: Milan Broz <gmazyland@gmail.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit baf2341be09f2d2782cf0e0242efa3868fc450af
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Tue Nov 25 17:45:15 2014 -0800
+
+    dm bufio: fix memleak when using a dm_buffer's inline bio
+    
+    commit 445559cdcb98a141f5de415b94fd6eaccab87e6d upstream.
+    
+    When dm-bufio sets out to use the bio built into a struct dm_buffer to
+    issue an IO, it needs to call bio_reset after it's done with the bio
+    so that we can free things attached to the bio such as the integrity
+    payload.  Therefore, inject our own endio callback to take care of
+    the bio_reset after calling submit_io's end_io callback.
+    
+    Test case:
+    1. modprobe scsi_debug delay=0 dif=1 dix=199 ato=1 dev_size_mb=300
+    2. Set up a dm-bufio client, e.g. dm-verity, on the scsi_debug device
+    3. Repeatedly read metadata and watch kmalloc-192 leak!
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 74bce79fd4df17c1316dd0de23d94ce40daf8bf9
+Author: Peng Tao <tao.peng@primarydata.com>
+Date:   Mon Nov 17 11:05:17 2014 +0800
+
+    nfs41: fix nfs4_proc_layoutget error handling
+    
+    commit 4bd5a980de87d2b5af417485bde97b8eb3d6cf6a upstream.
+    
+    nfs4_layoutget_release() drops layout hdr refcnt. Grab the refcnt
+    early so that it is safe to call .release in case nfs4_alloc_pages
+    fails.
+    
+    Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+    Fixes: a47970ff78147 ("NFSv4.1: Hold reference to layout hdr in layoutget")
+    Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit d46939673d59f3687bff8438305a726b3bb084c5
+Author: Hannes Reinecke <hare@suse.de>
+Date:   Thu Oct 30 09:44:36 2014 +0100
+
+    scsi: correct return values for .eh_abort_handler implementations
+    
+    commit b6c92b7e0af575e2b8b05bdf33633cf9e1661cbf upstream.
+    
+    The .eh_abort_handler needs to return SUCCESS, FAILED, or
+    FAST_IO_FAIL. So fixup all callers to adhere to this requirement.
+    
+    Reviewed-by: Robert Elliott <elliott@hp.com>
+    Signed-off-by: Hannes Reinecke <hare@suse.de>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a29dc4ceb66bfc5495da0ab61ca5a8a04da2057d
+Author: Sumit.Saxena@avagotech.com <Sumit.Saxena@avagotech.com>
+Date:   Mon Nov 17 15:24:23 2014 +0530
+
+    megaraid_sas: corrected return of wait_event from abort frame path
+    
+    commit 170c238701ec38b1829321b17c70671c101bac55 upstream.
+    
+    Corrected wait_event() call which was waiting for wrong completion
+    status (0xFF).
+    
+    Signed-off-by: Sumit Saxena <sumit.saxena@avagotech.com>
+    Signed-off-by: Kashyap Desai <kashyap.desai@avagotech.com>
+    Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3b6762c09791529d189d0c9a607013cfdce91faa
+Author: Peter Guo <peter.guo@bayhubtech.com>
+Date:   Wed Sep 24 04:29:04 2014 +0200
+
+    mmc: sdhci-pci-o2micro: Fix Dell E5440 issue
+    
+    commit 6380ea099cdd46d7377b6fbec0291cf2aa387bad upstream.
+    
+    Fix Dell E5440 when reboot Linux, can't find o2micro sd host chip issue.
+    
+    Fixes: 01acf6917aed (mmc: sdhci-pci: add support of O2Micro/BayHubTech SD hosts)
+    Signed-off-by: Peter Guo <peter.guo@bayhubtech.com>
+    Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 185128cf59c111421ac79a7b366150d7a0431116
+Author: Baruch Siach <baruch@tkos.co.il>
+Date:   Mon Sep 22 10:12:51 2014 +0300
+
+    mmc: block: add newline to sysfs display of force_ro
+    
+    commit 0031a98a85e9fca282624bfc887f9531b2768396 upstream.
+    
+    Make force_ro consistent with other sysfs entries.
+    
+    Fixes: 371a689f64b0d ('mmc: MMC boot partitions support')
+    Cc: Andrei Warkentin <andrey.warkentin@gmail.com>
+    Signed-off-by: Baruch Siach <baruch@tkos.co.il>
+    Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit add16a40f74173109c5469e7e22c9c5eafb08d94
+Author: James Hogan <jhogan@kernel.org>
+Date:   Mon Nov 17 17:49:05 2014 +0000
+
+    mmc: dw_mmc: avoid write to CDTHRCTL on older versions
+    
+    commit 66dfd10173159cafa9cb0d39936b8daeaab8e3e0 upstream.
+    
+    Commit f1d2736c8156 (mmc: dw_mmc: control card read threshold) added
+    dw_mci_ctrl_rd_thld() with an unconditional write to the CDTHRCTL
+    register at offset 0x100. However before version 240a, the FIFO region
+    started at 0x100, so the write messes with the FIFO and completely
+    breaks the driver.
+    
+    If the version id < 240A, return early from dw_mci_ctl_rd_thld() so as
+    not to hit this problem.
+    
+    Fixes: f1d2736c8156 (mmc: dw_mmc: control card read threshold)
+    Signed-off-by: James Hogan <james.hogan@imgtec.com>
+    Acked-by: Jaehoon Chung <jh80.chung@samsung.com>
+    Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 6ed0f56de1104debd9f8fc50969225869a2c807a
+Author: Dmitry Eremin-Solenikov <dbaryshkov@gmail.com>
+Date:   Fri Oct 24 21:19:57 2014 +0400
+
+    mfd: tc6393xb: Fail ohci suspend if full state restore is required
+    
+    commit 1a5fb99de4850cba710d91becfa2c65653048589 upstream.
+    
+    Some boards with TC6393XB chip require full state restore during system
+    resume thanks to chip's VCC being cut off during suspend (Sharp SL-6000
+    tosa is one of them). Failing to do so would result in ohci Oops on
+    resume due to internal memory contentes being changed. Fail ohci suspend
+    on tc6393xb is full state restore is required.
+    
+    Recommended workaround is to unbind tmio-ohci driver before suspend and
+    rebind it after resume.
+    
+    Signed-off-by: Dmitry Eremin-Solenikov <dbaryshkov@gmail.com>
+    Signed-off-by: Lee Jones <lee.jones@linaro.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9de29b52163683bfd1f8692f1521a6418dccebc0
+Author: NeilBrown <neilb@suse.de>
+Date:   Tue Sep 9 14:13:51 2014 +1000
+
+    md/bitmap: always wait for writes on unplug.
+    
+    commit 4b5060ddae2b03c5387321fafc089d242225697a upstream.
+    
+    If two threads call bitmap_unplug at the same time, then
+    one might schedule all the writes, and the other might
+    decide that it doesn't need to wait.  But really it does.
+    
+    It rarely hurts to wait when it isn't absolutely necessary,
+    and the current code doesn't really focus on 'absolutely necessary'
+    anyway.  So just wait always.
+    
+    This can potentially lead to data corruption if a crash happens
+    at an awkward time and data was written before the bitmap was
+    updated.  It is very unlikely, but this should go to -stable
+    just to be safe.  Appropriate for any -stable.
+    
+    Signed-off-by: NeilBrown <neilb@suse.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit c06c656494797804aa7f603df37208b61792d0d1
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Fri Dec 5 19:03:28 2014 -0800
+
+    x86, kvm: Clear paravirt_enabled on KVM guests for espfix32's benefit
+    
+    commit 29fa6825463c97e5157284db80107d1bfac5d77b upstream.
+    
+    paravirt_enabled has the following effects:
+    
+     - Disables the F00F bug workaround warning.  There is no F00F bug
+       workaround any more because Linux's standard IDT handling already
+       works around the F00F bug, but the warning still exists.  This
+       is only cosmetic, and, in any event, there is no such thing as
+       KVM on a CPU with the F00F bug.
+    
+     - Disables 32-bit APM BIOS detection.  On a KVM paravirt system,
+       there should be no APM BIOS anyway.
+    
+     - Disables tboot.  I think that the tboot code should check the
+       CPUID hypervisor bit directly if it matters.
+    
+     - paravirt_enabled disables espfix32.  espfix32 should *not* be
+       disabled under KVM paravirt.
+    
+    The last point is the purpose of this patch.  It fixes a leak of the
+    high 16 bits of the kernel stack address on 32-bit KVM paravirt
+    guests.  Fixes CVE-2014-8134.
+    
+    Suggested-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit b7e804ab2e46308e54c0ec2b9e242271a455ddb8
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Mon Dec 8 13:55:20 2014 -0800
+
+    x86_64, switch_to(): Load TLS descriptors before switching DS and ES
+    
+    commit f647d7c155f069c1a068030255c300663516420e upstream.
+    
+    Otherwise, if buggy user code points DS or ES into the TLS
+    array, they would be corrupted after a context switch.
+    
+    This also significantly improves the comments and documents some
+    gotchas in the code.
+    
+    Before this patch, the both tests below failed.  With this
+    patch, the es test passes, although the gsbase test still fails.
+    
+     ----- begin es test -----
+    
+    /*
+     * Copyright (c) 2014 Andy Lutomirski
+     * GPL v2
+     */
+    
+    static unsigned short GDT3(int idx)
+    {
+            return (idx << 3) | 3;
+    }
+    
+    static int create_tls(int idx, unsigned int base)
+    {
+            struct user_desc desc = {
+                    .entry_number    = idx,
+                    .base_addr       = base,
+                    .limit           = 0xfffff,
+                    .seg_32bit       = 1,
+                    .contents        = 0, /* Data, grow-up */
+                    .read_exec_only  = 0,
+                    .limit_in_pages  = 1,
+                    .seg_not_present = 0,
+                    .useable         = 0,
+            };
+    
+            if (syscall(SYS_set_thread_area, &desc) != 0)
+                    err(1, "set_thread_area");
+    
+            return desc.entry_number;
+    }
+    
+    int main()
+    {
+            int idx = create_tls(-1, 0);
+            printf("Allocated GDT index %d\n", idx);
+    
+            unsigned short orig_es;
+            asm volatile ("mov %%es,%0" : "=rm" (orig_es));
+    
+            int errors = 0;
+            int total = 1000;
+            for (int i = 0; i < total; i++) {
+                    asm volatile ("mov %0,%%es" : : "rm" (GDT3(idx)));
+                    usleep(100);
+    
+                    unsigned short es;
+                    asm volatile ("mov %%es,%0" : "=rm" (es));
+                    asm volatile ("mov %0,%%es" : : "rm" (orig_es));
+                    if (es != GDT3(idx)) {
+                            if (errors == 0)
+                                    printf("[FAIL]\tES changed from 0x%hx to 0x%hx\n",
+                                           GDT3(idx), es);
+                            errors++;
+                    }
+            }
+    
+            if (errors) {
+                    printf("[FAIL]\tES was corrupted %d/%d times\n", errors, total);
+                    return 1;
+            } else {
+                    printf("[OK]\tES was preserved\n");
+                    return 0;
+            }
+    }
+    
+     ----- end es test -----
+    
+     ----- begin gsbase test -----
+    
+    /*
+     * gsbase.c, a gsbase test
+     * Copyright (c) 2014 Andy Lutomirski
+     * GPL v2
+     */
+    
+    static unsigned char *testptr, *testptr2;
+    
+    static unsigned char read_gs_testvals(void)
+    {
+            unsigned char ret;
+            asm volatile ("movb %%gs:%1, %0" : "=r" (ret) : "m" (*testptr));
+            return ret;
+    }
+    
+    int main()
+    {
+            int errors = 0;
+    
+            testptr = mmap((void *)0x200000000UL, 1, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+            if (testptr == MAP_FAILED)
+                    err(1, "mmap");
+    
+            testptr2 = mmap((void *)0x300000000UL, 1, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+            if (testptr2 == MAP_FAILED)
+                    err(1, "mmap");
+    
+            *testptr = 0;
+            *testptr2 = 1;
+    
+            if (syscall(SYS_arch_prctl, ARCH_SET_GS,
+                        (unsigned long)testptr2 - (unsigned long)testptr) != 0)
+                    err(1, "ARCH_SET_GS");
+    
+            usleep(100);
+    
+            if (read_gs_testvals() == 1) {
+                    printf("[OK]\tARCH_SET_GS worked\n");
+            } else {
+                    printf("[FAIL]\tARCH_SET_GS failed\n");
+                    errors++;
+            }
+    
+            asm volatile ("mov %0,%%gs" : : "r" (0));
+    
+            if (read_gs_testvals() == 0) {
+                    printf("[OK]\tWriting 0 to gs worked\n");
+            } else {
+                    printf("[FAIL]\tWriting 0 to gs failed\n");
+                    errors++;
+            }
+    
+            usleep(100);
+    
+            if (read_gs_testvals() == 0) {
+                    printf("[OK]\tgsbase is still zero\n");
+            } else {
+                    printf("[FAIL]\tgsbase was corrupted\n");
+                    errors++;
+            }
+    
+            return errors == 0 ? 0 : 1;
+    }
+    
+     ----- end gsbase test -----
+    
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Cc: Andi Kleen <andi@firstfloor.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Link: http://lkml.kernel.org/r/509d27c9fec78217691c3dad91cec87e1006b34a.1418075657.git.luto@amacapital.net
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 643152b8a487a0df92a156f137f37f14ca73267a
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Thu Dec 4 16:48:17 2014 -0800
+
+    x86/tls: Disallow unusual TLS segments
+    
+    commit 0e58af4e1d2166e9e33375a0f121e4867010d4f8 upstream.
+    
+    Users have no business installing custom code segments into the
+    GDT, and segments that are not present but are otherwise valid
+    are a historical source of interesting attacks.
+    
+    For completeness, block attempts to set the L bit.  (Prior to
+    this patch, the L bit would have been silently dropped.)
+    
+    This is an ABI break.  I've checked glibc, musl, and Wine, and
+    none of them look like they'll have any trouble.
+    
+    Note to stable maintainers: this is a hardening patch that fixes
+    no known bugs.  Given the possibility of ABI issues, this
+    probably shouldn't be backported quickly.
+    
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Acked-by: H. Peter Anvin <hpa@zytor.com>
+    Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Willy Tarreau <w@1wt.eu>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit aeb83c03a8f584ce0b9386761c22f145caced232
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Thu Dec 4 16:48:16 2014 -0800
+
+    x86/tls: Validate TLS entries to protect espfix
+    
+    commit 41bdc78544b8a93a9c6814b8bbbfef966272abbe upstream.
+    
+    Installing a 16-bit RW data segment into the GDT defeats espfix.
+    AFAICT this will not affect glibc, Wine, or dosemu at all.
+    
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Acked-by: H. Peter Anvin <hpa@zytor.com>
+    Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Willy Tarreau <w@1wt.eu>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 8190393a88f2b0321263a54f2a9eb5a2aa43be7e
+Author: Jan Kara <jack@suse.cz>
+Date:   Mon Dec 15 14:22:46 2014 +0100
+
+    isofs: Fix infinite looping over CE entries
+    
+    commit f54e18f1b831c92f6512d2eedb224cd63d607d3d upstream.
+    
+    Rock Ridge extensions define so called Continuation Entries (CE) which
+    define where is further space with Rock Ridge data. Corrupted isofs
+    image can contain arbitrarily long chain of these, including a one
+    containing loop and thus causing kernel to end in an infinite loop when
+    traversing these entries.
+    
+    Limit the traversal to 32 entries which should be more than enough space
+    to store all the Rock Ridge data.
+    
+    Reported-by: P J P <ppandit@redhat.com>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>

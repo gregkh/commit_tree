@@ -1,0 +1,2216 @@
+commit 252f23ea5987a4730e3399ef1ad5d78efcc786c9
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Fri Nov 21 09:23:22 2014 -0800
+
+    Linux 3.10.61
+
+commit f8a5117916dd2871c056963bf5ee0d1101c10099
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Wed Oct 16 13:46:59 2013 -0700
+
+    mm: memcg: handle non-error OOM situations more gracefully
+    
+    commit 4942642080ea82d99ab5b653abb9a12b7ba31f4a upstream.
+    
+    Commit 3812c8c8f395 ("mm: memcg: do not trap chargers with full
+    callstack on OOM") assumed that only a few places that can trigger a
+    memcg OOM situation do not return VM_FAULT_OOM, like optional page cache
+    readahead.  But there are many more and it's impractical to annotate
+    them all.
+    
+    First of all, we don't want to invoke the OOM killer when the failed
+    allocation is gracefully handled, so defer the actual kill to the end of
+    the fault handling as well.  This simplifies the code quite a bit for
+    added bonus.
+    
+    Second, since a failed allocation might not be the abrupt end of the
+    fault, the memcg OOM handler needs to be re-entrant until the fault
+    finishes for subsequent allocation attempts.  If an allocation is
+    attempted after the task already OOMed, allow it to bypass the limit so
+    that it can quickly finish the fault and invoke the OOM killer.
+    
+    Reported-by: azurIt <azurit@pobox.sk>
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Cc: Michal Hocko <mhocko@suse.cz>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit f79d6a468980516cbfb9e01313c846b82b9d2e7e
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Thu Sep 12 15:13:44 2013 -0700
+
+    mm: memcg: do not trap chargers with full callstack on OOM
+    
+    commit 3812c8c8f3953921ef18544110dafc3505c1ac62 upstream.
+    
+    The memcg OOM handling is incredibly fragile and can deadlock.  When a
+    task fails to charge memory, it invokes the OOM killer and loops right
+    there in the charge code until it succeeds.  Comparably, any other task
+    that enters the charge path at this point will go to a waitqueue right
+    then and there and sleep until the OOM situation is resolved.  The problem
+    is that these tasks may hold filesystem locks and the mmap_sem; locks that
+    the selected OOM victim may need to exit.
+    
+    For example, in one reported case, the task invoking the OOM killer was
+    about to charge a page cache page during a write(), which holds the
+    i_mutex.  The OOM killer selected a task that was just entering truncate()
+    and trying to acquire the i_mutex:
+    
+    OOM invoking task:
+      mem_cgroup_handle_oom+0x241/0x3b0
+      mem_cgroup_cache_charge+0xbe/0xe0
+      add_to_page_cache_locked+0x4c/0x140
+      add_to_page_cache_lru+0x22/0x50
+      grab_cache_page_write_begin+0x8b/0xe0
+      ext3_write_begin+0x88/0x270
+      generic_file_buffered_write+0x116/0x290
+      __generic_file_aio_write+0x27c/0x480
+      generic_file_aio_write+0x76/0xf0           # takes ->i_mutex
+      do_sync_write+0xea/0x130
+      vfs_write+0xf3/0x1f0
+      sys_write+0x51/0x90
+      system_call_fastpath+0x18/0x1d
+    
+    OOM kill victim:
+      do_truncate+0x58/0xa0              # takes i_mutex
+      do_last+0x250/0xa30
+      path_openat+0xd7/0x440
+      do_filp_open+0x49/0xa0
+      do_sys_open+0x106/0x240
+      sys_open+0x20/0x30
+      system_call_fastpath+0x18/0x1d
+    
+    The OOM handling task will retry the charge indefinitely while the OOM
+    killed task is not releasing any resources.
+    
+    A similar scenario can happen when the kernel OOM killer for a memcg is
+    disabled and a userspace task is in charge of resolving OOM situations.
+    In this case, ALL tasks that enter the OOM path will be made to sleep on
+    the OOM waitqueue and wait for userspace to free resources or increase
+    the group's limit.  But a userspace OOM handler is prone to deadlock
+    itself on the locks held by the waiting tasks.  For example one of the
+    sleeping tasks may be stuck in a brk() call with the mmap_sem held for
+    writing but the userspace handler, in order to pick an optimal victim,
+    may need to read files from /proc/<pid>, which tries to acquire the same
+    mmap_sem for reading and deadlocks.
+    
+    This patch changes the way tasks behave after detecting a memcg OOM and
+    makes sure nobody loops or sleeps with locks held:
+    
+    1. When OOMing in a user fault, invoke the OOM killer and restart the
+       fault instead of looping on the charge attempt.  This way, the OOM
+       victim can not get stuck on locks the looping task may hold.
+    
+    2. When OOMing in a user fault but somebody else is handling it
+       (either the kernel OOM killer or a userspace handler), don't go to
+       sleep in the charge context.  Instead, remember the OOMing memcg in
+       the task struct and then fully unwind the page fault stack with
+       -ENOMEM.  pagefault_out_of_memory() will then call back into the
+       memcg code to check if the -ENOMEM came from the memcg, and then
+       either put the task to sleep on the memcg's OOM waitqueue or just
+       restart the fault.  The OOM victim can no longer get stuck on any
+       lock a sleeping task may hold.
+    
+    Debugged by Michal Hocko.
+    
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Reported-by: azurIt <azurit@pobox.sk>
+    Acked-by: Michal Hocko <mhocko@suse.cz>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 7a147e0c45a8fa198ade4128bdcbf8592f48843e
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Thu Sep 12 15:13:43 2013 -0700
+
+    mm: memcg: rework and document OOM waiting and wakeup
+    
+    commit fb2a6fc56be66c169f8b80e07ed999ba453a2db2 upstream.
+    
+    The memcg OOM handler open-codes a sleeping lock for OOM serialization
+    (trylock, wait, repeat) because the required locking is so specific to
+    memcg hierarchies.  However, it would be nice if this construct would be
+    clearly recognizable and not be as obfuscated as it is right now.  Clean
+    up as follows:
+    
+    1. Remove the return value of mem_cgroup_oom_unlock()
+    
+    2. Rename mem_cgroup_oom_lock() to mem_cgroup_oom_trylock().
+    
+    3. Pull the prepare_to_wait() out of the memcg_oom_lock scope.  This
+       makes it more obvious that the task has to be on the waitqueue
+       before attempting to OOM-trylock the hierarchy, to not miss any
+       wakeups before going to sleep.  It just didn't matter until now
+       because it was all lumped together into the global memcg_oom_lock
+       spinlock section.
+    
+    4. Pull the mem_cgroup_oom_notify() out of the memcg_oom_lock scope.
+       It is proctected by the hierarchical OOM-lock.
+    
+    5. The memcg_oom_lock spinlock is only required to propagate the OOM
+       lock in any given hierarchy atomically.  Restrict its scope to
+       mem_cgroup_oom_(trylock|unlock).
+    
+    6. Do not wake up the waitqueue unconditionally at the end of the
+       function.  Only the lockholder has to wake up the next in line
+       after releasing the lock.
+    
+       Note that the lockholder kicks off the OOM-killer, which in turn
+       leads to wakeups from the uncharges of the exiting task.  But a
+       contender is not guaranteed to see them if it enters the OOM path
+       after the OOM kills but before the lockholder releases the lock.
+       Thus there has to be an explicit wakeup after releasing the lock.
+    
+    7. Put the OOM task on the waitqueue before marking the hierarchy as
+       under OOM as that is the point where we start to receive wakeups.
+       No point in listening before being on the waitqueue.
+    
+    8. Likewise, unmark the hierarchy before finishing the sleep, for
+       symmetry.
+    
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Acked-by: Michal Hocko <mhocko@suse.cz>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: azurIt <azurit@pobox.sk>
+    Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 11f34787b50ce71f66b85ad8790beaa5eee3f897
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Thu Sep 12 15:13:42 2013 -0700
+
+    mm: memcg: enable memcg OOM killer only for user faults
+    
+    commit 519e52473ebe9db5cdef44670d5a97f1fd53d721 upstream.
+    
+    System calls and kernel faults (uaccess, gup) can handle an out of memory
+    situation gracefully and just return -ENOMEM.
+    
+    Enable the memcg OOM killer only for user faults, where it's really the
+    only option available.
+    
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Acked-by: Michal Hocko <mhocko@suse.cz>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: azurIt <azurit@pobox.sk>
+    Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ed368ae78e6eafc10368e97246610d676bec3060
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Thu Sep 12 15:13:40 2013 -0700
+
+    x86: finish user fault error path with fatal signal
+    
+    commit 3a13c4d761b4b979ba8767f42345fed3274991b0 upstream.
+    
+    The x86 fault handler bails in the middle of error handling when the
+    task has a fatal signal pending.  For a subsequent patch this is a
+    problem in OOM situations because it relies on pagefault_out_of_memory()
+    being called even when the task has been killed, to perform proper
+    per-task OOM state unwinding.
+    
+    Shortcutting the fault like this is a rather minor optimization that
+    saves a few instructions in rare cases.  Just remove it for
+    user-triggered faults.
+    
+    Use the opportunity to split the fault retry handling from actual fault
+    errors and add locking documentation that reads suprisingly similar to
+    ARM's.
+    
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Reviewed-by: Michal Hocko <mhocko@suse.cz>
+    Acked-by: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: azurIt <azurit@pobox.sk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit e2ec2c2b96808afa2f57ec7d7949691146fca341
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Thu Sep 12 15:13:39 2013 -0700
+
+    arch: mm: pass userspace fault flag to generic fault handler
+    
+    commit 759496ba6407c6994d6a5ce3a5e74937d7816208 upstream.
+    
+    Unlike global OOM handling, memory cgroup code will invoke the OOM killer
+    in any OOM situation because it has no way of telling faults occuring in
+    kernel context - which could be handled more gracefully - from
+    user-triggered faults.
+    
+    Pass a flag that identifies faults originating in user space from the
+    architecture-specific fault handlers to generic code so that memcg OOM
+    handling can be improved.
+    
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Reviewed-by: Michal Hocko <mhocko@suse.cz>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: azurIt <azurit@pobox.sk>
+    Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 086c6cc5377d0908667e8f7082633aebf45cf95f
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Thu Sep 12 15:13:38 2013 -0700
+
+    arch: mm: do not invoke OOM killer on kernel fault OOM
+    
+    commit 871341023c771ad233620b7a1fb3d9c7031c4e5c upstream.
+    
+    Kernel faults are expected to handle OOM conditions gracefully (gup,
+    uaccess etc.), so they should never invoke the OOM killer.  Reserve this
+    for faults triggered in user context when it is the only option.
+    
+    Most architectures already do this, fix up the remaining few.
+    
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Reviewed-by: Michal Hocko <mhocko@suse.cz>
+    Acked-by: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: azurIt <azurit@pobox.sk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 20c92c01bfe0d5046f16853c07e2a24ea463cdf2
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Thu Sep 12 15:13:36 2013 -0700
+
+    arch: mm: remove obsolete init OOM protection
+    
+    commit 94bce453c78996cc4373d5da6cfabe07fcc6d9f9 upstream.
+    
+    The memcg code can trap tasks in the context of the failing allocation
+    until an OOM situation is resolved.  They can hold all kinds of locks
+    (fs, mm) at this point, which makes it prone to deadlocking.
+    
+    This series converts memcg OOM handling into a two step process that is
+    started in the charge context, but any waiting is done after the fault
+    stack is fully unwound.
+    
+    Patches 1-4 prepare architecture handlers to support the new memcg
+    requirements, but in doing so they also remove old cruft and unify
+    out-of-memory behavior across architectures.
+    
+    Patch 5 disables the memcg OOM handling for syscalls, readahead, kernel
+    faults, because they can gracefully unwind the stack with -ENOMEM.  OOM
+    handling is restricted to user triggered faults that have no other
+    option.
+    
+    Patch 6 reworks memcg's hierarchical OOM locking to make it a little
+    more obvious wth is going on in there: reduce locked regions, rename
+    locking functions, reorder and document.
+    
+    Patch 7 implements the two-part OOM handling such that tasks are never
+    trapped with the full charge stack in an OOM situation.
+    
+    This patch:
+    
+    Back before smart OOM killing, when faulting tasks were killed directly on
+    allocation failures, the arch-specific fault handlers needed special
+    protection for the init process.
+    
+    Now that all fault handlers call into the generic OOM killer (see commit
+    609838cfed97: "mm: invoke oom-killer from remaining unconverted page
+    fault handlers"), which already provides init protection, the
+    arch-specific leftovers can be removed.
+    
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Reviewed-by: Michal Hocko <mhocko@suse.cz>
+    Acked-by: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: azurIt <azurit@pobox.sk>
+    Acked-by: Vineet Gupta <vgupta@synopsys.com>    [arch/arc bits]
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit b13a714fb4e374d9e23185d6f47e86109909cfe8
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Mon Jul 8 15:59:50 2013 -0700
+
+    mm: invoke oom-killer from remaining unconverted page fault handlers
+    
+    commit 609838cfed972d49a65aac7923a9ff5cbe482e30 upstream.
+    
+    A few remaining architectures directly kill the page faulting task in an
+    out of memory situation.  This is usually not a good idea since that
+    task might not even use a significant amount of memory and so may not be
+    the optimal victim to resolve the situation.
+    
+    Since 2.6.29's 1c0fe6e ("mm: invoke oom-killer from page fault") there
+    is a hook that architecture page fault handlers are supposed to call to
+    invoke the OOM killer and let it pick the right task to kill.  Convert
+    the remaining architectures over to this hook.
+    
+    To have the previous behavior of simply taking out the faulting task the
+    vm.oom_kill_allocating_task sysctl can be set to 1.
+    
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Reviewed-by: Michal Hocko <mhocko@suse.cz>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Acked-by: David Rientjes <rientjes@google.com>
+    Acked-by: Vineet Gupta <vgupta@synopsys.com>   [arch/arc bits]
+    Cc: James Hogan <james.hogan@imgtec.com>
+    Cc: David Howells <dhowells@redhat.com>
+    Cc: Jonas Bonn <jonas@southpole.se>
+    Cc: Chen Liqin <liqin.chen@sunplusct.com>
+    Cc: Lennox Wu <lennox.wu@gmail.com>
+    Cc: Chris Metcalf <cmetcalf@tilera.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit cda702df4736ab981f81ea4b529d14a2858fdc36
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Thu Oct 9 22:55:31 2014 +0200
+
+    net: sctp: fix skb_over_panic when receiving malformed ASCONF chunks
+    
+    commit 9de7922bc709eee2f609cd01d98aaedc4cf5ea74 upstream.
+    
+    Commit 6f4c618ddb0 ("SCTP : Add paramters validity check for
+    ASCONF chunk") added basic verification of ASCONF chunks, however,
+    it is still possible to remotely crash a server by sending a
+    special crafted ASCONF chunk, even up to pre 2.6.12 kernels:
+    
+    skb_over_panic: text:ffffffffa01ea1c3 len:31056 put:30768
+     head:ffff88011bd81800 data:ffff88011bd81800 tail:0x7950
+     end:0x440 dev:<NULL>
+     ------------[ cut here ]------------
+    kernel BUG at net/core/skbuff.c:129!
+    [...]
+    Call Trace:
+     <IRQ>
+     [<ffffffff8144fb1c>] skb_put+0x5c/0x70
+     [<ffffffffa01ea1c3>] sctp_addto_chunk+0x63/0xd0 [sctp]
+     [<ffffffffa01eadaf>] sctp_process_asconf+0x1af/0x540 [sctp]
+     [<ffffffff8152d025>] ? _read_unlock_bh+0x15/0x20
+     [<ffffffffa01e0038>] sctp_sf_do_asconf+0x168/0x240 [sctp]
+     [<ffffffffa01e3751>] sctp_do_sm+0x71/0x1210 [sctp]
+     [<ffffffff8147645d>] ? fib_rules_lookup+0xad/0xf0
+     [<ffffffffa01e6b22>] ? sctp_cmp_addr_exact+0x32/0x40 [sctp]
+     [<ffffffffa01e8393>] sctp_assoc_bh_rcv+0xd3/0x180 [sctp]
+     [<ffffffffa01ee986>] sctp_inq_push+0x56/0x80 [sctp]
+     [<ffffffffa01fcc42>] sctp_rcv+0x982/0xa10 [sctp]
+     [<ffffffffa01d5123>] ? ipt_local_in_hook+0x23/0x28 [iptable_filter]
+     [<ffffffff8148bdc9>] ? nf_iterate+0x69/0xb0
+     [<ffffffff81496d10>] ? ip_local_deliver_finish+0x0/0x2d0
+     [<ffffffff8148bf86>] ? nf_hook_slow+0x76/0x120
+     [<ffffffff81496d10>] ? ip_local_deliver_finish+0x0/0x2d0
+     [<ffffffff81496ded>] ip_local_deliver_finish+0xdd/0x2d0
+     [<ffffffff81497078>] ip_local_deliver+0x98/0xa0
+     [<ffffffff8149653d>] ip_rcv_finish+0x12d/0x440
+     [<ffffffff81496ac5>] ip_rcv+0x275/0x350
+     [<ffffffff8145c88b>] __netif_receive_skb+0x4ab/0x750
+     [<ffffffff81460588>] netif_receive_skb+0x58/0x60
+    
+    This can be triggered e.g., through a simple scripted nmap
+    connection scan injecting the chunk after the handshake, for
+    example, ...
+    
+      -------------- INIT[ASCONF; ASCONF_ACK] ------------->
+      <----------- INIT-ACK[ASCONF; ASCONF_ACK] ------------
+      -------------------- COOKIE-ECHO -------------------->
+      <-------------------- COOKIE-ACK ---------------------
+      ------------------ ASCONF; UNKNOWN ------------------>
+    
+    ... where ASCONF chunk of length 280 contains 2 parameters ...
+    
+      1) Add IP address parameter (param length: 16)
+      2) Add/del IP address parameter (param length: 255)
+    
+    ... followed by an UNKNOWN chunk of e.g. 4 bytes. Here, the
+    Address Parameter in the ASCONF chunk is even missing, too.
+    This is just an example and similarly-crafted ASCONF chunks
+    could be used just as well.
+    
+    The ASCONF chunk passes through sctp_verify_asconf() as all
+    parameters passed sanity checks, and after walking, we ended
+    up successfully at the chunk end boundary, and thus may invoke
+    sctp_process_asconf(). Parameter walking is done with
+    WORD_ROUND() to take padding into account.
+    
+    In sctp_process_asconf()'s TLV processing, we may fail in
+    sctp_process_asconf_param() e.g., due to removal of the IP
+    address that is also the source address of the packet containing
+    the ASCONF chunk, and thus we need to add all TLVs after the
+    failure to our ASCONF response to remote via helper function
+    sctp_add_asconf_response(), which basically invokes a
+    sctp_addto_chunk() adding the error parameters to the given
+    skb.
+    
+    When walking to the next parameter this time, we proceed
+    with ...
+    
+      length = ntohs(asconf_param->param_hdr.length);
+      asconf_param = (void *)asconf_param + length;
+    
+    ... instead of the WORD_ROUND()'ed length, thus resulting here
+    in an off-by-one that leads to reading the follow-up garbage
+    parameter length of 12336, and thus throwing an skb_over_panic
+    for the reply when trying to sctp_addto_chunk() next time,
+    which implicitly calls the skb_put() with that length.
+    
+    Fix it by using sctp_walk_params() [ which is also used in
+    INIT parameter processing ] macro in the verification *and*
+    in ASCONF processing: it will make sure we don't spill over,
+    that we walk parameters WORD_ROUND()'ed. Moreover, we're being
+    more defensive and guard against unknown parameter types and
+    missized addresses.
+    
+    Joint work with Vlad Yasevich.
+    
+    Fixes: b896b82be4ae ("[SCTP] ADDIP: Support for processing incoming ASCONF_ACK chunks.")
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Signed-off-by: Vlad Yasevich <vyasevich@gmail.com>
+    Acked-by: Neil Horman <nhorman@tuxdriver.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Cc: Josh Boyer <jwboyer@fedoraproject.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3329125539de90e5fa6ab83009f5f82ef73a3259
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Thu Oct 9 22:55:32 2014 +0200
+
+    net: sctp: fix panic on duplicate ASCONF chunks
+    
+    commit b69040d8e39f20d5215a03502a8e8b4c6ab78395 upstream.
+    
+    When receiving a e.g. semi-good formed connection scan in the
+    form of ...
+    
+      -------------- INIT[ASCONF; ASCONF_ACK] ------------->
+      <----------- INIT-ACK[ASCONF; ASCONF_ACK] ------------
+      -------------------- COOKIE-ECHO -------------------->
+      <-------------------- COOKIE-ACK ---------------------
+      ---------------- ASCONF_a; ASCONF_b ----------------->
+    
+    ... where ASCONF_a equals ASCONF_b chunk (at least both serials
+    need to be equal), we panic an SCTP server!
+    
+    The problem is that good-formed ASCONF chunks that we reply with
+    ASCONF_ACK chunks are cached per serial. Thus, when we receive a
+    same ASCONF chunk twice (e.g. through a lost ASCONF_ACK), we do
+    not need to process them again on the server side (that was the
+    idea, also proposed in the RFC). Instead, we know it was cached
+    and we just resend the cached chunk instead. So far, so good.
+    
+    Where things get nasty is in SCTP's side effect interpreter, that
+    is, sctp_cmd_interpreter():
+    
+    While incoming ASCONF_a (chunk = event_arg) is being marked
+    !end_of_packet and !singleton, and we have an association context,
+    we do not flush the outqueue the first time after processing the
+    ASCONF_ACK singleton chunk via SCTP_CMD_REPLY. Instead, we keep it
+    queued up, although we set local_cork to 1. Commit 2e3216cd54b1
+    changed the precedence, so that as long as we get bundled, incoming
+    chunks we try possible bundling on outgoing queue as well. Before
+    this commit, we would just flush the output queue.
+    
+    Now, while ASCONF_a's ASCONF_ACK sits in the corked outq, we
+    continue to process the same ASCONF_b chunk from the packet. As
+    we have cached the previous ASCONF_ACK, we find it, grab it and
+    do another SCTP_CMD_REPLY command on it. So, effectively, we rip
+    the chunk->list pointers and requeue the same ASCONF_ACK chunk
+    another time. Since we process ASCONF_b, it's correctly marked
+    with end_of_packet and we enforce an uncork, and thus flush, thus
+    crashing the kernel.
+    
+    Fix it by testing if the ASCONF_ACK is currently pending and if
+    that is the case, do not requeue it. When flushing the output
+    queue we may relink the chunk for preparing an outgoing packet,
+    but eventually unlink it when it's copied into the skb right
+    before transmission.
+    
+    Joint work with Vlad Yasevich.
+    
+    Fixes: 2e3216cd54b1 ("sctp: Follow security requirement of responding with 1 packet")
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Signed-off-by: Vlad Yasevich <vyasevich@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Cc: Josh Boyer <jwboyer@fedoraproject.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit bf53932bce5c58cf006ca2e1f81bd1d66d14ba45
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Thu Oct 9 22:55:33 2014 +0200
+
+    net: sctp: fix remote memory pressure from excessive queueing
+    
+    commit 26b87c7881006311828bb0ab271a551a62dcceb4 upstream.
+    
+    This scenario is not limited to ASCONF, just taken as one
+    example triggering the issue. When receiving ASCONF probes
+    in the form of ...
+    
+      -------------- INIT[ASCONF; ASCONF_ACK] ------------->
+      <----------- INIT-ACK[ASCONF; ASCONF_ACK] ------------
+      -------------------- COOKIE-ECHO -------------------->
+      <-------------------- COOKIE-ACK ---------------------
+      ---- ASCONF_a; [ASCONF_b; ...; ASCONF_n;] JUNK ------>
+      [...]
+      ---- ASCONF_m; [ASCONF_o; ...; ASCONF_z;] JUNK ------>
+    
+    ... where ASCONF_a, ASCONF_b, ..., ASCONF_z are good-formed
+    ASCONFs and have increasing serial numbers, we process such
+    ASCONF chunk(s) marked with !end_of_packet and !singleton,
+    since we have not yet reached the SCTP packet end. SCTP does
+    only do verification on a chunk by chunk basis, as an SCTP
+    packet is nothing more than just a container of a stream of
+    chunks which it eats up one by one.
+    
+    We could run into the case that we receive a packet with a
+    malformed tail, above marked as trailing JUNK. All previous
+    chunks are here goodformed, so the stack will eat up all
+    previous chunks up to this point. In case JUNK does not fit
+    into a chunk header and there are no more other chunks in
+    the input queue, or in case JUNK contains a garbage chunk
+    header, but the encoded chunk length would exceed the skb
+    tail, or we came here from an entirely different scenario
+    and the chunk has pdiscard=1 mark (without having had a flush
+    point), it will happen, that we will excessively queue up
+    the association's output queue (a correct final chunk may
+    then turn it into a response flood when flushing the
+    queue ;)): I ran a simple script with incremental ASCONF
+    serial numbers and could see the server side consuming
+    excessive amount of RAM [before/after: up to 2GB and more].
+    
+    The issue at heart is that the chunk train basically ends
+    with !end_of_packet and !singleton markers and since commit
+    2e3216cd54b1 ("sctp: Follow security requirement of responding
+    with 1 packet") therefore preventing an output queue flush
+    point in sctp_do_sm() -> sctp_cmd_interpreter() on the input
+    chunk (chunk = event_arg) even though local_cork is set,
+    but its precedence has changed since then. In the normal
+    case, the last chunk with end_of_packet=1 would trigger the
+    queue flush to accommodate possible outgoing bundling.
+    
+    In the input queue, sctp_inq_pop() seems to do the right thing
+    in terms of discarding invalid chunks. So, above JUNK will
+    not enter the state machine and instead be released and exit
+    the sctp_assoc_bh_rcv() chunk processing loop. It's simply
+    the flush point being missing at loop exit. Adding a try-flush
+    approach on the output queue might not work as the underlying
+    infrastructure might be long gone at this point due to the
+    side-effect interpreter run.
+    
+    One possibility, albeit a bit of a kludge, would be to defer
+    invalid chunk freeing into the state machine in order to
+    possibly trigger packet discards and thus indirectly a queue
+    flush on error. It would surely be better to discard chunks
+    as in the current, perhaps better controlled environment, but
+    going back and forth, it's simply architecturally not possible.
+    I tried various trailing JUNK attack cases and it seems to
+    look good now.
+    
+    Joint work with Vlad Yasevich.
+    
+    Fixes: 2e3216cd54b1 ("sctp: Follow security requirement of responding with 1 packet")
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Signed-off-by: Vlad Yasevich <vyasevich@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Cc: Josh Boyer <jwboyer@fedoraproject.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit c75f394964bc21d0b890bd62ead90ff51b3e1e72
+Author: Nadav Amit <namit@cs.technion.ac.il>
+Date:   Wed Sep 17 02:50:50 2014 +0300
+
+    KVM: x86: Don't report guest userspace emulation error to userspace
+    
+    commit a2b9e6c1a35afcc0973acb72e591c714e78885ff upstream.
+    
+    Commit fc3a9157d314 ("KVM: X86: Don't report L2 emulation failures to
+    user-space") disabled the reporting of L2 (nested guest) emulation failures to
+    userspace due to race-condition between a vmexit and the instruction emulator.
+    The same rational applies also to userspace applications that are permitted by
+    the guest OS to access MMIO area or perform PIO.
+    
+    This patch extends the current behavior - of injecting a #UD instead of
+    reporting it to userspace - also for guest userspace code.
+    
+    Signed-off-by: Nadav Amit <namit@cs.technion.ac.il>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 2e4ce498811f1aa2e9f2e600d442ad8da0ab6534
+Author: Tomas Henzl <thenzl@redhat.com>
+Date:   Thu Aug 1 15:14:00 2013 +0200
+
+    SCSI: hpsa: fix a race in cmd_free/scsi_done
+    
+    commit 2cc5bfaf854463d9d1aa52091f60110fbf102a96 upstream.
+    
+    When the driver calls scsi_done and after that frees it's internal
+    preallocated memory it can happen that a new job is enqueud before
+    the memory is freed. The allocation fails and the message
+    "cmd_alloc returned NULL" is shown.
+    Patch below fixes it by moving cmd->scsi_done after cmd_free.
+    
+    Signed-off-by: Tomas Henzl <thenzl@redhat.com>
+    Acked-by: Stephen M. Cameron <scameron@beardog.cce.hp.com>
+    Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+    Cc: Masoud Sharbiani <msharbiani@twitter.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 50e0289d813aceddedf962ea92299b68ac264671
+Author: Eugenia Emantayev <eugenia@mellanox.com>
+Date:   Thu Jul 25 19:21:23 2013 +0300
+
+    net/mlx4_en: Fix BlueFlame race
+    
+    commit 2d4b646613d6b12175b017aca18113945af1faf3 upstream.
+    
+    Fix a race between BlueFlame flow and stamping in post send flow.
+    Example:
+            SW: Build WQE 0 on the TX buffer, except the ownership bit
+            SW: Set ownership for WQE 0 on the TX buffer
+            SW: Ring doorbell for WQE 0
+            SW: Build WQE 1 on the TX buffer, except the ownership bit
+            SW: Set ownership for WQE 1 on the TX buffer
+            HW: Read WQE 0 and then WQE 1, before doorbell was rung/BF was done for WQE 1
+            HW: Produce CQEs for WQE 0 and WQE 1
+            SW: Process the CQEs, and stamp WQE 0 and WQE 1 accordingly (on the TX buffer)
+            SW: Copy WQE 1 from the TX buffer to the BF register - ALREADY STAMPED!
+            HW: CQE error with index 0xFFFF  - the BF WQE's control segment is STAMPED,
+                    so the BF index is 0xFFFF. Error: Invalid Opcode.
+    As a result QP enters the error state and no traffic can be sent.
+    
+    Solution:
+    When stamping - do not stamp last completed wqe.
+    
+    Signed-off-by: Eugenia Emantayev <eugenia@mellanox.com>
+    Signed-off-by: Amir Vadai <amirv@mellanox.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Cc: Vinson Lee <vlee@twopensource.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9f6bb0c21dbe0f0604a5fd3f8717677ffccd7aed
+Author: Ben Dooks <ben.dooks@codethink.co.uk>
+Date:   Thu Jul 25 14:38:03 2013 +0100
+
+    ARM: Correct BUG() assembly to ensure it is endian-agnostic
+    
+    commit 63328070eff2f4fd730c86966a0dbc976147c39f upstream.
+    
+    Currently BUG() uses .word or .hword to create the necessary illegal
+    instructions. However if we are building BE8 then these get swapped
+    by the linker into different illegal instructions in the text. This
+    means that the BUG() macro does not get trapped properly.
+    
+    Change to using <asm/opcodes.h> to provide the necessary ARM instruction
+    building as we cannot rely on gcc/gas having the `.inst` instructions
+    which where added to try and resolve this issue (reported by Dave Martin
+    <Dave.Martin@arm.com>).
+    
+    Signed-off-by: Ben Dooks <ben.dooks@codethink.co.uk>
+    Reviewed-by: Dave Martin <Dave.Martin@arm.com>
+    Cc: Wang Nan <wangnan0@huawei.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit f3c34e7e7a12401b080643beafbbbf249e017f24
+Author: Vince Weaver <vincent.weaver@maine.edu>
+Date:   Mon Jul 14 15:33:25 2014 -0400
+
+    perf/x86/intel: Use proper dTLB-load-misses event on IvyBridge
+    
+    commit 1996388e9f4e3444db8273bc08d25164d2967c21 upstream.
+    
+    This was discussed back in February:
+    
+            https://lkml.org/lkml/2014/2/18/956
+    
+    But I never saw a patch come out of it.
+    
+    On IvyBridge we share the SandyBridge cache event tables, but the
+    dTLB-load-miss event is not compatible.  Patch it up after
+    the fact to the proper DTLB_LOAD_MISSES.DEMAND_LD_MISS_CAUSES_A_WALK
+    
+    Signed-off-by: Vince Weaver <vincent.weaver@maine.edu>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Link: http://lkml.kernel.org/r/alpine.DEB.2.11.1407141528200.17214@vincent-weaver-1.umelst.maine.edu
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Cc: Hou Pengyang <houpengyang@huawei.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ba8beb4ca84e22996b0f553248ea52c760afb930
+Author: Alexander Usyskin <alexander.usyskin@intel.com>
+Date:   Mon Aug 25 16:46:53 2014 +0300
+
+    mei: bus: fix possible boundaries violation
+    
+    commit cfda2794b5afe7ce64ee9605c64bef0e56a48125 upstream.
+    
+    function 'strncpy' will fill whole buffer 'id.name' of fixed size (32)
+    with string value and will not leave place for NULL-terminator.
+    Possible buffer boundaries violation in following string operations.
+    Replace strncpy with strlcpy.
+    
+    Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+    Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 858879737bb5b7b7dca1d84df9018e7eb46d7294
+Author: Pawel Moll <pawel.moll@arm.com>
+Date:   Fri Jun 13 16:03:32 2014 +0100
+
+    perf: Handle compat ioctl
+    
+    commit b3f207855f57b9c8f43a547a801340bb5cbc59e5 upstream.
+    
+    When running a 32-bit userspace on a 64-bit kernel (eg. i386
+    application on x86_64 kernel or 32-bit arm userspace on arm64
+    kernel) some of the perf ioctls must be treated with special
+    care, as they have a pointer size encoded in the command.
+    
+    For example, PERF_EVENT_IOC_ID in 32-bit world will be encoded
+    as 0x80042407, but 64-bit kernel will expect 0x80082407. In
+    result the ioctl will fail returning -ENOTTY.
+    
+    This patch solves the problem by adding code fixing up the
+    size as compat_ioctl file operation.
+    
+    Reported-by: Drew Richardson <drew.richardson@arm.com>
+    Signed-off-by: Pawel Moll <pawel.moll@arm.com>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+    Cc: Jiri Olsa <jolsa@redhat.com>
+    Link: http://lkml.kernel.org/r/1402671812-9078-1-git-send-email-pawel.moll@arm.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: David Ahern <daahern@cisco.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3b851c17c479cfe176c98dd1519af46d5b8e571b
+Author: Yoichi Yuasa <yuasa@linux-mips.org>
+Date:   Wed Oct 2 15:03:03 2013 +0900
+
+    MIPS: Fix forgotten preempt_enable() when CPU has inclusive pcaches
+    
+    commit 5596b0b245fb9d2cefb5023b11061050351c1398 upstream.
+    
+    [    1.904000] BUG: scheduling while atomic: swapper/1/0x00000002
+    [    1.908000] Modules linked in:
+    [    1.916000] CPU: 0 PID: 1 Comm: swapper Not tainted 3.12.0-rc2-lemote-los.git-5318619-dirty #1
+    [    1.920000] Stack : 0000000031aac000 ffffffff810d0000 0000000000000052 ffffffff802730a4
+              0000000000000000 0000000000000001 ffffffff810cdf90 ffffffff810d0000
+              ffffffff8068b968 ffffffff806f5537 ffffffff810cdf90 980000009f0782e8
+              0000000000000001 ffffffff80720000 ffffffff806b0000 980000009f078000
+              980000009f290000 ffffffff805f312c 980000009f05b5d8 ffffffff80233518
+              980000009f05b5e8 ffffffff80274b7c 980000009f078000 ffffffff8068b968
+              0000000000000000 0000000000000000 0000000000000000 0000000000000000
+              0000000000000000 980000009f05b520 0000000000000000 ffffffff805f2f6c
+              0000000000000000 ffffffff80700000 ffffffff80700000 ffffffff806fc758
+              ffffffff80700000 ffffffff8020be98 ffffffff806fceb0 ffffffff805f2f6c
+              ...
+    [    2.028000] Call Trace:
+    [    2.032000] [<ffffffff8020be98>] show_stack+0x80/0x98
+    [    2.036000] [<ffffffff805f2f6c>] __schedule_bug+0x44/0x6c
+    [    2.040000] [<ffffffff805fac58>] __schedule+0x518/0x5b0
+    [    2.044000] [<ffffffff805f8a58>] schedule_timeout+0x128/0x1f0
+    [    2.048000] [<ffffffff80240314>] msleep+0x3c/0x60
+    [    2.052000] [<ffffffff80495400>] do_probe+0x238/0x3a8
+    [    2.056000] [<ffffffff804958b0>] ide_probe_port+0x340/0x7e8
+    [    2.060000] [<ffffffff80496028>] ide_host_register+0x2d0/0x7a8
+    [    2.064000] [<ffffffff8049c65c>] ide_pci_init_two+0x4e4/0x790
+    [    2.068000] [<ffffffff8049f9b8>] amd74xx_probe+0x148/0x2c8
+    [    2.072000] [<ffffffff803f571c>] pci_device_probe+0xc4/0x130
+    [    2.076000] [<ffffffff80478f60>] driver_probe_device+0x98/0x270
+    [    2.080000] [<ffffffff80479298>] __driver_attach+0xe0/0xe8
+    [    2.084000] [<ffffffff80476ab0>] bus_for_each_dev+0x78/0xe0
+    [    2.088000] [<ffffffff80478468>] bus_add_driver+0x230/0x310
+    [    2.092000] [<ffffffff80479b44>] driver_register+0x84/0x158
+    [    2.096000] [<ffffffff80200504>] do_one_initcall+0x104/0x160
+    
+    Signed-off-by: Yoichi Yuasa <yuasa@linux-mips.org>
+    Reported-by: Aaro Koskinen <aaro.koskinen@iki.fi>
+    Tested-by: Aaro Koskinen <aaro.koskinen@iki.fi>
+    Cc: linux-mips@linux-mips.org
+    Cc: Linux Kernel Mailing List <linux-kernel@vger.kernel.org>
+    Patchwork: https://patchwork.linux-mips.org/patch/5941/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+    Cc: Alexandre Oliva <lxoliva@fsfla.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 2a7978ef959430e21d93a6ab59284a11bc2c9bb6
+Author: Pali Rohár <pali@kernel.org>
+Date:   Mon Sep 29 15:10:51 2014 +0200
+
+    dell-wmi: Fix access out of memory
+    
+    commit a666b6ffbc9b6705a3ced704f52c3fe9ea8bf959 upstream.
+    
+    Without this patch, dell-wmi is trying to access elements of dynamically
+    allocated array without checking the array size. This can lead to memory
+    corruption or a kernel panic. This patch adds the missing checks for
+    array size.
+    
+    Signed-off-by: Pali Rohár <pali.rohar@gmail.com>
+    Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a2ad9bef40181939a8b3469a98f33775e4b0a23a
+Author: Ben Dooks <ben.dooks@codethink.co.uk>
+Date:   Fri Nov 8 18:29:25 2013 +0000
+
+    ARM: probes: fix instruction fetch order with <asm/opcodes.h>
+    
+    commit 888be25402021a425da3e85e2d5a954d7509286e upstream.
+    
+    If we are running BE8, the data and instruction endianness do not
+    match, so use <asm/opcodes.h> to correctly translate memory accesses
+    into ARM instructions.
+    
+    Acked-by: Jon Medhurst <tixy@linaro.org>
+    Signed-off-by: Ben Dooks <ben.dooks@codethink.co.uk>
+    [taras.kondratiuk@linaro.org: fixed Thumb instruction fetch order]
+    Signed-off-by: Taras Kondratiuk <taras.kondratiuk@linaro.org>
+    [wangnan: backport to 3.10 and 3.14:
+     - adjust context
+     - backport all changes on arch/arm/kernel/probes.c to
+       arch/arm/kernel/kprobes-common.c since we don't have
+       commit c18377c303787ded44b7decd7dee694db0f205e9.
+     - After the above adjustments, becomes same to Taras Kondratiuk's
+       original patch:
+         http://lists.linaro.org/pipermail/linaro-kernel/2014-January/010346.html
+    ]
+    Signed-off-by: Wang Nan <wangnan0@huawei.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a4ad890a7e7fac8177d93a4345c7a239339840ed
+Author: Jiri Pirko <jiri@resnulli.us>
+Date:   Thu Dec 5 16:27:37 2013 +0100
+
+    br: fix use of ->rx_handler_data in code executed on non-rx_handler path
+    
+    commit 859828c0ea476b42f3a93d69d117aaba90994b6f upstream.
+    
+    br_stp_rcv() is reached by non-rx_handler path. That means there is no
+    guarantee that dev is bridge port and therefore simple NULL check of
+    ->rx_handler_data is not enough. There is need to check if dev is really
+    bridge port and since only rcu read lock is held here, do it by checking
+    ->rx_handler pointer.
+    
+    Note that synchronize_net() in netdev_rx_handler_unregister() ensures
+    this approach as valid.
+    
+    Introduced originally by:
+    commit f350a0a87374418635689471606454abc7beaa3a
+      "bridge: use rx_handler_data pointer to store net_bridge_port pointer"
+    
+    Fixed but not in the best way by:
+    commit b5ed54e94d324f17c97852296d61a143f01b227a
+      "bridge: fix RCU races with bridge port"
+    
+    Reintroduced by:
+    commit 716ec052d2280d511e10e90ad54a86f5b5d4dcc2
+      "bridge: fix NULL pointer deref of br_port_get_rcu"
+    
+    Please apply to stable trees as well. Thanks.
+    
+    RH bugzilla reference: https://bugzilla.redhat.com/show_bug.cgi?id=1025770
+    
+    Reported-by: Laine Stump <laine@redhat.com>
+    Debugged-by: Michael S. Tsirkin <mst@redhat.com>
+    Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+    Signed-off-by: Jiri Pirko <jiri@resnulli.us>
+    Acked-by: Michael S. Tsirkin <mst@redhat.com>
+    Acked-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Cc: Andrew Collins <bsderandrew@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5eb4491e33b498f05bf51c75ed4abc46a5fccaba
+Author: Florian Westphal <fw@strlen.de>
+Date:   Sat Jun 7 21:17:04 2014 +0200
+
+    netfilter: nf_nat: fix oops on netns removal
+    
+    commit 945b2b2d259d1a4364a2799e80e8ff32f8c6ee6f upstream.
+    
+    Quoting Samu Kallio:
+    
+     Basically what's happening is, during netns cleanup,
+     nf_nat_net_exit gets called before ipv4_net_exit. As I understand
+     it, nf_nat_net_exit is supposed to kill any conntrack entries which
+     have NAT context (through nf_ct_iterate_cleanup), but for some
+     reason this doesn't happen (perhaps something else is still holding
+     refs to those entries?).
+    
+     When ipv4_net_exit is called, conntrack entries (including those
+     with NAT context) are cleaned up, but the
+     nat_bysource hashtable is long gone - freed in nf_nat_net_exit. The
+     bug happens when attempting to free a conntrack entry whose NAT hash
+     'prev' field points to a slot in the freed hash table (head for that
+     bin).
+    
+    We ignore conntracks with null nat bindings.  But this is wrong,
+    as these are in bysource hash table as well.
+    
+    Restore nat-cleaning for the netns-is-being-removed case.
+    
+    bug:
+    https://bugzilla.kernel.org/show_bug.cgi?id=65191
+    
+    Fixes: c2d421e1718 ('netfilter: nf_nat: fix race when unloading protocol modules')
+    Reported-by: Samu Kallio <samu.kallio@aberdeencloud.com>
+    Debugged-by: Samu Kallio <samu.kallio@aberdeencloud.com>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Tested-by: Samu Kallio <samu.kallio@aberdeencloud.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    [samu.kallio@aberdeencloud.com: backport to 3.10-stable]
+    Signed-off-by: Samu Kallio <samu.kallio@aberdeencloud.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 7c059c04ffe3de25d5aa66ad3541e53b94233ea3
+Author: Pablo Neira <pablo@netfilter.org>
+Date:   Tue Jul 29 18:12:15 2014 +0200
+
+    netfilter: xt_bpf: add mising opaque struct sk_filter definition
+    
+    commit e10038a8ec06ac819b7552bb67aaa6d2d6f850c1 upstream.
+    
+    This structure is not exposed to userspace, so fix this by defining
+    struct sk_filter; so we skip the casting in kernelspace. This is safe
+    since userspace has no way to lurk with that internal pointer.
+    
+    Fixes: e6f30c7 ("netfilter: x_tables: add xt_bpf match")
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Acked-by: Willem de Bruijn <willemb@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 0bf7a5e16a5356b9dadc503aac66f4f587823e8b
+Author: Houcheng Lin <houcheng@gmail.com>
+Date:   Thu Oct 23 10:36:08 2014 +0200
+
+    netfilter: nf_log: release skbuff on nlmsg put failure
+    
+    commit b51d3fa364885a2c1e1668f88776c67c95291820 upstream.
+    
+    The kernel should reserve enough room in the skb so that the DONE
+    message can always be appended.  However, in case of e.g. new attribute
+    erronously not being size-accounted for, __nfulnl_send() will still
+    try to put next nlmsg into this full skbuf, causing the skb to be stuck
+    forever and blocking delivery of further messages.
+    
+    Fix issue by releasing skb immediately after nlmsg_put error and
+    WARN() so we can track down the cause of such size mismatch.
+    
+    [ fw@strlen.de: add tailroom/len info to WARN ]
+    
+    Signed-off-by: Houcheng Lin <houcheng@gmail.com>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 07b170693adf94237d767b5545be013c1cab18c1
+Author: Florian Westphal <fw@strlen.de>
+Date:   Thu Oct 23 10:36:07 2014 +0200
+
+    netfilter: nfnetlink_log: fix maximum packet length logged to userspace
+    
+    commit c1e7dc91eed0ed1a51c9b814d648db18bf8fc6e9 upstream.
+    
+    don't try to queue payloads > 0xffff - NLA_HDRLEN, it does not work.
+    The nla length includes the size of the nla struct, so anything larger
+    results in u16 integer overflow.
+    
+    This patch is similar to
+    9cefbbc9c8f9abe (netfilter: nfnetlink_queue: cleanup copy_range usage).
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3a758a2b78da2f49f7165678faf999e946a0c4b5
+Author: Florian Westphal <fw@strlen.de>
+Date:   Thu Oct 23 10:36:06 2014 +0200
+
+    netfilter: nf_log: account for size of NLMSG_DONE attribute
+    
+    commit 9dfa1dfe4d5e5e66a991321ab08afe69759d797a upstream.
+    
+    We currently neither account for the nlattr size, nor do we consider
+    the size of the trailing NLMSG_DONE when allocating nlmsg skb.
+    
+    This can result in nflog to stop working, as __nfulnl_send() re-tries
+    sending forever if it failed to append NLMSG_DONE (which will never
+    work if buffer is not large enough).
+    
+    Reported-by: Houcheng Lin <houcheng@gmail.com>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit f2f25589e727f0257ee95d9e8521b7f30d3616a4
+Author: Andrey Vagin <avagin@openvz.org>
+Date:   Mon Oct 13 15:54:10 2014 -0700
+
+    ipc: always handle a new value of auto_msgmni
+    
+    commit 1195d94e006b23c6292e78857e154872e33b6d7e upstream.
+    
+    proc_dointvec_minmax() returns zero if a new value has been set.  So we
+    don't need to check all charecters have been handled.
+    
+    Below you can find two examples.  In the new value has not been handled
+    properly.
+    
+    $ strace ./a.out
+    open("/proc/sys/kernel/auto_msgmni", O_WRONLY) = 3
+    write(3, "0\n\0", 3)                    = 2
+    close(3)                                = 0
+    exit_group(0)
+    $ cat /sys/kernel/debug/tracing/trace
+    
+    $strace ./a.out
+    open("/proc/sys/kernel/auto_msgmni", O_WRONLY) = 3
+    write(3, "0\n", 2)                      = 2
+    close(3)                                = 0
+    
+    $ cat /sys/kernel/debug/tracing/trace
+    a.out-697   [000] ....  3280.998235: unregister_ipcns_notifier <-proc_ipcauto_dointvec_minmax
+    
+    Fixes: 9eefe520c814 ("ipc: do not use a negative value to re-enable msgmni automatic recomputin")
+    Signed-off-by: Andrey Vagin <avagin@openvz.org>
+    Cc: Mathias Krause <minipli@googlemail.com>
+    Cc: Manfred Spraul <manfred@colorfullife.com>
+    Cc: Joe Perches <joe@perches.com>
+    Cc: Davidlohr Bueso <davidlohr@hp.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 88d96d8e9ece6591b19a9989f010db1b623c0d9a
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Mon Oct 13 18:59:09 2014 -0600
+
+    clocksource: Remove "weak" from clocksource_default_clock() declaration
+    
+    commit 96a2adbc6f501996418da9f7afe39bf0e4d006a9 upstream.
+    
+    kernel/time/jiffies.c provides a default clocksource_default_clock()
+    definition explicitly marked "weak".  arch/s390 provides its own definition
+    intended to override the default, but the "weak" attribute on the
+    declaration applied to the s390 definition as well, so the linker chose one
+    based on link order (see 10629d711ed7 ("PCI: Remove __weak annotation from
+    pcibios_get_phb_of_node decl")).
+    
+    Remove the "weak" attribute from the clocksource_default_clock()
+    declaration so we always prefer a non-weak definition over the weak one,
+    independent of link order.
+    
+    Fixes: f1b82746c1e9 ("clocksource: Cleanup clocksource selection")
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Acked-by: John Stultz <john.stultz@linaro.org>
+    Acked-by: Ingo Molnar <mingo@kernel.org>
+    CC: Daniel Lezcano <daniel.lezcano@linaro.org>
+    CC: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 6078e7a5ce5e52245481faf71590744aae2c17a1
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Mon Oct 13 19:00:25 2014 -0600
+
+    kgdb: Remove "weak" from kgdb_arch_pc() declaration
+    
+    commit 107bcc6d566cb40184068d888637f9aefe6252dd upstream.
+    
+    kernel/debug/debug_core.c provides a default kgdb_arch_pc() definition
+    explicitly marked "weak".  Several architectures provide their own
+    definitions intended to override the default, but the "weak" attribute on
+    the declaration applied to the arch definitions as well, so the linker
+    chose one based on link order (see 10629d711ed7 ("PCI: Remove __weak
+    annotation from pcibios_get_phb_of_node decl")).
+    
+    Remove the "weak" attribute from the declaration so we always prefer a
+    non-weak definition over the weak one, independent of link order.
+    
+    Fixes: 688b744d8bc8 ("kgdb: fix signedness mixmatches, add statics, add declaration to header")
+    Tested-by: Vineet Gupta <vgupta@synopsys.com>   # for ARC build
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Reviewed-by: Harvey Harrison <harvey.harrison@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 0ec4fc584c3ee470f5150450acf49dd2dab5d1e7
+Author: Dan Carpenter <dan.carpenter@oracle.com>
+Date:   Fri Sep 5 09:09:28 2014 -0300
+
+    media: ttusb-dec: buffer overflow in ioctl
+    
+    commit f2e323ec96077642d397bb1c355def536d489d16 upstream.
+    
+    We need to add a limit check here so we don't overflow the buffer.
+    
+    Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab@osg.samsung.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 270e234c60d21681ac2afc04329cc0b5ab4ff035
+Author: Trond Myklebust <trond.myklebust@primarydata.com>
+Date:   Mon Nov 10 18:43:56 2014 -0500
+
+    NFSv4: Fix races between nfs_remove_bad_delegation() and delegation return
+    
+    commit 869f9dfa4d6d57b79e0afc3af14772c2a023eeb1 upstream.
+    
+    Any attempt to call nfs_remove_bad_delegation() while a delegation is being
+    returned is currently a no-op. This means that we can end up looping
+    forever in nfs_end_delegation_return() if something causes the delegation
+    to be revoked.
+    This patch adds a mechanism whereby the state recovery code can communicate
+    to the delegation return code that the delegation is no longer valid and
+    that it should not be used when reclaiming state.
+    It also changes the return value for nfs4_handle_delegation_recall_error()
+    to ensure that nfs_end_delegation_return() does not reattempt the lock
+    reclaim before state recovery is done.
+    
+    http://lkml.kernel.org/r/CAN-5tyHwG=Cn2Q9KsHWadewjpTTy_K26ee+UnSvHvG4192p-Xw@mail.gmail.com
+    Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 29d312e94b2ede1cd3270ed1237a2817032f287d
+Author: Jan Kara <jack@suse.cz>
+Date:   Thu Oct 23 14:02:47 2014 +0200
+
+    nfs: Fix use of uninitialized variable in nfs_getattr()
+    
+    commit 16caf5b6101d03335b386e77e9e14136f989be87 upstream.
+    
+    Variable 'err' needn't be initialized when nfs_getattr() uses it to
+    check whether it should call generic_fillattr() or not. That can result
+    in spurious error returns. Initialize 'err' properly.
+    
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit bc2075d558b1395a80c1354665679c8970ba5829
+Author: Trond Myklebust <trond.myklebust@primarydata.com>
+Date:   Fri Oct 17 23:02:52 2014 +0300
+
+    NFS: Don't try to reclaim delegation open state if recovery failed
+    
+    commit f8ebf7a8ca35dde321f0cd385fee6f1950609367 upstream.
+    
+    If state recovery failed, then we should not attempt to reclaim delegated
+    state.
+    
+    http://lkml.kernel.org/r/CAN-5tyHwG=Cn2Q9KsHWadewjpTTy_K26ee+UnSvHvG4192p-Xw@mail.gmail.com
+    Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 361eeee70ea9c57a2ce018ea0ce720f44a3fc07d
+Author: Trond Myklebust <trond.myklebust@primarydata.com>
+Date:   Fri Oct 17 15:10:25 2014 +0300
+
+    NFSv4: Ensure that we remove NFSv4.0 delegations when state has expired
+    
+    commit 4dfd4f7af0afd201706ad186352ca423b0f17d4b upstream.
+    
+    NFSv4.0 does not have TEST_STATEID/FREE_STATEID functionality, so
+    unlike NFSv4.1, the recovery procedure when stateids have expired or
+    have been revoked requires us to just forget the delegation.
+    
+    http://lkml.kernel.org/r/CAN-5tyHwG=Cn2Q9KsHWadewjpTTy_K26ee+UnSvHvG4192p-Xw@mail.gmail.com
+    Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit abf9765d3b73f3bf7ebea763b9b86aa38e29bd24
+Author: Pali Rohár <pali@kernel.org>
+Date:   Sat Nov 8 12:58:57 2014 -0800
+
+    Input: alps - allow up to 2 invalid packets without resetting device
+    
+    commit 9d720b34c0a432639252f63012e18b0507f5b432 upstream.
+    
+    On some Dell Latitude laptops ALPS device or Dell EC send one invalid byte
+    in 6 bytes ALPS packet. In this case psmouse driver enter out of sync
+    state. It looks like that all other bytes in packets are valid and also
+    device working properly. So there is no need to do full device reset, just
+    need to wait for byte which match condition for first byte (start of
+    packet). Because ALPS packets are bigger (6 or 8 bytes) default limit is
+    small.
+    
+    This patch increase number of invalid bytes to size of 2 ALPS packets which
+    psmouse driver can drop before do full reset.
+    
+    Resetting ALPS devices take some time and when doing reset on some Dell
+    laptops touchpad, trackstick and also keyboard do not respond. So it is
+    better to do it only if really necessary.
+    
+    Signed-off-by: Pali Rohár <pali.rohar@gmail.com>
+    Tested-by: Pali Rohár <pali.rohar@gmail.com>
+    Reviewed-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit bff25f7d4005a0dceba5042698d6a66f7c1821fc
+Author: Pali Rohár <pali@kernel.org>
+Date:   Sat Nov 8 12:45:23 2014 -0800
+
+    Input: alps - ignore potential bare packets when device is out of sync
+    
+    commit 4ab8f7f320f91f279c3f06a9795cfea5c972888a upstream.
+    
+    5th and 6th byte of ALPS trackstick V3 protocol match condition for first
+    byte of PS/2 3 bytes packet. When driver enters out of sync state and ALPS
+    trackstick is sending data then driver match 5th, 6th and next 1st bytes as
+    PS/2.
+    
+    It basically means if user is using trackstick when driver is in out of
+    sync state driver will never resync. Processing these bytes as 3 bytes PS/2
+    data cause total mess (random cursor movements, random clicks) and make
+    trackstick unusable until psmouse driver decide to do full device reset.
+    
+    Lot of users reported problems with ALPS devices on Dell Latitude E6440,
+    E6540 and E7440 laptops. ALPS device or Dell EC for unknown reason send
+    some invalid ALPS PS/2 bytes which cause driver out of sync. It looks like
+    that i8042 and psmouse/alps driver always receive group of 6 bytes packets
+    so there are no missing bytes and no bytes were inserted between valid
+    ones.
+    
+    This patch does not fix root of problem with ALPS devices found in Dell
+    Latitude laptops but it does not allow to process some (invalid)
+    subsequence of 6 bytes ALPS packets as 3 bytes PS/2 when driver is out of
+    sync.
+    
+    So with this patch trackstick input device does not report bogus data when
+    also driver is out of sync, so trackstick should be usable on those
+    machines.
+    
+    Signed-off-by: Pali Rohár <pali.rohar@gmail.com>
+    Tested-by: Pali Rohár <pali.rohar@gmail.com>
+    Reviewed-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 513f8da83b3ef6cf1475da6ef3d851286e8466fa
+Author: Heinz Mauelshagen <heinzm@redhat.com>
+Date:   Fri Oct 17 13:38:50 2014 +0200
+
+    dm raid: ensure superblock's size matches device's logical block size
+    
+    commit 40d43c4b4cac4c2647bf07110d7b07d35f399a84 upstream.
+    
+    The dm-raid superblock (struct dm_raid_superblock) is padded to 512
+    bytes and that size is being used to read it in from the metadata
+    device into one preallocated page.
+    
+    Reading or writing this on a 512-byte sector device works fine but on
+    a 4096-byte sector device this fails.
+    
+    Set the dm-raid superblock's size to the logical block size of the
+    metadata device, because IO at that size is guaranteed too work.  Also
+    add a size check to avoid silent partial metadata loss in case the
+    superblock should ever grow past the logical block size or PAGE_SIZE.
+    
+    [includes pointer math fix from Dan Carpenter]
+    Reported-by: "Liuhua Wang" <lwang@suse.com>
+    Signed-off-by: Heinz Mauelshagen <heinzm@redhat.com>
+    Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit fe30b804a20bbc3218193f0d528e9749332fb06a
+Author: Joe Thornber <ejt@redhat.com>
+Date:   Mon Nov 10 15:03:24 2014 +0000
+
+    dm btree: fix a recursion depth bug in btree walking code
+    
+    commit 9b460d3699324d570a4d4161c3741431887f102f upstream.
+    
+    The walk code was using a 'ro_spine' to hold it's locked btree nodes.
+    But this data structure is designed for the rolling lock scheme, and
+    as such automatically unlocks blocks that are two steps up the call
+    chain.  This is not suitable for the simple recursive walk algorithm,
+    which retraces its steps.
+    
+    This code is only used by the persistent array code, which in turn is
+    only used by dm-cache.  In order to trigger it you need to have a
+    mapping tree that is more than 2 levels deep; which equates to 8-16
+    million cache blocks.  For instance a 4T ssd with a very small block
+    size of 32k only just triggers this bug.
+    
+    The fix just places the locked blocks on the stack, and stops using
+    the ro_spine altogether.
+    
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9d0c27027cba7de2e42695d7bd29fa42666dac63
+Author: Jan Kara <jack@suse.cz>
+Date:   Thu Oct 30 20:43:38 2014 +0100
+
+    block: Fix computation of merged request priority
+    
+    commit ece9c72accdc45c3a9484dacb1125ce572647288 upstream.
+    
+    Priority of a merged request is computed by ioprio_best(). If one of the
+    requests has undefined priority (IOPRIO_CLASS_NONE) and another request
+    has priority from IOPRIO_CLASS_BE, the function will return the
+    undefined priority which is wrong. Fix the function to properly return
+    priority of a request with the defined priority.
+    
+    Fixes: d58cdfb89ce0c6bd5f81ae931a984ef298dbda20
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit aca0ab61812decb0bd0335fc9c4b065991884b66
+Author: Helge Deller <deller@gmx.de>
+Date:   Mon Nov 10 21:46:18 2014 +0100
+
+    parisc: Use compat layer for msgctl, shmat, shmctl and semtimedop syscalls
+    
+    commit 2fe749f50b0bec07650ef135b29b1f55bf543869 upstream.
+    
+    Switch over the msgctl, shmat, shmctl and semtimedop syscalls to use the compat
+    layer. The problem was found with the debian procenv package, which called
+            shmctl(0, SHM_INFO, &info);
+    in which the shmctl syscall then overwrote parts of the surrounding areas on
+    the stack on which the info variable was stored and thus lead to a segfault
+    later on.
+    
+    Additionally fix the definition of struct shminfo64 to use unsigned longs like
+    the other architectures. This has no impact on userspace since we only have a
+    32bit userspace up to now.
+    
+    Signed-off-by: Helge Deller <deller@gmx.de>
+    Cc: John David Anglin <dave.anglin@bell.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 945f341afb991b94fce08f633353efa0c623f719
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon Nov 3 19:36:40 2014 +0100
+
+    scsi: only re-lock door after EH on devices that were reset
+    
+    commit 48379270fe6808cf4612ee094adc8da2b7a83baa upstream.
+    
+    Setups that use the blk-mq I/O path can lock up if a host with a single
+    device that has its door locked enters EH.  Make sure to only send the
+    command to re-lock the door to devices that actually were reset and thus
+    might have lost their state.  Otherwise the EH code might be get blocked
+    on blk_get_request as all requests for non-reset devices might be in use.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reported-by: Meelis Roos <meelis.roos@ut.ee>
+    Tested-by: Meelis Roos <meelis.roos@ut.ee>
+    Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 32049712c4d803139fecf7a59cfa3e24c8456d03
+Author: Peng Tao <tao.peng@primarydata.com>
+Date:   Wed Nov 5 22:36:50 2014 +0800
+
+    nfs: fix pnfs direct write memory leak
+    
+    commit 8c393f9a721c30a030049a680e1bf896669bb279 upstream.
+    
+    For pNFS direct writes, layout driver may dynamically allocate ds_cinfo.buckets.
+    So we need to take care to free them when freeing dreq.
+    
+    Ideally this needs to be done inside layout driver where ds_cinfo.buckets
+    are allocated. But buckets are attached to dreq and reused across LD IO iterations.
+    So I feel it's OK to free them in the generic layer.
+    
+    Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+    Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 562e494829ef4d54cf9c6c0676038dac3e2917af
+Author: Stefan Richter <stefanr@s5r6.in-berlin.de>
+Date:   Tue Nov 11 17:16:44 2014 +0100
+
+    firewire: cdev: prevent kernel stack leaking into ioctl arguments
+    
+    commit eaca2d8e75e90a70a63a6695c9f61932609db212 upstream.
+    
+    Found by the UC-KLEE tool:  A user could supply less input to
+    firewire-cdev ioctls than write- or write/read-type ioctl handlers
+    expect.  The handlers used data from uninitialized kernel stack then.
+    
+    This could partially leak back to the user if the kernel subsequently
+    generated fw_cdev_event_'s (to be read from the firewire-cdev fd)
+    which notably would contain the _u64 closure field which many of the
+    ioctl argument structures contain.
+    
+    The fact that the handlers would act on random garbage input is a
+    lesser issue since all handlers must check their input anyway.
+    
+    The fix simply always null-initializes the entire ioctl argument buffer
+    regardless of the actual length of expected user input.  That is, a
+    runtime overhead of memset(..., 40) is added to each firewirew-cdev
+    ioctl() call.  [Comment from Clemens Ladisch:  This part of the stack is
+    most likely to be already in the cache.]
+    
+    Remarks:
+      - There was never any leak from kernel stack to the ioctl output
+        buffer itself.  IOW, it was not possible to read kernel stack by a
+        read-type or write/read-type ioctl alone; the leak could at most
+        happen in combination with read()ing subsequent event data.
+      - The actual expected minimum user input of each ioctl from
+        include/uapi/linux/firewire-cdev.h is, in bytes:
+        [0x00] = 32, [0x05] =  4, [0x0a] = 16, [0x0f] = 20, [0x14] = 16,
+        [0x01] = 36, [0x06] = 20, [0x0b] =  4, [0x10] = 20, [0x15] = 20,
+        [0x02] = 20, [0x07] =  4, [0x0c] =  0, [0x11] =  0, [0x16] =  8,
+        [0x03] =  4, [0x08] = 24, [0x0d] = 20, [0x12] = 36, [0x17] = 12,
+        [0x04] = 20, [0x09] = 24, [0x0e] =  4, [0x13] = 40, [0x18] =  4.
+    
+    Reported-by: David Ramos <daramos@stanford.edu>
+    Signed-off-by: Stefan Richter <stefanr@s5r6.in-berlin.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 16640ca660f4980fb5c1f4e4febce19875f4c1b8
+Author: Kyle McMartin <kyle@redhat.com>
+Date:   Wed Nov 12 21:07:44 2014 +0000
+
+    arm64: __clear_user: handle exceptions on strb
+    
+    commit 97fc15436b36ee3956efad83e22a557991f7d19d upstream.
+    
+    ARM64 currently doesn't fix up faults on the single-byte (strb) case of
+    __clear_user... which means that we can cause a nasty kernel panic as an
+    ordinary user with any multiple PAGE_SIZE+1 read from /dev/zero.
+    i.e.: dd if=/dev/zero of=foo ibs=1 count=1 (or ibs=65537, etc.)
+    
+    This is a pretty obscure bug in the general case since we'll only
+    __do_kernel_fault (since there's no extable entry for pc) if the
+    mmap_sem is contended. However, with CONFIG_DEBUG_VM enabled, we'll
+    always fault.
+    
+    if (!down_read_trylock(&mm->mmap_sem)) {
+            if (!user_mode(regs) && !search_exception_tables(regs->pc))
+                    goto no_context;
+    retry:
+            down_read(&mm->mmap_sem);
+    } else {
+            /*
+             * The above down_read_trylock() might have succeeded in
+             * which
+             * case, we'll have missed the might_sleep() from
+             * down_read().
+             */
+            might_sleep();
+            if (!user_mode(regs) && !search_exception_tables(regs->pc))
+                    goto no_context;
+    }
+    
+    Fix that by adding an extable entry for the strb instruction, since it
+    touches user memory, similar to the other stores in __clear_user.
+    
+    Signed-off-by: Kyle McMartin <kyle@redhat.com>
+    Reported-by: Miloš Prchlík <mprchlik@redhat.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3e1f6a23ed6ae2a031fb3cc539744c3d8691be5b
+Author: Nathan Lynch <nathan_lynch@mentor.com>
+Date:   Mon Nov 10 23:46:27 2014 +0100
+
+    ARM: 8198/1: make kuser helpers depend on MMU
+    
+    commit 08b964ff3c51b10aaf2e6ba639f40054c09f0f7a upstream.
+    
+    The kuser helpers page is not set up on non-MMU systems, so it does
+    not make sense to allow CONFIG_KUSER_HELPERS to be enabled when
+    CONFIG_MMU=n.  Allowing it to be set on !MMU results in an oops in
+    set_tls (used in execve and the arm_syscall trap handler):
+    
+    Unhandled exception: IPSR = 00000005 LR = fffffff1
+    CPU: 0 PID: 1 Comm: swapper Not tainted 3.18.0-rc1-00041-ga30465a #216
+    task: 8b838000 ti: 8b82a000 task.ti: 8b82a000
+    PC is at flush_thread+0x32/0x40
+    LR is at flush_thread+0x21/0x40
+    pc : [<8f00157a>]    lr : [<8f001569>]    psr: 4100000b
+    sp : 8b82be20  ip : 00000000  fp : 8b83c000
+    r10: 00000001  r9 : 88018c84  r8 : 8bb85000
+    r7 : 8b838000  r6 : 00000000  r5 : 8bb77400  r4 : 8b82a000
+    r3 : ffff0ff0  r2 : 8b82a000  r1 : 00000000  r0 : 88020354
+    xPSR: 4100000b
+    CPU: 0 PID: 1 Comm: swapper Not tainted 3.18.0-rc1-00041-ga30465a #216
+    [<8f002bc1>] (unwind_backtrace) from [<8f002033>] (show_stack+0xb/0xc)
+    [<8f002033>] (show_stack) from [<8f00265b>] (__invalid_entry+0x4b/0x4c)
+    
+    As best I can tell this issue existed for the set_tls ARM syscall
+    before commit fbfb872f5f41 "ARM: 8148/1: flush TLS and thumbee
+    register state during exec" consolidated the TLS manipulation code
+    into the set_tls helper function, but now that we're using it to flush
+    register state during execve, !MMU users encounter the oops at the
+    first exec.
+    
+    Prevent CONFIG_MMU=n configurations from enabling
+    CONFIG_KUSER_HELPERS.
+    
+    Fixes: fbfb872f5f41 (ARM: 8148/1: flush TLS and thumbee register state during exec)
+    
+    Signed-off-by: Nathan Lynch <nathan_lynch@mentor.com>
+    Reported-by: Stefan Agner <stefan@agner.ch>
+    Acked-by: Uwe Kleine-König <u.kleine-koenig@pengutronix.de>
+    Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9458c73ccd64b1ed8c53793e9afd1daa6b826081
+Author: Alex Deucher <alexander.deucher@amd.com>
+Date:   Wed Nov 5 17:14:32 2014 -0500
+
+    drm/radeon: add missing crtc unlock when setting up the MC
+    
+    commit f0d7bfb9407fccb6499ec01c33afe43512a439a2 upstream.
+    
+    Need to unlock the crtc after updating the blanking state.
+    
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 2e613ff8d8221da89904473a8136ee29efeca6f0
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Mon Nov 3 13:57:46 2014 +0100
+
+    mac80211: fix use-after-free in defragmentation
+    
+    commit b8fff407a180286aa683d543d878d98d9fc57b13 upstream.
+    
+    Upon receiving the last fragment, all but the first fragment
+    are freed, but the multicast check for statistics at the end
+    of the function refers to the current skb (the last fragment)
+    causing a use-after-free bug.
+    
+    Since multicast frames cannot be fragmented and we check for
+    this early in the function, just modify that check to also
+    do the accounting to fix the issue.
+    
+    Reported-by: Yosef Khyal <yosefx.khyal@intel.com>
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit b34fafa32078fec415d2d5ec2361fc3b072351cf
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Mon Nov 3 14:01:25 2014 +0800
+
+    macvtap: Fix csum_start when VLAN tags are present
+    
+    commit 3ce9b20f1971690b8b3b620e735ec99431573b39 upstream.
+    
+    When VLAN is in use in macvtap_put_user, we end up setting
+    csum_start to the wrong place.  The result is that the whoever
+    ends up doing the checksum setting will corrupt the packet instead
+    of writing the checksum to the expected location, usually this
+    means writing the checksum with an offset of -4.
+    
+    This patch fixes this by adjusting csum_start when VLAN tags are
+    detected.
+    
+    Fixes: f09e2249c4f5 ("macvtap: restore vlan header on user read")
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit 597b38963392a700288552da78db8f4f3d088d21
+Author: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+Date:   Tue Sep 23 23:02:41 2014 +0300
+
+    iwlwifi: configure the LTR
+    
+    commit 9180ac50716a097a407c6d7e7e4589754a922260 upstream.
+    
+    The LTR is the handshake between the device and the root
+    complex about the latency allowed when the bus exits power
+    save. This configuration was missing and this led to high
+    latency in the link power up. The end user could experience
+    high latency in the network because of this.
+    
+    Signed-off-by: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 8169b2b999c9e0e196fdf8e96668f535ae648e5f
+Author: Ilya Dryomov <idryomov@redhat.com>
+Date:   Thu Oct 23 00:25:22 2014 +0400
+
+    libceph: do not crash on large auth tickets
+    
+    commit aaef31703a0cf6a733e651885bfb49edc3ac6774 upstream.
+    
+    Large (greater than 32k, the value of PAGE_ALLOC_COSTLY_ORDER) auth
+    tickets will have their buffers vmalloc'ed, which leads to the
+    following crash in crypto:
+    
+    [   28.685082] BUG: unable to handle kernel paging request at ffffeb04000032c0
+    [   28.686032] IP: [<ffffffff81392b42>] scatterwalk_pagedone+0x22/0x80
+    [   28.686032] PGD 0
+    [   28.688088] Oops: 0000 [#1] PREEMPT SMP
+    [   28.688088] Modules linked in:
+    [   28.688088] CPU: 0 PID: 878 Comm: kworker/0:2 Not tainted 3.17.0-vm+ #305
+    [   28.688088] Hardware name: Bochs Bochs, BIOS Bochs 01/01/2007
+    [   28.688088] Workqueue: ceph-msgr con_work
+    [   28.688088] task: ffff88011a7f9030 ti: ffff8800d903c000 task.ti: ffff8800d903c000
+    [   28.688088] RIP: 0010:[<ffffffff81392b42>]  [<ffffffff81392b42>] scatterwalk_pagedone+0x22/0x80
+    [   28.688088] RSP: 0018:ffff8800d903f688  EFLAGS: 00010286
+    [   28.688088] RAX: ffffeb04000032c0 RBX: ffff8800d903f718 RCX: ffffeb04000032c0
+    [   28.688088] RDX: 0000000000000000 RSI: 0000000000000001 RDI: ffff8800d903f750
+    [   28.688088] RBP: ffff8800d903f688 R08: 00000000000007de R09: ffff8800d903f880
+    [   28.688088] R10: 18df467c72d6257b R11: 0000000000000000 R12: 0000000000000010
+    [   28.688088] R13: ffff8800d903f750 R14: ffff8800d903f8a0 R15: 0000000000000000
+    [   28.688088] FS:  00007f50a41c7700(0000) GS:ffff88011fc00000(0000) knlGS:0000000000000000
+    [   28.688088] CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
+    [   28.688088] CR2: ffffeb04000032c0 CR3: 00000000da3f3000 CR4: 00000000000006b0
+    [   28.688088] Stack:
+    [   28.688088]  ffff8800d903f698 ffffffff81392ca8 ffff8800d903f6e8 ffffffff81395d32
+    [   28.688088]  ffff8800dac96000 ffff880000000000 ffff8800d903f980 ffff880119b7e020
+    [   28.688088]  ffff880119b7e010 0000000000000000 0000000000000010 0000000000000010
+    [   28.688088] Call Trace:
+    [   28.688088]  [<ffffffff81392ca8>] scatterwalk_done+0x38/0x40
+    [   28.688088]  [<ffffffff81392ca8>] scatterwalk_done+0x38/0x40
+    [   28.688088]  [<ffffffff81395d32>] blkcipher_walk_done+0x182/0x220
+    [   28.688088]  [<ffffffff813990bf>] crypto_cbc_encrypt+0x15f/0x180
+    [   28.688088]  [<ffffffff81399780>] ? crypto_aes_set_key+0x30/0x30
+    [   28.688088]  [<ffffffff8156c40c>] ceph_aes_encrypt2+0x29c/0x2e0
+    [   28.688088]  [<ffffffff8156d2a3>] ceph_encrypt2+0x93/0xb0
+    [   28.688088]  [<ffffffff8156d7da>] ceph_x_encrypt+0x4a/0x60
+    [   28.688088]  [<ffffffff8155b39d>] ? ceph_buffer_new+0x5d/0xf0
+    [   28.688088]  [<ffffffff8156e837>] ceph_x_build_authorizer.isra.6+0x297/0x360
+    [   28.688088]  [<ffffffff8112089b>] ? kmem_cache_alloc_trace+0x11b/0x1c0
+    [   28.688088]  [<ffffffff8156b496>] ? ceph_auth_create_authorizer+0x36/0x80
+    [   28.688088]  [<ffffffff8156ed83>] ceph_x_create_authorizer+0x63/0xd0
+    [   28.688088]  [<ffffffff8156b4b4>] ceph_auth_create_authorizer+0x54/0x80
+    [   28.688088]  [<ffffffff8155f7c0>] get_authorizer+0x80/0xd0
+    [   28.688088]  [<ffffffff81555a8b>] prepare_write_connect+0x18b/0x2b0
+    [   28.688088]  [<ffffffff81559289>] try_read+0x1e59/0x1f10
+    
+    This is because we set up crypto scatterlists as if all buffers were
+    kmalloc'ed.  Fix it.
+    
+    Signed-off-by: Ilya Dryomov <idryomov@redhat.com>
+    Reviewed-by: Sage Weil <sage@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 86800fc632fd29ff30d557fcf1fbd76d2416c483
+Author: Max Filippov <jcmvbkbc@gmail.com>
+Date:   Mon Oct 6 21:01:17 2014 +0400
+
+    xtensa: re-wire umount syscall to sys_oldumount
+    
+    commit 2651cc6974d47fc43bef1cd8cd26966e4f5ba306 upstream.
+    
+    Userspace actually passes single parameter (path name) to the umount
+    syscall, so new umount just fails. Fix it by requesting old umount
+    syscall implementation and re-wiring umount to it.
+    
+    Signed-off-by: Max Filippov <jcmvbkbc@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9a262b4b21aaebe6323b2b8362465ca796f12768
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Tue Nov 11 15:45:57 2014 +0100
+
+    ALSA: usb-audio: Fix memory leak in FTU quirk
+    
+    commit 1a290581ded60e87276741f8ca97b161d2b226fc upstream.
+    
+    M-audio FastTrack Ultra quirk doesn't release the kzalloc'ed memory.
+    This patch adds the private_free callback to release it properly.
+    
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9921a2d59ae1ad736ef4e6abf2a67d961e74a95c
+Author: Tejun Heo <tj@kernel.org>
+Date:   Mon Oct 27 10:22:56 2014 -0400
+
+    ahci: disable MSI instead of NCQ on Samsung pci-e SSDs on macbooks
+    
+    commit 66a7cbc303f4d28f201529b06061944d51ab530c upstream.
+    
+    Samsung pci-e SSDs on macbooks failed miserably on NCQ commands, so
+    67809f85d31e ("ahci: disable NCQ on Samsung pci-e SSDs on macbooks")
+    disabled NCQ on them.  It turns out that NCQ is fine as long as MSI is
+    not used, so let's turn off MSI and leave NCQ on.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Link: https://bugzilla.kernel.org/show_bug.cgi?id=60731
+    Tested-by: <dorin@i51.org>
+    Tested-by: Imre Kaloz <kaloz@openwrt.org>
+    Fixes: 67809f85d31e ("ahci: disable NCQ on Samsung pci-e SSDs on macbooks")
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 4886eb4a453cb51598a9e3796c095e94dd552e5b
+Author: James Ralston <james.d.ralston@intel.com>
+Date:   Mon Oct 13 15:16:38 2014 -0700
+
+    ahci: Add Device IDs for Intel Sunrise Point PCH
+    
+    commit 690000b930456a98663567d35dd5c54b688d1e3f upstream.
+    
+    This patch adds the AHCI-mode SATA Device IDs for the Intel Sunrise Point PCH.
+    
+    Signed-off-by: James Ralston <james.d.ralston@intel.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit bd501a2eb28282b657555b32acbc65b6c102af1d
+Author: Miklos Szeredi <mszeredi@suse.cz>
+Date:   Tue Nov 4 11:27:12 2014 +0100
+
+    audit: keep inode pinned
+    
+    commit 799b601451b21ebe7af0e6e8f6e2ccd4683c5064 upstream.
+    
+    Audit rules disappear when an inode they watch is evicted from the cache.
+    This is likely not what we want.
+    
+    The guilty commit is "fsnotify: allow marks to not pin inodes in core",
+    which didn't take into account that audit_tree adds watches with a zero
+    mask.
+    
+    Adding any mask should fix this.
+    
+    Fixes: 90b1e7a57880 ("fsnotify: allow marks to not pin inodes in core")
+    Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+    Signed-off-by: Paul Moore <pmoore@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 89b27dc7ce6465ca4cec9603b7d5fcdc678f30f9
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Fri Sep 5 15:13:52 2014 -0700
+
+    x86, x32, audit: Fix x32's AUDIT_ARCH wrt audit
+    
+    commit 81f49a8fd7088cfcb588d182eeede862c0e3303e upstream.
+    
+    is_compat_task() is the wrong check for audit arch; the check should
+    be is_ia32_task(): x32 syscalls should be AUDIT_ARCH_X86_64, not
+    AUDIT_ARCH_I386.
+    
+    CONFIG_AUDITSYSCALL is currently incompatible with x32, so this has
+    no visible effect.
+    
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Link: http://lkml.kernel.org/r/a0138ed8c709882aec06e4acc30bfa9b623b8717.1409954077.git.luto@amacapital.net
+    Signed-off-by: H. Peter Anvin <hpa@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 96920746658f98dbdaccc90ab818443471accc89
+Author: Andreas Larsson <andreas@gaisler.com>
+Date:   Wed Nov 5 15:52:08 2014 +0100
+
+    sparc32: Implement xchg and atomic_xchg using ATOMIC_HASH locks
+    
+    [ Upstream commit 1a17fdc4f4ed06b63fac1937470378a5441a663a ]
+    
+    Atomicity between xchg and cmpxchg cannot be guaranteed when xchg is
+    implemented with a swap and cmpxchg is implemented with locks.
+    Without this, e.g. mcs_spin_lock and mcs_spin_unlock are broken.
+    
+    Signed-off-by: Andreas Larsson <andreas@gaisler.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 134712463afbd65c6b11193cd8000c83fc5b3a1b
+Author: David S. Miller <davem@davemloft.net>
+Date:   Fri Nov 7 09:50:48 2014 -0800
+
+    sparc64: Do irq_{enter,exit}() around generic_smp_call_function*().
+    
+    [ Upstream commit ab5c780913bca0a5763ca05dd5c2cb5cb08ccb26 ]
+    
+    Otherwise rcu_irq_{enter,exit}() do not happen and we get dumps like:
+    
+    ====================
+    [  188.275021] ===============================
+    [  188.309351] [ INFO: suspicious RCU usage. ]
+    [  188.343737] 3.18.0-rc3-00068-g20f3963-dirty #54 Not tainted
+    [  188.394786] -------------------------------
+    [  188.429170] include/linux/rcupdate.h:883 rcu_read_lock() used
+    illegally while idle!
+    [  188.505235]
+    other info that might help us debug this:
+    
+    [  188.554230]
+    RCU used illegally from idle CPU!
+    rcu_scheduler_active = 1, debug_locks = 0
+    [  188.637587] RCU used illegally from extended quiescent state!
+    [  188.690684] 3 locks held by swapper/7/0:
+    [  188.721932]  #0:  (&x->wait#11){......}, at: [<0000000000495de8>] complete+0x8/0x60
+    [  188.797994]  #1:  (&p->pi_lock){-.-.-.}, at: [<000000000048510c>] try_to_wake_up+0xc/0x400
+    [  188.881343]  #2:  (rcu_read_lock){......}, at: [<000000000048a910>] select_task_rq_fair+0x90/0xb40
+    [  188.973043]stack backtrace:
+    [  188.993879] CPU: 7 PID: 0 Comm: swapper/7 Not tainted 3.18.0-rc3-00068-g20f3963-dirty #54
+    [  189.076187] Call Trace:
+    [  189.089719]  [0000000000499360] lockdep_rcu_suspicious+0xe0/0x100
+    [  189.147035]  [000000000048a99c] select_task_rq_fair+0x11c/0xb40
+    [  189.202253]  [00000000004852d8] try_to_wake_up+0x1d8/0x400
+    [  189.252258]  [000000000048554c] default_wake_function+0xc/0x20
+    [  189.306435]  [0000000000495554] __wake_up_common+0x34/0x80
+    [  189.356448]  [00000000004955b4] __wake_up_locked+0x14/0x40
+    [  189.406456]  [0000000000495e08] complete+0x28/0x60
+    [  189.448142]  [0000000000636e28] blk_end_sync_rq+0x8/0x20
+    [  189.496057]  [0000000000639898] __blk_mq_end_request+0x18/0x60
+    [  189.550249]  [00000000006ee014] scsi_end_request+0x94/0x180
+    [  189.601286]  [00000000006ee334] scsi_io_completion+0x1d4/0x600
+    [  189.655463]  [00000000006e51c4] scsi_finish_command+0xc4/0xe0
+    [  189.708598]  [00000000006ed958] scsi_softirq_done+0x118/0x140
+    [  189.761735]  [00000000006398ec] __blk_mq_complete_request_remote+0xc/0x20
+    [  189.827383]  [00000000004c75d0] generic_smp_call_function_single_interrupt+0x150/0x1c0
+    [  189.906581]  [000000000043e514] smp_call_function_single_client+0x14/0x40
+    ====================
+    
+    Based almost entirely upon a patch by Paul E. McKenney.
+    
+    Reported-by: Meelis Roos <mroos@linux.ee>
+    Tested-by: Meelis Roos <mroos@linux.ee>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 865db7fbbcf2651989b0134a6babb8b093b53a61
+Author: David S. Miller <davem@davemloft.net>
+Date:   Sat Nov 1 00:33:58 2014 -0400
+
+    sparc64: Fix crashes in schizo_pcierr_intr_other().
+    
+    [ Upstream commit 7da89a2a3776442a57e918ca0b8678d1b16a7072 ]
+    
+    Meelis Roos reports crashes during bootup on a V480 that look like
+    this:
+    
+    ====================
+    [   61.300577] PCI: Scanning PBM /pci@9,600000
+    [   61.304867] schizo f009b070: PCI host bridge to bus 0003:00
+    [   61.310385] pci_bus 0003:00: root bus resource [io  0x7ffe9000000-0x7ffe9ffffff] (bus address [0x0000-0xffffff])
+    [   61.320515] pci_bus 0003:00: root bus resource [mem 0x7fb00000000-0x7fbffffffff] (bus address [0x00000000-0xffffffff])
+    [   61.331173] pci_bus 0003:00: root bus resource [bus 00]
+    [   61.385344] Unable to handle kernel NULL pointer dereference
+    [   61.390970] tsk->{mm,active_mm}->context = 0000000000000000
+    [   61.396515] tsk->{mm,active_mm}->pgd = fff000b000002000
+    [   61.401716]               \|/ ____ \|/
+    [   61.401716]               "@'/ .. \`@"
+    [   61.401716]               /_| \__/ |_\
+    [   61.401716]                  \__U_/
+    [   61.416362] swapper/0(0): Oops [#1]
+    [   61.419837] CPU: 0 PID: 0 Comm: swapper/0 Not tainted 3.18.0-rc1-00422-g2cc9188-dirty #24
+    [   61.427975] task: fff000b0fd8e9c40 ti: fff000b0fd928000 task.ti: fff000b0fd928000
+    [   61.435426] TSTATE: 0000004480e01602 TPC: 00000000004455e4 TNPC: 00000000004455e8 Y: 00000000    Not tainted
+    [   61.445230] TPC: <schizo_pcierr_intr+0x104/0x560>
+    [   61.449897] g0: 0000000000000000 g1: 0000000000000000 g2: 0000000000a10f78 g3: 000000000000000a
+    [   61.458563] g4: fff000b0fd8e9c40 g5: fff000b0fdd82000 g6: fff000b0fd928000 g7: 000000000000000a
+    [   61.467229] o0: 000000000000003d o1: 0000000000000000 o2: 0000000000000006 o3: fff000b0ffa5fc7e
+    [   61.475894] o4: 0000000000060000 o5: c000000000000000 sp: fff000b0ffa5f3c1 ret_pc: 00000000004455cc
+    [   61.484909] RPC: <schizo_pcierr_intr+0xec/0x560>
+    [   61.489500] l0: fff000b0fd8e9c40 l1: 0000000000a20800 l2: 0000000000000000 l3: 000000000119a430
+    [   61.498164] l4: 0000000001742400 l5: 00000000011cfbe0 l6: 00000000011319c0 l7: fff000b0fd8ea348
+    [   61.506830] i0: 0000000000000000 i1: fff000b0fdb34000 i2: 0000000320000000 i3: 0000000000000000
+    [   61.515497] i4: 00060002010b003f i5: 0000040004e02000 i6: fff000b0ffa5f481 i7: 00000000004a9920
+    [   61.524175] I7: <handle_irq_event_percpu+0x40/0x140>
+    [   61.529099] Call Trace:
+    [   61.531531]  [00000000004a9920] handle_irq_event_percpu+0x40/0x140
+    [   61.537681]  [00000000004a9a58] handle_irq_event+0x38/0x80
+    [   61.543145]  [00000000004ac77c] handle_fasteoi_irq+0xbc/0x200
+    [   61.548860]  [00000000004a9084] generic_handle_irq+0x24/0x40
+    [   61.554500]  [000000000042be0c] handler_irq+0xac/0x100
+    ====================
+    
+    The problem is that pbm->pci_bus->self is NULL.
+    
+    This code is trying to go through the standard PCI config space
+    interfaces to read the PCI controller's PCI_STATUS register.
+    
+    This doesn't work, because we more often than not do not enumerate
+    the PCI controller as a bonafide PCI device during the OF device
+    node scan.  Therefore bus->self remains NULL.
+    
+    Existing common code for PSYCHO and PSYCHO-like PCI controllers
+    handles this properly, by doing the config space access directly.
+    
+    Do the same here, pbm->pci_ops->{read,write}().
+    
+    Reported-by: Meelis Roos <mroos@linux.ee>
+    Tested-by: Meelis Roos <mroos@linux.ee>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit df6329d2eb252866542b9efaef34b2e0d777e649
+Author: Dwight Engen <dwight.engen@oracle.com>
+Date:   Thu Oct 30 15:55:35 2014 -0400
+
+    sunvdc: don't call VD_OP_GET_VTOC
+    
+    [ Upstream commit 85b0c6e62c48bb9179fd5b3e954f362fb346cbd5 ]
+    
+    The VD_OP_GET_VTOC operation will succeed only if the vdisk backend has a
+    VTOC label, otherwise it will fail. In particular, it will return error
+    48 (ENOTSUP) if the disk has an EFI label. VTOC disk labels are already
+    handled by directly reading the disk in block/partitions/sun.c (enabled by
+    CONFIG_SUN_PARTITION which defaults to y on SPARC). Since port->label is
+    unused in the driver, remove the call and the field.
+    
+    Signed-off-by: Dwight Engen <dwight.engen@oracle.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 891b60578feb65bdc55b69948ce98fea7ca88b1f
+Author: Dwight Engen <dwight.engen@oracle.com>
+Date:   Fri Sep 19 09:43:02 2014 -0400
+
+    vio: fix reuse of vio_dring slot
+    
+    [ Upstream commit d0aedcd4f14a22e23b313f42b7e6e6ebfc0fbc31 ]
+    
+    vio_dring_avail() will allow use of every dring entry, but when the last
+    entry is allocated then dr->prod == dr->cons which is indistinguishable from
+    the ring empty condition. This causes the next allocation to reuse an entry.
+    When this happens in sunvdc, the server side vds driver begins nack'ing the
+    messages and ends up resetting the ldc channel. This problem does not effect
+    sunvnet since it checks for < 2.
+    
+    The fix here is to just never allocate the very last dring slot so that full
+    and empty are not the same condition. The request start path was changed to
+    check for the ring being full a bit earlier, and to stop the blk_queue if
+    there is no space left. The blk_queue will be restarted once the ring is
+    only half full again. The number of ring entries was increased to 512 which
+    matches the sunvnet and Solaris vdc drivers, and greatly reduces the
+    frequency of hitting the ring full condition and the associated blk_queue
+    stop/starting. The checks in sunvent were adjusted to account for
+    vio_dring_avail() returning 1 less.
+    
+    Orabug: 19441666
+    OraBZ: 14983
+    
+    Signed-off-by: Dwight Engen <dwight.engen@oracle.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5cf61378accedc6acd5923f3b00bc945be1a9d29
+Author: Dwight Engen <dwight.engen@oracle.com>
+Date:   Fri Sep 19 09:42:53 2014 -0400
+
+    sunvdc: limit each sg segment to a page
+    
+    [ Upstream commit 5eed69ffd248c9f68f56c710caf07db134aef28b ]
+    
+    ldc_map_sg() could fail its check that the number of pages referred to
+    by the sg scatterlist was <= the number of cookies.
+    
+    This fixes the issue by doing a similar thing to the xen-blkfront driver,
+    ensuring that the scatterlist will only ever contain a segment count <=
+    port->ring_cookies, and each segment will be page aligned, and <= page
+    size. This ensures that the scatterlist is always mappable.
+    
+    Orabug: 19347817
+    OraBZ: 15945
+    
+    Signed-off-by: Dwight Engen <dwight.engen@oracle.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9e23c21149bfdc57aa9d9a35821994dfb0253c40
+Author: Allen Pais <allen.pais@oracle.com>
+Date:   Fri Sep 19 09:42:26 2014 -0400
+
+    sunvdc: compute vdisk geometry from capacity
+    
+    [ Upstream commit de5b73f08468b4fc5e2f6d1505f650262622f78b ]
+    
+    The LDom diskserver doesn't return reliable geometry data. In addition,
+    the types for all fields in the vio_disk_geom are u16, which were being
+    truncated in the cast into the u8's of the Linux struct hd_geometry.
+    
+    Modify vdc_getgeo() to compute the geometry from the disk's capacity in a
+    manner consistent with xen-blkfront::blkif_getgeo().
+    
+    Signed-off-by: Dwight Engen <dwight.engen@oracle.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit e4da88a6dab26f68c5f0e493178f9ef2c23f0d08
+Author: Allen Pais <allen.pais@oracle.com>
+Date:   Fri Sep 19 09:42:14 2014 -0400
+
+    sunvdc: add cdrom and v1.1 protocol support
+    
+    [ Upstream commit 9bce21828d54a95143f1b74619705c2dd8e88b92 ]
+    
+    Interpret the media type from v1.1 protocol to support CDROM/DVD.
+    
+    For v1.0 protocol, a disk's size continues to be calculated from the
+    geometry returned by the vdisk server. The geometry returned by the server
+    can be less than the actual number of sectors available in the backing
+    image/device due to the rounding in the division used to compute the
+    geometry in the vdisk server.
+    
+    In v1.1 protocol a disk's actual size in sectors is returned during the
+    handshake. Use this size when v1.1 protocol is negotiated. Since this size
+    will always be larger than the former geometry computed size, disks created
+    under v1.0 will be forwards compatible to v1.1, but not vice versa.
+    
+    Signed-off-by: Dwight Engen <dwight.engen@oracle.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit e79c2487e4e01ccad077252c398627fd99f55924
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Mon Nov 10 18:00:09 2014 +0100
+
+    net: sctp: fix memory leak in auth key management
+    
+    [ Upstream commit 4184b2a79a7612a9272ce20d639934584a1f3786 ]
+    
+    A very minimal and simple user space application allocating an SCTP
+    socket, setting SCTP_AUTH_KEY setsockopt(2) on it and then closing
+    the socket again will leak the memory containing the authentication
+    key from user space:
+    
+    unreferenced object 0xffff8800837047c0 (size 16):
+      comm "a.out", pid 2789, jiffies 4296954322 (age 192.258s)
+      hex dump (first 16 bytes):
+        01 00 00 00 04 00 00 00 00 00 00 00 00 00 00 00  ................
+      backtrace:
+        [<ffffffff816d7e8e>] kmemleak_alloc+0x4e/0xb0
+        [<ffffffff811c88d8>] __kmalloc+0xe8/0x270
+        [<ffffffffa0870c23>] sctp_auth_create_key+0x23/0x50 [sctp]
+        [<ffffffffa08718b1>] sctp_auth_set_key+0xa1/0x140 [sctp]
+        [<ffffffffa086b383>] sctp_setsockopt+0xd03/0x1180 [sctp]
+        [<ffffffff815bfd94>] sock_common_setsockopt+0x14/0x20
+        [<ffffffff815beb61>] SyS_setsockopt+0x71/0xd0
+        [<ffffffff816e58a9>] system_call_fastpath+0x12/0x17
+        [<ffffffffffffffff>] 0xffffffffffffffff
+    
+    This is bad because of two things, we can bring down a machine from
+    user space when auth_enable=1, but also we would leave security sensitive
+    keying material in memory without clearing it after use. The issue is
+    that sctp_auth_create_key() already sets the refcount to 1, but after
+    allocation sctp_auth_set_key() does an additional refcount on it, and
+    thus leaving it around when we free the socket.
+    
+    Fixes: 65b07e5d0d0 ("[SCTP]: API updates to suport SCTP-AUTH extensions.")
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Cc: Vlad Yasevich <vyasevich@gmail.com>
+    Acked-by: Neil Horman <nhorman@tuxdriver.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 7031dcb018db2a7776c1c31ef156cf8ac8da8a99
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Mon Nov 10 17:54:26 2014 +0100
+
+    net: sctp: fix NULL pointer dereference in af->from_addr_param on malformed packet
+    
+    [ Upstream commit e40607cbe270a9e8360907cb1e62ddf0736e4864 ]
+    
+    An SCTP server doing ASCONF will panic on malformed INIT ping-of-death
+    in the form of:
+    
+      ------------ INIT[PARAM: SET_PRIMARY_IP] ------------>
+    
+    While the INIT chunk parameter verification dissects through many things
+    in order to detect malformed input, it misses to actually check parameters
+    inside of parameters. E.g. RFC5061, section 4.2.4 proposes a 'set primary
+    IP address' parameter in ASCONF, which has as a subparameter an address
+    parameter.
+    
+    So an attacker may send a parameter type other than SCTP_PARAM_IPV4_ADDRESS
+    or SCTP_PARAM_IPV6_ADDRESS, param_type2af() will subsequently return 0
+    and thus sctp_get_af_specific() returns NULL, too, which we then happily
+    dereference unconditionally through af->from_addr_param().
+    
+    The trace for the log:
+    
+    BUG: unable to handle kernel NULL pointer dereference at 0000000000000078
+    IP: [<ffffffffa01e9c62>] sctp_process_init+0x492/0x990 [sctp]
+    PGD 0
+    Oops: 0000 [#1] SMP
+    [...]
+    Pid: 0, comm: swapper Not tainted 2.6.32-504.el6.x86_64 #1 Bochs Bochs
+    RIP: 0010:[<ffffffffa01e9c62>]  [<ffffffffa01e9c62>] sctp_process_init+0x492/0x990 [sctp]
+    [...]
+    Call Trace:
+     <IRQ>
+     [<ffffffffa01f2add>] ? sctp_bind_addr_copy+0x5d/0xe0 [sctp]
+     [<ffffffffa01e1fcb>] sctp_sf_do_5_1B_init+0x21b/0x340 [sctp]
+     [<ffffffffa01e3751>] sctp_do_sm+0x71/0x1210 [sctp]
+     [<ffffffffa01e5c09>] ? sctp_endpoint_lookup_assoc+0xc9/0xf0 [sctp]
+     [<ffffffffa01e61f6>] sctp_endpoint_bh_rcv+0x116/0x230 [sctp]
+     [<ffffffffa01ee986>] sctp_inq_push+0x56/0x80 [sctp]
+     [<ffffffffa01fcc42>] sctp_rcv+0x982/0xa10 [sctp]
+     [<ffffffffa01d5123>] ? ipt_local_in_hook+0x23/0x28 [iptable_filter]
+     [<ffffffff8148bdc9>] ? nf_iterate+0x69/0xb0
+     [<ffffffff81496d10>] ? ip_local_deliver_finish+0x0/0x2d0
+     [<ffffffff8148bf86>] ? nf_hook_slow+0x76/0x120
+     [<ffffffff81496d10>] ? ip_local_deliver_finish+0x0/0x2d0
+    [...]
+    
+    A minimal way to address this is to check for NULL as we do on all
+    other such occasions where we know sctp_get_af_specific() could
+    possibly return with NULL.
+    
+    Fixes: d6de3097592b ("[SCTP]: Add the handling of "Set Primary IP Address" parameter to INIT")
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Cc: Vlad Yasevich <vyasevich@gmail.com>
+    Acked-by: Neil Horman <nhorman@tuxdriver.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 460ceaa05d35a85502f661a8754d9304c0b941b5
+Author: Steffen Klassert <steffen.klassert@secunet.com>
+Date:   Mon Nov 3 09:19:30 2014 +0100
+
+    gre6: Move the setting of dev->iflink into the ndo_init functions.
+    
+    [ Upstream commit f03eb128e3f4276f46442d14f3b8f864f3775821 ]
+    
+    Otherwise it gets overwritten by register_netdev().
+    
+    Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 2d2a8385287335071789c88e4df4a516091472d5
+Author: Steffen Klassert <steffen.klassert@secunet.com>
+Date:   Mon Nov 3 09:19:27 2014 +0100
+
+    ip6_tunnel: Use ip6_tnl_dev_init as the ndo_init function.
+    
+    [ Upstream commit 6c6151daaf2d8dc2046d9926539feed5f66bf74e ]
+    
+    ip6_tnl_dev_init() sets the dev->iflink via a call to
+    ip6_tnl_link_config(). After that, register_netdevice()
+    sets dev->iflink = -1. So we loose the iflink configuration
+    for ipv6 tunnels. Fix this by using ip6_tnl_dev_init() as the
+    ndo_init function. Then ip6_tnl_dev_init() is called after
+    dev->iflink is set to -1 from register_netdevice().
+    
+    Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>

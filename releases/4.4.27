@@ -1,0 +1,742 @@
+commit 3afd8362fabd167bb04f79501f21dd67aa9cb99f
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Sat Oct 22 12:27:13 2016 +0200
+
+    Linux 4.4.27
+
+commit c7077fba80b443ab771f7df4d892dcc687a27b92
+Author: Glauber Costa <glauber@scylladb.com>
+Date:   Thu Sep 22 20:59:59 2016 -0400
+
+    cfq: fix starvation of asynchronous writes
+    
+    commit 3932a86b4b9d1f0b049d64d4591ce58ad18b44ec upstream.
+    
+    While debugging timeouts happening in my application workload (ScyllaDB), I have
+    observed calls to open() taking a long time, ranging everywhere from 2 seconds -
+    the first ones that are enough to time out my application - to more than 30
+    seconds.
+    
+    The problem seems to happen because XFS may block on pending metadata updates
+    under certain circumnstances, and that's confirmed with the following backtrace
+    taken by the offcputime tool (iovisor/bcc):
+    
+        ffffffffb90c57b1 finish_task_switch
+        ffffffffb97dffb5 schedule
+        ffffffffb97e310c schedule_timeout
+        ffffffffb97e1f12 __down
+        ffffffffb90ea821 down
+        ffffffffc046a9dc xfs_buf_lock
+        ffffffffc046abfb _xfs_buf_find
+        ffffffffc046ae4a xfs_buf_get_map
+        ffffffffc046babd xfs_buf_read_map
+        ffffffffc0499931 xfs_trans_read_buf_map
+        ffffffffc044a561 xfs_da_read_buf
+        ffffffffc0451390 xfs_dir3_leaf_read.constprop.16
+        ffffffffc0452b90 xfs_dir2_leaf_lookup_int
+        ffffffffc0452e0f xfs_dir2_leaf_lookup
+        ffffffffc044d9d3 xfs_dir_lookup
+        ffffffffc047d1d9 xfs_lookup
+        ffffffffc0479e53 xfs_vn_lookup
+        ffffffffb925347a path_openat
+        ffffffffb9254a71 do_filp_open
+        ffffffffb9242a94 do_sys_open
+        ffffffffb9242b9e sys_open
+        ffffffffb97e42b2 entry_SYSCALL_64_fastpath
+        00007fb0698162ed [unknown]
+    
+    Inspecting my run with blktrace, I can see that the xfsaild kthread exhibit very
+    high "Dispatch wait" times, on the dozens of seconds range and consistent with
+    the open() times I have saw in that run.
+    
+    Still from the blktrace output, we can after searching a bit, identify the
+    request that wasn't dispatched:
+    
+      8,0   11      152    81.092472813   804  A  WM 141698288 + 8 <- (8,1) 141696240
+      8,0   11      153    81.092472889   804  Q  WM 141698288 + 8 [xfsaild/sda1]
+      8,0   11      154    81.092473207   804  G  WM 141698288 + 8 [xfsaild/sda1]
+      8,0   11      206    81.092496118   804  I  WM 141698288 + 8 (   22911) [xfsaild/sda1]
+      <==== 'I' means Inserted (into the IO scheduler) ===================================>
+      8,0    0   289372    96.718761435     0  D  WM 141698288 + 8 (15626265317) [swapper/0]
+      <==== Only 15s later the CFQ scheduler dispatches the request ======================>
+    
+    As we can see above, in this particular example CFQ took 15 seconds to dispatch
+    this request. Going back to the full trace, we can see that the xfsaild queue
+    had plenty of opportunity to run, and it was selected as the active queue many
+    times. It would just always be preempted by something else (example):
+    
+      8,0    1        0    81.117912979     0  m   N cfq1618SN / insert_request
+      8,0    1        0    81.117913419     0  m   N cfq1618SN / add_to_rr
+      8,0    1        0    81.117914044     0  m   N cfq1618SN / preempt
+      8,0    1        0    81.117914398     0  m   N cfq767A  / slice expired t=1
+      8,0    1        0    81.117914755     0  m   N cfq767A  / resid=40
+      8,0    1        0    81.117915340     0  m   N / served: vt=1948520448 min_vt=1948520448
+      8,0    1        0    81.117915858     0  m   N cfq767A  / sl_used=1 disp=0 charge=0 iops=1 sect=0
+    
+    where cfq767 is the xfsaild queue and cfq1618 corresponds to one of the ScyllaDB
+    IO dispatchers.
+    
+    The requests preempting the xfsaild queue are synchronous requests. That's a
+    characteristic of ScyllaDB workloads, as we only ever issue O_DIRECT requests.
+    While it can be argued that preempting ASYNC requests in favor of SYNC is part
+    of the CFQ logic, I don't believe that doing so for 15+ seconds is anyone's
+    goal.
+    
+    Moreover, unless I am misunderstanding something, that breaks the expectation
+    set by the "fifo_expire_async" tunable, which in my system is set to the
+    default.
+    
+    Looking at the code, it seems to me that the issue is that after we make
+    an async queue active, there is no guarantee that it will execute any request.
+    
+    When the queue itself tests if it cfq_may_dispatch() it can bail if it sees SYNC
+    requests in flight. An incoming request from another queue can also preempt it
+    in such situation before we have the chance to execute anything (as seen in the
+    trace above).
+    
+    This patch sets the must_dispatch flag if we notice that we have requests
+    that are already fifo_expired. This flag is always cleared after
+    cfq_dispatch_request() returns from cfq_dispatch_requests(), so it won't pin
+    the queue for subsequent requests (unless they are themselves expired)
+    
+    Care is taken during preempt to still allow rt requests to preempt us
+    regardless.
+    
+    Testing my workload with this patch applied produces much better results.
+    From the application side I see no timeouts, and the open() latency histogram
+    generated by systemtap looks much better, with the worst outlier at 131ms:
+    
+    Latency histogram of xfs_buf_lock acquisition (microseconds):
+     value |-------------------------------------------------- count
+         0 |                                                     11
+         1 |@@@@                                                161
+         2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@  1966
+         4 |@                                                    54
+         8 |                                                     36
+        16 |                                                      7
+        32 |                                                      0
+        64 |                                                      0
+           ~
+      1024 |                                                      0
+      2048 |                                                      0
+      4096 |                                                      1
+      8192 |                                                      1
+     16384 |                                                      2
+     32768 |                                                      0
+     65536 |                                                      0
+    131072 |                                                      1
+    262144 |                                                      0
+    524288 |                                                      0
+    
+    Signed-off-by: Glauber Costa <glauber@scylladb.com>
+    CC: Jens Axboe <axboe@kernel.dk>
+    CC: linux-block@vger.kernel.org
+    CC: linux-kernel@vger.kernel.org
+    Signed-off-by: Glauber Costa <glauber@scylladb.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit b3b4283f7e46f563b438e587a0a567118a45a3fd
+Author: Miklos Szeredi <mszeredi@redhat.com>
+Date:   Fri Sep 16 12:44:20 2016 +0200
+
+    vfs: move permission checking into notify_change() for utimes(NULL)
+    
+    commit f2b20f6ee842313a0d681dbbf7f87b70291a6a3b upstream.
+    
+    This fixes a bug where the permission was not properly checked in
+    overlayfs.  The testcase is ltp/utimensat01.
+    
+    It is also cleaner and safer to do the permission checking in the vfs
+    helper instead of the caller.
+    
+    This patch introduces an additional ia_valid flag ATTR_TOUCH (since
+    touch(1) is the most obvious user of utimes(NULL)) that is passed into
+    notify_change whenever the conditions for this special permission checking
+    mode are met.
+    
+    Reported-by: Aihua Zhang <zhangaihua1@huawei.com>
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+    Tested-by: Aihua Zhang <zhangaihua1@huawei.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 1832397d8ce4de6827fb102a70649c63e7a2f9a2
+Author: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Date:   Sat Oct 8 10:14:37 2016 -0300
+
+    dlm: free workqueues after the connections
+    
+    commit 3a8db79889ce16930aff19b818f5b09651bb7644 upstream.
+    
+    After backporting commit ee44b4bc054a ("dlm: use sctp 1-to-1 API")
+    series to a kernel with an older workqueue which didn't use RCU yet, it
+    was noticed that we are freeing the workqueues in dlm_lowcomms_stop()
+    too early as free_conn() will try to access that memory for canceling
+    the queued works if any.
+    
+    This issue was introduced by commit 0d737a8cfd83 as before it such
+    attempt to cancel the queued works wasn't performed, so the issue was
+    not present.
+    
+    This patch fixes it by simply inverting the free order.
+    
+    Fixes: 0d737a8cfd83 ("dlm: fix race while closing connections")
+    Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+    Signed-off-by: David Teigland <teigland@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 78e1355d421d266f8309f81ce0770a0f9372a0ec
+Author: Marcelo Cerri <marcelo.cerri@canonical.com>
+Date:   Wed Sep 28 13:42:10 2016 -0300
+
+    crypto: vmx - Fix memory corruption caused by p8_ghash
+    
+    commit 80da44c29d997e28c4442825f35f4ac339813877 upstream.
+    
+    This patch changes the p8_ghash driver to use ghash-generic as a fixed
+    fallback implementation. This allows the correct value of descsize to be
+    defined directly in its shash_alg structure and avoids problems with
+    incorrect buffer sizes when its state is exported or imported.
+    
+    Reported-by: Jan Stancek <jstancek@redhat.com>
+    Fixes: cc333cd68dfa ("crypto: vmx - Adding GHASH routines for VMX module")
+    Signed-off-by: Marcelo Cerri <marcelo.cerri@canonical.com>
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 4f8c2ad3eeb5bc635ce23d8148cfb4b070704a8b
+Author: Marcelo Cerri <marcelo.cerri@canonical.com>
+Date:   Wed Sep 28 13:42:09 2016 -0300
+
+    crypto: ghash-generic - move common definitions to a new header file
+    
+    commit a397ba829d7f8aff4c90af3704573a28ccd61a59 upstream.
+    
+    Move common values and types used by ghash-generic to a new header file
+    so drivers can directly use ghash-generic as a fallback implementation.
+    
+    Fixes: cc333cd68dfa ("crypto: vmx - Adding GHASH routines for VMX module")
+    Signed-off-by: Marcelo Cerri <marcelo.cerri@canonical.com>
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 847d63fcaf37730aed89c1d29373d5dd0b9b405a
+Author: gmail <yngsion@gmail.com>
+Date:   Fri Sep 30 01:33:37 2016 -0400
+
+    ext4: release bh in make_indexed_dir
+    
+    commit e81d44778d1d57bbaef9e24c4eac7c8a7a401d40 upstream.
+    
+    The commit 6050d47adcad: "ext4: bail out from make_indexed_dir() on
+    first error" could end up leaking bh2 in the error path.
+    
+    [ Also avoid renaming bh2 to bh, which just confuses things --tytso ]
+    
+    Signed-off-by: yangsheng <yngsion@gmail.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 2db2fd9538e40e905d174c2d1067c99b58a98d7a
+Author: Ross Zwisler <zwisler@kernel.org>
+Date:   Thu Sep 22 11:49:38 2016 -0400
+
+    ext4: allow DAX writeback for hole punch
+    
+    commit cca32b7eeb4ea24fa6596650e06279ad9130af98 upstream.
+    
+    Currently when doing a DAX hole punch with ext4 we fail to do a writeback.
+    This is because the logic around filemap_write_and_wait_range() in
+    ext4_punch_hole() only looks for dirty page cache pages in the radix tree,
+    not for dirty DAX exceptional entries.
+    
+    Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+    Reviewed-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 6f6c12ce00e8bb3f36b12ebb83b004f3cf4ec695
+Author: Fabian Frederick <fabf@skynet.be>
+Date:   Thu Sep 15 11:39:52 2016 -0400
+
+    ext4: fix memory leak in ext4_insert_range()
+    
+    commit edf15aa180d7b98fe16bd3eda42f9dd0e60dee20 upstream.
+    
+    Running xfstests generic/013 with kmemleak gives the following:
+    
+    unreferenced object 0xffff8801d3d27de0 (size 96):
+      comm "fsstress", pid 4941, jiffies 4294860168 (age 53.485s)
+      hex dump (first 32 bytes):
+        00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00  ................
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+      backtrace:
+        [<ffffffff818eaaf3>] kmemleak_alloc+0x23/0x40
+        [<ffffffff81179805>] __kmalloc+0xf5/0x1d0
+        [<ffffffff8122ef5c>] ext4_find_extent+0x1ec/0x2f0
+        [<ffffffff8123530c>] ext4_insert_range+0x34c/0x4a0
+        [<ffffffff81235942>] ext4_fallocate+0x4e2/0x8b0
+        [<ffffffff81181334>] vfs_fallocate+0x134/0x210
+        [<ffffffff8118203f>] SyS_fallocate+0x3f/0x60
+        [<ffffffff818efa9b>] entry_SYSCALL_64_fastpath+0x13/0x8f
+        [<ffffffffffffffff>] 0xffffffffffffffff
+    
+    Problem seems mitigated by dropping refs and freeing path
+    when there's no path[depth].p_ext
+    
+    Signed-off-by: Fabian Frederick <fabf@skynet.be>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit d380cbb8637f8edba056f50c96adf64c26bdd940
+Author: Daeho Jeong <daeho.jeong@samsung.com>
+Date:   Mon Sep 5 22:56:10 2016 -0400
+
+    ext4: reinforce check of i_dtime when clearing high fields of uid and gid
+    
+    commit 93e3b4e6631d2a74a8cf7429138096862ff9f452 upstream.
+    
+    Now, ext4_do_update_inode() clears high 16-bit fields of uid/gid
+    of deleted and evicted inode to fix up interoperability with old
+    kernels. However, it checks only i_dtime of an inode to determine
+    whether the inode was deleted and evicted, and this is very risky,
+    because i_dtime can be used for the pointer maintaining orphan inode
+    list, too. We need to further check whether the i_dtime is being
+    used for the orphan inode list even if the i_dtime is not NULL.
+    
+    We found that high 16-bit fields of uid/gid of inode are unintentionally
+    and permanently cleared when the inode truncation is just triggered,
+    but not finished, and the inode metadata, whose high uid/gid bits are
+    cleared, is written on disk, and the sudden power-off follows that
+    in order.
+    
+    Signed-off-by: Daeho Jeong <daeho.jeong@samsung.com>
+    Signed-off-by: Hobin Woo <hobin.woo@samsung.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 76a8f17e0b850d5bb842097b0ee9c2e96af806a0
+Author: Eric Whitney <enwlinux@gmail.com>
+Date:   Mon Aug 29 15:45:11 2016 -0400
+
+    ext4: enforce online defrag restriction for encrypted files
+    
+    commit 14fbd4aa613bd5110556c281799ce36dc6f3ba97 upstream.
+    
+    Online defragging of encrypted files is not currently implemented.
+    However, the move extent ioctl can still return successfully when
+    called.  For example, this occurs when xfstest ext4/020 is run on an
+    encrypted file system, resulting in a corrupted test file and a
+    corresponding test failure.
+    
+    Until the proper functionality is implemented, fail the move extent
+    ioctl if either the original or donor file is encrypted.
+    
+    Signed-off-by: Eric Whitney <enwlinux@gmail.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 2ed1b50a40e6d023e91a7a7d2cdb4b1247d8cec3
+Author: Brian King <brking@linux.vnet.ibm.com>
+Date:   Mon Sep 19 08:59:19 2016 -0500
+
+    scsi: ibmvfc: Fix I/O hang when port is not mapped
+    
+    commit 07d0e9a847401ffd2f09bd450d41644cd090e81d upstream.
+    
+    If a VFC port gets unmapped in the VIOS, it may not respond with a CRQ
+    init complete following H_REG_CRQ. If this occurs, we can end up having
+    called scsi_block_requests and not a resulting unblock until the init
+    complete happens, which may never occur, and we end up hanging I/O
+    requests.  This patch ensures the host action stay set to
+    IBMVFC_HOST_ACTION_TGT_DEL so we move all rports into devloss state and
+    unblock unless we receive an init complete.
+    
+    Signed-off-by: Brian King <brking@linux.vnet.ibm.com>
+    Acked-by: Tyrel Datwyler <tyreld@linux.vnet.ibm.com>
+    Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 161cbfec102b846247b23d4addb22ae597fa5b88
+Author: Borislav Petkov <bp@alien8.de>
+Date:   Fri Sep 23 13:22:26 2016 +0200
+
+    scsi: arcmsr: Simplify user_len checking
+    
+    commit 4bd173c30792791a6daca8c64793ec0a4ae8324f upstream.
+    
+    Do the user_len check first and then the ver_addr allocation so that we
+    can save us the kfree() on the error path when user_len is >
+    ARCMSR_API_DATA_BUFLEN.
+    
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Cc: Marco Grassi <marco.gra@gmail.com>
+    Cc: Dan Carpenter <dan.carpenter@oracle.com>
+    Cc: Tomas Henzl <thenzl@redhat.com>
+    Cc: Martin K. Petersen <martin.petersen@oracle.com>
+    Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+    Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+    Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 24040922827859d1d69597c3bc0c31fad523fd21
+Author: Dan Carpenter <dan.carpenter@oracle.com>
+Date:   Thu Sep 15 16:44:56 2016 +0300
+
+    scsi: arcmsr: Buffer overflow in arcmsr_iop_message_xfer()
+    
+    commit 7bc2b55a5c030685b399bb65b6baa9ccc3d1f167 upstream.
+    
+    We need to put an upper bound on "user_len" so the memcpy() doesn't
+    overflow.
+    
+    Reported-by: Marco Grassi <marco.gra@gmail.com>
+    Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+    Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+    Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ffb3c7a99a15a7644c2fc632d6474a1e4c0c800c
+Author: Justin Maggard <jmaggard10@gmail.com>
+Date:   Tue Oct 4 13:17:58 2016 -0700
+
+    async_pq_val: fix DMA memory leak
+    
+    commit c84750906b4818d4929fbf73a4ae6c113b94f52b upstream.
+    
+    Add missing dmaengine_unmap_put(), so we don't OOM during RAID6 sync.
+    
+    Fixes: 1786b943dad0 ("async_pq_val: convert to dmaengine_unmap_data")
+    Signed-off-by: Justin Maggard <jmaggard@netgear.com>
+    Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+    Signed-off-by: Vinod Koul <vinod.koul@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit be90a09bd915e417feae76d9a72c2a37dc5cf1b7
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sun Apr 10 18:50:48 2016 -0400
+
+    reiserfs: switch to generic_{get,set,remove}xattr()
+    
+    commit 79a628d14ec7ee9adfdc3ce04343d5ff7ec20c18 upstream.
+    
+    reiserfs_xattr_[sg]et() will fail with -EOPNOTSUPP for V1 inodes anyway,
+    and all reiserfs instances of ->[sg]et() call it and so does ->set_acl().
+    
+    Checks for name length in the instances had been bogus; they should've
+    been "bugger off if it's _exactly_ the prefix" (as generic would
+    do on its own) and not "bugger off if it's shorter than the prefix" -
+    that can't happen.
+    
+    xattr_full_name() is needed to adjust for the fact that generic instances
+    will skip the prefix in the name passed to ->[gs]et(); reiserfs homegrown
+    analogues didn't.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    [jeffm: Backported to v4.4: adjust context]
+    Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5c16520bdcd41740abcadb58133637faecf713c9
+Author: Mike Galbraith <efault@gmx.de>
+Date:   Mon Aug 13 15:21:23 2012 +0200
+
+    reiserfs: Unlock superblock before calling reiserfs_quota_on_mount()
+    
+    commit 420902c9d086848a7548c83e0a49021514bd71b7 upstream.
+    
+    If we hold the superblock lock while calling reiserfs_quota_on_mount(), we can
+    deadlock our own worker - mount blocks kworker/3:2, sleeps forever more.
+    
+    crash> ps|grep UN
+        715      2   3  ffff880220734d30  UN   0.0       0      0  [kworker/3:2]
+       9369   9341   2  ffff88021ffb7560  UN   1.3  493404 123184  Xorg
+       9665   9664   3  ffff880225b92ab0  UN   0.0   47368    812  udisks-daemon
+      10635  10403   3  ffff880222f22c70  UN   0.0   14904    936  mount
+    crash> bt ffff880220734d30
+    PID: 715    TASK: ffff880220734d30  CPU: 3   COMMAND: "kworker/3:2"
+     #0 [ffff8802244c3c20] schedule at ffffffff8144584b
+     #1 [ffff8802244c3cc8] __rt_mutex_slowlock at ffffffff814472b3
+     #2 [ffff8802244c3d28] rt_mutex_slowlock at ffffffff814473f5
+     #3 [ffff8802244c3dc8] reiserfs_write_lock at ffffffffa05f28fd [reiserfs]
+     #4 [ffff8802244c3de8] flush_async_commits at ffffffffa05ec91d [reiserfs]
+     #5 [ffff8802244c3e08] process_one_work at ffffffff81073726
+     #6 [ffff8802244c3e68] worker_thread at ffffffff81073eba
+     #7 [ffff8802244c3ec8] kthread at ffffffff810782e0
+     #8 [ffff8802244c3f48] kernel_thread_helper at ffffffff81450064
+    crash> rd ffff8802244c3cc8 10
+    ffff8802244c3cc8:  ffffffff814472b3 ffff880222f23250   .rD.....P2."....
+    ffff8802244c3cd8:  0000000000000000 0000000000000286   ................
+    ffff8802244c3ce8:  ffff8802244c3d30 ffff880220734d80   0=L$.....Ms ....
+    ffff8802244c3cf8:  ffff880222e8f628 0000000000000000   (.."............
+    ffff8802244c3d08:  0000000000000000 0000000000000002   ................
+    crash> struct rt_mutex ffff880222e8f628
+    struct rt_mutex {
+      wait_lock = {
+        raw_lock = {
+          slock = 65537
+        }
+      },
+      wait_list = {
+        node_list = {
+          next = 0xffff8802244c3d48,
+          prev = 0xffff8802244c3d48
+        }
+      },
+      owner = 0xffff880222f22c71,
+      save_state = 0
+    }
+    crash> bt 0xffff880222f22c70
+    PID: 10635  TASK: ffff880222f22c70  CPU: 3   COMMAND: "mount"
+     #0 [ffff8802216a9868] schedule at ffffffff8144584b
+     #1 [ffff8802216a9910] schedule_timeout at ffffffff81446865
+     #2 [ffff8802216a99a0] wait_for_common at ffffffff81445f74
+     #3 [ffff8802216a9a30] flush_work at ffffffff810712d3
+     #4 [ffff8802216a9ab0] schedule_on_each_cpu at ffffffff81074463
+     #5 [ffff8802216a9ae0] invalidate_bdev at ffffffff81178aba
+     #6 [ffff8802216a9af0] vfs_load_quota_inode at ffffffff811a3632
+     #7 [ffff8802216a9b50] dquot_quota_on_mount at ffffffff811a375c
+     #8 [ffff8802216a9b80] finish_unfinished at ffffffffa05dd8b0 [reiserfs]
+     #9 [ffff8802216a9cc0] reiserfs_fill_super at ffffffffa05de825 [reiserfs]
+        RIP: 00007f7b9303997a  RSP: 00007ffff443c7a8  RFLAGS: 00010202
+        RAX: 00000000000000a5  RBX: ffffffff8144ef12  RCX: 00007f7b932e9ee0
+        RDX: 00007f7b93d9a400  RSI: 00007f7b93d9a3e0  RDI: 00007f7b93d9a3c0
+        RBP: 00007f7b93d9a2c0   R8: 00007f7b93d9a550   R9: 0000000000000001
+        R10: ffffffffc0ed040e  R11: 0000000000000202  R12: 000000000000040e
+        R13: 0000000000000000  R14: 00000000c0ed040e  R15: 00007ffff443ca20
+        ORIG_RAX: 00000000000000a5  CS: 0033  SS: 002b
+    
+    Signed-off-by: Mike Galbraith <efault@gmx.de>
+    Acked-by: Frederic Weisbecker <fweisbec@gmail.com>
+    Acked-by: Mike Galbraith <mgalbraith@suse.de>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a3a9b33e49ff91f6ceaeb1d5855046d50cefa3ef
+Author: Nicolas Iooss <nicolas.iooss_linux@m4x.org>
+Date:   Sun Aug 28 21:10:04 2016 +0200
+
+    ASoC: Intel: Atom: add a missing star in a memcpy call
+    
+    commit 61ab0d403bbd9d5f6e000e3b5734049141b91f6f upstream.
+    
+    In sst_prepare_and_post_msg(), when a response is received in "block",
+    the following code gets executed:
+    
+        *data = kzalloc(block->size, GFP_KERNEL);
+        memcpy(data, (void *) block->data, block->size);
+    
+    The memcpy() call overwrites the content of the *data pointer instead of
+    filling the newly-allocated memory (which pointer is hold by *data).
+    Fix this by merging kzalloc+memcpy into a single kmemdup() call.
+    
+    Thanks Joe Perches for suggesting using kmemdup()
+    
+    Fixes: 60dc8dbacb00 ("ASoC: Intel: sst: Add some helper functions")
+    Signed-off-by: Nicolas Iooss <nicolas.iooss_linux@m4x.org>
+    Signed-off-by: Mark Brown <broonie@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 85e27fe87acd059aa1c615184ec2c9ac9bfe29d2
+Author: Rafał Miłecki <rafal@milecki.pl>
+Date:   Wed Sep 21 08:23:24 2016 +0200
+
+    brcmfmac: fix memory leak in brcmf_fill_bss_param
+    
+    commit 23e9c128adb2038c27a424a5f91136e7fa3e0dc6 upstream.
+    
+    This function is called from get_station callback which means that every
+    time user space was getting/dumping station(s) we were leaking 2 KiB.
+    
+    Signed-off-by: Rafał Miłecki <rafal@milecki.pl>
+    Fixes: 1f0dc59a6de ("brcmfmac: rework .get_station() callback")
+    Acked-by: Arend van Spriel <arend.vanspriel@broadcom.com>
+    Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 6281c0883a9d56371a791304e756513a45975304
+Author: Guilherme G Piccoli <gpiccoli@linux.vnet.ibm.com>
+Date:   Mon Oct 3 00:31:12 2016 -0700
+
+    i40e: avoid NULL pointer dereference and recursive errors on early PCI error
+    
+    commit edfc23ee3e0ebbb6713d7574ab1b00abff178f6c upstream.
+    
+    Although rare, it's possible to hit PCI error early on device
+    probe, meaning possibly some structs are not entirely initialized,
+    and some might even be completely uninitialized, leading to NULL
+    pointer dereference.
+    
+    The i40e driver currently presents a "bad" behavior if device hits
+    such early PCI error: firstly, the struct i40e_pf might not be
+    attached to pci_dev yet, leading to a NULL pointer dereference on
+    access to pf->state.
+    
+    Even checking if the struct is NULL and avoiding the access in that
+    case isn't enough, since the driver cannot recover from PCI error
+    that early; in our experiments we saw multiple failures on kernel
+    log, like:
+    
+      [549.664] i40e 0007:01:00.1: Initial pf_reset failed: -15
+      [549.664] i40e: probe of 0007:01:00.1 failed with error -15
+      [...]
+      [871.644] i40e 0007:01:00.1: The driver for the device stopped because the
+      device firmware failed to init. Try updating your NVM image.
+      [871.644] i40e: probe of 0007:01:00.1 failed with error -32
+      [...]
+      [872.516] i40e 0007:01:00.0: ARQ: Unknown event 0x0000 ignored
+    
+    Between the first probe failure (error -15) and the second (error -32)
+    another PCI error happened due to the first bad probe. Also, driver
+    started to flood console with those ARQ event messages.
+    
+    This patch will prevent these issues by allowing error recovery
+    mechanism to remove the failed device from the system instead of
+    trying to recover from early PCI errors during device probe.
+    
+    Signed-off-by: Guilherme G Piccoli <gpiccoli@linux.vnet.ibm.com>
+    Acked-by: Jacob Keller <jacob.e.keller@intel.com>
+    Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+    Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 879d001c6d3b6bdd880b6c86acbb0d1ea8e2f548
+Author: Miklos Szeredi <mszeredi@redhat.com>
+Date:   Sat Oct 1 07:32:32 2016 +0200
+
+    fuse: fix killing s[ug]id in setattr
+    
+    commit a09f99eddef44035ec764075a37bace8181bec38 upstream.
+    
+    Fuse allowed VFS to set mode in setattr in order to clear suid/sgid on
+    chown and truncate, and (since writeback_cache) write.  The problem with
+    this is that it'll potentially restore a stale mode.
+    
+    The poper fix would be to let the filesystems do the suid/sgid clearing on
+    the relevant operations.  Possibly some are already doing it but there's no
+    way we can detect this.
+    
+    So fix this by refreshing and recalculating the mode.  Do this only if
+    ATTR_KILL_S[UG]ID is set to not destroy performance for writes.  This is
+    still racy but the size of the window is reduced.
+    
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 97a2eba1ed753daaa53531e37385a60a88daefb9
+Author: Miklos Szeredi <mszeredi@redhat.com>
+Date:   Sat Oct 1 07:32:32 2016 +0200
+
+    fuse: invalidate dir dentry after chmod
+    
+    commit 5e2b8828ff3d79aca8c3a1730652758753205b61 upstream.
+    
+    Without "default_permissions" the userspace filesystem's lookup operation
+    needs to perform the check for search permission on the directory.
+    
+    If directory does not allow search for everyone (this is quite rare) then
+    userspace filesystem has to set entry timeout to zero to make sure
+    permissions are always performed.
+    
+    Changing the mode bits of the directory should also invalidate the
+    (previously cached) dentry to make sure the next lookup will have a chance
+    of updating the timeout, if needed.
+    
+    Reported-by: Jean-Pierre André <jean-pierre.andre@wanadoo.fr>
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 80b742b84f85e3688e02eefd8b820642c4635329
+Author: Miklos Szeredi <mszeredi@redhat.com>
+Date:   Sat Oct 1 07:32:32 2016 +0200
+
+    fuse: listxattr: verify xattr list
+    
+    commit cb3ae6d25a5471be62bfe6ac1fccc0e91edeaba0 upstream.
+    
+    Make sure userspace filesystem is returning a well formed list of xattr
+    names (zero or more nonzero length, null terminated strings).
+    
+    [Michael Theall: only verify in the nonzero size case]
+    
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 1ccdc775631e5d636d796cc92b07852d319e9a09
+Author: Peng Fan <van.freenix@gmail.com>
+Date:   Thu Jul 21 16:04:21 2016 +0800
+
+    drivers: base: dma-mapping: page align the size when unmap_kernel_range
+    
+    commit 85714108e673cdebf1b96abfd50fb02a29e37577 upstream.
+    
+    When dma_common_free_remap, the input parameter 'size' may not
+    be page aligned. And, met kernel warning when doing iommu dma
+    for usb on i.MX8 platform:
+    "
+    WARNING: CPU: 0 PID: 869 at mm/vmalloc.c:70 vunmap_page_range+0x1cc/0x1d0()
+    Modules linked in:
+    CPU: 0 PID: 869 Comm: kworker/u8:2 Not tainted 4.1.12-00444-gc5f9d1d-dirty #147
+    Hardware name: Freescale i.MX8DV Sabreauto (DT)
+    Workqueue: ci_otg ci_otg_work
+    Call trace:
+    [<ffffffc000089920>] dump_backtrace+0x0/0x124
+    [<ffffffc000089a54>] show_stack+0x10/0x1c
+    [<ffffffc0006d1e6c>] dump_stack+0x84/0xc8
+    [<ffffffc0000b4568>] warn_slowpath_common+0x98/0xd0
+    [<ffffffc0000b4664>] warn_slowpath_null+0x14/0x20
+    [<ffffffc000170348>] vunmap_page_range+0x1c8/0x1d0
+    [<ffffffc000170388>] unmap_kernel_range+0x20/0x88
+    [<ffffffc000460ad0>] dma_common_free_remap+0x74/0x84
+    [<ffffffc0000940d8>] __iommu_free_attrs+0x9c/0x178
+    [<ffffffc0005032bc>] ehci_mem_cleanup+0x140/0x194
+    [<ffffffc000503548>] ehci_stop+0x8c/0xdc
+    [<ffffffc0004e8258>] usb_remove_hcd+0xf0/0x1cc
+    [<ffffffc000516bc0>] host_stop+0x1c/0x58
+    [<ffffffc000514240>] ci_otg_work+0xdc/0x120
+    [<ffffffc0000c9c34>] process_one_work+0x134/0x33c
+    [<ffffffc0000c9f78>] worker_thread+0x13c/0x47c
+    [<ffffffc0000cf43c>] kthread+0xd8/0xf0
+    "
+    
+    For dma_common_pages_remap:
+    dma_common_pages_remap
+       |->get_vm_area_caller
+            |->__get_vm_area_node
+                |->size = PAGE_ALIGN(size);   Round up to page aligned
+    
+    So, in dma_common_free_remap, we also need a page aligned size,
+    pass 'PAGE_ALIGN(size)' to unmap_kernel_range.
+    
+    Signed-off-by: Peng Fan <van.freenix@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit bea4698176f86cc2ad1ebe2ac9396520af7b0848
+Author: Junjie Mao <junjie.mao@enight.me>
+Date:   Mon Oct 17 09:20:25 2016 +0800
+
+    btrfs: assign error values to the correct bio structs
+    
+    commit 14155cafeadda946376260e2ad5d39a0528a332f upstream.
+    
+    Fixes: 4246a0b63bd8 ("block: add a bi_error field to struct bio")
+    Signed-off-by: Junjie Mao <junjie.mao@enight.me>
+    Acked-by: David Sterba <dsterba@suse.cz>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 42c947900f8d017ebfdca25fa214f87820734db7
+Author: Kefeng Wang <wangkefeng.wang@huawei.com>
+Date:   Wed Aug 24 16:33:33 2016 +0800
+
+    serial: 8250_dw: Check the data->pclk when get apb_pclk
+    
+    commit e16b46f190a22587898b331f9d58583b0b166c9a upstream.
+    
+    It should check the data->pclk, not data->clk when get apb_pclk.
+    
+    Fixes: c8ed99d4f6a8("serial: 8250_dw: Add support for deferred probing")
+    Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+    Tested-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>

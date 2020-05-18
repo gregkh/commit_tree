@@ -1,0 +1,2948 @@
+commit 5164f0c3740d357ba460b44222bedfa2475ca794
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Sat Oct 5 12:27:56 2019 +0200
+
+    Linux 4.4.195
+
+commit ec9a11a0b2f87b80c4882901bbc3f8e8636ec662
+Author: Filipe Manana <fdmanana@suse.com>
+Date:   Tue Sep 24 10:49:54 2019 +0100
+
+    Btrfs: fix race setting up and completing qgroup rescan workers
+    
+    [ Upstream commit 13fc1d271a2e3ab8a02071e711add01fab9271f6 ]
+    
+    There is a race between setting up a qgroup rescan worker and completing
+    a qgroup rescan worker that can lead to callers of the qgroup rescan wait
+    ioctl to either not wait for the rescan worker to complete or to hang
+    forever due to missing wake ups. The following diagram shows a sequence
+    of steps that illustrates the race.
+    
+            CPU 1                                                         CPU 2                                  CPU 3
+    
+     btrfs_ioctl_quota_rescan()
+      btrfs_qgroup_rescan()
+       qgroup_rescan_init()
+        mutex_lock(&fs_info->qgroup_rescan_lock)
+        spin_lock(&fs_info->qgroup_lock)
+    
+        fs_info->qgroup_flags |=
+          BTRFS_QGROUP_STATUS_FLAG_RESCAN
+    
+        init_completion(
+          &fs_info->qgroup_rescan_completion)
+    
+        fs_info->qgroup_rescan_running = true
+    
+        mutex_unlock(&fs_info->qgroup_rescan_lock)
+        spin_unlock(&fs_info->qgroup_lock)
+    
+        btrfs_init_work()
+         --> starts the worker
+    
+                                                            btrfs_qgroup_rescan_worker()
+                                                             mutex_lock(&fs_info->qgroup_rescan_lock)
+    
+                                                             fs_info->qgroup_flags &=
+                                                               ~BTRFS_QGROUP_STATUS_FLAG_RESCAN
+    
+                                                             mutex_unlock(&fs_info->qgroup_rescan_lock)
+    
+                                                             starts transaction, updates qgroup status
+                                                             item, etc
+    
+                                                                                                               btrfs_ioctl_quota_rescan()
+                                                                                                                btrfs_qgroup_rescan()
+                                                                                                                 qgroup_rescan_init()
+                                                                                                                  mutex_lock(&fs_info->qgroup_rescan_lock)
+                                                                                                                  spin_lock(&fs_info->qgroup_lock)
+    
+                                                                                                                  fs_info->qgroup_flags |=
+                                                                                                                    BTRFS_QGROUP_STATUS_FLAG_RESCAN
+    
+                                                                                                                  init_completion(
+                                                                                                                    &fs_info->qgroup_rescan_completion)
+    
+                                                                                                                  fs_info->qgroup_rescan_running = true
+    
+                                                                                                                  mutex_unlock(&fs_info->qgroup_rescan_lock)
+                                                                                                                  spin_unlock(&fs_info->qgroup_lock)
+    
+                                                                                                                  btrfs_init_work()
+                                                                                                                   --> starts another worker
+    
+                                                             mutex_lock(&fs_info->qgroup_rescan_lock)
+    
+                                                             fs_info->qgroup_rescan_running = false
+    
+                                                             mutex_unlock(&fs_info->qgroup_rescan_lock)
+    
+                                                             complete_all(&fs_info->qgroup_rescan_completion)
+    
+    Before the rescan worker started by the task at CPU 3 completes, if
+    another task calls btrfs_ioctl_quota_rescan(), it will get -EINPROGRESS
+    because the flag BTRFS_QGROUP_STATUS_FLAG_RESCAN is set at
+    fs_info->qgroup_flags, which is expected and correct behaviour.
+    
+    However if other task calls btrfs_ioctl_quota_rescan_wait() before the
+    rescan worker started by the task at CPU 3 completes, it will return
+    immediately without waiting for the new rescan worker to complete,
+    because fs_info->qgroup_rescan_running is set to false by CPU 2.
+    
+    This race is making test case btrfs/171 (from fstests) to fail often:
+    
+      btrfs/171 9s ... - output mismatch (see /home/fdmanana/git/hub/xfstests/results//btrfs/171.out.bad)
+    #      --- tests/btrfs/171.out     2018-09-16 21:30:48.505104287 +0100
+    #      +++ /home/fdmanana/git/hub/xfstests/results//btrfs/171.out.bad      2019-09-19 02:01:36.938486039 +0100
+    #      @@ -1,2 +1,3 @@
+    #       QA output created by 171
+    #      +ERROR: quota rescan failed: Operation now in progress
+    #       Silence is golden
+    #      ...
+    #      (Run 'diff -u /home/fdmanana/git/hub/xfstests/tests/btrfs/171.out /home/fdmanana/git/hub/xfstests/results//btrfs/171.out.bad'  to see the entire diff)
+    
+    That is because the test calls the btrfs-progs commands "qgroup quota
+    rescan -w", "qgroup assign" and "qgroup remove" in a sequence that makes
+    calls to the rescan start ioctl fail with -EINPROGRESS (note the "btrfs"
+    commands 'qgroup assign' and 'qgroup remove' often call the rescan start
+    ioctl after calling the qgroup assign ioctl,
+    btrfs_ioctl_qgroup_assign()), since previous waits didn't actually wait
+    for a rescan worker to complete.
+    
+    Another problem the race can cause is missing wake ups for waiters,
+    since the call to complete_all() happens outside a critical section and
+    after clearing the flag BTRFS_QGROUP_STATUS_FLAG_RESCAN. In the sequence
+    diagram above, if we have a waiter for the first rescan task (executed
+    by CPU 2), then fs_info->qgroup_rescan_completion.wait is not empty, and
+    if after the rescan worker clears BTRFS_QGROUP_STATUS_FLAG_RESCAN and
+    before it calls complete_all() against
+    fs_info->qgroup_rescan_completion, the task at CPU 3 calls
+    init_completion() against fs_info->qgroup_rescan_completion which
+    re-initilizes its wait queue to an empty queue, therefore causing the
+    rescan worker at CPU 2 to call complete_all() against an empty queue,
+    never waking up the task waiting for that rescan worker.
+    
+    Fix this by clearing BTRFS_QGROUP_STATUS_FLAG_RESCAN and setting
+    fs_info->qgroup_rescan_running to false in the same critical section,
+    delimited by the mutex fs_info->qgroup_rescan_lock, as well as doing the
+    call to complete_all() in that same critical section. This gives the
+    protection needed to avoid rescan wait ioctl callers not waiting for a
+    running rescan worker and the lost wake ups problem, since setting that
+    rescan flag and boolean as well as initializing the wait queue is done
+    already in a critical section delimited by that mutex (at
+    qgroup_rescan_init()).
+    
+    Fixes: 57254b6ebce4ce ("Btrfs: add ioctl to wait for qgroup rescan completion")
+    Fixes: d2c609b834d62f ("btrfs: properly track when rescan worker is running")
+    CC: stable@vger.kernel.org # 4.4+
+    Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+    Signed-off-by: Filipe Manana <fdmanana@suse.com>
+    Signed-off-by: David Sterba <dsterba@suse.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 87bd41e20d9f5fb9bad7eb989050b72946f28d07
+Author: Nikolay Borisov <nborisov@suse.com>
+Date:   Wed Sep 4 19:33:58 2019 +0300
+
+    btrfs: Relinquish CPUs in btrfs_compare_trees
+    
+    commit 6af112b11a4bc1b560f60a618ac9c1dcefe9836e upstream.
+    
+    When doing any form of incremental send the parent and the child trees
+    need to be compared via btrfs_compare_trees. This  can result in long
+    loop chains without ever relinquishing the CPU. This causes softlockup
+    detector to trigger when comparing trees with a lot of items. Example
+    report:
+    
+    watchdog: BUG: soft lockup - CPU#0 stuck for 24s! [snapperd:16153]
+    CPU: 0 PID: 16153 Comm: snapperd Not tainted 5.2.9-1-default #1 openSUSE Tumbleweed (unreleased)
+    Hardware name: QEMU KVM Virtual Machine, BIOS 0.0.0 02/06/2015
+    pstate: 40000005 (nZcv daif -PAN -UAO)
+    pc : __ll_sc_arch_atomic_sub_return+0x14/0x20
+    lr : btrfs_release_extent_buffer_pages+0xe0/0x1e8 [btrfs]
+    sp : ffff00001273b7e0
+    Call trace:
+     __ll_sc_arch_atomic_sub_return+0x14/0x20
+     release_extent_buffer+0xdc/0x120 [btrfs]
+     free_extent_buffer.part.0+0xb0/0x118 [btrfs]
+     free_extent_buffer+0x24/0x30 [btrfs]
+     btrfs_release_path+0x4c/0xa0 [btrfs]
+     btrfs_free_path.part.0+0x20/0x40 [btrfs]
+     btrfs_free_path+0x24/0x30 [btrfs]
+     get_inode_info+0xa8/0xf8 [btrfs]
+     finish_inode_if_needed+0xe0/0x6d8 [btrfs]
+     changed_cb+0x9c/0x410 [btrfs]
+     btrfs_compare_trees+0x284/0x648 [btrfs]
+     send_subvol+0x33c/0x520 [btrfs]
+     btrfs_ioctl_send+0x8a0/0xaf0 [btrfs]
+     btrfs_ioctl+0x199c/0x2288 [btrfs]
+     do_vfs_ioctl+0x4b0/0x820
+     ksys_ioctl+0x84/0xb8
+     __arm64_sys_ioctl+0x28/0x38
+     el0_svc_common.constprop.0+0x7c/0x188
+     el0_svc_handler+0x34/0x90
+     el0_svc+0x8/0xc
+    
+    Fix this by adding a call to cond_resched at the beginning of the main
+    loop in btrfs_compare_trees.
+    
+    Fixes: 7069830a9e38 ("Btrfs: add btrfs_compare_trees function")
+    CC: stable@vger.kernel.org # 4.4+
+    Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+    Signed-off-by: Nikolay Borisov <nborisov@suse.com>
+    Reviewed-by: David Sterba <dsterba@suse.com>
+    Signed-off-by: David Sterba <dsterba@suse.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 2cd8f741aa121a647b9f2a184edd1720111b9821
+Author: Filipe Manana <fdmanana@suse.com>
+Date:   Mon Aug 12 19:14:29 2019 +0100
+
+    Btrfs: fix use-after-free when using the tree modification log
+    
+    commit efad8a853ad2057f96664328a0d327a05ce39c76 upstream.
+    
+    At ctree.c:get_old_root(), we are accessing a root's header owner field
+    after we have freed the respective extent buffer. This results in an
+    use-after-free that can lead to crashes, and when CONFIG_DEBUG_PAGEALLOC
+    is set, results in a stack trace like the following:
+    
+      [ 3876.799331] stack segment: 0000 [#1] SMP DEBUG_PAGEALLOC PTI
+      [ 3876.799363] CPU: 0 PID: 15436 Comm: pool Not tainted 5.3.0-rc3-btrfs-next-54 #1
+      [ 3876.799385] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.12.0-0-ga698c8995f-prebuilt.qemu.org 04/01/2014
+      [ 3876.799433] RIP: 0010:btrfs_search_old_slot+0x652/0xd80 [btrfs]
+      (...)
+      [ 3876.799502] RSP: 0018:ffff9f08c1a2f9f0 EFLAGS: 00010286
+      [ 3876.799518] RAX: ffff8dd300000000 RBX: ffff8dd85a7a9348 RCX: 000000038da26000
+      [ 3876.799538] RDX: 0000000000000000 RSI: ffffe522ce368980 RDI: 0000000000000246
+      [ 3876.799559] RBP: dae1922adadad000 R08: 0000000008020000 R09: ffffe522c0000000
+      [ 3876.799579] R10: ffff8dd57fd788c8 R11: 000000007511b030 R12: ffff8dd781ddc000
+      [ 3876.799599] R13: ffff8dd9e6240578 R14: ffff8dd6896f7a88 R15: ffff8dd688cf90b8
+      [ 3876.799620] FS:  00007f23ddd97700(0000) GS:ffff8dda20200000(0000) knlGS:0000000000000000
+      [ 3876.799643] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+      [ 3876.799660] CR2: 00007f23d4024000 CR3: 0000000710bb0005 CR4: 00000000003606f0
+      [ 3876.799682] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+      [ 3876.799703] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+      [ 3876.799723] Call Trace:
+      [ 3876.799735]  ? do_raw_spin_unlock+0x49/0xc0
+      [ 3876.799749]  ? _raw_spin_unlock+0x24/0x30
+      [ 3876.799779]  resolve_indirect_refs+0x1eb/0xc80 [btrfs]
+      [ 3876.799810]  find_parent_nodes+0x38d/0x1180 [btrfs]
+      [ 3876.799841]  btrfs_check_shared+0x11a/0x1d0 [btrfs]
+      [ 3876.799870]  ? extent_fiemap+0x598/0x6e0 [btrfs]
+      [ 3876.799895]  extent_fiemap+0x598/0x6e0 [btrfs]
+      [ 3876.799913]  do_vfs_ioctl+0x45a/0x700
+      [ 3876.799926]  ksys_ioctl+0x70/0x80
+      [ 3876.799938]  ? trace_hardirqs_off_thunk+0x1a/0x20
+      [ 3876.799953]  __x64_sys_ioctl+0x16/0x20
+      [ 3876.799965]  do_syscall_64+0x62/0x220
+      [ 3876.799977]  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+      [ 3876.799993] RIP: 0033:0x7f23e0013dd7
+      (...)
+      [ 3876.800056] RSP: 002b:00007f23ddd96ca8 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+      [ 3876.800078] RAX: ffffffffffffffda RBX: 00007f23d80210f8 RCX: 00007f23e0013dd7
+      [ 3876.800099] RDX: 00007f23d80210f8 RSI: 00000000c020660b RDI: 0000000000000003
+      [ 3876.800626] RBP: 000055fa2a2a2440 R08: 0000000000000000 R09: 00007f23ddd96d7c
+      [ 3876.801143] R10: 00007f23d8022000 R11: 0000000000000246 R12: 00007f23ddd96d80
+      [ 3876.801662] R13: 00007f23ddd96d78 R14: 00007f23d80210f0 R15: 00007f23ddd96d80
+      (...)
+      [ 3876.805107] ---[ end trace e53161e179ef04f9 ]---
+    
+    Fix that by saving the root's header owner field into a local variable
+    before freeing the root's extent buffer, and then use that local variable
+    when needed.
+    
+    Fixes: 30b0463a9394d9 ("Btrfs: fix accessing the root pointer in tree mod log functions")
+    CC: stable@vger.kernel.org # 3.10+
+    Reviewed-by: Nikolay Borisov <nborisov@suse.com>
+    Reviewed-by: Anand Jain <anand.jain@oracle.com>
+    Signed-off-by: Filipe Manana <fdmanana@suse.com>
+    Reviewed-by: David Sterba <dsterba@suse.com>
+    Signed-off-by: David Sterba <dsterba@suse.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 05f4bc30f5a0f3f0f56e87de3a2d6dfcc280b769
+Author: Mark Salyzyn <salyzyn@android.com>
+Date:   Thu Aug 29 11:30:14 2019 -0700
+
+    ovl: filter of trusted xattr results in audit
+    
+    commit 5c2e9f346b815841f9bed6029ebcb06415caf640 upstream.
+    
+    When filtering xattr list for reading, presence of trusted xattr
+    results in a security audit log.  However, if there is other content
+    no errno will be set, and if there isn't, the errno will be -ENODATA
+    and not -EPERM as is usually associated with a lack of capability.
+    The check does not block the request to list the xattrs present.
+    
+    Switch to ns_capable_noaudit to reflect a more appropriate check.
+    
+    Signed-off-by: Mark Salyzyn <salyzyn@android.com>
+    Cc: linux-security-module@vger.kernel.org
+    Cc: kernel-team@android.com
+    Cc: stable@vger.kernel.org # v3.18+
+    Fixes: a082c6f680da ("ovl: filter trusted xattr for non-admin")
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 0d9cc53fde529a8ab037d1cd8052daacf7573fb5
+Author: Pavel Shilovsky <pshilov@microsoft.com>
+Date:   Thu Sep 26 12:31:20 2019 -0700
+
+    CIFS: Fix oplock handling for SMB 2.1+ protocols
+    
+    commit a016e2794fc3a245a91946038dd8f34d65e53cc3 upstream.
+    
+    There may be situations when a server negotiates SMB 2.1
+    protocol version or higher but responds to a CREATE request
+    with an oplock rather than a lease.
+    
+    Currently the client doesn't handle such a case correctly:
+    when another CREATE comes in the server sends an oplock
+    break to the initial CREATE and the client doesn't send
+    an ack back due to a wrong caching level being set (READ
+    instead of RWH). Missing an oplock break ack makes the
+    server wait until the break times out which dramatically
+    increases the latency of the second CREATE.
+    
+    Fix this by properly detecting oplocks when using SMB 2.1
+    protocol version and higher.
+    
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Pavel Shilovsky <pshilov@microsoft.com>
+    Signed-off-by: Steve French <stfrench@microsoft.com>
+    Reviewed-by: Ronnie Sahlberg <lsahlber@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ba8d9cdbe5a2174187a8b9694bb3c9e4862c1936
+Author: Chris Brandt <chris.brandt@renesas.com>
+Date:   Thu Sep 26 07:19:09 2019 -0500
+
+    i2c: riic: Clear NACK in tend isr
+    
+    commit a71e2ac1f32097fbb2beab098687a7a95c84543e upstream.
+    
+    The NACKF flag should be cleared in INTRIICNAKI interrupt processing as
+    description in HW manual.
+    
+    This issue shows up quickly when PREEMPT_RT is applied and a device is
+    probed that is not plugged in (like a touchscreen controller). The result
+    is endless interrupts that halt system boot.
+    
+    Fixes: 310c18a41450 ("i2c: riic: add driver")
+    Cc: stable@vger.kernel.org
+    Reported-by: Chien Nguyen <chien.nguyen.eb@rvc.renesas.com>
+    Signed-off-by: Chris Brandt <chris.brandt@renesas.com>
+    Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit c648d4350015ab238c0b1ba35616adfb72f5d76b
+Author: Laurent Vivier <lvivier@redhat.com>
+Date:   Tue Sep 17 11:54:50 2019 +0200
+
+    hwrng: core - don't wait on add_early_randomness()
+    
+    commit 78887832e76541f77169a24ac238fccb51059b63 upstream.
+    
+    add_early_randomness() is called by hwrng_register() when the
+    hardware is added. If this hardware and its module are present
+    at boot, and if there is no data available the boot hangs until
+    data are available and can't be interrupted.
+    
+    For instance, in the case of virtio-rng, in some cases the host can be
+    not able to provide enough entropy for all the guests.
+    
+    We can have two easy ways to reproduce the problem but they rely on
+    misconfiguration of the hypervisor or the egd daemon:
+    
+    - if virtio-rng device is configured to connect to the egd daemon of the
+    host but when the virtio-rng driver asks for data the daemon is not
+    connected,
+    
+    - if virtio-rng device is configured to connect to the egd daemon of the
+    host but the egd daemon doesn't provide data.
+    
+    The guest kernel will hang at boot until the virtio-rng driver provides
+    enough data.
+    
+    To avoid that, call rng_get_data() in non-blocking mode (wait=0)
+    from add_early_randomness().
+    
+    Signed-off-by: Laurent Vivier <lvivier@redhat.com>
+    Fixes: d9e797261933 ("hwrng: add randomness to system from rng...")
+    Cc: <stable@vger.kernel.org>
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 70a2b17f151e28ce659782ae9751b54ca9b6563b
+Author: Chao Yu <chao@kernel.org>
+Date:   Wed Sep 11 17:36:50 2019 +0800
+
+    quota: fix wrong condition in is_quota_modification()
+    
+    commit 6565c182094f69e4ffdece337d395eb7ec760efc upstream.
+    
+    Quoted from
+    commit 3da40c7b0898 ("ext4: only call ext4_truncate when size <= isize")
+    
+    " At LSF we decided that if we truncate up from isize we shouldn't trim
+      fallocated blocks that were fallocated with KEEP_SIZE and are past the
+     new i_size.  This patch fixes ext4 to do this. "
+    
+    And generic/092 of fstest have covered this case for long time, however
+    is_quota_modification() didn't adjust based on that rule, so that in
+    below condition, we will lose to quota block change:
+    - fallocate blocks beyond EOF
+    - remount
+    - truncate(file_path, file_size)
+    
+    Fix it.
+    
+    Link: https://lore.kernel.org/r/20190911093650.35329-1-yuchao0@huawei.com
+    Fixes: 3da40c7b0898 ("ext4: only call ext4_truncate when size <= isize")
+    CC: stable@vger.kernel.org
+    Signed-off-by: Chao Yu <yuchao0@huawei.com>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 39950e657d5e16328cc93ab6bfc7780ab8f70c2c
+Author: Theodore Ts'o <tytso@mit.edu>
+Date:   Fri Aug 23 22:38:00 2019 -0400
+
+    ext4: fix punch hole for inline_data file systems
+    
+    commit c1e8220bd316d8ae8e524df39534b8a412a45d5e upstream.
+    
+    If a program attempts to punch a hole on an inline data file, we need
+    to convert it to a normal file first.
+    
+    This was detected using ext4/032 using the adv configuration.  Simple
+    reproducer:
+    
+    mke2fs -Fq -t ext4 -O inline_data /dev/vdc
+    mount /vdc
+    echo "" > /vdc/testfile
+    xfs_io -c 'truncate 33554432' /vdc/testfile
+    xfs_io -c 'fpunch 0 1048576' /vdc/testfile
+    umount /vdc
+    e2fsck -fy /dev/vdc
+    
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 4e9518d21cf0244247b2386f11949fb4ccf38667
+Author: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Date:   Mon Aug 26 22:13:25 2019 +0900
+
+    /dev/mem: Bail out upon SIGKILL.
+    
+    commit 8619e5bdeee8b2c685d686281f2d2a6017c4bc15 upstream.
+    
+    syzbot found that a thread can stall for minutes inside read_mem() or
+    write_mem() after that thread was killed by SIGKILL [1]. Reading from
+    iomem areas of /dev/mem can be slow, depending on the hardware.
+    While reading 2GB at one read() is legal, delaying termination of killed
+    thread for minutes is bad. Thus, allow reading/writing /dev/mem and
+    /dev/kmem to be preemptible and killable.
+    
+      [ 1335.912419][T20577] read_mem: sz=4096 count=2134565632
+      [ 1335.943194][T20577] read_mem: sz=4096 count=2134561536
+      [ 1335.978280][T20577] read_mem: sz=4096 count=2134557440
+      [ 1336.011147][T20577] read_mem: sz=4096 count=2134553344
+      [ 1336.041897][T20577] read_mem: sz=4096 count=2134549248
+    
+    Theoretically, reading/writing /dev/mem and /dev/kmem can become
+    "interruptible". But this patch chose "killable". Future patch will make
+    them "interruptible" so that we can revert to "killable" if some program
+    regressed.
+    
+    [1] https://syzkaller.appspot.com/bug?id=a0e3436829698d5824231251fad9d8e998f94f5e
+    
+    Signed-off-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+    Cc: stable <stable@vger.kernel.org>
+    Reported-by: syzbot <syzbot+8ab2d0f39fb79fe6ca40@syzkaller.appspotmail.com>
+    Link: https://lore.kernel.org/r/1566825205-10703-1-git-send-email-penguin-kernel@I-love.SAKURA.ne.jp
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit b85938f66b6ef4680a06e3229c10f5d6353f53d9
+Author: Denis Kenzior <denkenz@gmail.com>
+Date:   Wed Aug 28 16:11:10 2019 -0500
+
+    cfg80211: Purge frame registrations on iftype change
+    
+    commit c1d3ad84eae35414b6b334790048406bd6301b12 upstream.
+    
+    Currently frame registrations are not purged, even when changing the
+    interface type.  This can lead to potentially weird situations where
+    frames possibly not allowed on a given interface type remain registered
+    due to the type switching happening after registration.
+    
+    The kernel currently relies on userspace apps to actually purge the
+    registrations themselves, this is not something that the kernel should
+    rely on.
+    
+    Add a call to cfg80211_mlme_purge_registrations() to forcefully remove
+    any registrations left over prior to switching the iftype.
+    
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Denis Kenzior <denkenz@gmail.com>
+    Link: https://lore.kernel.org/r/20190828211110.15005-1-denkenz@gmail.com
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit c7925cc21fb29dc5edfb00f61c82cfb8a6db52d2
+Author: Xiao Ni <xni@redhat.com>
+Date:   Mon Jul 8 10:14:32 2019 +0800
+
+    md/raid6: Set R5_ReadError when there is read failure on parity disk
+    
+    commit 143f6e733b73051cd22dcb80951c6c929da413ce upstream.
+    
+    7471fb77ce4d ("md/raid6: Fix anomily when recovering a single device in
+    RAID6.") avoids rereading P when it can be computed from other members.
+    However, this misses the chance to re-write the right data to P. This
+    patch sets R5_ReadError if the re-read fails.
+    
+    Also, when re-read is skipped, we also missed the chance to reset
+    rdev->read_errors to 0. It can fail the disk when there are many read
+    errors on P member disk (other disks don't have read error)
+    
+    V2: upper layer read request don't read parity/Q data. So there is no
+    need to consider such situation.
+    
+    This is Reported-by: kbuild test robot <lkp@intel.com>
+    
+    Fixes: 7471fb77ce4d ("md/raid6: Fix anomily when recovering a single device in RAID6.")
+    Cc: <stable@vger.kernel.org> #4.4+
+    Signed-off-by: Xiao Ni <xni@redhat.com>
+    Signed-off-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit c22df8ea7c5831d6fdca2f6f136f0d32d7064ff9
+Author: Thadeu Lima de Souza Cascardo <cascardo@canonical.com>
+Date:   Tue Sep 3 14:18:02 2019 -0300
+
+    alarmtimer: Use EOPNOTSUPP instead of ENOTSUPP
+    
+    commit f18ddc13af981ce3c7b7f26925f099e7c6929aba upstream.
+    
+    ENOTSUPP is not supposed to be returned to userspace. This was found on an
+    OpenPower machine, where the RTC does not support set_alarm.
+    
+    On that system, a clock_nanosleep(CLOCK_REALTIME_ALARM, ...) results in
+    "524 Unknown error 524"
+    
+    Replace it with EOPNOTSUPP which results in the expected "95 Operation not
+    supported" error.
+    
+    Fixes: 1c6b39ad3f01 (alarmtimers: Return -ENOTSUPP if no RTC device is present)
+    Signed-off-by: Thadeu Lima de Souza Cascardo <cascardo@canonical.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: stable@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190903171802.28314-1-cascardo@canonical.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 8b49a407ce256d147861562e19f71a759e97b140
+Author: Luis Araneda <luaraneda@gmail.com>
+Date:   Thu Aug 8 08:52:43 2019 -0400
+
+    ARM: zynq: Use memcpy_toio instead of memcpy on smp bring-up
+    
+    commit b7005d4ef4f3aa2dc24019ffba03a322557ac43d upstream.
+    
+    This fixes a kernel panic on memcpy when
+    FORTIFY_SOURCE is enabled.
+    
+    The initial smp implementation on commit aa7eb2bb4e4a
+    ("arm: zynq: Add smp support")
+    used memcpy, which worked fine until commit ee333554fed5
+    ("ARM: 8749/1: Kconfig: Add ARCH_HAS_FORTIFY_SOURCE")
+    enabled overflow checks at runtime, producing a read
+    overflow panic.
+    
+    The computed size of memcpy args are:
+    - p_size (dst): 4294967295 = (size_t) -1
+    - q_size (src): 1
+    - size (len): 8
+    
+    Additionally, the memory is marked as __iomem, so one of
+    the memcpy_* functions should be used for read/write.
+    
+    Fixes: aa7eb2bb4e4a ("arm: zynq: Add smp support")
+    Signed-off-by: Luis Araneda <luaraneda@gmail.com>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 789536b7f01446d952d054d412065674024e3024
+Author: Amadeusz Sławiński <amadeuszx.slawinski@intel.com>
+Date:   Tue Aug 27 16:17:08 2019 +0200
+
+    ASoC: Intel: Fix use of potentially uninitialized variable
+    
+    commit 810f3b860850148788fc1ed8a6f5f807199fed65 upstream.
+    
+    If ipc->ops.reply_msg_match is NULL, we may end up using uninitialized
+    mask value.
+    
+    reported by smatch:
+    sound/soc/intel/common/sst-ipc.c:266 sst_ipc_reply_find_msg() error: uninitialized symbol 'mask'.
+    
+    Signed-off-by: Amadeusz Sławiński <amadeuszx.slawinski@intel.com>
+    Link: https://lore.kernel.org/r/20190827141712.21015-3-amadeuszx.slawinski@linux.intel.com
+    Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+    Signed-off-by: Mark Brown <broonie@kernel.org>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 16740be2f6b55e6c1c51bd28268d7980fd66ec8f
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Sun Aug 18 12:03:23 2019 -0300
+
+    media: sn9c20x: Add MSI MS-1039 laptop to flip_dmi_table
+    
+    commit 7e0bb5828311f811309bed5749528ca04992af2f upstream.
+    
+    Like a bunch of other MSI laptops the MS-1039 uses a 0c45:627b
+    SN9C201 + OV7660 webcam which is mounted upside down.
+    
+    Add it to the sn9c20x flip_dmi_table to deal with this.
+    
+    Cc: stable@vger.kernel.org
+    Reported-by: Rui Salvaterra <rsalvaterra@gmail.com>
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 10ec9d66ff15d6888e47efaf09602b2da7a7606e
+Author: Sean Christopherson <sean.j.christopherson@intel.com>
+Date:   Tue Sep 3 16:36:45 2019 -0700
+
+    KVM: x86: Manually calculate reserved bits when loading PDPTRS
+    
+    commit 16cfacc8085782dab8e365979356ce1ca87fd6cc upstream.
+    
+    Manually generate the PDPTR reserved bit mask when explicitly loading
+    PDPTRs.  The reserved bits that are being tracked by the MMU reflect the
+    current paging mode, which is unlikely to be PAE paging in the vast
+    majority of flows that use load_pdptrs(), e.g. CR0 and CR4 emulation,
+    __set_sregs(), etc...  This can cause KVM to incorrectly signal a bad
+    PDPTR, or more likely, miss a reserved bit check and subsequently fail
+    a VM-Enter due to a bad VMCS.GUEST_PDPTR.
+    
+    Add a one off helper to generate the reserved bits instead of sharing
+    code across the MMU's calculations and the PDPTR emulation.  The PDPTR
+    reserved bits are basically set in stone, and pushing a helper into
+    the MMU's calculation adds unnecessary complexity without improving
+    readability.
+    
+    Oppurtunistically fix/update the comment for load_pdptrs().
+    
+    Note, the buggy commit also introduced a deliberate functional change,
+    "Also remove bit 5-6 from rsvd_bits_mask per latest SDM.", which was
+    effectively (and correctly) reverted by commit cd9ae5fe47df ("KVM: x86:
+    Fix page-tables reserved bits").  A bit of SDM archaeology shows that
+    the SDM from late 2008 had a bug (likely a copy+paste error) where it
+    listed bits 6:5 as AVL and A for PDPTEs used for 4k entries but reserved
+    for 2mb entries.  I.e. the SDM contradicted itself, and bits 6:5 are and
+    always have been reserved.
+    
+    Fixes: 20c466b56168d ("KVM: Use rsvd_bits_mask in load_pdptrs()")
+    Cc: stable@vger.kernel.org
+    Cc: Nadav Amit <nadav.amit@gmail.com>
+    Reported-by: Doug Reiland <doug.reiland@intel.com>
+    Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+    Reviewed-by: Peter Xu <peterx@redhat.com>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit bcb66cfc3fcf5a879b93eb6e6b5a60487d80b63d
+Author: Jan Dakinevich <jan.dakinevich@virtuozzo.com>
+Date:   Tue Aug 27 13:07:08 2019 +0000
+
+    KVM: x86: set ctxt->have_exception in x86_decode_insn()
+    
+    commit c8848cee74ff05638e913582a476bde879c968ad upstream.
+    
+    x86_emulate_instruction() takes into account ctxt->have_exception flag
+    during instruction decoding, but in practice this flag is never set in
+    x86_decode_insn().
+    
+    Fixes: 6ea6e84309ca ("KVM: x86: inject exceptions produced by x86_decode_insn")
+    Cc: stable@vger.kernel.org
+    Cc: Denis Lunev <den@virtuozzo.com>
+    Cc: Roman Kagan <rkagan@virtuozzo.com>
+    Cc: Denis Plotnikov <dplotnikov@virtuozzo.com>
+    Signed-off-by: Jan Dakinevich <jan.dakinevich@virtuozzo.com>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5de105cc60f8d3b58661d9084f9a409bb720c0c0
+Author: Jan Dakinevich <jan.dakinevich@virtuozzo.com>
+Date:   Tue Aug 27 13:07:09 2019 +0000
+
+    KVM: x86: always stop emulation on page fault
+    
+    commit 8530a79c5a9f4e29e6ffb35ec1a79d81f4968ec8 upstream.
+    
+    inject_emulated_exception() returns true if and only if nested page
+    fault happens. However, page fault can come from guest page tables
+    walk, either nested or not nested. In both cases we should stop an
+    attempt to read under RIP and give guest to step over its own page
+    fault handler.
+    
+    This is also visible when an emulated instruction causes a #GP fault
+    and the VMware backdoor is enabled.  To handle the VMware backdoor,
+    KVM intercepts #GP faults; with only the next patch applied,
+    x86_emulate_instruction() injects a #GP but returns EMULATE_FAIL
+    instead of EMULATE_DONE.   EMULATE_FAIL causes handle_exception_nmi()
+    (or gp_interception() for SVM) to re-inject the original #GP because it
+    thinks emulation failed due to a non-VMware opcode.  This patch prevents
+    the issue as x86_emulate_instruction() will return EMULATE_DONE after
+    injecting the #GP.
+    
+    Fixes: 6ea6e84309ca ("KVM: x86: inject exceptions produced by x86_decode_insn")
+    Cc: stable@vger.kernel.org
+    Cc: Denis Lunev <den@virtuozzo.com>
+    Cc: Roman Kagan <rkagan@virtuozzo.com>
+    Cc: Denis Plotnikov <dplotnikov@virtuozzo.com>
+    Signed-off-by: Jan Dakinevich <jan.dakinevich@virtuozzo.com>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit f5c0d4a616cfb199d8a8b9adac0366886d0f2dd0
+Author: Helge Deller <deller@gmx.de>
+Date:   Thu Sep 5 16:44:17 2019 +0200
+
+    parisc: Disable HP HSC-PCI Cards to prevent kernel crash
+    
+    commit 5fa1659105fac63e0f3c199b476025c2e04111ce upstream.
+    
+    The HP Dino PCI controller chip can be used in two variants: as on-board
+    controller (e.g. in B160L), or on an Add-On card ("Card-Mode") to bridge
+    PCI components to systems without a PCI bus, e.g. to a HSC/GSC bus.  One
+    such Add-On card is the HP HSC-PCI Card which has one or more DEC Tulip
+    PCI NIC chips connected to the on-card Dino PCI controller.
+    
+    Dino in Card-Mode has a big disadvantage: All PCI memory accesses need
+    to go through the DINO_MEM_DATA register, so Linux drivers will not be
+    able to use the ioremap() function. Without ioremap() many drivers will
+    not work, one example is the tulip driver which then simply crashes the
+    kernel if it tries to access the ports on the HP HSC card.
+    
+    This patch disables the HP HSC card if it finds one, and as such
+    fixes the kernel crash on a HP D350/2 machine.
+    
+    Signed-off-by: Helge Deller <deller@gmx.de>
+    Noticed-by: Phil Scarr <phil.scarr@pm.me>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit d9768d068b4ee98932eb24205f39c60397d57571
+Author: Vasily Averin <vvs@virtuozzo.com>
+Date:   Fri Sep 13 18:17:11 2019 +0300
+
+    fuse: fix missing unlock_page in fuse_writepage()
+    
+    commit d5880c7a8620290a6c90ced7a0e8bd0ad9419601 upstream.
+    
+    unlock_page() was missing in case of an already in-flight write against the
+    same page.
+    
+    Signed-off-by: Vasily Averin <vvs@virtuozzo.com>
+    Fixes: ff17be086477 ("fuse: writepage: skip already in flight")
+    Cc: <stable@vger.kernel.org> # v3.13
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 291697f621a082ebd1a26ee5e8bfde62dc05890f
+Author: Vincent Whitchurch <vincent.whitchurch@axis.com>
+Date:   Thu Jul 11 16:29:37 2019 +0200
+
+    printk: Do not lose last line in kmsg buffer dump
+    
+    [ Upstream commit b46eff55ad5bd98e746c0a7022fe7ee071de5fee ]
+    
+    kmsg_dump_get_buffer() is supposed to select all the youngest log
+    messages which fit into the provided buffer.  It determines the correct
+    start index by using msg_print_text() with a NULL buffer to calculate
+    the size of each entry.  However, when performing the actual writes,
+    msg_print_text() only writes the entry to the buffer if the written len
+    is lesser than the size of the buffer.  So if the lengths of the
+    selected youngest log messages happen to precisely fill up the provided
+    buffer, the last log message is not included.
+    
+    We don't want to modify msg_print_text() to fill up the buffer and start
+    returning a length which is equal to the size of the buffer, since
+    callers of its other users, such as kmsg_dump_get_line(), depend upon
+    the current behaviour.
+    
+    Instead, fix kmsg_dump_get_buffer() to compensate for this.
+    
+    For example, with the following two final prints:
+    
+    [    6.427502] AAAAAAAAAAAAA
+    [    6.427769] BBBBBBBB12345
+    
+    A dump of a 64-byte buffer filled by kmsg_dump_get_buffer(), before this
+    patch:
+    
+     00000000: 3c 30 3e 5b 20 20 20 20 36 2e 35 32 32 31 39 37  <0>[    6.522197
+     00000010: 5d 20 41 41 41 41 41 41 41 41 41 41 41 41 41 0a  ] AAAAAAAAAAAAA.
+     00000020: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+     00000030: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+    
+    After this patch:
+    
+     00000000: 3c 30 3e 5b 20 20 20 20 36 2e 34 35 36 36 37 38  <0>[    6.456678
+     00000010: 5d 20 42 42 42 42 42 42 42 42 31 32 33 34 35 0a  ] BBBBBBBB12345.
+     00000020: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+     00000030: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+    
+    Link: http://lkml.kernel.org/r/20190711142937.4083-1-vincent.whitchurch@axis.com
+    Fixes: e2ae715d66bf4bec ("kmsg - kmsg_dump() use iterator to receive log buffer content")
+    To: rostedt@goodmis.org
+    Cc: linux-kernel@vger.kernel.org
+    Cc: <stable@vger.kernel.org> # v3.5+
+    Signed-off-by: Vincent Whitchurch <vincent.whitchurch@axis.com>
+    Reviewed-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+    Signed-off-by: Petr Mladek <pmladek@suse.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 82a136986dbc112af10666ce530624808a6b9b67
+Author: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Date:   Tue Sep 10 22:51:52 2019 +0900
+
+    ALSA: firewire-tascam: check intermediate state of clock status and retry
+    
+    commit e1a00b5b253a4f97216b9a33199a863987075162 upstream.
+    
+    2 bytes in MSB of register for clock status is zero during intermediate
+    state after changing status of sampling clock in models of TASCAM FireWire
+    series. The duration of this state differs depending on cases. During the
+    state, it's better to retry reading the register for current status of
+    the clock.
+    
+    In current implementation, the intermediate state is checked only when
+    getting current sampling transmission frequency, then retry reading.
+    This care is required for the other operations to read the register.
+    
+    This commit moves the codes of check and retry into helper function
+    commonly used for operations to read the register.
+    
+    Fixes: e453df44f0d6 ("ALSA: firewire-tascam: add PCM functionality")
+    Cc: <stable@vger.kernel.org> # v4.4+
+    Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+    Link: https://lore.kernel.org/r/20190910135152.29800-3-o-takashi@sakamocchi.jp
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 02842b98ab1ea2f00c3f0a0c5eeb0776ee4bed0d
+Author: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Date:   Tue Sep 10 22:51:51 2019 +0900
+
+    ALSA: firewire-tascam: handle error code when getting current source of clock
+    
+    commit 2617120f4de6d0423384e0e86b14c78b9de84d5a upstream.
+    
+    The return value of snd_tscm_stream_get_clock() is ignored. This commit
+    checks the value and handle error.
+    
+    Fixes: e453df44f0d6 ("ALSA: firewire-tascam: add PCM functionality")
+    Cc: <stable@vger.kernel.org> # v4.4+
+    Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+    Link: https://lore.kernel.org/r/20190910135152.29800-2-o-takashi@sakamocchi.jp
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit e875c35b74ac5b5e89ca6933bdd5d8a5e6d5fbf0
+Author: Sakari Ailus <sakari.ailus@linux.intel.com>
+Date:   Wed Aug 7 11:19:00 2019 -0300
+
+    media: omap3isp: Set device on omap3isp subdevs
+    
+    [ Upstream commit e9eb103f027725053a4b02f93d7f2858b56747ce ]
+    
+    The omap3isp driver registered subdevs without the dev field being set. Do
+    that now.
+    
+    Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+    Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 6454910f3171b4ac428fc160dccb29abeece3d9d
+Author: Qu Wenruo <wqu@suse.com>
+Date:   Tue Jul 16 17:00:33 2019 +0800
+
+    btrfs: extent-tree: Make sure we only allocate extents from block groups with the same type
+    
+    [ Upstream commit 2a28468e525f3924efed7f29f2bc5a2926e7e19a ]
+    
+    [BUG]
+    With fuzzed image and MIXED_GROUPS super flag, we can hit the following
+    BUG_ON():
+    
+      kernel BUG at fs/btrfs/delayed-ref.c:491!
+      invalid opcode: 0000 [#1] PREEMPT SMP NOPTI
+      CPU: 0 PID: 1849 Comm: sync Tainted: G           O      5.2.0-custom #27
+      RIP: 0010:update_existing_head_ref.cold+0x44/0x46 [btrfs]
+      Call Trace:
+       add_delayed_ref_head+0x20c/0x2d0 [btrfs]
+       btrfs_add_delayed_tree_ref+0x1fc/0x490 [btrfs]
+       btrfs_free_tree_block+0x123/0x380 [btrfs]
+       __btrfs_cow_block+0x435/0x500 [btrfs]
+       btrfs_cow_block+0x110/0x240 [btrfs]
+       btrfs_search_slot+0x230/0xa00 [btrfs]
+       ? __lock_acquire+0x105e/0x1e20
+       btrfs_insert_empty_items+0x67/0xc0 [btrfs]
+       alloc_reserved_file_extent+0x9e/0x340 [btrfs]
+       __btrfs_run_delayed_refs+0x78e/0x1240 [btrfs]
+       ? kvm_clock_read+0x18/0x30
+       ? __sched_clock_gtod_offset+0x21/0x50
+       btrfs_run_delayed_refs.part.0+0x4e/0x180 [btrfs]
+       btrfs_run_delayed_refs+0x23/0x30 [btrfs]
+       btrfs_commit_transaction+0x53/0x9f0 [btrfs]
+       btrfs_sync_fs+0x7c/0x1c0 [btrfs]
+       ? __ia32_sys_fdatasync+0x20/0x20
+       sync_fs_one_sb+0x23/0x30
+       iterate_supers+0x95/0x100
+       ksys_sync+0x62/0xb0
+       __ia32_sys_sync+0xe/0x20
+       do_syscall_64+0x65/0x240
+       entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    
+    [CAUSE]
+    This situation is caused by several factors:
+    - Fuzzed image
+      The extent tree of this fs missed one backref for extent tree root.
+      So we can allocated space from that slot.
+    
+    - MIXED_BG feature
+      Super block has MIXED_BG flag.
+    
+    - No mixed block groups exists
+      All block groups are just regular ones.
+    
+    This makes data space_info->block_groups[] contains metadata block
+    groups.  And when we reserve space for data, we can use space in
+    metadata block group.
+    
+    Then we hit the following file operations:
+    
+    - fallocate
+      We need to allocate data extents.
+      find_free_extent() choose to use the metadata block to allocate space
+      from, and choose the space of extent tree root, since its backref is
+      missing.
+    
+      This generate one delayed ref head with is_data = 1.
+    
+    - extent tree update
+      We need to update extent tree at run_delayed_ref time.
+    
+      This generate one delayed ref head with is_data = 0, for the same
+      bytenr of old extent tree root.
+    
+    Then we trigger the BUG_ON().
+    
+    [FIX]
+    The quick fix here is to check block_group->flags before using it.
+    
+    The problem can only happen for MIXED_GROUPS fs. Regular filesystems
+    won't have space_info with DATA|METADATA flag, and no way to hit the
+    bug.
+    
+    Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=203255
+    Reported-by: Jungyeon Yoon <jungyeon.yoon@gmail.com>
+    Signed-off-by: Qu Wenruo <wqu@suse.com>
+    Signed-off-by: David Sterba <dsterba@suse.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 22404e0663c94d06f3b1fe6d23a86b292cc630ab
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Thu Aug 22 09:58:07 2019 +0200
+
+    ALSA: hda/realtek - Blacklist PC beep for Lenovo ThinkCentre M73/93
+    
+    [ Upstream commit 051c78af14fcd74a22b5af45548ad9d588247cc7 ]
+    
+    Lenovo ThinkCentre M73 and M93 don't seem to have a proper beep
+    although the driver tries to probe and set up blindly.
+    Blacklist these machines for suppressing the beep creation.
+    
+    BugLink: https://bugzilla.kernel.org/show_bug.cgi?id=204635
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit b54d1e51bba72256f977912b6b4197bd1494c72e
+Author: Tomas Bortoli <tomasbortoli@gmail.com>
+Date:   Wed Jul 31 12:19:05 2019 -0300
+
+    media: ttusb-dec: Fix info-leak in ttusb_dec_send_command()
+    
+    [ Upstream commit a10feaf8c464c3f9cfdd3a8a7ce17e1c0d498da1 ]
+    
+    The function at issue does not always initialize each byte allocated
+    for 'b' and can therefore leak uninitialized memory to a USB device in
+    the call to usb_bulk_msg()
+    
+    Use kzalloc() instead of kmalloc()
+    
+    Signed-off-by: Tomas Bortoli <tomasbortoli@gmail.com>
+    Reported-by: syzbot+0522702e9d67142379f1@syzkaller.appspotmail.com
+    Signed-off-by: Sean Young <sean@mess.org>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit a580cba06adc7ba60c1b3f34d26f2b681862bfd0
+Author: Kevin Easton <kevin@guarana.org>
+Date:   Wed Jul 10 13:31:38 2019 +0000
+
+    libertas: Add missing sentinel at end of if_usb.c fw_table
+    
+    [ Upstream commit 764f3f1ecffc434096e0a2b02f1a6cc964a89df6 ]
+    
+    This sentinel tells the firmware loading process when to stop.
+    
+    Reported-and-tested-by: syzbot+98156c174c5a2cad9f8f@syzkaller.appspotmail.com
+    Signed-off-by: Kevin Easton <kevin@guarana.org>
+    Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 16b6055dcbc214d63330e760e5cebad9c507df0b
+Author: Al Cooper <alcooperx@gmail.com>
+Date:   Tue Sep 3 07:51:14 2019 -0400
+
+    mmc: sdhci: Fix incorrect switch to HS mode
+    
+    [ Upstream commit c894e33ddc1910e14d6f2a2016f60ab613fd8b37 ]
+    
+    When switching from any MMC speed mode that requires 1.8v
+    (HS200, HS400 and HS400ES) to High Speed (HS) mode, the system
+    ends up configured for SDR12 with a 50MHz clock which is an illegal
+    mode.
+    
+    This happens because the SDHCI_CTRL_VDD_180 bit in the
+    SDHCI_HOST_CONTROL2 register is left set and when this bit is
+    set, the speed mode is controlled by the SDHCI_CTRL_UHS field
+    in the SDHCI_HOST_CONTROL2 register. The SDHCI_CTRL_UHS field
+    will end up being set to 0 (SDR12) by sdhci_set_uhs_signaling()
+    because there is no UHS mode being set.
+    
+    The fix is to change sdhci_set_uhs_signaling() to set the
+    SDHCI_CTRL_UHS field to SDR25 (which is the same as HS) for
+    any switch to HS mode.
+    
+    This was found on a new eMMC controller that does strict checking
+    of the speed mode and the corresponding clock rate. It caused the
+    switch to HS400 mode to fail because part of the sequence to switch
+    to HS400 requires a switch from HS200 to HS before going to HS400.
+    
+    Suggested-by: Adrian Hunter <adrian.hunter@intel.com>
+    Signed-off-by: Al Cooper <alcooperx@gmail.com>
+    Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit e328a6282d42f0924d4d75393d486a2acf48a9f1
+Author: Peter Ujfalusi <peter.ujfalusi@ti.com>
+Date:   Fri Sep 6 08:55:24 2019 +0300
+
+    ASoC: dmaengine: Make the pcm->name equal to pcm->id if the name is not set
+    
+    [ Upstream commit 2ec42f3147e1610716f184b02e65d7f493eed925 ]
+    
+    Some tools use the snd_pcm_info_get_name() to try to identify PCMs or for
+    other purposes.
+    
+    Currently it is left empty with the dmaengine-pcm, in this case copy the
+    pcm->id string as pcm->name.
+    
+    For example IGT is using this to find the HDMI PCM for testing audio on it.
+    
+    Signed-off-by: Peter Ujfalusi <peter.ujfalusi@ti.com>
+    Reported-by: Arthur She <arthur.she@linaro.org>
+    Link: https://lore.kernel.org/r/20190906055524.7393-1-peter.ujfalusi@ti.com
+    Signed-off-by: Mark Brown <broonie@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit c0505afc8a8e0ed7323c94caec9c21cac3358634
+Author: Masami Hiramatsu <mhiramat@kernel.org>
+Date:   Tue Sep 3 20:08:21 2019 +0900
+
+    kprobes: Prohibit probing on BUG() and WARN() address
+    
+    [ Upstream commit e336b4027775cb458dc713745e526fa1a1996b2a ]
+    
+    Since BUG() and WARN() may use a trap (e.g. UD2 on x86) to
+    get the address where the BUG() has occurred, kprobes can not
+    do single-step out-of-line that instruction. So prohibit
+    probing on such address.
+    
+    Without this fix, if someone put a kprobe on WARN(), the
+    kernel will crash with invalid opcode error instead of
+    outputing warning message, because kernel can not find
+    correct bug address.
+    
+    Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
+    Acked-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+    Acked-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+    Cc: Anil S Keshavamurthy <anil.s.keshavamurthy@intel.com>
+    Cc: David S . Miller <davem@davemloft.net>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Naveen N . Rao <naveen.n.rao@linux.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Steven Rostedt <rostedt@goodmis.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: https://lkml.kernel.org/r/156750890133.19112.3393666300746167111.stgit@devnote2
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 77a4084872bb4c0456263cce83f48cb2b41044e6
+Author: Peter Ujfalusi <peter.ujfalusi@ti.com>
+Date:   Fri Aug 23 15:56:14 2019 +0300
+
+    dmaengine: ti: edma: Do not reset reserved paRAM slots
+    
+    [ Upstream commit c5dbe60664b3660f5ac5854e21273ea2e7ff698f ]
+    
+    Skip resetting paRAM slots marked as reserved as they might be used by
+    other cores.
+    
+    Signed-off-by: Peter Ujfalusi <peter.ujfalusi@ti.com>
+    Link: https://lore.kernel.org/r/20190823125618.8133-2-peter.ujfalusi@ti.com
+    Signed-off-by: Vinod Koul <vkoul@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit b8c11e01be7f7fcbda697e8cf9aa1f4ec65816f6
+Author: Yufen Yu <yuyufen@huawei.com>
+Date:   Tue Sep 3 21:12:41 2019 +0800
+
+    md/raid1: fail run raid1 array when active disk less than one
+    
+    [ Upstream commit 07f1a6850c5d5a65c917c3165692b5179ac4cb6b ]
+    
+    When run test case:
+      mdadm -CR /dev/md1 -l 1 -n 4 /dev/sd[a-d] --assume-clean --bitmap=internal
+      mdadm -S /dev/md1
+      mdadm -A /dev/md1 /dev/sd[b-c] --run --force
+    
+      mdadm --zero /dev/sda
+      mdadm /dev/md1 -a /dev/sda
+    
+      echo offline > /sys/block/sdc/device/state
+      echo offline > /sys/block/sdb/device/state
+      sleep 5
+      mdadm -S /dev/md1
+    
+      echo running > /sys/block/sdb/device/state
+      echo running > /sys/block/sdc/device/state
+      mdadm -A /dev/md1 /dev/sd[a-c] --run --force
+    
+    mdadm run fail with kernel message as follow:
+    [  172.986064] md: kicking non-fresh sdb from array!
+    [  173.004210] md: kicking non-fresh sdc from array!
+    [  173.022383] md/raid1:md1: active with 0 out of 4 mirrors
+    [  173.022406] md1: failed to create bitmap (-5)
+    
+    In fact, when active disk in raid1 array less than one, we
+    need to return fail in raid1_run().
+    
+    Reviewed-by: NeilBrown <neilb@suse.de>
+    Signed-off-by: Yufen Yu <yuyufen@huawei.com>
+    Signed-off-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit a8d1f3f889226bab381d660135328ad5ce9807c7
+Author: Wang Shenran <shenran268@gmail.com>
+Date:   Wed Jul 24 11:01:10 2019 +0300
+
+    hwmon: (acpi_power_meter) Change log level for 'unsafe software power cap'
+    
+    [ Upstream commit 6e4d91aa071810deac2cd052161aefb376ecf04e ]
+    
+    At boot time, the acpi_power_meter driver logs the following error level
+    message: "Ignoring unsafe software power cap". Having read about it from
+    a few sources, it seems that the error message can be quite misleading.
+    
+    While the message can imply that Linux is ignoring the fact that the
+    system is operating in potentially dangerous conditions, the truth is
+    the driver found an ACPI_PMC object that supports software power
+    capping. The driver simply decides not to use it, perhaps because it
+    doesn't support the object.
+    
+    The best solution is probably changing the log level from error to warning.
+    All sources I have found, regarding the error, have downplayed its
+    significance. There is not much of a reason for it to be on error level,
+    while causing potential confusions or misinterpretations.
+    
+    Signed-off-by: Wang Shenran <shenran268@gmail.com>
+    Link: https://lore.kernel.org/r/20190724080110.6952-1-shenran268@gmail.com
+    Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 4bda2b79a9d04c8ba31681c66e95877dbb433416
+Author: Wenwen Wang <wenwen@cs.uga.edu>
+Date:   Fri Aug 16 00:08:27 2019 -0500
+
+    ACPI: custom_method: fix memory leaks
+    
+    [ Upstream commit 03d1571d9513369c17e6848476763ebbd10ec2cb ]
+    
+    In cm_write(), 'buf' is allocated through kzalloc(). In the following
+    execution, if an error occurs, 'buf' is not deallocated, leading to memory
+    leaks. To fix this issue, free 'buf' before returning the error.
+    
+    Fixes: 526b4af47f44 ("ACPI: Split out custom_method functionality into an own driver")
+    Signed-off-by: Wenwen Wang <wenwen@cs.uga.edu>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit bf3afb03d4d56a1e29ae71bd7d6ce4a62e757cd4
+Author: Tzvetomir Stoyanov <tstoyanov@vmware.com>
+Date:   Mon Aug 5 16:43:15 2019 -0400
+
+    libtraceevent: Change users plugin directory
+    
+    [ Upstream commit e97fd1383cd77c467d2aed7fa4e596789df83977 ]
+    
+    To be compliant with XDG user directory layout, the user's plugin
+    directory is changed from ~/.traceevent/plugins to
+    ~/.local/lib/traceevent/plugins/
+    
+    Suggested-by: Patrick McLean <chutzpah@gentoo.org>
+    Signed-off-by: Tzvetomir Stoyanov <tstoyanov@vmware.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Jiri Olsa <jolsa@redhat.com>
+    Cc: Namhyung Kim <namhyung@kernel.org>
+    Cc: Patrick McLean <chutzpah@gentoo.org>
+    Cc: linux-trace-devel@vger.kernel.org
+    Link: https://lore.kernel.org/linux-trace-devel/20190313144206.41e75cf8@patrickm/
+    Link: http://lore.kernel.org/linux-trace-devel/20190801074959.22023-4-tz.stoyanov@gmail.com
+    Link: http://lore.kernel.org/lkml/20190805204355.344622683@goodmis.org
+    Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+    Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 318e486d4ed967187b91957d1683b8e75e2b1ea6
+Author: Al Stone <ahs3@redhat.com>
+Date:   Tue Aug 27 18:21:20 2019 -0600
+
+    ACPI / CPPC: do not require the _PSD method
+    
+    [ Upstream commit 4c4cdc4c63853fee48c02e25c8605fb65a6c9924 ]
+    
+    According to the ACPI 6.3 specification, the _PSD method is optional
+    when using CPPC.  The underlying assumption is that each CPU can change
+    frequency independently from all other CPUs; _PSD is provided to tell
+    the OS that some processors can NOT do that.
+    
+    However, the acpi_get_psd() function returns ENODEV if there is no _PSD
+    method present, or an ACPI error status if an error occurs when evaluating
+    _PSD, if present.  This makes _PSD mandatory when using CPPC, in violation
+    of the specification, and only on Linux.
+    
+    This has forced some firmware writers to provide a dummy _PSD, even though
+    it is irrelevant, but only because Linux requires it; other OSPMs follow
+    the spec.  We really do not want to have OS specific ACPI tables, though.
+    
+    So, correct acpi_get_psd() so that it does not return an error if there
+    is no _PSD method present, but does return a failure when the method can
+    not be executed properly.  This allows _PSD to be optional as it should
+    be.
+    
+    Signed-off-by: Al Stone <ahs3@redhat.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 7ff7d1e7a749843920201489aaed20154eff5a15
+Author: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+Date:   Thu Aug 22 11:55:07 2019 -0300
+
+    media: ov9650: add a sanity check
+    
+    [ Upstream commit 093347abc7a4e0490e3c962ecbde2dc272a8f708 ]
+    
+    As pointed by cppcheck:
+    
+            [drivers/media/i2c/ov9650.c:706]: (error) Shifting by a negative value is undefined behaviour
+            [drivers/media/i2c/ov9650.c:707]: (error) Shifting by a negative value is undefined behaviour
+            [drivers/media/i2c/ov9650.c:721]: (error) Shifting by a negative value is undefined behaviour
+    
+    Prevent mangling with gains with invalid values.
+    
+    As pointed by Sylvester, this should never happen in practice,
+    as min value of V4L2_CID_GAIN control is 16 (gain is always >= 16
+    and m is always >= 0), but it is too hard for a static analyzer
+    to get this, as the logic with validates control min/max is
+    elsewhere inside V4L2 core.
+    
+    Reviewed-by: Sylwester Nawrocki <s.nawrocki@samsung.com>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 9dfd33530c9401ac656a3d3428e977e7cce13b99
+Author: Maciej S. Szmigiero <mail@maciej.szmigiero.name>
+Date:   Tue Aug 20 19:05:55 2019 -0300
+
+    media: saa7134: fix terminology around saa7134_i2c_eeprom_md7134_gate()
+    
+    [ Upstream commit 9d802222a3405599d6e1984d9324cddf592ea1f4 ]
+    
+    saa7134_i2c_eeprom_md7134_gate() function and the associated comment uses
+    an inverted i2c gate open / closed terminology.
+    Let's fix this.
+    
+    Signed-off-by: Maciej S. Szmigiero <mail@maciej.szmigiero.name>
+    Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+    [hverkuil-cisco@xs4all.nl: fix alignment checkpatch warning]
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit a9df2fd8e064ea6426297adf2ac78b5e4a6d2b4b
+Author: Wenwen Wang <wenwen@cs.uga.edu>
+Date:   Sat Aug 17 02:27:46 2019 -0300
+
+    media: cpia2_usb: fix memory leaks
+    
+    [ Upstream commit 1c770f0f52dca1a2323c594f01f5ec6f1dddc97f ]
+    
+    In submit_urbs(), 'cam->sbuf[i].data' is allocated through kmalloc_array().
+    However, it is not deallocated if the following allocation for urbs fails.
+    To fix this issue, free 'cam->sbuf[i].data' if usb_alloc_urb() fails.
+    
+    Signed-off-by: Wenwen Wang <wenwen@cs.uga.edu>
+    Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 70e2968f3bf2bce0abf2a2e9a9516652d035a376
+Author: Wenwen Wang <wenwen@cs.uga.edu>
+Date:   Sun Aug 18 02:40:14 2019 -0300
+
+    media: saa7146: add cleanup in hexium_attach()
+    
+    [ Upstream commit 42e64117d3b4a759013f77bbcf25ab6700e55de7 ]
+    
+    If saa7146_register_device() fails, no cleanup is executed, leading to
+    memory/resource leaks. To fix this issue, perform necessary cleanup work
+    before returning the error.
+    
+    Signed-off-by: Wenwen Wang <wenwen@cs.uga.edu>
+    Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 11b1a42a99d3ce1d59ab2d7ffa4f52b3e87bf59e
+Author: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+Date:   Thu Aug 15 10:00:33 2019 -0300
+
+    media: hdpvr: add terminating 0 at end of string
+    
+    [ Upstream commit 8b8900b729e4f31f12ac1127bde137c775c327e6 ]
+    
+    dev->usbc_buf was passed as argument for %s, but it was not safeguarded
+    by a terminating 0.
+    
+    This caused this syzbot issue:
+    
+    https://syzkaller.appspot.com/bug?extid=79d18aac4bf1770dd050
+    
+    Reported-and-tested-by: syzbot+79d18aac4bf1770dd050@syzkaller.appspotmail.com
+    
+    Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 4678cdb0851cdaee0bda3d9eb975e71613a472e7
+Author: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+Date:   Thu Aug 15 09:40:52 2019 -0300
+
+    media: radio/si470x: kill urb on error
+    
+    [ Upstream commit 0d616f2a3fdbf1304db44d451d9f07008556923b ]
+    
+    In the probe() function radio->int_in_urb was not killed if an
+    error occurred in the probe sequence. It was also missing in
+    the disconnect.
+    
+    This caused this syzbot issue:
+    
+    https://syzkaller.appspot.com/bug?extid=2d4fc2a0c45ad8da7e99
+    
+    Reported-and-tested-by: syzbot+2d4fc2a0c45ad8da7e99@syzkaller.appspotmail.com
+    
+    Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 0fc9c24adca9b54156597c69e896810b3a5b9c3d
+Author: Arnd Bergmann <arnd@arndb.de>
+Date:   Fri Aug 9 16:40:35 2019 +0200
+
+    net: lpc-enet: fix printk format strings
+    
+    [ Upstream commit de6f97b2bace0e2eb6c3a86e124d1e652a587b56 ]
+    
+    compile-testing this driver on other architectures showed
+    multiple warnings:
+    
+      drivers/net/ethernet/nxp/lpc_eth.c: In function 'lpc_eth_drv_probe':
+      drivers/net/ethernet/nxp/lpc_eth.c:1337:19: warning: format '%d' expects argument of type 'int', but argument 4 has type 'resource_size_t {aka long long unsigned int}' [-Wformat=]
+    
+      drivers/net/ethernet/nxp/lpc_eth.c:1342:19: warning: format '%x' expects argument of type 'unsigned int', but argument 4 has type 'dma_addr_t {aka long long unsigned int}' [-Wformat=]
+    
+    Use format strings that work on all architectures.
+    
+    Link: https://lore.kernel.org/r/20190809144043.476786-10-arnd@arndb.de
+    Reported-by: kbuild test robot <lkp@intel.com>
+    Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit f39c1742f807389f1932ea2a74d70757b72ffd91
+Author: Sakari Ailus <sakari.ailus@linux.intel.com>
+Date:   Wed Aug 7 11:21:27 2019 -0300
+
+    media: omap3isp: Don't set streaming state on random subdevs
+    
+    [ Upstream commit 7ef57be07ac146e70535747797ef4aee0f06e9f9 ]
+    
+    The streaming state should be set to the first upstream sub-device only,
+    not everywhere, for a sub-device driver itself knows how to best control
+    the streaming state of its own upstream sub-devices.
+    
+    Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+    Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 89052e706600df609299bbf6e33297da705e97c8
+Author: Arnd Bergmann <arnd@arndb.de>
+Date:   Fri Aug 9 18:33:17 2019 +0200
+
+    dmaengine: iop-adma: use correct printk format strings
+    
+    [ Upstream commit 00c9755524fbaa28117be774d7c92fddb5ca02f3 ]
+    
+    When compile-testing on other architectures, we get lots of warnings
+    about incorrect format strings, like:
+    
+       drivers/dma/iop-adma.c: In function 'iop_adma_alloc_slots':
+       drivers/dma/iop-adma.c:307:6: warning: format '%x' expects argument of type 'unsigned int', but argument 6 has type 'dma_addr_t {aka long long unsigned int}' [-Wformat=]
+    
+       drivers/dma/iop-adma.c: In function 'iop_adma_prep_dma_memcpy':
+    >> drivers/dma/iop-adma.c:518:40: warning: format '%u' expects argument of type 'unsigned int', but argument 5 has type 'size_t {aka long unsigned int}' [-Wformat=]
+    
+    Use %zu for printing size_t as required, and cast the dma_addr_t
+    arguments to 'u64' for printing with %llx. Ideally this should use
+    the %pad format string, but that requires an lvalue argument that
+    doesn't work here.
+    
+    Link: https://lore.kernel.org/r/20190809163334.489360-3-arnd@arndb.de
+    Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+    Acked-by: Vinod Koul <vkoul@kernel.org>
+    Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 3553e7fb0b9ca279c78ffebbf38c2b313f1221f1
+Author: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+Date:   Fri Aug 16 03:38:13 2019 -0300
+
+    media: gspca: zero usb_buf on error
+    
+    [ Upstream commit 4843a543fad3bf8221cf14e5d5f32d15cee89e84 ]
+    
+    If reg_r() fails, then gspca_dev->usb_buf was left uninitialized,
+    and some drivers used the contents of that buffer in logic.
+    
+    This caused several syzbot errors:
+    
+    https://syzkaller.appspot.com/bug?extid=397fd082ce5143e2f67d
+    https://syzkaller.appspot.com/bug?extid=1a35278dd0ebfb3a038a
+    https://syzkaller.appspot.com/bug?extid=06ddf1788cfd048c5e82
+    
+    I analyzed the gspca drivers and zeroed the buffer where needed.
+    
+    Reported-and-tested-by: syzbot+1a35278dd0ebfb3a038a@syzkaller.appspotmail.com
+    Reported-and-tested-by: syzbot+397fd082ce5143e2f67d@syzkaller.appspotmail.com
+    Reported-and-tested-by: syzbot+06ddf1788cfd048c5e82@syzkaller.appspotmail.com
+    
+    Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit f39d3370a3e4c59eb4ae5ea387d6ea623e7a026a
+Author: Xiaofei Tan <tanxiaofei@huawei.com>
+Date:   Fri Jul 26 09:43:37 2019 +0800
+
+    efi: cper: print AER info of PCIe fatal error
+    
+    [ Upstream commit b194a77fcc4001dc40aecdd15d249648e8a436d1 ]
+    
+    AER info of PCIe fatal error is not printed in the current driver.
+    Because APEI driver will panic directly for fatal error, and can't
+    run to the place of printing AER info.
+    
+    An example log is as following:
+    {763}[Hardware Error]: Hardware error from APEI Generic Hardware Error Source: 11
+    {763}[Hardware Error]: event severity: fatal
+    {763}[Hardware Error]:  Error 0, type: fatal
+    {763}[Hardware Error]:   section_type: PCIe error
+    {763}[Hardware Error]:   port_type: 0, PCIe end point
+    {763}[Hardware Error]:   version: 4.0
+    {763}[Hardware Error]:   command: 0x0000, status: 0x0010
+    {763}[Hardware Error]:   device_id: 0000:82:00.0
+    {763}[Hardware Error]:   slot: 0
+    {763}[Hardware Error]:   secondary_bus: 0x00
+    {763}[Hardware Error]:   vendor_id: 0x8086, device_id: 0x10fb
+    {763}[Hardware Error]:   class_code: 000002
+    Kernel panic - not syncing: Fatal hardware error!
+    
+    This issue was imported by the patch, '37448adfc7ce ("aerdrv: Move
+    cper_print_aer() call out of interrupt context")'. To fix this issue,
+    this patch adds print of AER info in cper_print_pcie() for fatal error.
+    
+    Here is the example log after this patch applied:
+    {24}[Hardware Error]: Hardware error from APEI Generic Hardware Error Source: 10
+    {24}[Hardware Error]: event severity: fatal
+    {24}[Hardware Error]:  Error 0, type: fatal
+    {24}[Hardware Error]:   section_type: PCIe error
+    {24}[Hardware Error]:   port_type: 0, PCIe end point
+    {24}[Hardware Error]:   version: 4.0
+    {24}[Hardware Error]:   command: 0x0546, status: 0x4010
+    {24}[Hardware Error]:   device_id: 0000:01:00.0
+    {24}[Hardware Error]:   slot: 0
+    {24}[Hardware Error]:   secondary_bus: 0x00
+    {24}[Hardware Error]:   vendor_id: 0x15b3, device_id: 0x1019
+    {24}[Hardware Error]:   class_code: 000002
+    {24}[Hardware Error]:   aer_uncor_status: 0x00040000, aer_uncor_mask: 0x00000000
+    {24}[Hardware Error]:   aer_uncor_severity: 0x00062010
+    {24}[Hardware Error]:   TLP Header: 000000c0 01010000 00000001 00000000
+    Kernel panic - not syncing: Fatal hardware error!
+    
+    Fixes: 37448adfc7ce ("aerdrv: Move cper_print_aer() call out of interrupt context")
+    Signed-off-by: Xiaofei Tan <tanxiaofei@huawei.com>
+    Reviewed-by: James Morse <james.morse@arm.com>
+    [ardb: put parens around terms of && operator]
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 6b544c54638b36610c5154ebf8243124f10f6aa5
+Author: Guoqing Jiang <jgq516@gmail.com>
+Date:   Wed Jul 24 11:09:20 2019 +0200
+
+    md: don't set In_sync if array is frozen
+    
+    [ Upstream commit 062f5b2ae12a153644c765e7ba3b0f825427be1d ]
+    
+    When a disk is added to array, the following path is called in mdadm.
+    
+    Manage_subdevs -> sysfs_freeze_array
+                   -> Manage_add
+                   -> sysfs_set_str(&info, NULL, "sync_action","idle")
+    
+    Then from kernel side, Manage_add invokes the path (add_new_disk ->
+    validate_super = super_1_validate) to set In_sync flag.
+    
+    Since In_sync means "device is in_sync with rest of array", and the new
+    added disk need to resync thread to help the synchronization of data.
+    And md_reap_sync_thread would call spare_active to set In_sync for the
+    new added disk finally. So don't set In_sync if array is in frozen.
+    
+    Signed-off-by: Guoqing Jiang <guoqing.jiang@cloud.ionos.com>
+    Signed-off-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 6809adb82cea49a131ee6de36c45950b11821dc5
+Author: Guoqing Jiang <jgq516@gmail.com>
+Date:   Wed Jul 24 11:09:21 2019 +0200
+
+    md: don't call spare_active in md_reap_sync_thread if all member devices can't work
+    
+    [ Upstream commit 0d8ed0e9bf9643f27f4816dca61081784dedb38d ]
+    
+    When add one disk to array, the md_reap_sync_thread is responsible
+    to activate the spare and set In_sync flag for the new member in
+    spare_active().
+    
+    But if raid1 has one member disk A, and disk B is added to the array.
+    Then we offline A before all the datas are synchronized from A to B,
+    obviously B doesn't have the latest data as A, but B is still marked
+    with In_sync flag.
+    
+    So let's not call spare_active under the condition, otherwise B is
+    still showed with 'U' state which is not correct.
+    
+    Signed-off-by: Guoqing Jiang <guoqing.jiang@cloud.ionos.com>
+    Signed-off-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 41330a743f732efd431b00244479cd83ca747486
+Author: chenzefeng <chenzefeng2@huawei.com>
+Date:   Tue Aug 6 15:46:33 2019 +0800
+
+    ia64:unwind: fix double free for mod->arch.init_unw_table
+    
+    [ Upstream commit c5e5c48c16422521d363c33cfb0dcf58f88c119b ]
+    
+    The function free_module in file kernel/module.c as follow:
+    
+    void free_module(struct module *mod) {
+            ......
+            module_arch_cleanup(mod);
+            ......
+            module_arch_freeing_init(mod);
+            ......
+    }
+    
+    Both module_arch_cleanup and module_arch_freeing_init function
+    would free the mod->arch.init_unw_table, which cause double free.
+    
+    Here, set mod->arch.init_unw_table = NULL after remove the unwind
+    table to avoid double free.
+    
+    Signed-off-by: chenzefeng <chenzefeng2@huawei.com>
+    Signed-off-by: Tony Luck <tony.luck@intel.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 9812dc6f0db6ba42f4ca4037cd7ff005531694f1
+Author: Ard van Breemen <ard@kwaak.net>
+Date:   Fri Aug 2 13:52:14 2019 +0200
+
+    ALSA: usb-audio: Skip bSynchAddress endpoint check if it is invalid
+    
+    [ Upstream commit 1b34121d9f26d272b0b2334209af6b6fc82d4bf1 ]
+    
+    The Linux kernel assumes that get_endpoint(alts,0) and
+    get_endpoint(alts,1) are eachothers feedback endpoints.
+    To reassure that validity it will test bsynchaddress to comply with that
+    assumption. But if the bsyncaddress is 0 (invalid), it will flag that as
+    a wrong assumption and return an error.
+    Fix: Skip the test if bSynchAddress is 0.
+    Note: those with a valid bSynchAddress should have a code quirck added.
+    
+    Signed-off-by: Ard van Breemen <ard@kwaak.net>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit fe120e1253bc81e0914ad8e7e21aebca3f8ee8c1
+Author: Vinod Koul <vkoul@kernel.org>
+Date:   Wed Jul 24 04:05:12 2019 +0530
+
+    base: soc: Export soc_device_register/unregister APIs
+    
+    [ Upstream commit f7ccc7a397cf2ef64aebb2f726970b93203858d2 ]
+    
+    Qcom Socinfo driver can be built as a module, so
+    export these two APIs.
+    
+    Tested-by: Vinod Koul <vkoul@kernel.org>
+    Signed-off-by: Vinod Koul <vkoul@kernel.org>
+    Signed-off-by: Vaishali Thakkar <vaishali.thakkar@linaro.org>
+    Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Reviewed-by: Stephen Boyd <swboyd@chromium.org>
+    Reviewed-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+    Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit a8d7151b7f3a6bee52ee17e690ca5f1f74684ff3
+Author: Oliver Neukum <oneukum@suse.com>
+Date:   Tue Jul 30 05:50:44 2019 -0300
+
+    media: iguanair: add sanity checks
+    
+    [ Upstream commit ab1cbdf159beba7395a13ab70bc71180929ca064 ]
+    
+    The driver needs to check the endpoint types, too, as opposed
+    to the number of endpoints. This also requires moving the check earlier.
+    
+    Reported-by: syzbot+01a77b82edaa374068e1@syzkaller.appspotmail.com
+    Signed-off-by: Oliver Neukum <oneukum@suse.com>
+    Signed-off-by: Sean Young <sean@mess.org>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 9916480fc2b674b47968bf3b0f5f490b2805548e
+Author: Jia-Ju Bai <baijiaju1990@gmail.com>
+Date:   Fri Jul 26 10:14:42 2019 +0800
+
+    ALSA: i2c: ak4xxx-adda: Fix a possible null pointer dereference in build_adc_controls()
+    
+    [ Upstream commit 2127c01b7f63b06a21559f56a8c81a3c6535bd1a ]
+    
+    In build_adc_controls(), there is an if statement on line 773 to check
+    whether ak->adc_info is NULL:
+        if (! ak->adc_info ||
+            ! ak->adc_info[mixer_ch].switch_name)
+    
+    When ak->adc_info is NULL, it is used on line 792:
+        knew.name = ak->adc_info[mixer_ch].selector_name;
+    
+    Thus, a possible null-pointer dereference may occur.
+    
+    To fix this bug, referring to lines 773 and 774, ak->adc_info
+    and ak->adc_info[mixer_ch].selector_name are checked before being used.
+    
+    This bug is found by a static analysis tool STCheck written by us.
+    
+    Signed-off-by: Jia-Ju Bai <baijiaju1990@gmail.com>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit c5f680b2ca2c6708052db733af90bc5a61a59065
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Fri Jul 26 11:42:34 2019 +0200
+
+    ALSA: hda - Show the fatal CORB/RIRB error more clearly
+    
+    [ Upstream commit dd65f7e19c6961ba6a69f7c925021b7a270cb950 ]
+    
+    The last fallback of CORB/RIRB communication error recovery is to turn
+    on the single command mode, and this last resort usually means that
+    something is really screwed up.  Instead of a normal dev_err(), show
+    the error more clearly with dev_WARN() with the caller stack trace.
+    
+    Also, show the bus-reset fallback also as an error, too.
+    
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 3b6cccf414ac23606aaa68e43392be52493eb279
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon Jul 22 20:47:08 2019 +0200
+
+    x86/apic: Soft disable APIC before initializing it
+    
+    [ Upstream commit 2640da4cccf5cc613bf26f0998b9e340f4b5f69c ]
+    
+    If the APIC was already enabled on entry of setup_local_APIC() then
+    disabling it soft via the SPIV register makes a lot of sense.
+    
+    That masks all LVT entries and brings it into a well defined state.
+    
+    Otherwise previously enabled LVTs which are not touched in the setup
+    function stay unmasked and might surprise the just booting kernel.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Link: https://lkml.kernel.org/r/20190722105219.068290579@linutronix.de
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 03b8c7430457993761da4b1f5e54a1a56cf7a4b0
+Author: Grzegorz Halat <ghalat@redhat.com>
+Date:   Fri Jun 28 14:28:13 2019 +0200
+
+    x86/reboot: Always use NMI fallback when shutdown via reboot vector IPI fails
+    
+    [ Upstream commit 747d5a1bf293dcb33af755a6d285d41b8c1ea010 ]
+    
+    A reboot request sends an IPI via the reboot vector and waits for all other
+    CPUs to stop. If one or more CPUs are in critical regions with interrupts
+    disabled then the IPI is not handled on those CPUs and the shutdown hangs
+    if native_stop_other_cpus() is called with the wait argument set.
+    
+    Such a situation can happen when one CPU was stopped within a lock held
+    section and another CPU is trying to acquire that lock with interrupts
+    disabled. There are other scenarios which can cause such a lockup as well.
+    
+    In theory the shutdown should be attempted by an NMI IPI after the timeout
+    period elapsed. Though the wait loop after sending the reboot vector IPI
+    prevents this. It checks the wait request argument and the timeout. If wait
+    is set, which is true for sys_reboot() then it won't fall through to the
+    NMI shutdown method after the timeout period has finished.
+    
+    This was an oversight when the NMI shutdown mechanism was added to handle
+    the 'reboot IPI is not working' situation. The mechanism was added to deal
+    with stuck panic shutdowns, which do not have the wait request set, so the
+    'wait request' case was probably not considered.
+    
+    Remove the wait check from the post reboot vector IPI wait loop and enforce
+    that the wait loop in the NMI fallback path is invoked even if NMI IPIs are
+    disabled or the registration of the NMI handler fails. That second wait
+    loop will then hang if not all CPUs shutdown and the wait argument is set.
+    
+    [ tglx: Avoid the hard to parse line break in the NMI fallback path,
+            add comments and massage the changelog ]
+    
+    Fixes: 7d007d21e539 ("x86/reboot: Use NMI to assist in shutting down if IRQ fails")
+    Signed-off-by: Grzegorz Halat <ghalat@redhat.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Don Zickus <dzickus@redhat.com>
+    Link: https://lkml.kernel.org/r/20190628122813.15500-1-ghalat@redhat.com
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 5043f2cf144aa92ce04bcf88d4f7e217439eab72
+Author: Juri Lelli <juri.lelli@redhat.com>
+Date:   Fri Jul 19 08:34:55 2019 +0200
+
+    sched/core: Fix CPU controller for !RT_GROUP_SCHED
+    
+    [ Upstream commit a07db5c0865799ebed1f88be0df50c581fb65029 ]
+    
+    On !CONFIG_RT_GROUP_SCHED configurations it is currently not possible to
+    move RT tasks between cgroups to which CPU controller has been attached;
+    but it is oddly possible to first move tasks around and then make them
+    RT (setschedule to FIFO/RR).
+    
+    E.g.:
+    
+      # mkdir /sys/fs/cgroup/cpu,cpuacct/group1
+      # chrt -fp 10 $$
+      # echo $$ > /sys/fs/cgroup/cpu,cpuacct/group1/tasks
+      bash: echo: write error: Invalid argument
+      # chrt -op 0 $$
+      # echo $$ > /sys/fs/cgroup/cpu,cpuacct/group1/tasks
+      # chrt -fp 10 $$
+      # cat /sys/fs/cgroup/cpu,cpuacct/group1/tasks
+      2345
+      2598
+      # chrt -p 2345
+      pid 2345's current scheduling policy: SCHED_FIFO
+      pid 2345's current scheduling priority: 10
+    
+    Also, as Michal noted, it is currently not possible to enable CPU
+    controller on unified hierarchy with !CONFIG_RT_GROUP_SCHED (if there
+    are any kernel RT threads in root cgroup, they can't be migrated to the
+    newly created CPU controller's root in cgroup_update_dfl_csses()).
+    
+    Existing code comes with a comment saying the "we don't support RT-tasks
+    being in separate groups". Such comment is however stale and belongs to
+    pre-RT_GROUP_SCHED times. Also, it doesn't make much sense for
+    !RT_GROUP_ SCHED configurations, since checks related to RT bandwidth
+    are not performed at all in these cases.
+    
+    Make moving RT tasks between CPU controller groups viable by removing
+    special case check for RT (and DEADLINE) tasks.
+    
+    Signed-off-by: Juri Lelli <juri.lelli@redhat.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Reviewed-by: Michal Koutný <mkoutny@suse.com>
+    Reviewed-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+    Acked-by: Tejun Heo <tj@kernel.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: lizefan@huawei.com
+    Cc: longman@redhat.com
+    Cc: luca.abeni@santannapisa.it
+    Cc: rostedt@goodmis.org
+    Link: https://lkml.kernel.org/r/20190719063455.27328-1-juri.lelli@redhat.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 5da394bd2dc1679d52f0e0d9f220739b9a404741
+Author: Vincent Guittot <vincent.guittot@linaro.org>
+Date:   Mon Jul 1 17:47:02 2019 +0200
+
+    sched/fair: Fix imbalance due to CPU affinity
+    
+    [ Upstream commit f6cad8df6b30a5d2bbbd2e698f74b4cafb9fb82b ]
+    
+    The load_balance() has a dedicated mecanism to detect when an imbalance
+    is due to CPU affinity and must be handled at parent level. In this case,
+    the imbalance field of the parent's sched_group is set.
+    
+    The description of sg_imbalanced() gives a typical example of two groups
+    of 4 CPUs each and 4 tasks each with a cpumask covering 1 CPU of the first
+    group and 3 CPUs of the second group. Something like:
+    
+            { 0 1 2 3 } { 4 5 6 7 }
+                    *     * * *
+    
+    But the load_balance fails to fix this UC on my octo cores system
+    made of 2 clusters of quad cores.
+    
+    Whereas the load_balance is able to detect that the imbalanced is due to
+    CPU affinity, it fails to fix it because the imbalance field is cleared
+    before letting parent level a chance to run. In fact, when the imbalance is
+    detected, the load_balance reruns without the CPU with pinned tasks. But
+    there is no other running tasks in the situation described above and
+    everything looks balanced this time so the imbalance field is immediately
+    cleared.
+    
+    The imbalance field should not be cleared if there is no other task to move
+    when the imbalance is detected.
+    
+    Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: https://lkml.kernel.org/r/1561996022-28829-1-git-send-email-vincent.guittot@linaro.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 84a6dd572b18177bc66dd90b4a865eb3f8c0a1c0
+Author: Luke Nowakowski-Krijger <lnowakow@eng.ucsd.edu>
+Date:   Wed Jul 17 10:19:46 2019 -0400
+
+    media: hdpvr: Add device num check and handling
+    
+    [ Upstream commit d4a6a9537bc32811486282206ecfb7c53754b74d ]
+    
+    Add hdpvr device num check and error handling
+    
+    We need to increment the device count atomically before we checkout a
+    device to make sure that we do not reach the max count, otherwise we get
+    out-of-bounds errors as reported by syzbot.
+    
+    Reported-and-tested-by: syzbot+aac8d0d7205f112045d2@syzkaller.appspotmail.com
+    
+    Signed-off-by: Luke Nowakowski-Krijger <lnowakow@eng.ucsd.edu>
+    Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 78335bc692d72f54348e95ee62e1942401faf995
+Author: Arnd Bergmann <arnd@arndb.de>
+Date:   Fri Jun 28 08:14:53 2019 -0400
+
+    media: dib0700: fix link error for dibx000_i2c_set_speed
+    
+    [ Upstream commit 765bb8610d305ee488b35d07e2a04ae52fb2df9c ]
+    
+    When CONFIG_DVB_DIB9000 is disabled, we can still compile code that
+    now fails to link against dibx000_i2c_set_speed:
+    
+    drivers/media/usb/dvb-usb/dib0700_devices.o: In function `dib01x0_pmu_update.constprop.7':
+    dib0700_devices.c:(.text.unlikely+0x1c9c): undefined reference to `dibx000_i2c_set_speed'
+    
+    The call sites are both through dib01x0_pmu_update(), which gets passed
+    an 'i2c' pointer from dib9000_get_i2c_master(), which has returned
+    NULL. Checking this pointer seems to be a good idea anyway, and it avoids
+    the link failure in most cases.
+    
+    Sean Young found another case that is not fixed by that, where certain
+    gcc versions leave an unused function in place that causes the link error,
+    but adding an explict IS_ENABLED() check also solves this.
+    
+    Fixes: b7f54910ce01 ("V4L/DVB (4647): Added module for DiB0700 based devices")
+    Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+    Signed-off-by: Sean Young <sean@mess.org>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 28b772b6890184b5de673230be6991402f6d05c4
+Author: Nick Stoughton <nstoughton@logitech.com>
+Date:   Wed Jul 17 14:56:06 2019 -0700
+
+    leds: leds-lp5562 allow firmware files up to the maximum length
+    
+    [ Upstream commit ed2abfebb041473092b41527903f93390d38afa7 ]
+    
+    Firmware files are in ASCII, using 2 hex characters per byte. The
+    maximum length of a firmware string is therefore
+    
+    16 (commands) * 2 (bytes per command) * 2 (characters per byte) = 64
+    
+    Fixes: ff45262a85db ("leds: add new LP5562 LED driver")
+    Signed-off-by: Nick Stoughton <nstoughton@logitech.com>
+    Acked-by: Pavel Machek <pavel@ucw.cz>
+    Signed-off-by: Jacek Anaszewski <jacek.anaszewski@gmail.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 2989ee3412b7135b8362a0cc1ae30d6dd31e61d4
+Author: Stefan Wahren <wahrenst@gmx.net>
+Date:   Tue Jul 16 19:15:18 2019 +0200
+
+    dmaengine: bcm2835: Print error in case setting DMA mask fails
+    
+    [ Upstream commit 72503b25ee363827aafffc3e8d872e6a92a7e422 ]
+    
+    During enabling of the RPi 4, we found out that the driver doesn't provide
+    a helpful error message in case setting DMA mask fails. So add one.
+    
+    Signed-off-by: Stefan Wahren <wahrenst@gmx.net>
+    Link: https://lore.kernel.org/r/1563297318-4900-1-git-send-email-wahrenst@gmx.net
+    Signed-off-by: Vinod Koul <vkoul@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit ae6be6302e18dea7df8a61634f89d91c4abb986a
+Author: Oleksandr Suvorov <oleksandr.suvorov@toradex.com>
+Date:   Fri Jul 19 10:05:37 2019 +0000
+
+    ASoC: sgtl5000: Fix charge pump source assignment
+    
+    [ Upstream commit b6319b061ba279577fd7030a9848fbd6a17151e3 ]
+    
+    If VDDA != VDDIO and any of them is greater than 3.1V, charge pump
+    source can be assigned automatically [1].
+    
+    [1] https://www.nxp.com/docs/en/data-sheet/SGTL5000.pdf
+    
+    Signed-off-by: Oleksandr Suvorov <oleksandr.suvorov@toradex.com>
+    Reviewed-by: Marcel Ziswiler <marcel.ziswiler@toradex.com>
+    Reviewed-by: Igor Opaniuk <igor.opaniuk@toradex.com>
+    Reviewed-by: Fabio Estevam <festevam@gmail.com>
+    Link: https://lore.kernel.org/r/20190719100524.23300-7-oleksandr.suvorov@toradex.com
+    Signed-off-by: Mark Brown <broonie@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit f49a9f57ed39b6bc75649764785a6173b910e553
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Sat Jul 20 12:33:37 2019 +0100
+
+    ALSA: hda: Flush interrupts on disabling
+    
+    [ Upstream commit caa8422d01e983782548648e125fd617cadcec3f ]
+    
+    I was looking at
+    
+    <4> [241.835158] general protection fault: 0000 [#1] PREEMPT SMP PTI
+    <4> [241.835181] CPU: 1 PID: 214 Comm: kworker/1:3 Tainted: G     U            5.2.0-CI-CI_DRM_6509+ #1
+    <4> [241.835199] Hardware name: Dell Inc.                 OptiPlex 745                 /0GW726, BIOS 2.3.1  05/21/2007
+    <4> [241.835234] Workqueue: events snd_hdac_bus_process_unsol_events [snd_hda_core]
+    <4> [241.835256] RIP: 0010:input_handle_event+0x16d/0x5e0
+    <4> [241.835270] Code: 48 8b 93 58 01 00 00 8b 52 08 89 50 04 8b 83 f8 06 00 00 48 8b 93 00 07 00 00 8d 70 01 48 8d 04 c2 83 e1 08 89 b3 f8 06 00 00 <66> 89 28 66 44 89 60 02 44 89 68 04 8b 93 f8 06 00 00 0f 84 fd fe
+    <4> [241.835304] RSP: 0018:ffffc9000019fda0 EFLAGS: 00010046
+    <4> [241.835317] RAX: 6b6b6b6ec6c6c6c3 RBX: ffff8880290fefc8 RCX: 0000000000000000
+    <4> [241.835332] RDX: 000000006b6b6b6b RSI: 000000006b6b6b6c RDI: 0000000000000046
+    <4> [241.835347] RBP: 0000000000000005 R08: 0000000000000000 R09: 0000000000000001
+    <4> [241.835362] R10: ffffc9000019faa0 R11: 0000000000000000 R12: 0000000000000004
+    <4> [241.835377] R13: 0000000000000000 R14: ffff8880290ff1d0 R15: 0000000000000293
+    <4> [241.835392] FS:  0000000000000000(0000) GS:ffff88803de80000(0000) knlGS:0000000000000000
+    <4> [241.835409] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    <4> [241.835422] CR2: 00007ffe9a99e9b7 CR3: 000000002f588000 CR4: 00000000000006e0
+    <4> [241.835436] Call Trace:
+    <4> [241.835449]  input_event+0x45/0x70
+    <4> [241.835464]  snd_jack_report+0xdc/0x100
+    <4> [241.835490]  snd_hda_jack_report_sync+0x83/0xc0 [snd_hda_codec]
+    <4> [241.835512]  snd_hdac_bus_process_unsol_events+0x5a/0x70 [snd_hda_core]
+    <4> [241.835530]  process_one_work+0x245/0x610
+    
+    which has the hallmarks of a worker queued from interrupt after it was
+    supposedly cancelled (note the POISON_FREE), and I could not see where
+    the interrupt would be flushed on shutdown so added the likely suspects.
+    
+    Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=111174
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 001ff467264f3e51c8bb18de5cbe62e91d05cfc5
+Author: Ori Nimron <orinimron123@gmail.com>
+Date:   Fri Sep 20 09:35:49 2019 +0200
+
+    nfc: enforce CAP_NET_RAW for raw sockets
+    
+    [ Upstream commit 3a359798b176183ef09efb7a3dc59abad1cc7104 ]
+    
+    When creating a raw AF_NFC socket, CAP_NET_RAW needs to be checked
+    first.
+    
+    Signed-off-by: Ori Nimron <orinimron123@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a279cd311c1e3870de25fe48e948487b4785e9cd
+Author: Ori Nimron <orinimron123@gmail.com>
+Date:   Fri Sep 20 09:35:48 2019 +0200
+
+    ieee802154: enforce CAP_NET_RAW for raw sockets
+    
+    [ Upstream commit e69dbd4619e7674c1679cba49afd9dd9ac347eef ]
+    
+    When creating a raw AF_IEEE802154 socket, CAP_NET_RAW needs to be
+    checked first.
+    
+    Signed-off-by: Ori Nimron <orinimron123@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Acked-by: Stefan Schmidt <stefan@datenfreihafen.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit c15d89b5cb86dfcdee536d093ece512091ed6e5c
+Author: Ori Nimron <orinimron123@gmail.com>
+Date:   Fri Sep 20 09:35:47 2019 +0200
+
+    ax25: enforce CAP_NET_RAW for raw sockets
+    
+    [ Upstream commit 0614e2b73768b502fc32a75349823356d98aae2c ]
+    
+    When creating a raw AF_AX25 socket, CAP_NET_RAW needs to be checked
+    first.
+    
+    Signed-off-by: Ori Nimron <orinimron123@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ec1e04b8979464990e000850d14d3e562999a82d
+Author: Ori Nimron <orinimron123@gmail.com>
+Date:   Fri Sep 20 09:35:46 2019 +0200
+
+    appletalk: enforce CAP_NET_RAW for raw sockets
+    
+    [ Upstream commit 6cc03e8aa36c51f3b26a0d21a3c4ce2809c842ac ]
+    
+    When creating a raw AF_APPLETALK socket, CAP_NET_RAW needs to be checked
+    first.
+    
+    Signed-off-by: Ori Nimron <orinimron123@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a03818269bfbc2ff6d25e3e44eb2247df53648ca
+Author: Ori Nimron <orinimron123@gmail.com>
+Date:   Fri Sep 20 09:35:45 2019 +0200
+
+    mISDN: enforce CAP_NET_RAW for raw sockets
+    
+    [ Upstream commit b91ee4aa2a2199ba4d4650706c272985a5a32d80 ]
+    
+    When creating a raw AF_ISDN socket, CAP_NET_RAW needs to be checked
+    first.
+    
+    Signed-off-by: Ori Nimron <orinimron123@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a4d63b4102316eb10cc1bf37274d50a4d4f8962c
+Author: Oliver Neukum <oneukum@suse.com>
+Date:   Thu Sep 19 10:23:08 2019 +0200
+
+    usbnet: sanity checking of packet sizes and device mtu
+    
+    [ Upstream commit 280ceaed79f18db930c0cc8bb21f6493490bf29c ]
+    
+    After a reset packet sizes and device mtu can change and need
+    to be reevaluated to calculate queue sizes.
+    Malicious devices can set this to zero and we divide by it.
+    Introduce sanity checking.
+    
+    Reported-and-tested-by:  syzbot+6102c120be558c885f04@syzkaller.appspotmail.com
+    Signed-off-by: Oliver Neukum <oneukum@suse.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 608557096364a7307467e3f5b005630dd2835f3e
+Author: Bjørn Mork <bjorn@mork.no>
+Date:   Wed Sep 18 14:17:38 2019 +0200
+
+    usbnet: ignore endpoints with invalid wMaxPacketSize
+    
+    [ Upstream commit 8d3d7c2029c1b360f1a6b0a2fca470b57eb575c0 ]
+    
+    Endpoints with zero wMaxPacketSize are not usable for transferring
+    data. Ignore such endpoints when looking for valid in, out and
+    status pipes, to make the drivers more robust against invalid and
+    meaningless descriptors.
+    
+    The wMaxPacketSize of these endpoints are used for memory allocations
+    and as divisors in many usbnet minidrivers. Avoiding zero is therefore
+    critical.
+    
+    Signed-off-by: Bjørn Mork <bjorn@mork.no>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 2a7604cde62bdebaec8cc2e487349ed47dabb8a0
+Author: Stephen Hemminger <stephen@networkplumber.org>
+Date:   Fri Sep 20 18:18:26 2019 +0200
+
+    skge: fix checksum byte order
+    
+    [ Upstream commit 5aafeb74b5bb65b34cc87c7623f9fa163a34fa3b ]
+    
+    Running old skge driver on PowerPC causes checksum errors
+    because hardware reported 1's complement checksum is in little-endian
+    byte order.
+    
+    Reported-by: Benoit <benoit.sansoni@gmail.com>
+    Signed-off-by: Stephen Hemminger <stephen@networkplumber.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9601d33226baf4155960ea24a164b584e9c38ef2
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Wed Sep 18 08:05:39 2019 -0700
+
+    sch_netem: fix a divide by zero in tabledist()
+    
+    [ Upstream commit b41d936b5ecfdb3a4abc525ce6402a6c49cffddc ]
+    
+    syzbot managed to crash the kernel in tabledist() loading
+    an empty distribution table.
+    
+            t = dist->table[rnd % dist->size];
+    
+    Simply return an error when such load is attempted.
+    
+    Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Reported-by: syzbot <syzkaller@googlegroups.com>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 4c8afdc16e45c49656cc66981f5c30ac0baf69a8
+Author: Li RongQing <lirongqing@baidu.com>
+Date:   Tue Sep 24 19:11:52 2019 +0800
+
+    openvswitch: change type of UPCALL_PID attribute to NLA_UNSPEC
+    
+    [ Upstream commit ea8564c865299815095bebeb4b25bef474218e4c ]
+    
+    userspace openvswitch patch "(dpif-linux: Implement the API
+    functions to allow multiple handler threads read upcall)"
+    changes its type from U32 to UNSPEC, but leave the kernel
+    unchanged
+    
+    and after kernel 6e237d099fac "(netlink: Relax attr validation
+    for fixed length types)", this bug is exposed by the below
+    warning
+    
+            [   57.215841] netlink: 'ovs-vswitchd': attribute type 5 has an invalid length.
+    
+    Fixes: 5cd667b0a456 ("openvswitch: Allow each vport to have an array of 'port_id's")
+    Signed-off-by: Li RongQing <lirongqing@baidu.com>
+    Acked-by: Pravin B Shelar <pshelar@ovn.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit cecefdab590bc58c9304a2b9c1275d981e267251
+Author: Peter Mamonov <pmamonov@gmail.com>
+Date:   Wed Sep 18 19:27:55 2019 +0300
+
+    net/phy: fix DP83865 10 Mbps HDX loopback disable function
+    
+    [ Upstream commit e47488b2df7f9cb405789c7f5d4c27909fc597ae ]
+    
+    According to the DP83865 datasheet "the 10 Mbps HDX loopback can be
+    disabled in the expanded memory register 0x1C0.1". The driver erroneously
+    used bit 0 instead of bit 1.
+    
+    Fixes: 4621bf129856 ("phy: Add file missed in previous commit.")
+    Signed-off-by: Peter Mamonov <pmamonov@gmail.com>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit b5f703829cf6bd81275a7a3ca31b3902f0a0f171
+Author: Bjørn Mork <bjorn@mork.no>
+Date:   Wed Sep 18 14:01:46 2019 +0200
+
+    cdc_ncm: fix divide-by-zero caused by invalid wMaxPacketSize
+    
+    [ Upstream commit 3fe4b3351301660653a2bc73f2226da0ebd2b95e ]
+    
+    Endpoints with zero wMaxPacketSize are not usable for transferring
+    data. Ignore such endpoints when looking for valid in, out and
+    status pipes, to make the driver more robust against invalid and
+    meaningless descriptors.
+    
+    The wMaxPacketSize of the out pipe is used as divisor. So this change
+    fixes a divide-by-zero bug.
+    
+    Reported-by: syzbot+ce366e2b8296e25d84f5@syzkaller.appspotmail.com
+    Signed-off-by: Bjørn Mork <bjorn@mork.no>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit d7065a5e68efd4ed633ccd8d2333f067e2e51101
+Author: Uwe Kleine-König <u.kleine-koenig@pengutronix.de>
+Date:   Fri Sep 20 16:08:21 2019 +0200
+
+    arcnet: provide a buffer big enough to actually receive packets
+    
+    [ Upstream commit 108639aac35eb57f1d0e8333f5fc8c7ff68df938 ]
+    
+    struct archdr is only big enough to hold the header of various types of
+    arcnet packets. So to provide enough space to hold the data read from
+    hardware provide a buffer large enough to hold a packet with maximal
+    size.
+    
+    The problem was noticed by the stack protector which makes the kernel
+    oops.
+    
+    Signed-off-by: Uwe Kleine-König <u.kleine-koenig@pengutronix.de>
+    Acked-by: Michael Grzeschik <m.grzeschik@pengutronix.de>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit e76fb5f7e8b9d5a80b928a2df8c86521c7963aeb
+Author: Jian-Hong Pan <jian-hong@endlessm.com>
+Date:   Tue Sep 3 17:10:42 2019 +0800
+
+    Bluetooth: btrtl: Additional Realtek 8822CE Bluetooth devices
+    
+    [ Upstream commit 6d0762b19c5963ff9e178e8af3626532ee04d93d ]
+    
+    The ASUS X412FA laptop contains a Realtek RTL8822CE device with an
+    associated BT chip using a USB ID of 04ca:4005. This ID is added to the
+    driver.
+    
+    The /sys/kernel/debug/usb/devices portion for this device is:
+    
+    T:  Bus=01 Lev=01 Prnt=01 Port=09 Cnt=04 Dev#=  4 Spd=12   MxCh= 0
+    D:  Ver= 1.00 Cls=e0(wlcon) Sub=01 Prot=01 MxPS=64 #Cfgs=  1
+    P:  Vendor=04ca ProdID=4005 Rev= 0.00
+    S:  Manufacturer=Realtek
+    S:  Product=Bluetooth Radio
+    S:  SerialNumber=00e04c000001
+    C:* #Ifs= 2 Cfg#= 1 Atr=a0 MxPwr=500mA
+    I:* If#= 0 Alt= 0 #EPs= 3 Cls=e0(wlcon) Sub=01 Prot=01 Driver=btusb
+    E:  Ad=81(I) Atr=03(Int.) MxPS=  16 Ivl=1ms
+    E:  Ad=02(O) Atr=02(Bulk) MxPS=  64 Ivl=0ms
+    E:  Ad=82(I) Atr=02(Bulk) MxPS=  64 Ivl=0ms
+    I:* If#= 1 Alt= 0 #EPs= 2 Cls=e0(wlcon) Sub=01 Prot=01 Driver=btusb
+    E:  Ad=03(O) Atr=01(Isoc) MxPS=   0 Ivl=1ms
+    E:  Ad=83(I) Atr=01(Isoc) MxPS=   0 Ivl=1ms
+    I:  If#= 1 Alt= 1 #EPs= 2 Cls=e0(wlcon) Sub=01 Prot=01 Driver=btusb
+    E:  Ad=03(O) Atr=01(Isoc) MxPS=   9 Ivl=1ms
+    E:  Ad=83(I) Atr=01(Isoc) MxPS=   9 Ivl=1ms
+    I:  If#= 1 Alt= 2 #EPs= 2 Cls=e0(wlcon) Sub=01 Prot=01 Driver=btusb
+    E:  Ad=03(O) Atr=01(Isoc) MxPS=  17 Ivl=1ms
+    E:  Ad=83(I) Atr=01(Isoc) MxPS=  17 Ivl=1ms
+    I:  If#= 1 Alt= 3 #EPs= 2 Cls=e0(wlcon) Sub=01 Prot=01 Driver=btusb
+    E:  Ad=03(O) Atr=01(Isoc) MxPS=  25 Ivl=1ms
+    E:  Ad=83(I) Atr=01(Isoc) MxPS=  25 Ivl=1ms
+    I:  If#= 1 Alt= 4 #EPs= 2 Cls=e0(wlcon) Sub=01 Prot=01 Driver=btusb
+    E:  Ad=03(O) Atr=01(Isoc) MxPS=  33 Ivl=1ms
+    E:  Ad=83(I) Atr=01(Isoc) MxPS=  33 Ivl=1ms
+    I:  If#= 1 Alt= 5 #EPs= 2 Cls=e0(wlcon) Sub=01 Prot=01 Driver=btusb
+    E:  Ad=03(O) Atr=01(Isoc) MxPS=  49 Ivl=1ms
+    E:  Ad=83(I) Atr=01(Isoc) MxPS=  49 Ivl=1ms
+    
+    Buglink: https://bugzilla.kernel.org/show_bug.cgi?id=204707
+    Signed-off-by: Jian-Hong Pan <jian-hong@endlessm.com>
+    Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 736a524bf6efe6fc324609fe49ded340049df4de
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Mon Jun 3 14:58:57 2019 +0100
+
+    drm: Flush output polling on shutdown
+    
+    [ Upstream commit 3b295cb1a411d9c82bbfaa66bc17a8508716ed07 ]
+    
+    We need to mark the output polling as disabled to prevent concurrent
+    irqs from queuing new work as shutdown the probe -- causing that work to
+    execute after we have freed the structs:
+    
+    <4> [341.846490] DEBUG_LOCKS_WARN_ON(mutex_is_locked(lock))
+    <4> [341.846497] WARNING: CPU: 3 PID: 3300 at kernel/locking/mutex-debug.c:103 mutex_destroy+0x49/0x50
+    <4> [341.846508] Modules linked in: i915(-) vgem thunderbolt snd_hda_codec_hdmi snd_hda_codec_realtek snd_hda_codec_generic mei_hdcp x86_pkg_temp_thermal coretemp crct10dif_pclmul crc32_pclmul ghash_clmulni_intel snd_hda_codec snd_hwdep snd_hda_core snd_pcm mcs7830 btusb usbnet btrtl mii btbcm btintel bluetooth ecdh_generic ecc mei_me mei prime_numbers i2c_hid pinctrl_sunrisepoint pinctrl_intel [last unloaded: i915]
+    <4> [341.846546] CPU: 3 PID: 3300 Comm: i915_module_loa Tainted: G     U            5.2.0-rc2-CI-CI_DRM_6175+ #1
+    <4> [341.846553] Hardware name: Dell Inc. XPS 13 9360/0823VW, BIOS 2.9.0 07/09/2018
+    <4> [341.846560] RIP: 0010:mutex_destroy+0x49/0x50
+    <4> [341.846565] Code: 00 00 5b c3 e8 a8 9f 3b 00 85 c0 74 ed 8b 05 3e 55 23 01 85 c0 75 e3 48 c7 c6 00 d0 08 82 48 c7 c7 a8 aa 07 82 e8 e7 08 fa ff <0f> 0b eb cc 0f 1f 00 48 b8 11 11 11 11 11 11 11 11 48 89 76 20 48
+    <4> [341.846578] RSP: 0018:ffffc900006cfdb0 EFLAGS: 00010286
+    <4> [341.846583] RAX: 0000000000000000 RBX: ffff88826759a168 RCX: 0000000000000000
+    <4> [341.846589] RDX: 0000000000000002 RSI: 0000000000000000 RDI: ffffffff8112844c
+    <4> [341.846595] RBP: ffff8882708fa548 R08: 0000000000000000 R09: 0000000000039600
+    <4> [341.846601] R10: 0000000000000000 R11: 0000000000000ce4 R12: ffffffffa07de1e0
+    <4> [341.846607] R13: 0000000000000000 R14: 0000000000000000 R15: ffffffffa07de2d0
+    <4> [341.846613] FS:  00007f62b5ae0e40(0000) GS:ffff888276380000(0000) knlGS:0000000000000000
+    <4> [341.846620] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    <4> [341.846626] CR2: 000055a4e064f4a0 CR3: 0000000266b16006 CR4: 00000000003606e0
+    <4> [341.846632] Call Trace:
+    <4> [341.846639]  drm_fb_helper_fini.part.17+0xb3/0x100
+    <4> [341.846682]  intel_fbdev_fini+0x20/0x80 [i915]
+    <4> [341.846722]  intel_modeset_cleanup+0x9a/0x140 [i915]
+    <4> [341.846750]  i915_driver_unload+0xa3/0x100 [i915]
+    <4> [341.846778]  i915_pci_remove+0x19/0x30 [i915]
+    <4> [341.846784]  pci_device_remove+0x36/0xb0
+    <4> [341.846790]  device_release_driver_internal+0xd3/0x1b0
+    <4> [341.846795]  driver_detach+0x3f/0x80
+    <4> [341.846800]  bus_remove_driver+0x53/0xd0
+    <4> [341.846805]  pci_unregister_driver+0x25/0xa0
+    <4> [341.846843]  i915_exit+0x16/0x1c [i915]
+    <4> [341.846849]  __se_sys_delete_module+0x162/0x210
+    <4> [341.846855]  ? trace_hardirqs_off_thunk+0x1a/0x1c
+    <4> [341.846859]  ? do_syscall_64+0xd/0x1c0
+    <4> [341.846864]  do_syscall_64+0x55/0x1c0
+    <4> [341.846869]  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    <4> [341.846875] RIP: 0033:0x7f62b51871b7
+    <4> [341.846881] Code: 73 01 c3 48 8b 0d d1 8c 2c 00 f7 d8 64 89 01 48 83 c8 ff c3 66 2e 0f 1f 84 00 00 00 00 00 0f 1f 44 00 00 b8 b0 00 00 00 0f 05 <48> 3d 01 f0 ff ff 73 01 c3 48 8b 0d a1 8c 2c 00 f7 d8 64 89 01 48
+    <4> [341.846897] RSP: 002b:00007ffe7a227138 EFLAGS: 00000206 ORIG_RAX: 00000000000000b0
+    <4> [341.846904] RAX: ffffffffffffffda RBX: 00007ffe7a2272b0 RCX: 00007f62b51871b7
+    <4> [341.846910] RDX: 0000000000000001 RSI: 0000000000000800 RDI: 0000557cd6b55948
+    <4> [341.846916] RBP: 0000557cd6b558e0 R08: 0000557cd6b5594c R09: 00007ffe7a227160
+    <4> [341.846922] R10: 00007ffe7a226134 R11: 0000000000000206 R12: 0000000000000000
+    <4> [341.846927] R13: 00007ffe7a227820 R14: 0000000000000000 R15: 0000000000000000
+    <4> [341.846936] irq event stamp: 3547847
+    <4> [341.846940] hardirqs last  enabled at (3547847): [<ffffffff819aad2c>] _raw_spin_unlock_irqrestore+0x4c/0x60
+    <4> [341.846949] hardirqs last disabled at (3547846): [<ffffffff819aab9d>] _raw_spin_lock_irqsave+0xd/0x50
+    <4> [341.846957] softirqs last  enabled at (3547376): [<ffffffff81c0033a>] __do_softirq+0x33a/0x4b9
+    <4> [341.846966] softirqs last disabled at (3547367): [<ffffffff810b6379>] irq_exit+0xa9/0xc0
+    <4> [341.846973] WARNING: CPU: 3 PID: 3300 at kernel/locking/mutex-debug.c:103 mutex_destroy+0x49/0x50
+    <4> [341.846980] ---[ end trace ba94ca8952ba970e ]---
+    <7> [341.866547] [drm:intel_dp_detect [i915]] MST support? port A: no, sink: no, modparam: yes
+    <7> [341.890480] [drm:drm_add_display_info] non_desktop set to 0
+    <7> [341.890530] [drm:drm_add_edid_modes] ELD: no CEA Extension found
+    <7> [341.890537] [drm:drm_add_display_info] non_desktop set to 0
+    <7> [341.890578] [drm:drm_helper_probe_single_connector_modes] [CONNECTOR:86:eDP-1] probed modes :
+    <7> [341.890589] [drm:drm_mode_debug_printmodeline] Modeline "3200x1800": 60 373250 3200 3248 3280 3360 1800 1803 1808 1852 0x48 0xa
+    <7> [341.890602] [drm:drm_mode_debug_printmodeline] Modeline "3200x1800": 48 298600 3200 3248 3280 3360 1800 1803 1808 1852 0x40 0xa
+    <4> [341.890628] general protection fault: 0000 [#1] PREEMPT SMP PTI
+    <4> [341.890636] CPU: 0 PID: 508 Comm: kworker/0:4 Tainted: G     U  W         5.2.0-rc2-CI-CI_DRM_6175+ #1
+    <4> [341.890646] Hardware name: Dell Inc. XPS 13 9360/0823VW, BIOS 2.9.0 07/09/2018
+    <4> [341.890655] Workqueue: events output_poll_execute
+    <4> [341.890663] RIP: 0010:drm_setup_crtcs+0x13e/0xbe0
+    <4> [341.890669] Code: 00 41 8b 44 24 58 85 c0 0f 8e f9 01 00 00 44 8b 6c 24 20 44 8b 74 24 28 31 db 31 ed 49 8b 44 24 60 48 63 d5 44 89 ee 83 c5 01 <48> 8b 04 d0 44 89 f2 48 8b 38 48 8b 87 88 01 00 00 48 8b 40 20 e8
+    <4> [341.890686] RSP: 0018:ffffc9000033fd40 EFLAGS: 00010202
+    <4> [341.890692] RAX: 6b6b6b6b6b6b6b6b RBX: 0000000000000002 RCX: 0000000000000000
+    <4> [341.890700] RDX: 0000000000000001 RSI: 0000000000000c80 RDI: 00000000ffffffff
+    <4> [341.890707] RBP: 0000000000000002 R08: 0000000000000000 R09: 0000000000000000
+    <4> [341.890715] R10: 0000000000000c80 R11: 0000000000000000 R12: ffff888267599fe8
+    <4> [341.890722] R13: 0000000000000c80 R14: 0000000000000708 R15: 0000000000000007
+    <4> [341.890730] FS:  0000000000000000(0000) GS:ffff888276200000(0000) knlGS:0000000000000000
+    <4> [341.890739] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    <4> [341.890745] CR2: 000055a4e064f4a0 CR3: 000000026d234003 CR4: 00000000003606f0
+    <4> [341.890752] Call Trace:
+    <4> [341.890760]  drm_fb_helper_hotplug_event.part.24+0x89/0xb0
+    <4> [341.890768]  drm_kms_helper_hotplug_event+0x21/0x30
+    <4> [341.890774]  output_poll_execute+0x9d/0x1a0
+    <4> [341.890782]  process_one_work+0x245/0x610
+    <4> [341.890790]  worker_thread+0x37/0x380
+    <4> [341.890796]  ? process_one_work+0x610/0x610
+    <4> [341.890802]  kthread+0x119/0x130
+    <4> [341.890808]  ? kthread_park+0x80/0x80
+    <4> [341.890815]  ret_from_fork+0x3a/0x50
+    
+    Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=109964
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Imre Deak <imre.deak@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190603135910.15979-2-chris@chris-wilson.co.uk
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit c9aac2ca3403bc20f4c9a320c2e10e489ebda961
+Author: Chao Yu <chao@kernel.org>
+Date:   Sat May 25 23:07:25 2019 +0800
+
+    f2fs: fix to do sanity check on segment bitmap of LFS curseg
+    
+    [ Upstream commit c854f4d681365498f53ba07843a16423625aa7e9 ]
+    
+    As Jungyeon Reported in bugzilla:
+    
+    https://bugzilla.kernel.org/show_bug.cgi?id=203233
+    
+    - Reproduces
+    gcc poc_13.c
+    ./run.sh f2fs
+    
+    - Kernel messages
+     F2FS-fs (sdb): Bitmap was wrongly set, blk:4608
+     kernel BUG at fs/f2fs/segment.c:2133!
+     RIP: 0010:update_sit_entry+0x35d/0x3e0
+     Call Trace:
+      f2fs_allocate_data_block+0x16c/0x5a0
+      do_write_page+0x57/0x100
+      f2fs_do_write_node_page+0x33/0xa0
+      __write_node_page+0x270/0x4e0
+      f2fs_sync_node_pages+0x5df/0x670
+      f2fs_write_checkpoint+0x364/0x13a0
+      f2fs_sync_fs+0xa3/0x130
+      f2fs_do_sync_file+0x1a6/0x810
+      do_fsync+0x33/0x60
+      __x64_sys_fsync+0xb/0x10
+      do_syscall_64+0x43/0x110
+      entry_SYSCALL_64_after_hwframe+0x44/0xa9
+    
+    The testcase fails because that, in fuzzed image, current segment was
+    allocated with LFS type, its .next_blkoff should point to an unused
+    block address, but actually, its bitmap shows it's not. So during
+    allocation, f2fs crash when setting bitmap.
+    
+    Introducing sanity_check_curseg() to check such inconsistence of
+    current in-used segment.
+    
+    Signed-off-by: Chao Yu <yuchao0@huawei.com>
+    Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 810394b3917fe1854a3efa6a545fa46882e5bdbe
+Author: Chao Yu <chao@kernel.org>
+Date:   Fri Aug 2 18:15:48 2019 +0800
+
+    Revert "f2fs: avoid out-of-range memory access"
+    
+    [ Upstream commit a37d0862d17411edb67677a580a6f505ec2225f6 ]
+    
+    As Pavel Machek reported:
+    
+    "We normally use -EUCLEAN to signal filesystem corruption. Plus, it is
+    good idea to report it to the syslog and mark filesystem as "needing
+    fsck" if filesystem can do that."
+    
+    Still we need improve the original patch with:
+    - use unlikely keyword
+    - add message print
+    - return EUCLEAN
+    
+    However, after rethink this patch, I don't think we should add such
+    condition check here as below reasons:
+    - We have already checked the field in f2fs_sanity_check_ckpt(),
+    - If there is fs corrupt or security vulnerability, there is nothing
+    to guarantee the field is integrated after the check, unless we do
+    the check before each of its use, however no filesystem does that.
+    - We only have similar check for bitmap, which was added due to there
+    is bitmap corruption happened on f2fs' runtime in product.
+    - There are so many key fields in SB/CP/NAT did have such check
+    after f2fs_sanity_check_{sb,cp,..}.
+    
+    So I propose to revert this unneeded check.
+    
+    This reverts commit 56f3ce675103e3fb9e631cfb4131fc768bc23e9a.
+    
+    Signed-off-by: Chao Yu <yuchao0@huawei.com>
+    Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit bf0b3b4b81c212d00e6bdc7171ad4a7122988d38
+Author: Surbhi Palande <f2fsnewbie@gmail.com>
+Date:   Fri Aug 23 15:40:45 2019 -0700
+
+    f2fs: check all the data segments against all node ones
+    
+    [ Upstream commit 1166c1f2f69117ad254189ca781287afa6e550b6 ]
+    
+    As a part of the sanity checking while mounting, distinct segment number
+    assignment to data and node segments is verified. Fixing a small bug in
+    this verification between node and data segments. We need to check all
+    the data segments with all the node segments.
+    
+    Fixes: 042be0f849e5f ("f2fs: fix to do sanity check with current segment number")
+    Signed-off-by: Surbhi Palande <csurbhi@gmail.com>
+    Reviewed-by: Chao Yu <yuchao0@huawei.com>
+    Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit ba118859b4bc7986ce36c78e5b267d1bcaac1ea4
+Author: Marc Zyngier <maz@kernel.org>
+Date:   Thu Sep 5 14:56:47 2019 +0100
+
+    irqchip/gic-v3-its: Fix LPI release for Multi-MSI devices
+    
+    [ Upstream commit c9c96e30ecaa0aafa225aa1a5392cb7db17c7a82 ]
+    
+    When allocating a range of LPIs for a Multi-MSI capable device,
+    this allocation extended to the closest power of 2.
+    
+    But on the release path, the interrupts are released one by
+    one. This results in not releasing the "extra" range, leaking
+    the its_device. Trying to reprobe the device will then fail.
+    
+    Fix it by releasing the LPIs the same way we allocate them.
+    
+    Fixes: 8208d1708b88 ("irqchip/gic-v3-its: Align PCI Multi-MSI allocation on their size")
+    Reported-by: Jiaxing Luo <luojiaxing@huawei.com>
+    Tested-by: John Garry <john.garry@huawei.com>
+    Signed-off-by: Marc Zyngier <maz@kernel.org>
+    Link: https://lore.kernel.org/r/f5e948aa-e32f-3f74-ae30-31fee06c2a74@huawei.com
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 2a8d47d551f3fd68d45b1564f1915343d8d26777
+Author: Waiman Long <longman@redhat.com>
+Date:   Wed Jan 9 23:03:25 2019 -0500
+
+    locking/lockdep: Add debug_locks check in __lock_downgrade()
+    
+    [ Upstream commit 513e1073d52e55b8024b4f238a48de7587c64ccf ]
+    
+    Tetsuo Handa had reported he saw an incorrect "downgrading a read lock"
+    warning right after a previous lockdep warning. It is likely that the
+    previous warning turned off lock debugging causing the lockdep to have
+    inconsistency states leading to the lock downgrade warning.
+    
+    Fix that by add a check for debug_locks at the beginning of
+    __lock_downgrade().
+    
+    Reported-by: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+    Reported-by: syzbot+53383ae265fb161ef488@syzkaller.appspotmail.com
+    Signed-off-by: Waiman Long <longman@redhat.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Link: https://lkml.kernel.org/r/1547093005-26085-1-git-send-email-longman@redhat.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 3fea925a915ac7469c890a16d4fa45fc9ed531e5
+Author: Yu Wang <yyuwang@codeaurora.org>
+Date:   Fri May 10 17:04:52 2019 +0800
+
+    mac80211: handle deauthentication/disassociation from TDLS peer
+    
+    [ Upstream commit 79c92ca42b5a3e0ea172ea2ce8df8e125af237da ]
+    
+    When receiving a deauthentication/disassociation frame from a TDLS
+    peer, a station should not disconnect the current AP, but only
+    disable the current TDLS link if it's enabled.
+    
+    Without this change, a TDLS issue can be reproduced by following the
+    steps as below:
+    
+    1. STA-1 and STA-2 are connected to AP, bidirection traffic is running
+       between STA-1 and STA-2.
+    2. Set up TDLS link between STA-1 and STA-2, stay for a while, then
+       teardown TDLS link.
+    3. Repeat step #2 and monitor the connection between STA and AP.
+    
+    During the test, one STA may send a deauthentication/disassociation
+    frame to another, after TDLS teardown, with reason code 6/7, which
+    means: Class 2/3 frame received from nonassociated STA.
+    
+    On receive this frame, the receiver STA will disconnect the current
+    AP and then reconnect. It's not a expected behavior, purpose of this
+    frame should be disabling the TDLS link, not the link with AP.
+    
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Yu Wang <yyuwang@codeaurora.org>
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 943341211598d18a3bc1d1febf44edc1e0c21eb4
+Author: Arkadiusz Miskiewicz <a.miskiewicz@gmail.com>
+Date:   Wed Feb 15 14:21:27 2017 +0100
+
+    mac80211: Print text for disassociation reason
+    
+    [ Upstream commit 68506e9af132a6b5735c1dd4b11240da0cf5eeae ]
+    
+    When disassociation happens only numeric reason is printed
+    in ieee80211_rx_mgmt_disassoc(). Add text variant, too.
+    
+    Signed-off-by: Arkadiusz Miśkiewicz <arekm@maven.pl>
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 7703936b97b69b704922b4538a3aaf4a469aed8b
+Author: Shih-Yuan Lee (FourDollars) <fourdollars@debian.org>
+Date:   Fri Sep 20 21:40:53 2019 +0800
+
+    ALSA: hda - Add laptop imic fixup for ASUS M9V laptop
+    
+    commit 7b485d175631be676424aedb8cd2f66d0c93da78 upstream.
+    
+    The same fixup to enable laptop imic is needed for ASUS M9V with AD1986A
+    codec like another HP machine.
+    
+    Signed-off-by: Shih-Yuan Lee (FourDollars) <fourdollars@debian.org>
+    Cc: <stable@vger.kernel.org>
+    Link: https://lore.kernel.org/r/20190920134052.GA8035@localhost
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit e68c9b0f48b61592e2311c828cff37388778c90a
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Tue Feb 19 16:46:47 2019 +0100
+
+    ASoC: fsl: Fix of-node refcount unbalance in fsl_ssi_probe_from_dt()
+    
+    commit 2757970f6d0d0a112247600b23d38c0c728ceeb3 upstream.
+    
+    The node obtained from of_find_node_by_path() has to be unreferenced
+    after the use, but we forgot it for the root node.
+    
+    Fixes: f0fba2ad1b6b ("ASoC: multi-component - ASoC Multi-Component Support")
+    Cc: Timur Tabi <timur@kernel.org>
+    Cc: Nicolin Chen <nicoleotsuka@gmail.com>
+    Cc: Xiubo Li <Xiubo.Lee@gmail.com>
+    Cc: Fabio Estevam <festevam@gmail.com>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Acked-by: Nicolin Chen <nicoleotsuka@gmail.com>
+    Signed-off-by: Mark Brown <broonie@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 91573ae4aed0a49660abdad4d42f2a0db995ee5e
+Author: Mao Wenan <maowenan@huawei.com>
+Date:   Wed Sep 18 16:37:33 2019 +0800
+
+    net: rds: Fix NULL ptr use in rds_tcp_kill_sock
+    
+    After the commit c4e97b06cfdc ("net: rds: force to destroy
+    connection if t_sock is NULL in rds_tcp_kill_sock()."),
+    it introduced null-ptr-deref in rds_tcp_kill_sock as below:
+    
+    BUG: KASAN: null-ptr-deref on address 0000000000000020
+    Read of size 8 by task kworker/u16:10/910
+    CPU: 3 PID: 910 Comm: kworker/u16:10 Not tainted 4.4.178+ #3
+    Hardware name: linux,dummy-virt (DT)
+    Workqueue: netns cleanup_net
+    Call trace:
+    [<ffffff90080abb50>] dump_backtrace+0x0/0x618
+    [<ffffff90080ac1a0>] show_stack+0x38/0x60
+    [<ffffff9008c42b78>] dump_stack+0x1a8/0x230
+    [<ffffff90085d469c>] kasan_report_error+0xc8c/0xfc0
+    [<ffffff90085d54a4>] kasan_report+0x94/0xd8
+    [<ffffff90085d1b28>] __asan_load8+0x88/0x150
+    [<ffffff9009c9cc2c>] rds_tcp_dev_event+0x734/0xb48
+    [<ffffff90081eacb0>] raw_notifier_call_chain+0x150/0x1e8
+    [<ffffff900973fec0>] call_netdevice_notifiers_info+0x90/0x110
+    [<ffffff9009764874>] netdev_run_todo+0x2f4/0xb08
+    [<ffffff9009796d34>] rtnl_unlock+0x2c/0x48
+    [<ffffff9009756484>] default_device_exit_batch+0x444/0x528
+    [<ffffff9009720498>] ops_exit_list+0x1c0/0x240
+    [<ffffff9009724a80>] cleanup_net+0x738/0xbf8
+    [<ffffff90081ca6cc>] process_one_work+0x96c/0x13e0
+    [<ffffff90081cf370>] worker_thread+0x7e0/0x1910
+    [<ffffff90081e7174>] kthread+0x304/0x390
+    [<ffffff9008094280>] ret_from_fork+0x10/0x50
+    
+    If the first loop add the tc->t_sock = NULL to the tmp_list,
+    1). list_for_each_entry_safe(tc, _tc, &rds_tcp_conn_list, t_tcp_node)
+    
+    then the second loop is to find connections to destroy, tc->t_sock
+    might equal NULL, and tc->t_sock->sk happens null-ptr-deref.
+    2). list_for_each_entry_safe(tc, _tc, &tmp_list, t_tcp_node)
+    
+    Fixes: c4e97b06cfdc ("net: rds: force to destroy connection if t_sock is NULL in rds_tcp_kill_sock().")
+    Signed-off-by: Mao Wenan <maowenan@huawei.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit b19b5a895ad3162663e597680b94a1d9f706c9cb
+Author: Gustavo A. R. Silva <gustavo@embeddedor.com>
+Date:   Mon Sep 9 00:29:52 2019 -0500
+
+    crypto: talitos - fix missing break in switch statement
+    
+    commit 5fc194ea6d34dfad9833d3043ce41d6c52aff39a upstream.
+    
+    Add missing break statement in order to prevent the code from falling
+    through to case CRYPTO_ALG_TYPE_AHASH.
+    
+    Fixes: aeb4c132f33d ("crypto: talitos - Convert to new AEAD interface")
+    Cc: stable@vger.kernel.org
+    Reported-by: kbuild test robot <lkp@intel.com>
+    Signed-off-by: Gustavo A. R. Silva <gustavo@embeddedor.com>
+    Reviewed-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9ce51a5b414a42887505a6504a2f0273b89906a5
+Author: Tokunori Ikegami <ikegami.t@gmail.com>
+Date:   Tue Aug 6 04:03:18 2019 +0900
+
+    mtd: cfi_cmdset_0002: Use chip_good() to retry in do_write_oneword()
+    
+    commit 37c673ade35c707d50583b5b25091ff8ebdeafd7 upstream.
+    
+    As reported by the OpenWRT team, write requests sometimes fail on some
+    platforms.
+    Currently to check the state chip_ready() is used correctly as described by
+    the flash memory S29GL256P11TFI01 datasheet.
+    Also chip_good() is used to check if the write is succeeded and it was
+    implemented by the commit fb4a90bfcd6d8 ("[MTD] CFI-0002 - Improve error
+    checking").
+    But actually the write failure is caused on some platforms and also it can
+    be fixed by using chip_good() to check the state and retry instead.
+    Also it seems that it is caused after repeated about 1,000 times to retry
+    the write one word with the reset command.
+    By using chip_good() to check the state to be done it can be reduced the
+    retry with reset.
+    It is depended on the actual flash chip behavior so the root cause is
+    unknown.
+    
+    Cc: Chris Packham <chris.packham@alliedtelesis.co.nz>
+    Cc: Joakim Tjernlund <Joakim.Tjernlund@infinera.com>
+    Cc: linux-mtd@lists.infradead.org
+    Cc: stable@vger.kernel.org
+    Reported-by: Fabio Bettoni <fbettoni@gmail.com>
+    Signed-off-by: Felix Fietkau <nbd@nbd.name>
+    Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
+    Signed-off-by: Tokunori Ikegami <ikegami.t@gmail.com>
+    [vigneshr@ti.com: Fix a checkpatch warning]
+    Signed-off-by: Vignesh Raghavendra <vigneshr@ti.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 0bbb24a30e1abbb13752af0be8fd9b8c6049df52
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Wed Aug 21 13:27:12 2019 -0400
+
+    HID: hidraw: Fix invalid read in hidraw_ioctl
+    
+    commit 416dacb819f59180e4d86a5550052033ebb6d72c upstream.
+    
+    The syzbot fuzzer has reported a pair of problems in the
+    hidraw_ioctl() function: slab-out-of-bounds read and use-after-free
+    read.  An example of the first:
+    
+    BUG: KASAN: slab-out-of-bounds in strlen+0x79/0x90 lib/string.c:525
+    Read of size 1 at addr ffff8881c8035f38 by task syz-executor.4/2833
+    
+    CPU: 1 PID: 2833 Comm: syz-executor.4 Not tainted 5.3.0-rc2+ #1
+    Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS
+    Google 01/01/2011
+    Call Trace:
+      __dump_stack lib/dump_stack.c:77 [inline]
+      dump_stack+0xca/0x13e lib/dump_stack.c:113
+      print_address_description+0x6a/0x32c mm/kasan/report.c:351
+      __kasan_report.cold+0x1a/0x33 mm/kasan/report.c:482
+      kasan_report+0xe/0x12 mm/kasan/common.c:612
+      strlen+0x79/0x90 lib/string.c:525
+      strlen include/linux/string.h:281 [inline]
+      hidraw_ioctl+0x245/0xae0 drivers/hid/hidraw.c:446
+      vfs_ioctl fs/ioctl.c:46 [inline]
+      file_ioctl fs/ioctl.c:509 [inline]
+      do_vfs_ioctl+0xd2d/0x1330 fs/ioctl.c:696
+      ksys_ioctl+0x9b/0xc0 fs/ioctl.c:713
+      __do_sys_ioctl fs/ioctl.c:720 [inline]
+      __se_sys_ioctl fs/ioctl.c:718 [inline]
+      __x64_sys_ioctl+0x6f/0xb0 fs/ioctl.c:718
+      do_syscall_64+0xb7/0x580 arch/x86/entry/common.c:296
+      entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    RIP: 0033:0x459829
+    Code: fd b7 fb ff c3 66 2e 0f 1f 84 00 00 00 00 00 66 90 48 89 f8 48 89 f7
+    48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff
+    ff 0f 83 cb b7 fb ff c3 66 2e 0f 1f 84 00 00 00 00
+    RSP: 002b:00007f7a68f6dc78 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+    RAX: ffffffffffffffda RBX: 0000000000000003 RCX: 0000000000459829
+    RDX: 0000000000000000 RSI: 0000000080404805 RDI: 0000000000000004
+    RBP: 000000000075bf20 R08: 0000000000000000 R09: 0000000000000000
+    R10: 0000000000000000 R11: 0000000000000246 R12: 00007f7a68f6e6d4
+    R13: 00000000004c21de R14: 00000000004d5620 R15: 00000000ffffffff
+    
+    The two problems have the same cause: hidraw_ioctl() fails to test
+    whether the device has been removed.  This patch adds the missing test.
+    
+    Reported-and-tested-by: syzbot+5a6c4ec678a0c6ee84ba@syzkaller.appspotmail.com
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    CC: <stable@vger.kernel.org>
+    Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit ffc62dc252e1aaf1f93b6449c45bef581da5f066
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Tue Aug 20 16:00:21 2019 -0400
+
+    HID: logitech: Fix general protection fault caused by Logitech driver
+    
+    commit 5f9242775bb61f390f0885f23fc16397262c7538 upstream.
+    
+    The syzbot fuzzer found a general protection fault in the HID subsystem:
+    
+    kasan: CONFIG_KASAN_INLINE enabled
+    kasan: GPF could be caused by NULL-ptr deref or user memory access
+    general protection fault: 0000 [#1] SMP KASAN
+    CPU: 0 PID: 3715 Comm: syz-executor.3 Not tainted 5.2.0-rc6+ #15
+    Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS
+    Google 01/01/2011
+    RIP: 0010:__pm_runtime_resume+0x49/0x180 drivers/base/power/runtime.c:1069
+    Code: ed 74 d5 fe 45 85 ed 0f 85 9a 00 00 00 e8 6f 73 d5 fe 48 8d bd c1 02
+    00 00 48 b8 00 00 00 00 00 fc ff df 48 89 fa 48 c1 ea 03 <0f> b6 04 02 48
+    89 fa 83 e2 07 38 d0 7f 08 84 c0 0f 85 fe 00 00 00
+    RSP: 0018:ffff8881d99d78e0 EFLAGS: 00010202
+    RAX: dffffc0000000000 RBX: 0000000000000020 RCX: ffffc90003f3f000
+    RDX: 0000000416d8686d RSI: ffffffff82676841 RDI: 00000020b6c3436a
+    RBP: 00000020b6c340a9 R08: ffff8881c6d64800 R09: fffffbfff0e84c25
+    R10: ffff8881d99d7940 R11: ffffffff87426127 R12: 0000000000000004
+    R13: 0000000000000000 R14: ffff8881d9b94000 R15: ffffffff897f9048
+    FS:  00007f047f542700(0000) GS:ffff8881db200000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: 0000001b30f21000 CR3: 00000001ca032000 CR4: 00000000001406f0
+    DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+    DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+    Call Trace:
+      pm_runtime_get_sync include/linux/pm_runtime.h:226 [inline]
+      usb_autopm_get_interface+0x1b/0x50 drivers/usb/core/driver.c:1707
+      usbhid_power+0x7c/0xe0 drivers/hid/usbhid/hid-core.c:1234
+      hid_hw_power include/linux/hid.h:1038 [inline]
+      hidraw_open+0x20d/0x740 drivers/hid/hidraw.c:282
+      chrdev_open+0x219/0x5c0 fs/char_dev.c:413
+      do_dentry_open+0x497/0x1040 fs/open.c:778
+      do_last fs/namei.c:3416 [inline]
+      path_openat+0x1430/0x3ff0 fs/namei.c:3533
+      do_filp_open+0x1a1/0x280 fs/namei.c:3563
+      do_sys_open+0x3c0/0x580 fs/open.c:1070
+      do_syscall_64+0xb7/0x560 arch/x86/entry/common.c:301
+      entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    
+    It turns out the fault was caused by a bug in the HID Logitech driver,
+    which violates the requirement that every pathway calling
+    hid_hw_start() must also call hid_hw_stop().  This patch fixes the bug
+    by making sure the requirement is met.
+    
+    Reported-and-tested-by: syzbot+3cbe5cd105d2ad56a1df@syzkaller.appspotmail.com
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    CC: <stable@vger.kernel.org>
+    Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 30d86e698c284b42887c5731af390e4957b62fa1
+Author: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+Date:   Mon Nov 21 11:48:40 2016 +0100
+
+    HID: lg: make transfer buffers DMA capable
+    
+    commit 061232f0d47fa10103f3efa3e890f002a930d902 upstream.
+    
+    Kernel v4.9 strictly enforces DMA capable buffers, so we need to remove
+    buffers allocated on the stack.
+    
+    [jkosina@suse.cz: fix up second usage of hid_hw_raw_request(), spotted by
+     0day build bot]
+    Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+    Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit c03d9a82384cbf6199b597c101f17437e754d8f5
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Wed Sep 4 11:54:20 2019 -0400
+
+    HID: prodikeys: Fix general protection fault during probe
+    
+    commit 98375b86c79137416e9fd354177b85e768c16e56 upstream.
+    
+    The syzbot fuzzer provoked a general protection fault in the
+    hid-prodikeys driver:
+    
+    kasan: CONFIG_KASAN_INLINE enabled
+    kasan: GPF could be caused by NULL-ptr deref or user memory access
+    general protection fault: 0000 [#1] SMP KASAN
+    CPU: 0 PID: 12 Comm: kworker/0:1 Not tainted 5.3.0-rc5+ #28
+    Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS
+    Google 01/01/2011
+    Workqueue: usb_hub_wq hub_event
+    RIP: 0010:pcmidi_submit_output_report drivers/hid/hid-prodikeys.c:300  [inline]
+    RIP: 0010:pcmidi_set_operational drivers/hid/hid-prodikeys.c:558 [inline]
+    RIP: 0010:pcmidi_snd_initialise drivers/hid/hid-prodikeys.c:686 [inline]
+    RIP: 0010:pk_probe+0xb51/0xfd0 drivers/hid/hid-prodikeys.c:836
+    Code: 0f 85 50 04 00 00 48 8b 04 24 4c 89 7d 10 48 8b 58 08 e8 b2 53 e4 fc
+    48 8b 54 24 20 48 b8 00 00 00 00 00 fc ff df 48 c1 ea 03 <80> 3c 02 00 0f
+    85 13 04 00 00 48 ba 00 00 00 00 00 fc ff df 49 8b
+    
+    The problem is caused by the fact that pcmidi_get_output_report() will
+    return an error if the HID device doesn't provide the right sort of
+    output report, but pcmidi_set_operational() doesn't bother to check
+    the return code and assumes the function call always succeeds.
+    
+    This patch adds the missing check and aborts the probe operation if
+    necessary.
+    
+    Reported-and-tested-by: syzbot+1088533649dafa1c9004@syzkaller.appspotmail.com
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    CC: <stable@vger.kernel.org>
+    Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 4f1af2bcab137526c66ea92d3026e3f2879281e2
+Author: Marcel Holtmann <marcel@holtmann.org>
+Date:   Wed Sep 4 20:13:08 2019 +0200
+
+    Revert "Bluetooth: validate BLE connection interval updates"
+    
+    [ Upstream commit 68d19d7d995759b96169da5aac313363f92a9075 ]
+    
+    This reverts commit c49a8682fc5d298d44e8d911f4fa14690ea9485e.
+    
+    There are devices which require low connection intervals for usable operation
+    including keyboards and mice. Forcing a static connection interval for
+    these types of devices has an impact in latency and causes a regression.
+    
+    Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+    Signed-off-by: Johan Hedberg <johan.hedberg@intel.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>

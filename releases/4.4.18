@@ -1,0 +1,1941 @@
+commit e4884275a4bb1cbce5a24a507c3e267c887dc1bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Tue Aug 16 09:31:54 2016 +0200
+
+    Linux 4.4.18
+
+commit eccccb42d44f44badcfbdbb4e21a4f30d9694666
+Author: Vladimir Davydov <vdavydov.dev@gmail.com>
+Date:   Thu Aug 11 15:33:03 2016 -0700
+
+    mm: memcontrol: fix memcg id ref counter on swap charge move
+    
+    commit 615d66c37c755c49ce022c9e5ac0875d27d2603d upstream.
+    
+    Since commit 73f576c04b94 ("mm: memcontrol: fix cgroup creation failure
+    after many small jobs") swap entries do not pin memcg->css.refcnt
+    directly.  Instead, they pin memcg->id.ref.  So we should adjust the
+    reference counters accordingly when moving swap charges between cgroups.
+    
+    Fixes: 73f576c04b941 ("mm: memcontrol: fix cgroup creation failure after many small jobs")
+    Link: http://lkml.kernel.org/r/9ce297c64954a42dc90b543bc76106c4a94f07e8.1470219853.git.vdavydov@virtuozzo.com
+    Signed-off-by: Vladimir Davydov <vdavydov@virtuozzo.com>
+    Acked-by: Michal Hocko <mhocko@suse.com>
+    Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Michal Hocko <mhocko@suse.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a0fddee3fb342a4150c83c36e317660663691a72
+Author: Vladimir Davydov <vdavydov.dev@gmail.com>
+Date:   Thu Aug 11 15:33:00 2016 -0700
+
+    mm: memcontrol: fix swap counter leak on swapout from offline cgroup
+    
+    commit 1f47b61fb4077936465dcde872a4e5cc4fe708da upstream.
+    
+    An offline memory cgroup might have anonymous memory or shmem left
+    charged to it and no swap.  Since only swap entries pin the id of an
+    offline cgroup, such a cgroup will have no id and so an attempt to
+    swapout its anon/shmem will not store memory cgroup info in the swap
+    cgroup map.  As a result, memcg->swap or memcg->memsw will never get
+    uncharged from it and any of its ascendants.
+    
+    Fix this by always charging swapout to the first ancestor cgroup that
+    hasn't released its id yet.
+    
+    [hannes@cmpxchg.org: add comment to mem_cgroup_swapout]
+    [vdavydov@virtuozzo.com: use WARN_ON_ONCE() in mem_cgroup_id_get_online()]
+      Link: http://lkml.kernel.org/r/20160803123445.GJ13263@esperanza
+    Fixes: 73f576c04b941 ("mm: memcontrol: fix cgroup creation failure after many small jobs")
+    Link: http://lkml.kernel.org/r/5336daa5c9a32e776067773d9da655d2dc126491.1470219853.git.vdavydov@virtuozzo.com
+    Signed-off-by: Vladimir Davydov <vdavydov@virtuozzo.com>
+    Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+    Acked-by: Michal Hocko <mhocko@suse.com>
+    Cc: <stable@vger.kernel.org>    [3.19+]
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Michal Hocko <mhocko@suse.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 8627c7750a66a46d56d3564e1e881aa53764497c
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Wed Jul 20 15:44:57 2016 -0700
+
+    mm: memcontrol: fix cgroup creation failure after many small jobs
+    
+    commit 73f576c04b9410ed19660f74f97521bee6e1c546 upstream.
+    
+    The memory controller has quite a bit of state that usually outlives the
+    cgroup and pins its CSS until said state disappears.  At the same time
+    it imposes a 16-bit limit on the CSS ID space to economically store IDs
+    in the wild.  Consequently, when we use cgroups to contain frequent but
+    small and short-lived jobs that leave behind some page cache, we quickly
+    run into the 64k limitations of outstanding CSSs.  Creating a new cgroup
+    fails with -ENOSPC while there are only a few, or even no user-visible
+    cgroups in existence.
+    
+    Although pinning CSSs past cgroup removal is common, there are only two
+    instances that actually need an ID after a cgroup is deleted: cache
+    shadow entries and swapout records.
+    
+    Cache shadow entries reference the ID weakly and can deal with the CSS
+    having disappeared when it's looked up later.  They pose no hurdle.
+    
+    Swap-out records do need to pin the css to hierarchically attribute
+    swapins after the cgroup has been deleted; though the only pages that
+    remain swapped out after offlining are tmpfs/shmem pages.  And those
+    references are under the user's control, so they are manageable.
+    
+    This patch introduces a private 16-bit memcg ID and switches swap and
+    cache shadow entries over to using that.  This ID can then be recycled
+    after offlining when the CSS remains pinned only by objects that don't
+    specifically need it.
+    
+    This script demonstrates the problem by faulting one cache page in a new
+    cgroup and deleting it again:
+    
+      set -e
+      mkdir -p pages
+      for x in `seq 128000`; do
+        [ $((x % 1000)) -eq 0 ] && echo $x
+        mkdir /cgroup/foo
+        echo $$ >/cgroup/foo/cgroup.procs
+        echo trex >pages/$x
+        echo $$ >/cgroup/cgroup.procs
+        rmdir /cgroup/foo
+      done
+    
+    When run on an unpatched kernel, we eventually run out of possible IDs
+    even though there are no visible cgroups:
+    
+      [root@ham ~]# ./cssidstress.sh
+      [...]
+      65000
+      mkdir: cannot create directory '/cgroup/foo': No space left on device
+    
+    After this patch, the IDs get released upon cgroup destruction and the
+    cache and css objects get released once memory reclaim kicks in.
+    
+    [hannes@cmpxchg.org: init the IDR]
+      Link: http://lkml.kernel.org/r/20160621154601.GA22431@cmpxchg.org
+    Fixes: b2052564e66d ("mm: memcontrol: continue cache reclaim from offlined groups")
+    Link: http://lkml.kernel.org/r/20160617162516.GD19084@cmpxchg.org
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Reported-by: John Garcia <john.garcia@mesosphere.io>
+    Reviewed-by: Vladimir Davydov <vdavydov@virtuozzo.com>
+    Acked-by: Tejun Heo <tj@kernel.org>
+    Cc: Nikolay Borisov <kernel@kyup.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Michal Hocko <mhocko@suse.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3a22cf0c7b597f7139d3fdd27fa70aa55aa6d977
+Author: Vegard Nossum <vegard.nossum@oracle.com>
+Date:   Thu Jul 14 23:02:47 2016 -0400
+
+    ext4: fix reference counting bug on block allocation error
+    
+    commit 554a5ccc4e4a20c5f3ec859de0842db4b4b9c77e upstream.
+    
+    If we hit this error when mounted with errors=continue or
+    errors=remount-ro:
+    
+        EXT4-fs error (device loop0): ext4_mb_mark_diskspace_used:2940: comm ext4.exe: Allocating blocks 5090-6081 which overlap fs metadata
+    
+    then ext4_mb_new_blocks() will call ext4_mb_release_context() and try to
+    continue. However, ext4_mb_release_context() is the wrong thing to call
+    here since we are still actually using the allocation context.
+    
+    Instead, just error out. We could retry the allocation, but there is a
+    possibility of getting stuck in an infinite loop instead, so this seems
+    safer.
+    
+    [ Fixed up so we don't return EAGAIN to userspace. --tytso ]
+    
+    Fixes: 8556e8f3b6 ("ext4: Don't allow new groups to be added during block allocation")
+    Signed-off-by: Vegard Nossum <vegard.nossum@oracle.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit db82c747482bab275cd639ed0007ee27ec0c35a1
+Author: Vegard Nossum <vegard.nossum@oracle.com>
+Date:   Thu Jul 14 23:21:35 2016 -0400
+
+    ext4: short-cut orphan cleanup on error
+    
+    commit c65d5c6c81a1f27dec5f627f67840726fcd146de upstream.
+    
+    If we encounter a filesystem error during orphan cleanup, we should stop.
+    Otherwise, we may end up in an infinite loop where the same inode is
+    processed again and again.
+    
+        EXT4-fs (loop0): warning: checktime reached, running e2fsck is recommended
+        EXT4-fs error (device loop0): ext4_mb_generate_buddy:758: group 2, block bitmap and bg descriptor inconsistent: 6117 vs 0 free clusters
+        Aborting journal on device loop0-8.
+        EXT4-fs (loop0): Remounting filesystem read-only
+        EXT4-fs error (device loop0) in ext4_free_blocks:4895: Journal has aborted
+        EXT4-fs error (device loop0) in ext4_do_update_inode:4893: Journal has aborted
+        EXT4-fs error (device loop0) in ext4_do_update_inode:4893: Journal has aborted
+        EXT4-fs error (device loop0) in ext4_ext_remove_space:3068: IO failure
+        EXT4-fs error (device loop0) in ext4_ext_truncate:4667: Journal has aborted
+        EXT4-fs error (device loop0) in ext4_orphan_del:2927: Journal has aborted
+        EXT4-fs error (device loop0) in ext4_do_update_inode:4893: Journal has aborted
+        EXT4-fs (loop0): Inode 16 (00000000618192a0): orphan list check failed!
+        [...]
+        EXT4-fs (loop0): Inode 16 (0000000061819748): orphan list check failed!
+        [...]
+        EXT4-fs (loop0): Inode 16 (0000000061819bf0): orphan list check failed!
+        [...]
+    
+    See-also: c9eb13a9105 ("ext4: fix hang when processing corrupted orphaned inode list")
+    Cc: Jan Kara <jack@suse.cz>
+    Signed-off-by: Vegard Nossum <vegard.nossum@oracle.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit f8d4d52ce410c804d56fab866fa9fd2ec04d8d6e
+Author: Theodore Ts'o <tytso@mit.edu>
+Date:   Tue Jul 5 20:01:52 2016 -0400
+
+    ext4: validate s_reserved_gdt_blocks on mount
+    
+    commit 5b9554dc5bf008ae7f68a52e3d7e76c0920938a2 upstream.
+    
+    If s_reserved_gdt_blocks is extremely large, it's possible for
+    ext4_init_block_bitmap(), which is called when ext4 sets up an
+    uninitialized block bitmap, to corrupt random kernel memory.  Add the
+    same checks which e2fsck has --- it must never be larger than
+    blocksize / sizeof(__u32) --- and then add a backup check in
+    ext4_init_block_bitmap() in case the superblock gets modified after
+    the file system is mounted.
+    
+    Reported-by: Vegard Nossum <vegard.nossum@oracle.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 175f36cb34d4b06ca2384073f2b741db2e0f915b
+Author: Vegard Nossum <vegard.nossum@oracle.com>
+Date:   Mon Jul 4 11:03:00 2016 -0400
+
+    ext4: don't call ext4_should_journal_data() on the journal inode
+    
+    commit 6a7fd522a7c94cdef0a3b08acf8e6702056e635c upstream.
+    
+    If ext4_fill_super() fails early, it's possible for ext4_evict_inode()
+    to call ext4_should_journal_data() before superblock options and flags
+    are fully set up.  In that case, the iput() on the journal inode can
+    end up causing a BUG().
+    
+    Work around this problem by reordering the tests so we only call
+    ext4_should_journal_data() after we know it's not the journal inode.
+    
+    Fixes: 2d859db3e4 ("ext4: fix data corruption in inodes with journalled data")
+    Fixes: 2b405bfa84 ("ext4: fix data=journal fast mount/umount hang")
+    Cc: Jan Kara <jack@suse.cz>
+    Signed-off-by: Vegard Nossum <vegard.nossum@oracle.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Reviewed-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5a7f477c725e866729307ff87011f8dd812a3cdf
+Author: Jan Kara <jack@suse.cz>
+Date:   Mon Jul 4 10:14:01 2016 -0400
+
+    ext4: fix deadlock during page writeback
+    
+    commit 646caa9c8e196880b41cd3e3d33a2ebc752bdb85 upstream.
+    
+    Commit 06bd3c36a733 (ext4: fix data exposure after a crash) uncovered a
+    deadlock in ext4_writepages() which was previously much harder to hit.
+    After this commit xfstest generic/130 reproduces the deadlock on small
+    filesystems.
+    
+    The problem happens when ext4_do_update_inode() sets LARGE_FILE feature
+    and marks current inode handle as synchronous. That subsequently results
+    in ext4_journal_stop() called from ext4_writepages() to block waiting for
+    transaction commit while still holding page locks, reference to io_end,
+    and some prepared bio in mpd structure each of which can possibly block
+    transaction commit from completing and thus results in deadlock.
+    
+    Fix the problem by releasing page locks, io_end reference, and
+    submitting prepared bio before calling ext4_journal_stop().
+    
+    [ Changed to defer the call to ext4_journal_stop() only if the handle
+      is synchronous.  --tytso ]
+    
+    Reported-and-tested-by: Eryu Guan <eguan@redhat.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9e38db20d794504bb52f9592c90cdc8754f97251
+Author: Vegard Nossum <vegard.nossum@oracle.com>
+Date:   Thu Jun 30 11:53:46 2016 -0400
+
+    ext4: check for extents that wrap around
+    
+    commit f70749ca42943faa4d4dcce46dfdcaadb1d0c4b6 upstream.
+    
+    An extent with lblock = 4294967295 and len = 1 will pass the
+    ext4_valid_extent() test:
+    
+            ext4_lblk_t last = lblock + len - 1;
+    
+            if (len == 0 || lblock > last)
+                    return 0;
+    
+    since last = 4294967295 + 1 - 1 = 4294967295. This would later trigger
+    the BUG_ON(es->es_lblk + es->es_len < es->es_lblk) in ext4_es_end().
+    
+    We can simplify it by removing the - 1 altogether and changing the test
+    to use lblock + len <= lblock, since now if len = 0, then lblock + 0 ==
+    lblock and it fails, and if len > 0 then lblock + len > lblock in order
+    to pass (i.e. it doesn't overflow).
+    
+    Fixes: 5946d0893 ("ext4: check for overlapping extents in ext4_valid_extent_entries()")
+    Fixes: 2f974865f ("ext4: check for zero length extent explicitly")
+    Cc: Eryu Guan <guaneryu@gmail.com>
+    Signed-off-by: Phil Turnbull <phil.turnbull@oracle.com>
+    Signed-off-by: Vegard Nossum <vegard.nossum@oracle.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 08bb036c9d82ec70fd88c7e08345373a97f98637
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Tue Jul 12 13:17:57 2016 +0800
+
+    crypto: scatterwalk - Fix test in scatterwalk_done
+    
+    commit 5f070e81bee35f1b7bd1477bb223a873ff657803 upstream.
+    
+    When there is more data to be processed, the current test in
+    scatterwalk_done may prevent us from calling pagedone even when
+    we should.
+    
+    In particular, if we're on an SG entry spanning multiple pages
+    where the last page is not a full page, we will incorrectly skip
+    calling pagedone on the second last page.
+    
+    This patch fixes this by adding a separate test for whether we've
+    reached the end of a page.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 148fbb966837725e6ff8f151ae6053521d04882c
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Wed Jun 15 22:27:05 2016 +0800
+
+    crypto: gcm - Filter out async ghash if necessary
+    
+    commit b30bdfa86431afbafe15284a3ad5ac19b49b88e3 upstream.
+    
+    As it is if you ask for a sync gcm you may actually end up with
+    an async one because it does not filter out async implementations
+    of ghash.
+    
+    This patch fixes this by adding the necessary filter when looking
+    for ghash.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 92f71339bceeda3a13b71e9663bf422bf3d3e941
+Author: Wei Fang <fangwei1@huawei.com>
+Date:   Wed Jul 6 11:32:20 2016 +0800
+
+    fs/dcache.c: avoid soft-lockup in dput()
+    
+    commit 47be61845c775643f1aa4d2a54343549f943c94c upstream.
+    
+    We triggered soft-lockup under stress test which
+    open/access/write/close one file concurrently on more than
+    five different CPUs:
+    
+    WARN: soft lockup - CPU#0 stuck for 11s! [who:30631]
+    ...
+    [<ffffffc0003986f8>] dput+0x100/0x298
+    [<ffffffc00038c2dc>] terminate_walk+0x4c/0x60
+    [<ffffffc00038f56c>] path_lookupat+0x5cc/0x7a8
+    [<ffffffc00038f780>] filename_lookup+0x38/0xf0
+    [<ffffffc000391180>] user_path_at_empty+0x78/0xd0
+    [<ffffffc0003911f4>] user_path_at+0x1c/0x28
+    [<ffffffc00037d4fc>] SyS_faccessat+0xb4/0x230
+    
+    ->d_lock trylock may failed many times because of concurrently
+    operations, and dput() may execute a long time.
+    
+    Fix this by replacing cpu_relax() with cond_resched().
+    dput() used to be sleepable, so make it sleepable again
+    should be safe.
+    
+    Signed-off-by: Wei Fang <fangwei1@huawei.com>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit b6e0a217f621c62a2abd3ce4c6ae8146c8122e98
+Author: Wei Fang <fangwei1@huawei.com>
+Date:   Mon Jul 25 21:17:04 2016 +0800
+
+    fuse: fix wrong assignment of ->flags in fuse_send_init()
+    
+    commit 9446385f05c9af25fed53dbed3cc75763730be52 upstream.
+    
+    FUSE_HAS_IOCTL_DIR should be assigned to ->flags, it may be a typo.
+    
+    Signed-off-by: Wei Fang <fangwei1@huawei.com>
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+    Fixes: 69fe05c90ed5 ("fuse: add missing INIT flags")
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9ca5f11d9261e7ed491e425b2efde5e9cecf1447
+Author: Maxim Patlasov <mpatlasov@virtuozzo.com>
+Date:   Tue Jul 19 18:12:26 2016 -0700
+
+    fuse: fuse_flush must check mapping->flags for errors
+    
+    commit 9ebce595f63a407c5cec98f98f9da8459b73740a upstream.
+    
+    fuse_flush() calls write_inode_now() that triggers writeback, but actual
+    writeback will happen later, on fuse_sync_writes(). If an error happens,
+    fuse_writepage_end() will set error bit in mapping->flags. So, we have to
+    check mapping->flags after fuse_sync_writes().
+    
+    Signed-off-by: Maxim Patlasov <mpatlasov@virtuozzo.com>
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+    Fixes: 4d99ff8f12eb ("fuse: Turn writeback cache on")
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3d1c64d81fd887ec0cac56f0299c2234a5450011
+Author: Alexey Kuznetsov <kuznet@parallels.com>
+Date:   Tue Jul 19 12:48:01 2016 -0700
+
+    fuse: fsync() did not return IO errors
+    
+    commit ac7f052b9e1534c8248f814b6f0068ad8d4a06d2 upstream.
+    
+    Due to implementation of fuse writeback filemap_write_and_wait_range() does
+    not catch errors. We have to do this directly after fuse_sync_writes()
+    
+    Signed-off-by: Alexey Kuznetsov <kuznet@virtuozzo.com>
+    Signed-off-by: Maxim Patlasov <mpatlasov@virtuozzo.com>
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+    Fixes: 4d99ff8f12eb ("fuse: Turn writeback cache on")
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 62659f0b9ed71ffb8a1e66a42eb52ab8ddadb77a
+Author: Fabian Frederick <fabf@skynet.be>
+Date:   Tue Aug 2 14:03:07 2016 -0700
+
+    sysv, ipc: fix security-layer leaking
+    
+    commit 9b24fef9f0410fb5364245d6cc2bd044cc064007 upstream.
+    
+    Commit 53dad6d3a8e5 ("ipc: fix race with LSMs") updated ipc_rcu_putref()
+    to receive rcu freeing function but used generic ipc_rcu_free() instead
+    of msg_rcu_free() which does security cleaning.
+    
+    Running LTP msgsnd06 with kmemleak gives the following:
+    
+      cat /sys/kernel/debug/kmemleak
+    
+      unreferenced object 0xffff88003c0a11f8 (size 8):
+        comm "msgsnd06", pid 1645, jiffies 4294672526 (age 6.549s)
+        hex dump (first 8 bytes):
+          1b 00 00 00 01 00 00 00                          ........
+        backtrace:
+          kmemleak_alloc+0x23/0x40
+          kmem_cache_alloc_trace+0xe1/0x180
+          selinux_msg_queue_alloc_security+0x3f/0xd0
+          security_msg_queue_alloc+0x2e/0x40
+          newque+0x4e/0x150
+          ipcget+0x159/0x1b0
+          SyS_msgget+0x39/0x40
+          entry_SYSCALL_64_fastpath+0x13/0x8f
+    
+    Manfred Spraul suggested to fix sem.c as well and Davidlohr Bueso to
+    only use ipc_rcu_free in case of security allocation failure in newary()
+    
+    Fixes: 53dad6d3a8e ("ipc: fix race with LSMs")
+    Link: http://lkml.kernel.org/r/1470083552-22966-1-git-send-email-fabf@skynet.be
+    Signed-off-by: Fabian Frederick <fabf@skynet.be>
+    Cc: Davidlohr Bueso <dbueso@suse.de>
+    Cc: Manfred Spraul <manfred@colorfullife.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9a95c0cfc6f21b9ac66269d4782ea5a0f58cdf91
+Author: Vegard Nossum <vegard.nossum@oracle.com>
+Date:   Fri Jul 29 10:40:31 2016 +0200
+
+    block: fix use-after-free in seq file
+    
+    commit 77da160530dd1dc94f6ae15a981f24e5f0021e84 upstream.
+    
+    I got a KASAN report of use-after-free:
+    
+        ==================================================================
+        BUG: KASAN: use-after-free in klist_iter_exit+0x61/0x70 at addr ffff8800b6581508
+        Read of size 8 by task trinity-c1/315
+        =============================================================================
+        BUG kmalloc-32 (Not tainted): kasan: bad access detected
+        -----------------------------------------------------------------------------
+    
+        Disabling lock debugging due to kernel taint
+        INFO: Allocated in disk_seqf_start+0x66/0x110 age=144 cpu=1 pid=315
+                ___slab_alloc+0x4f1/0x520
+                __slab_alloc.isra.58+0x56/0x80
+                kmem_cache_alloc_trace+0x260/0x2a0
+                disk_seqf_start+0x66/0x110
+                traverse+0x176/0x860
+                seq_read+0x7e3/0x11a0
+                proc_reg_read+0xbc/0x180
+                do_loop_readv_writev+0x134/0x210
+                do_readv_writev+0x565/0x660
+                vfs_readv+0x67/0xa0
+                do_preadv+0x126/0x170
+                SyS_preadv+0xc/0x10
+                do_syscall_64+0x1a1/0x460
+                return_from_SYSCALL_64+0x0/0x6a
+        INFO: Freed in disk_seqf_stop+0x42/0x50 age=160 cpu=1 pid=315
+                __slab_free+0x17a/0x2c0
+                kfree+0x20a/0x220
+                disk_seqf_stop+0x42/0x50
+                traverse+0x3b5/0x860
+                seq_read+0x7e3/0x11a0
+                proc_reg_read+0xbc/0x180
+                do_loop_readv_writev+0x134/0x210
+                do_readv_writev+0x565/0x660
+                vfs_readv+0x67/0xa0
+                do_preadv+0x126/0x170
+                SyS_preadv+0xc/0x10
+                do_syscall_64+0x1a1/0x460
+                return_from_SYSCALL_64+0x0/0x6a
+    
+        CPU: 1 PID: 315 Comm: trinity-c1 Tainted: G    B           4.7.0+ #62
+        Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Ubuntu-1.8.2-1ubuntu1 04/01/2014
+         ffffea0002d96000 ffff880119b9f918 ffffffff81d6ce81 ffff88011a804480
+         ffff8800b6581500 ffff880119b9f948 ffffffff8146c7bd ffff88011a804480
+         ffffea0002d96000 ffff8800b6581500 fffffffffffffff4 ffff880119b9f970
+        Call Trace:
+         [<ffffffff81d6ce81>] dump_stack+0x65/0x84
+         [<ffffffff8146c7bd>] print_trailer+0x10d/0x1a0
+         [<ffffffff814704ff>] object_err+0x2f/0x40
+         [<ffffffff814754d1>] kasan_report_error+0x221/0x520
+         [<ffffffff8147590e>] __asan_report_load8_noabort+0x3e/0x40
+         [<ffffffff83888161>] klist_iter_exit+0x61/0x70
+         [<ffffffff82404389>] class_dev_iter_exit+0x9/0x10
+         [<ffffffff81d2e8ea>] disk_seqf_stop+0x3a/0x50
+         [<ffffffff8151f812>] seq_read+0x4b2/0x11a0
+         [<ffffffff815f8fdc>] proc_reg_read+0xbc/0x180
+         [<ffffffff814b24e4>] do_loop_readv_writev+0x134/0x210
+         [<ffffffff814b4c45>] do_readv_writev+0x565/0x660
+         [<ffffffff814b8a17>] vfs_readv+0x67/0xa0
+         [<ffffffff814b8de6>] do_preadv+0x126/0x170
+         [<ffffffff814b92ec>] SyS_preadv+0xc/0x10
+    
+    This problem can occur in the following situation:
+    
+    open()
+     - pread()
+        - .seq_start()
+           - iter = kmalloc() // succeeds
+           - seqf->private = iter
+        - .seq_stop()
+           - kfree(seqf->private)
+     - pread()
+        - .seq_start()
+           - iter = kmalloc() // fails
+        - .seq_stop()
+           - class_dev_iter_exit(seqf->private) // boom! old pointer
+    
+    As the comment in disk_seqf_stop() says, stop is called even if start
+    failed, so we need to reinitialise the private pointer to NULL when seq
+    iteration stops.
+    
+    An alternative would be to set the private pointer to NULL when the
+    kmalloc() in disk_seqf_start() fails.
+    
+    Signed-off-by: Vegard Nossum <vegard.nossum@oracle.com>
+    Acked-by: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3cde0e742e29d112aca58731a77d8a3aee386fb8
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed Jul 27 11:42:38 2016 +0100
+
+    x86/syscalls/64: Add compat_sys_keyctl for 32-bit userspace
+    
+    commit f7d665627e103e82d34306c7d3f6f46f387c0d8b upstream.
+    
+    x86_64 needs to use compat_sys_keyctl for 32-bit userspace rather than
+    calling sys_keyctl(). The latter will work in a lot of cases, thereby
+    hiding the issue.
+    
+    Reported-by: Stephan Mueller <smueller@chronox.de>
+    Tested-by: Stephan Mueller <smueller@chronox.de>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: keyrings@vger.kernel.org
+    Cc: linux-security-module@vger.kernel.org
+    Link: http://lkml.kernel.org/r/146961615805.14395.5581949237156769439.stgit@warthog.procyon.org.uk
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 821d5e6b8aed558a989514ea85fa14e097111cf0
+Author: Matt Roper <matthew.d.roper@intel.com>
+Date:   Mon Feb 8 11:05:28 2016 -0800
+
+    drm/i915: Pretend cursor is always on for ILK-style WM calculations (v2)
+    
+    commit e2e407dc093f530b771ee8bf8fe1be41e3cea8b3 upstream.
+    
+    Due to our lack of two-step watermark programming, our driver has
+    historically pretended that the cursor plane is always on for the
+    purpose of watermark calculations; this helps avoid serious flickering
+    when the cursor turns off/on (e.g., when the user moves the mouse
+    pointer to a different screen).  That workaround was accidentally
+    dropped as we started working toward atomic watermark updates.  Since we
+    still aren't quite there yet with two-stage updates, we need to
+    resurrect the workaround and treat the cursor as always active.
+    
+    v2: Tweak cursor width calculations slightly to more closely match the
+        logic we used before the atomic overhaul began.  (Ville)
+    
+    Cc: simdev11@outlook.com
+    Cc: manfred.kitzbichler@gmail.com
+    Cc: drm-intel-fixes@lists.freedesktop.org
+    Reported-by: simdev11@outlook.com
+    Reported-by: manfred.kitzbichler@gmail.com
+    Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=93892
+    Fixes: 43d59eda1 ("drm/i915: Eliminate usage of plane_wm_parameters from ILK-style WM code (v2)")
+    Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1454479611-6804-1-git-send-email-matthew.d.roper@intel.com
+    (cherry picked from commit b2435692dbb709d4c8ff3b2f2815c9b8423b72bb)
+    Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1454958328-30129-1-git-send-email-matthew.d.roper@intel.com
+    Tested-by: Jay <mymailclone@t-online.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit fb93281fa225923c89cf94db59abfd98bba4709f
+Author: Toshi Kani <toshi.kani@hpe.com>
+Date:   Mon Apr 11 13:36:00 2016 -0600
+
+    x86/mm/pat: Fix BUG_ON() in mmap_mem() on QEMU/i386
+    
+    commit 1886297ce0c8d563a08c8a8c4c0b97743e06cd37 upstream.
+    
+    The following BUG_ON() crash was reported on QEMU/i386:
+    
+      kernel BUG at arch/x86/mm/physaddr.c:79!
+      Call Trace:
+      phys_mem_access_prot_allowed
+      mmap_mem
+      ? mmap_region
+      mmap_region
+      do_mmap
+      vm_mmap_pgoff
+      SyS_mmap_pgoff
+      do_int80_syscall_32
+      entry_INT80_32
+    
+    after commit:
+    
+      edfe63ec97ed ("x86/mtrr: Fix Xorg crashes in Qemu sessions")
+    
+    PAT is now set to disabled state when MTRRs are disabled.
+    Thus, reactivating the __pa(high_memory) check in
+    phys_mem_access_prot_allowed().
+    
+    When CONFIG_DEBUG_VIRTUAL is set, __pa() calls __phys_addr(),
+    which in turn calls slow_virt_to_phys() for 'high_memory'.
+    Because 'high_memory' is set to (the max direct mapped virt
+    addr + 1), it is not a valid virtual address.  Hence,
+    slow_virt_to_phys() returns 0 and hit the BUG_ON.  Using
+    __pa_nodebug() instead of __pa() will fix this BUG_ON.
+    
+    However, this code block, originally written for Pentiums and
+    earlier, is no longer adequate since a 32-bit Xen guest has
+    MTRRs disabled and supports ZONE_HIGHMEM.  In this setup,
+    this code sets UC attribute for accessing RAM in high memory
+    range.
+    
+    Delete this code block as it has been unused for a long time.
+    
+    Reported-by: kernel test robot <ying.huang@linux.intel.com>
+    Reviewed-by: Borislav Petkov <bp@suse.de>
+    Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: David Vrabel <david.vrabel@citrix.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: xen-devel@lists.xenproject.org
+    Link: http://lkml.kernel.org/r/1460403360-25441-1-git-send-email-toshi.kani@hpe.com
+    Link: https://lkml.org/lkml/2016/4/1/608
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit e270fdc5237154293d0b58d85ee6584742f98aeb
+Author: Toshi Kani <toshi.kani@hpe.com>
+Date:   Wed Mar 23 15:42:03 2016 -0600
+
+    x86/pat: Document the PAT initialization sequence
+    
+    commit b6350c21cfe8aa9d65e189509a23c0ea4b8362c2 upstream.
+    
+    Update PAT documentation to describe how PAT is initialized under
+    various configurations.
+    
+    Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Borislav Petkov <bp@suse.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Juergen Gross <jgross@suse.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Luis R. Rodriguez <mcgrof@suse.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Toshi Kani <toshi.kani@hp.com>
+    Cc: elliott@hpe.com
+    Cc: konrad.wilk@oracle.com
+    Cc: paul.gortmaker@windriver.com
+    Cc: xen-devel@lists.xenproject.org
+    Link: http://lkml.kernel.org/r/1458769323-24491-8-git-send-email-toshi.kani@hpe.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 26b340ea33f49af99449607c20c97fa3f499c5fa
+Author: Toshi Kani <toshi.kani@hpe.com>
+Date:   Wed Mar 23 15:42:02 2016 -0600
+
+    x86/xen, pat: Remove PAT table init code from Xen
+    
+    commit 88ba281108ed0c25c9d292b48bd3f272fcb90dd0 upstream.
+    
+    Xen supports PAT without MTRRs for its guests.  In order to
+    enable WC attribute, it was necessary for xen_start_kernel()
+    to call pat_init_cache_modes() to update PAT table before
+    starting guest kernel.
+    
+    Now that the kernel initializes PAT table to the BIOS handoff
+    state when MTRR is disabled, this Xen-specific PAT init code
+    is no longer necessary.  Delete it from xen_start_kernel().
+    
+    Also change __init_cache_modes() to a static function since
+    PAT table should not be tweaked by other modules.
+    
+    Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: Juergen Gross <jgross@suse.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Borislav Petkov <bp@suse.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Luis R. Rodriguez <mcgrof@suse.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Toshi Kani <toshi.kani@hp.com>
+    Cc: elliott@hpe.com
+    Cc: paul.gortmaker@windriver.com
+    Cc: xen-devel@lists.xenproject.org
+    Link: http://lkml.kernel.org/r/1458769323-24491-7-git-send-email-toshi.kani@hpe.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a23b299b4a7d0083a3bdb61d1586956f817e8961
+Author: Toshi Kani <toshi.kani@hpe.com>
+Date:   Wed Mar 23 15:42:01 2016 -0600
+
+    x86/mtrr: Fix PAT init handling when MTRR is disabled
+    
+    commit ad025a73f0e9344ac73ffe1b74c184033e08e7d5 upstream.
+    
+    get_mtrr_state() calls pat_init() on BSP even if MTRR is disabled.
+    This results in calling pat_init() on BSP only since APs do not call
+    pat_init() when MTRR is disabled.  This inconsistency between BSP
+    and APs leads to undefined behavior.
+    
+    Make BSP's calling condition to pat_init() consistent with AP's,
+    mtrr_ap_init() and mtrr_aps_init().
+    
+    Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Borislav Petkov <bp@suse.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Juergen Gross <jgross@suse.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Luis R. Rodriguez <mcgrof@suse.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Toshi Kani <toshi.kani@hp.com>
+    Cc: elliott@hpe.com
+    Cc: konrad.wilk@oracle.com
+    Cc: paul.gortmaker@windriver.com
+    Cc: xen-devel@lists.xenproject.org
+    Link: http://lkml.kernel.org/r/1458769323-24491-6-git-send-email-toshi.kani@hpe.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 594055cf63d2ed5b06387f91ce9505ae651fc38d
+Author: Toshi Kani <toshi.kani@hpe.com>
+Date:   Wed Mar 23 15:42:00 2016 -0600
+
+    x86/mtrr: Fix Xorg crashes in Qemu sessions
+    
+    commit edfe63ec97ed8d4496225f7ba54c9ce4207c5431 upstream.
+    
+    A Xorg failure on qemu32 was reported as a regression [1] caused by
+    commit 9cd25aac1f44 ("x86/mm/pat: Emulate PAT when it is disabled").
+    
+    This patch fixes the Xorg crash.
+    
+    Negative effects of this regression were the following two failures [2]
+    in Xorg on QEMU with QEMU CPU model "qemu32" (-cpu qemu32), which were
+    triggered by the fact that its virtual CPU does not support MTRRs.
+    
+     #1. copy_process() failed in the check in reserve_pfn_range()
+    
+        copy_process
+         copy_mm
+          dup_mm
+           dup_mmap
+            copy_page_range
+             track_pfn_copy
+              reserve_pfn_range
+    
+     A WC map request was tracked as WC in memtype, which set a PTE as
+     UC (pgprot) per __cachemode2pte_tbl[].  This led to this error in
+     reserve_pfn_range() called from track_pfn_copy(), which obtained
+     a pgprot from a PTE.  It converts pgprot to page_cache_mode, which
+     does not necessarily result in the original page_cache_mode since
+     __cachemode2pte_tbl[] redirects multiple types to UC.
+    
+     #2. error path in copy_process() then hit WARN_ON_ONCE in
+         untrack_pfn().
+    
+         x86/PAT: Xorg:509 map pfn expected mapping type uncached-
+         minus for [mem 0xfd000000-0xfdffffff], got write-combining
+          Call Trace:
+         dump_stack
+         warn_slowpath_common
+         ? untrack_pfn
+         ? untrack_pfn
+         warn_slowpath_null
+         untrack_pfn
+         ? __kunmap_atomic
+         unmap_single_vma
+         ? pagevec_move_tail_fn
+         unmap_vmas
+         exit_mmap
+         mmput
+         copy_process.part.47
+         _do_fork
+         SyS_clone
+         do_syscall_32_irqs_on
+         entry_INT80_32
+    
+    These negative effects are caused by two separate bugs, but they
+    can be addressed in separate patches.  Fixing the pat_init() issue
+    described below addresses the root cause, and avoids Xorg to hit
+    these cases.
+    
+    When the CPU does not support MTRRs, MTRR does not call pat_init(),
+    which leaves PAT enabled without initializing PAT.  This pat_init()
+    issue is a long-standing issue, but manifested as issue #1 (and then
+    hit issue #2) with the above-mentioned commit because the memtype
+    now tracks cache attribute with 'page_cache_mode'.
+    
+    This pat_init() issue existed before the commit, but we used pgprot
+    in memtype.  Hence, we did not have issue #1 before.  But WC request
+    resulted in WT in effect because WC pgrot is actually WT when PAT
+    is not initialized.  This is not how it was designed to work.  When
+    PAT is set to disable properly, WC is converted to UC.  The use of
+    WT can result in a system crash if the target range does not support
+    WT.  Fortunately, nobody ran into such issue before.
+    
+    To fix this pat_init() issue, PAT code has been enhanced to provide
+    pat_disable() interface.  Call this interface when MTRRs are disabled.
+    By setting PAT to disable properly, PAT bypasses the memtype check,
+    and avoids issue #1.
+    
+      [1]: https://lkml.org/lkml/2016/3/3/828
+      [2]: https://lkml.org/lkml/2016/3/4/775
+    
+    Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Borislav Petkov <bp@suse.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Juergen Gross <jgross@suse.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Luis R. Rodriguez <mcgrof@suse.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Toshi Kani <toshi.kani@hp.com>
+    Cc: elliott@hpe.com
+    Cc: konrad.wilk@oracle.com
+    Cc: paul.gortmaker@windriver.com
+    Cc: xen-devel@lists.xenproject.org
+    Link: http://lkml.kernel.org/r/1458769323-24491-5-git-send-email-toshi.kani@hpe.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 32c854288949a34f4dc08655d0c4b0294916e6c0
+Author: Toshi Kani <toshi.kani@hpe.com>
+Date:   Wed Mar 23 15:41:59 2016 -0600
+
+    x86/mm/pat: Replace cpu_has_pat with boot_cpu_has()
+    
+    commit d63dcf49cf5ae5605f4d14229e3888e104f294b1 upstream.
+    
+    Borislav Petkov suggested:
+    
+     > Please use on init paths boot_cpu_has(X86_FEATURE_PAT) and on fast
+     > paths static_cpu_has(X86_FEATURE_PAT). No more of that cpu_has_XXX
+     > ugliness.
+    
+    Replace the use of cpu_has_pat on init paths with boot_cpu_has().
+    
+    Suggested-by: Borislav Petkov <bp@suse.de>
+    Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Juergen Gross <jgross@suse.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Luis R. Rodriguez <mcgrof@suse.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Robert Elliott <elliott@hpe.com>
+    Cc: Toshi Kani <toshi.kani@hp.com>
+    Cc: konrad.wilk@oracle.com
+    Cc: paul.gortmaker@windriver.com
+    Cc: xen-devel@lists.xenproject.org
+    Link: http://lkml.kernel.org/r/1458769323-24491-4-git-send-email-toshi.kani@hpe.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit d50e8b108ef8980bd193de587d984e986be2ecc1
+Author: Toshi Kani <toshi.kani@hpe.com>
+Date:   Wed Mar 23 15:41:58 2016 -0600
+
+    x86/mm/pat: Add pat_disable() interface
+    
+    commit 224bb1e5d67ba0f2872c98002d6a6f991ac6fd4a upstream.
+    
+    In preparation for fixing a regression caused by:
+    
+      9cd25aac1f44 ("x86/mm/pat: Emulate PAT when it is disabled")
+    
+    ... PAT needs to provide an interface that prevents the OS from
+    initializing the PAT MSR.
+    
+    PAT MSR initialization must be done on all CPUs using the specific
+    sequence of operations defined in the Intel SDM.  This requires MTRRs
+    to be enabled since pat_init() is called as part of MTRR init
+    from mtrr_rendezvous_handler().
+    
+    Make pat_disable() as the interface that prevents the OS from
+    initializing the PAT MSR.  MTRR will call this interface when it
+    cannot provide the SDM-defined sequence to initialize PAT.
+    
+    This also assures that pat_disable() called from pat_bsp_init()
+    will set the PAT table properly when CPU does not support PAT.
+    
+    Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Borislav Petkov <bp@suse.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Juergen Gross <jgross@suse.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Luis R. Rodriguez <mcgrof@suse.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Robert Elliott <elliott@hpe.com>
+    Cc: Toshi Kani <toshi.kani@hp.com>
+    Cc: konrad.wilk@oracle.com
+    Cc: paul.gortmaker@windriver.com
+    Cc: xen-devel@lists.xenproject.org
+    Link: http://lkml.kernel.org/r/1458769323-24491-3-git-send-email-toshi.kani@hpe.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 8f5b8210fff0e8469c056b82490d786bc6bde92a
+Author: Toshi Kani <toshi.kani@hpe.com>
+Date:   Wed Mar 23 15:41:57 2016 -0600
+
+    x86/mm/pat: Add support of non-default PAT MSR setting
+    
+    commit 02f037d641dc6672be5cfe7875a48ab99b95b154 upstream.
+    
+    In preparation for fixing a regression caused by:
+    
+      9cd25aac1f44 ("x86/mm/pat: Emulate PAT when it is disabled")'
+    
+    ... PAT needs to support a case that PAT MSR is initialized with a
+    non-default value.
+    
+    When pat_init() is called and PAT is disabled, it initializes the
+    PAT table with the BIOS default value. Xen, however, sets PAT MSR
+    with a non-default value to enable WC. This causes inconsistency
+    between the PAT table and PAT MSR when PAT is set to disable on Xen.
+    
+    Change pat_init() to handle the PAT disable cases properly.  Add
+    init_cache_modes() to handle two cases when PAT is set to disable.
+    
+     1. CPU supports PAT: Set PAT table to be consistent with PAT MSR.
+     2. CPU does not support PAT: Set PAT table to be consistent with
+        PWT and PCD bits in a PTE.
+    
+    Note, __init_cache_modes(), renamed from pat_init_cache_modes(),
+    will be changed to a static function in a later patch.
+    
+    Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Borislav Petkov <bp@suse.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Juergen Gross <jgross@suse.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Luis R. Rodriguez <mcgrof@suse.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Toshi Kani <toshi.kani@hp.com>
+    Cc: elliott@hpe.com
+    Cc: konrad.wilk@oracle.com
+    Cc: paul.gortmaker@windriver.com
+    Cc: xen-devel@lists.xenproject.org
+    Link: http://lkml.kernel.org/r/1458769323-24491-2-git-send-email-toshi.kani@hpe.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5c7d0f49cf1492866fa619af4538f56938abe07d
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Sat Apr 16 15:16:07 2016 -0700
+
+    devpts: clean up interface to pty drivers
+    
+    commit 67245ff332064c01b760afa7a384ccda024bfd24 upstream.
+    
+    This gets rid of the horrible notion of having that
+    
+        struct inode *ptmx_inode
+    
+    be the linchpin of the interface between the pty code and devpts.
+    
+    By de-emphasizing the ptmx inode, a lot of things actually get cleaner,
+    and we will have a much saner way forward.  In particular, this will
+    allow us to associate with any particular devpts instance at open-time,
+    and not be artificially tied to one particular ptmx inode.
+    
+    The patch itself is actually fairly straightforward, and apart from some
+    locking and return path cleanups it's pretty mechanical:
+    
+     - the interfaces that devpts exposes all take "struct pts_fs_info *"
+       instead of "struct inode *ptmx_inode" now.
+    
+       NOTE! The "struct pts_fs_info" thing is a completely opaque structure
+       as far as the pty driver is concerned: it's still declared entirely
+       internally to devpts. So the pty code can't actually access it in any
+       way, just pass it as a "cookie" to the devpts code.
+    
+     - the "look up the pts fs info" is now a single clear operation, that
+       also does the reference count increment on the pts superblock.
+    
+       So "devpts_add/del_ref()" is gone, and replaced by a "lookup and get
+       ref" operation (devpts_get_ref(inode)), along with a "put ref" op
+       (devpts_put_ref()).
+    
+     - the pty master "tty->driver_data" field now contains the pts_fs_info,
+       not the ptmx inode.
+    
+     - because we don't care about the ptmx inode any more as some kind of
+       base index, the ref counting can now drop the inode games - it just
+       gets the ref on the superblock.
+    
+     - the pts_fs_info now has a back-pointer to the super_block. That's so
+       that we can easily look up the information we actually need. Although
+       quite often, the pts fs info was actually all we wanted, and not having
+       to look it up based on some magical inode makes things more
+       straightforward.
+    
+    In particular, now that "devpts_get_ref(inode)" operation should really
+    be the *only* place we need to look up what devpts instance we're
+    associated with, and we do it exactly once, at ptmx_open() time.
+    
+    The other side of this is that one ptmx node could now be associated
+    with multiple different devpts instances - you could have a single
+    /dev/ptmx node, and then have multiple mount namespaces with their own
+    instances of devpts mounted on /dev/pts/.  And that's all perfectly sane
+    in a model where we just look up the pts instance at open time.
+    
+    This will eventually allow us to get rid of our odd single-vs-multiple
+    pts instance model, but this patch in itself changes no semantics, only
+    an internal binding model.
+    
+    Cc: Eric Biederman <ebiederm@xmission.com>
+    Cc: Peter Anvin <hpa@zytor.com>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Cc: Peter Hurley <peter@hurleysoftware.com>
+    Cc: Serge Hallyn <serge.hallyn@ubuntu.com>
+    Cc: Willy Tarreau <w@1wt.eu>
+    Cc: Aurelien Jarno <aurelien@aurel32.net>
+    Cc: Alan Cox <gnomes@lxorguk.ukuu.org.uk>
+    Cc: Jann Horn <jann@thejh.net>
+    Cc: Greg KH <greg@kroah.com>
+    Cc: Jiri Slaby <jslaby@suse.com>
+    Cc: Florian Weimer <fw@deneb.enyo.de>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Francesco Ruggeri <fruggeri@arista.com>
+    Cc: "Herton R. Krzesinski" <herton@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 93f84c8864658c740d205624ab9d23ceca235e46
+Author: Theodore Ts'o <tytso@mit.edu>
+Date:   Sun Jul 3 17:01:26 2016 -0400
+
+    random: strengthen input validation for RNDADDTOENTCNT
+    
+    commit 86a574de4590ffe6fd3f3ca34cdcf655a78e36ec upstream.
+    
+    Don't allow RNDADDTOENTCNT or RNDADDENTROPY to accept a negative
+    entropy value.  It doesn't make any sense to subtract from the entropy
+    counter, and it can trigger a warning:
+    
+    random: negative entropy/overflow: pool input count -40000
+    ------------[ cut here ]------------
+    WARNING: CPU: 3 PID: 6828 at drivers/char/random.c:670[<      none
+     >] credit_entropy_bits+0x21e/0xad0 drivers/char/random.c:670
+    Modules linked in:
+    CPU: 3 PID: 6828 Comm: a.out Not tainted 4.7.0-rc4+ #4
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs 01/01/2011
+     ffffffff880b58e0 ffff88005dd9fcb0 ffffffff82cc838f ffffffff87158b40
+     fffffbfff1016b1c 0000000000000000 0000000000000000 ffffffff87158b40
+     ffffffff83283dae 0000000000000009 ffff88005dd9fcf8 ffffffff8136d27f
+    Call Trace:
+     [<     inline     >] __dump_stack lib/dump_stack.c:15
+     [<ffffffff82cc838f>] dump_stack+0x12e/0x18f lib/dump_stack.c:51
+     [<ffffffff8136d27f>] __warn+0x19f/0x1e0 kernel/panic.c:516
+     [<ffffffff8136d48c>] warn_slowpath_null+0x2c/0x40 kernel/panic.c:551
+     [<ffffffff83283dae>] credit_entropy_bits+0x21e/0xad0 drivers/char/random.c:670
+     [<     inline     >] credit_entropy_bits_safe drivers/char/random.c:734
+     [<ffffffff8328785d>] random_ioctl+0x21d/0x250 drivers/char/random.c:1546
+     [<     inline     >] vfs_ioctl fs/ioctl.c:43
+     [<ffffffff8185316c>] do_vfs_ioctl+0x18c/0xff0 fs/ioctl.c:674
+     [<     inline     >] SYSC_ioctl fs/ioctl.c:689
+     [<ffffffff8185405f>] SyS_ioctl+0x8f/0xc0 fs/ioctl.c:680
+     [<ffffffff86a995c0>] entry_SYSCALL_64_fastpath+0x23/0xc1
+    arch/x86/entry/entry_64.S:207
+    ---[ end trace 5d4902b2ba842f1f ]---
+    
+    This was triggered using the test program:
+    
+    // autogenerated by syzkaller (http://github.com/google/syzkaller)
+    
+    int main() {
+            int fd = open("/dev/random", O_RDWR);
+            int val = -5000;
+            ioctl(fd, RNDADDTOENTCNT, &val);
+            return 0;
+    }
+    
+    It's harmless in that (a) only root can trigger it, and (b) after
+    complaining the code never does let the entropy count go negative, but
+    it's better to simply not allow this userspace from passing in a
+    negative entropy value altogether.
+    
+    Google-Bug-Id: #29575089
+    Reported-By: Dmitry Vyukov <dvyukov@google.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 6090bfb684a9985e29c3c0aae52a4b93f967e90f
+Author: John Johansen <john.johansen@canonical.com>
+Date:   Wed Nov 18 11:41:05 2015 -0800
+
+    apparmor: fix ref count leak when profile sha1 hash is read
+    
+    commit 0b938a2e2cf0b0a2c8bac9769111545aff0fee97 upstream.
+    
+    Signed-off-by: John Johansen <john.johansen@canonical.com>
+    Acked-by: Seth Arnold <seth.arnold@canonical.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 4cf8f0b0b3e635d8a17f19ef3a183c4c95a4af39
+Author: Michael Holzheu <holzheu@linux.vnet.ibm.com>
+Date:   Mon Jun 13 17:03:48 2016 +0200
+
+    Revert "s390/kdump: Clear subchannel ID to signal non-CCW/SCSI IPL"
+    
+    commit 5419447e2142d6ed68c9f5c1a28630b3a290a845 upstream.
+    
+    This reverts commit 852ffd0f4e23248b47531058e531066a988434b5.
+    
+    There are use cases where an intermediate boot kernel (1) uses kexec
+    to boot the final production kernel (2). For this scenario we should
+    provide the original boot information to the production kernel (2).
+    Therefore clearing the boot information during kexec() should not
+    be done.
+    
+    Reported-by: Steffen Maier <maier@linux.vnet.ibm.com>
+    Signed-off-by: Michael Holzheu <holzheu@linux.vnet.ibm.com>
+    Reviewed-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+    Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit cca36a7dad58fc7a95944319e48162194ead6f00
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed Jul 27 11:43:37 2016 +0100
+
+    KEYS: 64-bit MIPS needs to use compat_sys_keyctl for 32-bit userspace
+    
+    commit 20f06ed9f61a185c6dabd662c310bed6189470df upstream.
+    
+    MIPS64 needs to use compat_sys_keyctl for 32-bit userspace rather than
+    calling sys_keyctl.  The latter will work in a lot of cases, thereby hiding
+    the issue.
+    
+    Reported-by: Stephan Mueller <smueller@chronox.de>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Cc: linux-mips@linux-mips.org
+    Cc: linux-kernel@vger.kernel.org
+    Cc: linux-security-module@vger.kernel.org
+    Cc: keyrings@vger.kernel.org
+    Patchwork: https://patchwork.linux-mips.org/patch/13832/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 0107ea0e0928c8a077f0f912c809f2b86fa7496c
+Author: Dave Weinstein <olorin@google.com>
+Date:   Thu Jul 28 11:55:41 2016 -0700
+
+    arm: oabi compat: add missing access checks
+    
+    commit 7de249964f5578e67b99699c5f0b405738d820a2 upstream.
+    
+    Add access checks to sys_oabi_epoll_wait() and sys_oabi_semtimedop().
+    This fixes CVE-2016-3857, a local privilege escalation under
+    CONFIG_OABI_COMPAT.
+    
+    Reported-by: Chiachih Wu <wuchiachih@gmail.com>
+    Reviewed-by: Kees Cook <keescook@chromium.org>
+    Reviewed-by: Nicolas Pitre <nico@linaro.org>
+    Signed-off-by: Dave Weinstein <olorin@google.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 66e5d7b47c864f1821041f77752930ec3b8dfc22
+Author: Bjørn Mork <bjorn@mork.no>
+Date:   Mon Mar 7 21:15:36 2016 +0100
+
+    cdc_ncm: do not call usbnet_link_change from cdc_ncm_bind
+    
+    commit 4d06dd537f95683aba3651098ae288b7cbff8274 upstream.
+    
+    usbnet_link_change will call schedule_work and should be
+    avoided if bind is failing. Otherwise we will end up with
+    scheduled work referring to a netdev which has gone away.
+    
+    Instead of making the call conditional, we can just defer
+    it to usbnet_probe, using the driver_info flag made for
+    this purpose.
+    
+    Fixes: 8a34b0ae8778 ("usbnet: cdc_ncm: apply usbnet_link_change")
+    Reported-by: Andrey Konovalov <andreyknvl@gmail.com>
+    Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Bjørn Mork <bjorn@mork.no>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 3088903a55f218c0d3758de086ede3901b8711b0
+Author: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date:   Thu Jun 9 16:56:28 2016 +0300
+
+    i2c: i801: Allow ACPI SystemIO OpRegion to conflict with PCI BAR
+    
+    commit a7ae81952cdab56a1277bd2f9ed7284c0f575120 upstream.
+    
+    Many Intel systems the BIOS declares a SystemIO OpRegion below the SMBus
+    PCI device as can be seen in ACPI DSDT table from Lenovo Yoga 900:
+    
+      Device (SBUS)
+      {
+          OperationRegion (SMBI, SystemIO, (SBAR << 0x05), 0x10)
+          Field (SMBI, ByteAcc, NoLock, Preserve)
+          {
+              HSTS,   8,
+              Offset (0x02),
+              HCON,   8,
+              HCOM,   8,
+              TXSA,   8,
+              DAT0,   8,
+              DAT1,   8,
+              HBDR,   8,
+              PECR,   8,
+              RXSA,   8,
+              SDAT,   16
+          }
+    
+    There are also bunch of AML methods that that the BIOS can use to access
+    these fields. Most of the systems in question AML methods accessing the
+    SMBI OpRegion are never used.
+    
+    Now, because of this SMBI OpRegion many systems fail to load the SMBus
+    driver with an error looking like one below:
+    
+      ACPI Warning: SystemIO range 0x0000000000003040-0x000000000000305F
+           conflicts with OpRegion 0x0000000000003040-0x000000000000304F
+           (\_SB.PCI0.SBUS.SMBI) (20160108/utaddress-255)
+      ACPI: If an ACPI driver is available for this device, you should use
+           it instead of the native driver
+    
+    The reason is that this SMBI OpRegion conflicts with the PCI BAR used by
+    the SMBus driver.
+    
+    It turns out that we can install a custom SystemIO address space handler
+    for the SMBus device to intercept all accesses through that OpRegion. This
+    allows us to share the PCI BAR with the AML code if it for some reason is
+    using it. We do not expect that this OpRegion handler will ever be called
+    but if it is we print a warning and prevent all access from the SMBus
+    driver itself.
+    
+    Link: https://bugzilla.kernel.org/show_bug.cgi?id=110041
+    Reported-by: Andy Lutomirski <luto@kernel.org>
+    Reported-by: Pali Rohár <pali.rohar@gmail.com>
+    Suggested-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+    Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Reviewed-by: Jean Delvare <jdelvare@suse.de>
+    Reviewed-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+    Tested-by: Pali Rohár <pali.rohar@gmail.com>
+    Tested-by: Jean Delvare <jdelvare@suse.de>
+    Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 979a61a02992e2029fcedcdf32c05050aa652c9c
+Author: Hector Marco-Gisbert <hecmargi@upv.es>
+Date:   Thu Mar 10 20:51:00 2016 +0100
+
+    x86/mm/32: Enable full randomization on i386 and X86_32
+    
+    commit 8b8addf891de8a00e4d39fc32f93f7c5eb8feceb upstream.
+    
+    Currently on i386 and on X86_64 when emulating X86_32 in legacy mode, only
+    the stack and the executable are randomized but not other mmapped files
+    (libraries, vDSO, etc.). This patch enables randomization for the
+    libraries, vDSO and mmap requests on i386 and in X86_32 in legacy mode.
+    
+    By default on i386 there are 8 bits for the randomization of the libraries,
+    vDSO and mmaps which only uses 1MB of VA.
+    
+    This patch preserves the original randomness, using 1MB of VA out of 3GB or
+    4GB. We think that 1MB out of 3GB is not a big cost for having the ASLR.
+    
+    The first obvious security benefit is that all objects are randomized (not
+    only the stack and the executable) in legacy mode which highly increases
+    the ASLR effectiveness, otherwise the attackers may use these
+    non-randomized areas. But also sensitive setuid/setgid applications are
+    more secure because currently, attackers can disable the randomization of
+    these applications by setting the ulimit stack to "unlimited". This is a
+    very old and widely known trick to disable the ASLR in i386 which has been
+    allowed for too long.
+    
+    Another trick used to disable the ASLR was to set the ADDR_NO_RANDOMIZE
+    personality flag, but fortunately this doesn't work on setuid/setgid
+    applications because there is security checks which clear Security-relevant
+    flags.
+    
+    This patch always randomizes the mmap_legacy_base address, removing the
+    possibility to disable the ASLR by setting the stack to "unlimited".
+    
+    Signed-off-by: Hector Marco-Gisbert <hecmargi@upv.es>
+    Acked-by: Ismael Ripoll Ripoll <iripoll@upv.es>
+    Acked-by: Kees Cook <keescook@chromium.org>
+    Acked-by: Arjan van de Ven <arjan@linux.intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: akpm@linux-foundation.org
+    Cc: kees Cook <keescook@chromium.org>
+    Link: http://lkml.kernel.org/r/1457639460-5242-1-git-send-email-hecmargi@upv.es
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Cc: Laura Abbott <labbott@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 6e1242497cdf8274b8a27f24325634089c77285e
+Author: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+Date:   Fri Jan 8 17:58:49 2016 +0100
+
+    HID: sony: do not bail out when the sixaxis refuses the output report
+    
+    commit 19f4c2ba869517048add62c202f9645b6adf5dfb upstream.
+    
+    When setting the operational mode, some third party (Speedlink Strike-FX)
+    gamepads refuse the output report. Failing here means we refuse to
+    initialize the gamepad while this should be harmless.
+    
+    The weird part is that the initial commit that added this: a7de9b8
+    ("HID: sony: Enable Gasia third-party PS3 controllers") mentions this
+    very same controller as one requiring this output report.
+    Anyway, it's broken for one user at least, so let's change it.
+    We will report an error, but at least the controller should work.
+    
+    And no, these devices present themselves as legacy Sony controllers
+    (VID:PID of 054C:0268, as in the official ones) so there are no ways
+    of discriminating them from the official ones.
+    
+    https://bugzilla.redhat.com/show_bug.cgi?id=1255325
+    
+    Reported-and-tested-by: Max Fedotov <thesourcehim@gmail.com>
+    Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+    Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+    Cc: Laura Abbott <labbott@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit d71d4aceae67acf0dd95fa288439d9801f76c9cb
+Author: Christophe Le Roy <christophe.fish@gmail.com>
+Date:   Fri Dec 11 09:13:42 2015 +0100
+
+    PNP: Add Broadwell to Intel MCH size workaround
+    
+    commit a77060f07ffc6ac978e280e738302f3e5572a99e upstream.
+    
+    Add device ID 0x1604 for Broadwell to commit cb171f7abb9a ("PNP:
+    Work around BIOS defects in Intel MCH area reporting").
+    
+    >From a Lenovo ThinkPad T550:
+    
+      system 00:01: [io  0x1800-0x189f] could not be reserved
+      system 00:01: [io  0x0800-0x087f] has been reserved
+      system 00:01: [io  0x0880-0x08ff] has been reserved
+      system 00:01: [io  0x0900-0x097f] has been reserved
+      system 00:01: [io  0x0980-0x09ff] has been reserved
+      system 00:01: [io  0x0a00-0x0a7f] has been reserved
+      system 00:01: [io  0x0a80-0x0aff] has been reserved
+      system 00:01: [io  0x0b00-0x0b7f] has been reserved
+      system 00:01: [io  0x0b80-0x0bff] has been reserved
+      system 00:01: [io  0x15e0-0x15ef] has been reserved
+      system 00:01: [io  0x1600-0x167f] has been reserved
+      system 00:01: [io  0x1640-0x165f] has been reserved
+      system 00:01: [mem 0xf8000000-0xfbffffff] could not be reserved
+      system 00:01: [mem 0xfed1c000-0xfed1ffff] has been reserved
+      system 00:01: [mem 0xfed10000-0xfed13fff] has been reserved
+      system 00:01: [mem 0xfed18000-0xfed18fff] has been reserved
+      system 00:01: [mem 0xfed19000-0xfed19fff] has been reserved
+      system 00:01: [mem 0xfed45000-0xfed4bfff] has been reserved
+      system 00:01: Plug and Play ACPI device, IDs PNP0c02 (active)
+      [...]
+      resource sanity check: requesting [mem 0xfed10000-0xfed15fff], which spans more than pnp 00:01 [mem 0xfed10000-0xfed13fff]
+      ------------[ cut here ]------------
+      WARNING: CPU: 2 PID: 1 at /build/linux-CrHvZ_/linux-4.2.6/arch/x86/mm/ioremap.c:198 __ioremap_caller+0x2ee/0x360()
+      Info: mapping multiple BARs. Your kernel is fine.
+      Modules linked in:
+      CPU: 2 PID: 1 Comm: swapper/0 Not tainted 4.2.0-1-amd64 #1 Debian 4.2.6-1
+      Hardware name: LENOVO 20CKCTO1WW/20CKCTO1WW, BIOS N11ET34W (1.10 ) 08/20/2015
+       0000000000000000 ffffffff817e6868 ffffffff8154e2f6 ffff8802241efbf8
+       ffffffff8106e5b1 ffffc90000e98000 0000000000006000 ffffc90000e98000
+       0000000000006000 0000000000000000 ffffffff8106e62a ffffffff817e68c8
+      Call Trace:
+       [<ffffffff8154e2f6>] ? dump_stack+0x40/0x50
+       [<ffffffff8106e5b1>] ? warn_slowpath_common+0x81/0xb0
+       [<ffffffff8106e62a>] ? warn_slowpath_fmt+0x4a/0x50
+       [<ffffffff810742a3>] ? iomem_map_sanity_check+0xb3/0xc0
+       [<ffffffff8105dade>] ? __ioremap_caller+0x2ee/0x360
+       [<ffffffff81036ae6>] ? snb_uncore_imc_init_box+0x66/0x90
+       [<ffffffff810351a8>] ? uncore_pci_probe+0xc8/0x1a0
+       [<ffffffff81302d7f>] ? local_pci_probe+0x3f/0xa0
+       [<ffffffff81303ea4>] ? pci_device_probe+0xc4/0x110
+       [<ffffffff813d9b1e>] ? driver_probe_device+0x1ee/0x450
+       [<ffffffff813d9dfb>] ? __driver_attach+0x7b/0x80
+       [<ffffffff813d9d80>] ? driver_probe_device+0x450/0x450
+       [<ffffffff813d796a>] ? bus_for_each_dev+0x5a/0x90
+       [<ffffffff813d9091>] ? bus_add_driver+0x1f1/0x290
+       [<ffffffff81b37fa8>] ? uncore_cpu_setup+0xc/0xc
+       [<ffffffff813da73f>] ? driver_register+0x5f/0xe0
+       [<ffffffff81b38074>] ? intel_uncore_init+0xcc/0x2b0
+       [<ffffffff81b37fa8>] ? uncore_cpu_setup+0xc/0xc
+       [<ffffffff8100213e>] ? do_one_initcall+0xce/0x200
+       [<ffffffff8108a100>] ? parse_args+0x140/0x4e0
+       [<ffffffff81b2b0cb>] ? kernel_init_freeable+0x162/0x1e8
+       [<ffffffff815443f0>] ? rest_init+0x80/0x80
+       [<ffffffff815443fe>] ? kernel_init+0xe/0xf0
+       [<ffffffff81553e5f>] ? ret_from_fork+0x3f/0x70
+       [<ffffffff815443f0>] ? rest_init+0x80/0x80
+      ---[ end trace 472e7959536abf12 ]---
+    
+      00:00.0 Host bridge: Intel Corporation Broadwell-U Host Bridge -OPI (rev 09)
+              Subsystem: Lenovo Device 2223
+              Control: I/O- Mem+ BusMaster+ SpecCycle- MemWINV- VGASnoop- ParErr- Stepping- SERR- FastB2B- DisINTx-
+              Status: Cap+ 66MHz- UDF- FastB2B+ ParErr- DEVSEL=fast >TAbort- <TAbort- <MAbort+ >SERR- <PERR- INTx-
+              Latency: 0
+              Capabilities: [e0] Vendor Specific Information: Len=0c <?>
+              Kernel driver in use: bdw_uncore
+      00: 86 80 04 16 06 00 90 20 09 00 00 06 00 00 00 00
+      10: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+      20: 00 00 00 00 00 00 00 00 00 00 00 00 aa 17 23 22
+      30: 00 00 00 00 e0 00 00 00 00 00 00 00 00 00 00 00
+    
+    Signed-off-by: Christophe Le Roy <christophe.fish@gmail.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Cc: Laura Abbott <labbott@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 02170f4afcb4514270fcd39cec05650b7858c605
+Author: Josh Boyer <jwboyer@fedoraproject.org>
+Date:   Wed Feb 3 01:00:29 2016 +0100
+
+    PNP: Add Haswell-ULT to Intel MCH size workaround
+    
+    commit ed1f0eeebaeeb7f790e9e7642116a208581e5bfc upstream.
+    
+    Add device ID 0x0a04 for Haswell-ULT to the list of devices with MCH
+    problems.
+    
+    From a Lenovo ThinkPad T440S:
+    [    0.188604] pnp: PnP ACPI init
+    [    0.189044] system 00:00: [mem 0x00000000-0x0009ffff] could not be reserved
+    [    0.189048] system 00:00: [mem 0x000c0000-0x000c3fff] could not be reserved
+    [    0.189050] system 00:00: [mem 0x000c4000-0x000c7fff] could not be reserved
+    [    0.189052] system 00:00: [mem 0x000c8000-0x000cbfff] could not be reserved
+    [    0.189054] system 00:00: [mem 0x000cc000-0x000cffff] could not be reserved
+    [    0.189056] system 00:00: [mem 0x000d0000-0x000d3fff] has been reserved
+    [    0.189058] system 00:00: [mem 0x000d4000-0x000d7fff] has been reserved
+    [    0.189060] system 00:00: [mem 0x000d8000-0x000dbfff] has been reserved
+    [    0.189061] system 00:00: [mem 0x000dc000-0x000dffff] has been reserved
+    [    0.189063] system 00:00: [mem 0x000e0000-0x000e3fff] could not be reserved
+    [    0.189065] system 00:00: [mem 0x000e4000-0x000e7fff] could not be reserved
+    [    0.189067] system 00:00: [mem 0x000e8000-0x000ebfff] could not be reserved
+    [    0.189069] system 00:00: [mem 0x000ec000-0x000effff] could not be reserved
+    [    0.189071] system 00:00: [mem 0x000f0000-0x000fffff] could not be reserved
+    [    0.189073] system 00:00: [mem 0x00100000-0xdf9fffff] could not be reserved
+    [    0.189075] system 00:00: [mem 0xfec00000-0xfed3ffff] could not be reserved
+    [    0.189078] system 00:00: [mem 0xfed4c000-0xffffffff] could not be reserved
+    [    0.189082] system 00:00: Plug and Play ACPI device, IDs PNP0c01 (active)
+    [    0.189216] system 00:01: [io  0x1800-0x189f] could not be reserved
+    [    0.189220] system 00:01: [io  0x0800-0x087f] has been reserved
+    [    0.189222] system 00:01: [io  0x0880-0x08ff] has been reserved
+    [    0.189224] system 00:01: [io  0x0900-0x097f] has been reserved
+    [    0.189226] system 00:01: [io  0x0980-0x09ff] has been reserved
+    [    0.189229] system 00:01: [io  0x0a00-0x0a7f] has been reserved
+    [    0.189231] system 00:01: [io  0x0a80-0x0aff] has been reserved
+    [    0.189233] system 00:01: [io  0x0b00-0x0b7f] has been reserved
+    [    0.189235] system 00:01: [io  0x0b80-0x0bff] has been reserved
+    [    0.189238] system 00:01: [io  0x15e0-0x15ef] has been reserved
+    [    0.189240] system 00:01: [io  0x1600-0x167f] has been reserved
+    [    0.189242] system 00:01: [io  0x1640-0x165f] has been reserved
+    [    0.189246] system 00:01: [mem 0xf8000000-0xfbffffff] could not be reserved
+    [    0.189249] system 00:01: [mem 0x00000000-0x00000fff] could not be reserved
+    [    0.189251] system 00:01: [mem 0xfed1c000-0xfed1ffff] has been reserved
+    [    0.189254] system 00:01: [mem 0xfed10000-0xfed13fff] has been reserved
+    [    0.189256] system 00:01: [mem 0xfed18000-0xfed18fff] has been reserved
+    [    0.189258] system 00:01: [mem 0xfed19000-0xfed19fff] has been reserved
+    [    0.189261] system 00:01: [mem 0xfed45000-0xfed4bfff] has been reserved
+    [    0.189264] system 00:01: Plug and Play ACPI device, IDs PNP0c02 (active)
+    [....]
+    [    0.583653] resource sanity check: requesting [mem 0xfed10000-0xfed15fff], which spans more than pnp 00:01 [mem 0xfed10000-0xfed13fff]
+    [    0.583654] ------------[ cut here ]------------
+    [    0.583660] WARNING: CPU: 0 PID: 1 at arch/x86/mm/ioremap.c:198 __ioremap_caller+0x2c5/0x380()
+    [    0.583661] Info: mapping multiple BARs. Your kernel is fine.
+    [    0.583662] Modules linked in:
+    
+    [    0.583666] CPU: 0 PID: 1 Comm: swapper/0 Not tainted 4.3.3-303.fc23.x86_64 #1
+    [    0.583668] Hardware name: LENOVO 20AR001GXS/20AR001GXS, BIOS GJET86WW (2.36 ) 12/04/2015
+    [    0.583670]  0000000000000000 0000000014cf7e59 ffff880214a1baf8 ffffffff813a625f
+    [    0.583673]  ffff880214a1bb40 ffff880214a1bb30 ffffffff810a07c2 00000000fed10000
+    [    0.583675]  ffffc90000cb8000 0000000000006000 0000000000000000 ffff8800d6381040
+    [    0.583678] Call Trace:
+    [    0.583683]  [<ffffffff813a625f>] dump_stack+0x44/0x55
+    [    0.583686]  [<ffffffff810a07c2>] warn_slowpath_common+0x82/0xc0
+    [    0.583688]  [<ffffffff810a085c>] warn_slowpath_fmt+0x5c/0x80
+    [    0.583692]  [<ffffffff810a6fba>] ? iomem_map_sanity_check+0xba/0xd0
+    [    0.583695]  [<ffffffff81065835>] __ioremap_caller+0x2c5/0x380
+    [    0.583698]  [<ffffffff81065907>] ioremap_nocache+0x17/0x20
+    [    0.583701]  [<ffffffff8103a119>] snb_uncore_imc_init_box+0x79/0xb0
+    [    0.583705]  [<ffffffff81038900>] uncore_pci_probe+0xd0/0x1b0
+    [    0.583707]  [<ffffffff813efda5>] local_pci_probe+0x45/0xa0
+    [    0.583710]  [<ffffffff813f118d>] pci_device_probe+0xfd/0x140
+    [    0.583713]  [<ffffffff814d9b52>] driver_probe_device+0x222/0x480
+    [    0.583715]  [<ffffffff814d9e34>] __driver_attach+0x84/0x90
+    [    0.583717]  [<ffffffff814d9db0>] ? driver_probe_device+0x480/0x480
+    [    0.583720]  [<ffffffff814d762c>] bus_for_each_dev+0x6c/0xc0
+    [    0.583722]  [<ffffffff814d930e>] driver_attach+0x1e/0x20
+    [    0.583724]  [<ffffffff814d8e4b>] bus_add_driver+0x1eb/0x280
+    [    0.583727]  [<ffffffff81d6af1a>] ? uncore_cpu_setup+0x12/0x12
+    [    0.583729]  [<ffffffff814da680>] driver_register+0x60/0xe0
+    [    0.583733]  [<ffffffff813ef78c>] __pci_register_driver+0x4c/0x50
+    [    0.583736]  [<ffffffff81d6affc>] intel_uncore_init+0xe2/0x2e6
+    [    0.583738]  [<ffffffff81d6af1a>] ? uncore_cpu_setup+0x12/0x12
+    [    0.583741]  [<ffffffff81002123>] do_one_initcall+0xb3/0x200
+    [    0.583745]  [<ffffffff810be500>] ? parse_args+0x1a0/0x4a0
+    [    0.583749]  [<ffffffff81d5c1c8>] kernel_init_freeable+0x189/0x223
+    [    0.583752]  [<ffffffff81775c40>] ? rest_init+0x80/0x80
+    [    0.583754]  [<ffffffff81775c4e>] kernel_init+0xe/0xe0
+    [    0.583758]  [<ffffffff81781adf>] ret_from_fork+0x3f/0x70
+    [    0.583760]  [<ffffffff81775c40>] ? rest_init+0x80/0x80
+    [    0.583765] ---[ end trace 077c426a39e018aa ]---
+    
+    00:00.0 Host bridge [0600]: Intel Corporation Haswell-ULT DRAM Controller [8086:0a04] (rev 0b)
+            Subsystem: Lenovo Device [17aa:220c]
+            Control: I/O- Mem+ BusMaster+ SpecCycle- MemWINV- VGASnoop- ParErr- Stepping- SERR- FastB2B- DisINTx-
+            Status: Cap+ 66MHz- UDF- FastB2B+ ParErr- DEVSEL=fast >TAbort- <TAbort- <MAbort+ >SERR- <PERR- INTx-
+            Latency: 0
+            Capabilities: <access denied>
+            Kernel driver in use: hsw_uncore
+    
+    Link: https://bugzilla.redhat.com/show_bug.cgi?id=1300955
+    Tested-by: <robo@tcp.sk>
+    Signed-off-by: Josh Boyer <jwboyer@fedoraproject.org>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Cc: Laura Abbott <labbott@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5a6f9d06d844763261f89850f33a4b84cfc0f1c1
+Author: Hannes Reinecke <hare@suse.de>
+Date:   Tue Dec 1 10:16:42 2015 +0100
+
+    scsi: ignore errors from scsi_dh_add_device()
+    
+    commit 221255aee67ec1c752001080aafec0c4e9390d95 upstream.
+    
+    device handler initialisation might fail due to a number of
+    reasons. But as device_handlers are optional this shouldn't
+    cause us to disable the device entirely.
+    So just ignore errors from scsi_dh_add_device().
+    
+    Reviewed-by: Johannes Thumshirn <jthumshirn@suse.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Hannes Reinecke <hare@suse.de>
+    Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Cc: Laura Abbott <labbott@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 694dfd0ef02ded5b6fbea03a12350ee8a74921d5
+Author: Ben Hutchings <ben@decadent.org.uk>
+Date:   Tue May 31 03:33:57 2016 +0100
+
+    ipath: Restrict use of the write() interface
+    
+    Commit e6bd18f57aad ("IB/security: Restrict use of the write()
+    interface") fixed a security problem with various write()
+    implementations in the Infiniband subsystem.  In older kernel versions
+    the ipath_write() function has the same problem and needs the same
+    restriction.  (The ipath driver has been completely removed upstream.)
+    
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 9c946c931b63068c4197d9d0b4d24635418bc67d
+Author: Soheil Hassas Yeganeh <soheil@google.com>
+Date:   Fri Jul 29 09:34:02 2016 -0400
+
+    tcp: consider recv buf for the initial window scale
+    
+    [ Upstream commit f626300a3e776ccc9671b0dd94698fb3aa315966 ]
+    
+    tcp_select_initial_window() intends to advertise a window
+    scaling for the maximum possible window size. To do so,
+    it considers the maximum of net.ipv4.tcp_rmem[2] and
+    net.core.rmem_max as the only possible upper-bounds.
+    However, users with CAP_NET_ADMIN can use SO_RCVBUFFORCE
+    to set the socket's receive buffer size to values
+    larger than net.ipv4.tcp_rmem[2] and net.core.rmem_max.
+    Thus, SO_RCVBUFFORCE is effectively ignored by
+    tcp_select_initial_window().
+    
+    To fix this, consider the maximum of net.ipv4.tcp_rmem[2],
+    net.core.rmem_max and socket's initial buffer space.
+    
+    Fixes: b0573dea1fb3 ("[NET]: Introduce SO_{SND,RCV}BUFFORCE socket options")
+    Signed-off-by: Soheil Hassas Yeganeh <soheil@google.com>
+    Suggested-by: Neal Cardwell <ncardwell@google.com>
+    Acked-by: Neal Cardwell <ncardwell@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit e23696bc441f5e4fefb18e81d51069632480f64a
+Author: Manish Chopra <manish.chopra@qlogic.com>
+Date:   Mon Jul 25 19:07:46 2016 +0300
+
+    qed: Fix setting/clearing bit in completion bitmap
+    
+    [ Upstream commit 59d3f1ceb69b54569685d0c34dff16a1e0816b19 ]
+    
+    Slowpath completion handling is incorrectly changing
+    SPQ_RING_SIZE bits instead of a single one.
+    
+    Fixes: 76a9a3642a0b ("qed: fix handling of concurrent ramrods")
+    Signed-off-by: Manish Chopra <manish.chopra@qlogic.com>
+    Signed-off-by: Yuval Mintz <Yuval.Mintz@qlogic.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit fc9b7c086b6743aa4b1a70ada58352c665ada49a
+Author: Vegard Nossum <vegard.nossum@oracle.com>
+Date:   Sat Jul 23 07:43:50 2016 +0200
+
+    net/irda: fix NULL pointer dereference on memory allocation failure
+    
+    [ Upstream commit d3e6952cfb7ba5f4bfa29d4803ba91f96ce1204d ]
+    
+    I ran into this:
+    
+        kasan: CONFIG_KASAN_INLINE enabled
+        kasan: GPF could be caused by NULL-ptr deref or user memory access
+        general protection fault: 0000 [#1] PREEMPT SMP KASAN
+        CPU: 2 PID: 2012 Comm: trinity-c3 Not tainted 4.7.0-rc7+ #19
+        Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Ubuntu-1.8.2-1ubuntu1 04/01/2014
+        task: ffff8800b745f2c0 ti: ffff880111740000 task.ti: ffff880111740000
+        RIP: 0010:[<ffffffff82bbf066>]  [<ffffffff82bbf066>] irttp_connect_request+0x36/0x710
+        RSP: 0018:ffff880111747bb8  EFLAGS: 00010286
+        RAX: dffffc0000000000 RBX: 0000000000000000 RCX: 0000000069dd8358
+        RDX: 0000000000000009 RSI: 0000000000000027 RDI: 0000000000000048
+        RBP: ffff880111747c00 R08: 0000000000000000 R09: 0000000000000000
+        R10: 0000000069dd8358 R11: 1ffffffff0759723 R12: 0000000000000000
+        R13: ffff88011a7e4780 R14: 0000000000000027 R15: 0000000000000000
+        FS:  00007fc738404700(0000) GS:ffff88011af00000(0000) knlGS:0000000000000000
+        CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+        CR2: 00007fc737fdfb10 CR3: 0000000118087000 CR4: 00000000000006e0
+        Stack:
+         0000000000000200 ffff880111747bd8 ffffffff810ee611 ffff880119f1f220
+         ffff880119f1f4f8 ffff880119f1f4f0 ffff88011a7e4780 ffff880119f1f232
+         ffff880119f1f220 ffff880111747d58 ffffffff82bca542 0000000000000000
+        Call Trace:
+         [<ffffffff82bca542>] irda_connect+0x562/0x1190
+         [<ffffffff825ae582>] SYSC_connect+0x202/0x2a0
+         [<ffffffff825b4489>] SyS_connect+0x9/0x10
+         [<ffffffff8100334c>] do_syscall_64+0x19c/0x410
+         [<ffffffff83295ca5>] entry_SYSCALL64_slow_path+0x25/0x25
+        Code: 41 89 ca 48 89 e5 41 57 41 56 41 55 41 54 41 89 d7 53 48 89 fb 48 83 c7 48 48 89 fa 41 89 f6 48 c1 ea 03 48 83 ec 20 4c 8b 65 10 <0f> b6 04 02 84 c0 74 08 84 c0 0f 8e 4c 04 00 00 80 7b 48 00 74
+        RIP  [<ffffffff82bbf066>] irttp_connect_request+0x36/0x710
+         RSP <ffff880111747bb8>
+        ---[ end trace 4cda2588bc055b30 ]---
+    
+    The problem is that irda_open_tsap() can fail and leave self->tsap = NULL,
+    and then irttp_connect_request() almost immediately dereferences it.
+    
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Vegard Nossum <vegard.nossum@oracle.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 863c8bb8be39ad11f0d9d66a431b3d9ca5c11dd7
+Author: Florian Fainelli <f.fainelli@gmail.com>
+Date:   Fri Jul 15 15:42:52 2016 -0700
+
+    net: bgmac: Fix infinite loop in bgmac_dma_tx_add()
+    
+    [ Upstream commit e86663c475d384ab5f46cb5637e9b7ad08c5c505 ]
+    
+    Nothing is decrementing the index "i" while we are cleaning up the
+    fragments we could not successful transmit.
+    
+    Fixes: 9cde94506eacf ("bgmac: implement scatter/gather support")
+    Reported-by: coverity (CID 1352048)
+    Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 0020fa536cc610216f80b798b9a1c9b13c3a37fb
+Author: Beniamino Galvani <bgalvani@redhat.com>
+Date:   Wed Jul 13 18:25:08 2016 +0200
+
+    bonding: set carrier off for devices created through netlink
+    
+    [ Upstream commit 005db31d5f5f7c31cfdc43505d77eb3ca5cf8ec6 ]
+    
+    Commit e826eafa65c6 ("bonding: Call netif_carrier_off after
+    register_netdevice") moved netif_carrier_off() from bond_init() to
+    bond_create(), but the latter is called only for initial default
+    devices and ones created through sysfs:
+    
+     $ modprobe bonding
+     $ echo +bond1 > /sys/class/net/bonding_masters
+     $ ip link add bond2 type bond
+     $ grep "MII Status" /proc/net/bonding/*
+     /proc/net/bonding/bond0:MII Status: down
+     /proc/net/bonding/bond1:MII Status: down
+     /proc/net/bonding/bond2:MII Status: up
+    
+    Ensure that carrier is initially off also for devices created through
+    netlink.
+    
+    Signed-off-by: Beniamino Galvani <bgalvani@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit a9c221859696f976ba47ba39178af1175e4558e0
+Author: Julian Anastasov <ja@ssi.bg>
+Date:   Sun Jul 10 21:11:55 2016 +0300
+
+    ipv4: reject RTNH_F_DEAD and RTNH_F_LINKDOWN from user space
+    
+    [ Upstream commit 80610229ef7b26615dbb6cb6e873709a60bacc9f ]
+    
+    Vegard Nossum is reporting for a crash in fib_dump_info
+    when nh_dev = NULL and fib_nhs == 1:
+    
+    Pid: 50, comm: netlink.exe Not tainted 4.7.0-rc5+
+    RIP: 0033:[<00000000602b3d18>]
+    RSP: 0000000062623890  EFLAGS: 00010202
+    RAX: 0000000000000000 RBX: 000000006261b800 RCX: 0000000000000000
+    RDX: 0000000000000000 RSI: 0000000000000024 RDI: 000000006245ba00
+    RBP: 00000000626238f0 R08: 000000000000029c R09: 0000000000000000
+    R10: 0000000062468038 R11: 000000006245ba00 R12: 000000006245ba00
+    R13: 00000000625f96c0 R14: 00000000601e16f0 R15: 0000000000000000
+    Kernel panic - not syncing: Kernel mode fault at addr 0x2e0, ip 0x602b3d18
+    CPU: 0 PID: 50 Comm: netlink.exe Not tainted 4.7.0-rc5+ #581
+    Stack:
+     626238f0 960226a02 00000400 000000fe
+     62623910 600afca7 62623970 62623a48
+     62468038 00000018 00000000 00000000
+    Call Trace:
+     [<602b3e93>] rtmsg_fib+0xd3/0x190
+     [<602b6680>] fib_table_insert+0x260/0x500
+     [<602b0e5d>] inet_rtm_newroute+0x4d/0x60
+     [<60250def>] rtnetlink_rcv_msg+0x8f/0x270
+     [<60267079>] netlink_rcv_skb+0xc9/0xe0
+     [<60250d4b>] rtnetlink_rcv+0x3b/0x50
+     [<60265400>] netlink_unicast+0x1a0/0x2c0
+     [<60265e47>] netlink_sendmsg+0x3f7/0x470
+     [<6021dc9a>] sock_sendmsg+0x3a/0x90
+     [<6021e0d0>] ___sys_sendmsg+0x300/0x360
+     [<6021fa64>] __sys_sendmsg+0x54/0xa0
+     [<6021fac0>] SyS_sendmsg+0x10/0x20
+     [<6001ea68>] handle_syscall+0x88/0x90
+     [<600295fd>] userspace+0x3fd/0x500
+     [<6001ac55>] fork_handler+0x85/0x90
+    
+    $ addr2line -e vmlinux -i 0x602b3d18
+    include/linux/inetdevice.h:222
+    net/ipv4/fib_semantics.c:1264
+    
+    Problem happens when RTNH_F_LINKDOWN is provided from user space
+    when creating routes that do not use the flag, catched with
+    netlink fuzzer.
+    
+    Currently, the kernel allows user space to set both flags
+    to nh_flags and fib_flags but this is not intentional, the
+    assumption was that they are not set. Fix this by rejecting
+    both flags with EINVAL.
+    
+    Reported-by: Vegard Nossum <vegard.nossum@oracle.com>
+    Fixes: 0eeb075fad73 ("net: ipv4 sysctl option to ignore routes when nexthop link is down")
+    Signed-off-by: Julian Anastasov <ja@ssi.bg>
+    Cc: Andy Gospodarek <gospo@cumulusnetworks.com>
+    Cc: Dinesh Dutt <ddutt@cumulusnetworks.com>
+    Cc: Scott Feldman <sfeldma@gmail.com>
+    Reviewed-by: Andy Gospodarek <gospo@cumulusnetworks.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5413f1a526d2d51d7a5768133c90936c017165c6
+Author: Jason Baron <jbaron@akamai.com>
+Date:   Thu Jul 14 11:38:40 2016 -0400
+
+    tcp: enable per-socket rate limiting of all 'challenge acks'
+    
+    [ Upstream commit 083ae308280d13d187512b9babe3454342a7987e ]
+    
+    The per-socket rate limit for 'challenge acks' was introduced in the
+    context of limiting ack loops:
+    
+    commit f2b2c582e824 ("tcp: mitigate ACK loops for connections as tcp_sock")
+    
+    And I think it can be extended to rate limit all 'challenge acks' on a
+    per-socket basis.
+    
+    Since we have the global tcp_challenge_ack_limit, this patch allows for
+    tcp_challenge_ack_limit to be set to a large value and effectively rely on
+    the per-socket limit, or set tcp_challenge_ack_limit to a lower value and
+    still prevents a single connections from consuming the entire challenge ack
+    quota.
+    
+    It further moves in the direction of eliminating the global limit at some
+    point, as Eric Dumazet has suggested. This a follow-up to:
+    Subject: tcp: make challenge acks less predictable
+    
+    Cc: Eric Dumazet <edumazet@google.com>
+    Cc: David S. Miller <davem@davemloft.net>
+    Cc: Neal Cardwell <ncardwell@google.com>
+    Cc: Yuchung Cheng <ycheng@google.com>
+    Cc: Yue Cao <ycao009@ucr.edu>
+    Signed-off-by: Jason Baron <jbaron@akamai.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 72c2d3bccaba4a0a4de354f9d2d24eccd05bfccf
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Sun Jul 10 10:04:02 2016 +0200
+
+    tcp: make challenge acks less predictable
+    
+    [ Upstream commit 75ff39ccc1bd5d3c455b6822ab09e533c551f758 ]
+    
+    Yue Cao claims that current host rate limiting of challenge ACKS
+    (RFC 5961) could leak enough information to allow a patient attacker
+    to hijack TCP sessions. He will soon provide details in an academic
+    paper.
+    
+    This patch increases the default limit from 100 to 1000, and adds
+    some randomization so that the attacker can no longer hijack
+    sessions without spending a considerable amount of probes.
+    
+    Based on initial analysis and patch from Linus.
+    
+    Note that we also have per socket rate limiting, so it is tempting
+    to remove the host limit in the future.
+    
+    v2: randomize the count of challenge acks per second, not the period.
+    
+    Fixes: 282f23c6ee34 ("tcp: implement RFC 5961 3.2")
+    Reported-by: Yue Cao <ycao009@ucr.edu>
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Yuchung Cheng <ycheng@google.com>
+    Cc: Neal Cardwell <ncardwell@google.com>
+    Acked-by: Neal Cardwell <ncardwell@google.com>
+    Acked-by: Yuchung Cheng <ycheng@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>

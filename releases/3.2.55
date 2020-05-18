@@ -1,0 +1,2369 @@
+commit 39716f2c8648f3d26934c44a79c14a4e6298a920
+Author: Ben Hutchings <ben@decadent.org.uk>
+Date:   Sat Feb 15 19:20:18 2014 +0000
+
+    Linux 3.2.55
+
+commit b01e0013de67885b61907347ffcdf1e327c4e25e
+Author: Ying Xue <ying.xue@windriver.com>
+Date:   Tue Jul 17 15:03:43 2012 +0800
+
+    sched/rt: Avoid updating RT entry timeout twice within one tick period
+    
+    commit 57d2aa00dcec67afa52478730f2b524521af14fb upstream.
+    
+    The issue below was found in 2.6.34-rt rather than mainline rt
+    kernel, but the issue still exists upstream as well.
+    
+    So please let me describe how it was noticed on 2.6.34-rt:
+    
+    On this version, each softirq has its own thread, it means there
+    is at least one RT FIFO task per cpu. The priority of these
+    tasks is set to 49 by default. If user launches an RT FIFO task
+    with priority lower than 49 of softirq RT tasks, it's possible
+    there are two RT FIFO tasks enqueued one cpu runqueue at one
+    moment. By current strategy of balancing RT tasks, when it comes
+    to RT tasks, we really need to put them off to a CPU that they
+    can run on as soon as possible. Even if it means a bit of cache
+    line flushing, we want RT tasks to be run with the least latency.
+    
+    When the user RT FIFO task which just launched before is
+    running, the sched timer tick of the current cpu happens. In this
+    tick period, the timeout value of the user RT task will be
+    updated once. Subsequently, we try to wake up one softirq RT
+    task on its local cpu. As the priority of current user RT task
+    is lower than the softirq RT task, the current task will be
+    preempted by the higher priority softirq RT task. Before
+    preemption, we check to see if current can readily move to a
+    different cpu. If so, we will reschedule to allow the RT push logic
+    to try to move current somewhere else. Whenever the woken
+    softirq RT task runs, it first tries to migrate the user FIFO RT
+    task over to a cpu that is running a task of lesser priority. If
+    migration is done, it will send a reschedule request to the found
+    cpu by IPI interrupt. Once the target cpu responds the IPI
+    interrupt, it will pick the migrated user RT task to preempt its
+    current task. When the user RT task is running on the new cpu,
+    the sched timer tick of the cpu fires. So it will tick the user
+    RT task again. This also means the RT task timeout value will be
+    updated again. As the migration may be done in one tick period,
+    it means the user RT task timeout value will be updated twice
+    within one tick.
+    
+    If we set a limit on the amount of cpu time for the user RT task
+    by setrlimit(RLIMIT_RTTIME), the SIGXCPU signal should be posted
+    upon reaching the soft limit.
+    
+    But exactly when the SIGXCPU signal should be sent depends on the
+    RT task timeout value. In fact the timeout mechanism of sending
+    the SIGXCPU signal assumes the RT task timeout is increased once
+    every tick.
+    
+    However, currently the timeout value may be added twice per
+    tick. So it results in the SIGXCPU signal being sent earlier
+    than expected.
+    
+    To solve this issue, we prevent the timeout value from increasing
+    twice within one tick time by remembering the jiffies value of
+    last updating the timeout. As long as the RT task's jiffies is
+    different with the global jiffies value, we allow its timeout to
+    be updated.
+    
+    Signed-off-by: Ying Xue <ying.xue@windriver.com>
+    Signed-off-by: Fan Du <fan.du@windriver.com>
+    Reviewed-by: Yong Zhang <yong.zhang0@gmail.com>
+    Acked-by: Steven Rostedt <rostedt@goodmis.org>
+    Cc: <peterz@infradead.org>
+    Link: http://lkml.kernel.org/r/1342508623-2887-1-git-send-email-ying.xue@windriver.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    [ lizf: backported to 3.4: adjust context ]
+    Signed-off-by: Li Zefan <lizefan@huawei.com>
+    [bwh: Backported to 3.2: adjust filename]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 4553dab7f3e57b70fee61739325b6ff7bb56ac9b
+Author: Peter Boonstoppel <pboonstoppel@nvidia.com>
+Date:   Thu Aug 9 15:34:47 2012 -0700
+
+    sched: Unthrottle rt runqueues in __disable_runtime()
+    
+    commit a4c96ae319b8047f62dedbe1eac79e321c185749 upstream.
+    
+    migrate_tasks() uses _pick_next_task_rt() to get tasks from the
+    real-time runqueues to be migrated. When rt_rq is throttled
+    _pick_next_task_rt() won't return anything, in which case
+    migrate_tasks() can't move all threads over and gets stuck in an
+    infinite loop.
+    
+    Instead unthrottle rt runqueues before migrating tasks.
+    
+    Additionally: move unthrottle_offline_cfs_rqs() to rq_offline_fair()
+    
+    Signed-off-by: Peter Boonstoppel <pboonstoppel@nvidia.com>
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Cc: Paul Turner <pjt@google.com>
+    Link: http://lkml.kernel.org/r/5FBF8E85CA34454794F0F7ECBA79798F379D3648B7@HQMAIL04.nvidia.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    [ lizf: backported to 3.4: adjust context ]
+    Signed-off-by: Li Zefan <lizefan@huawei.com>
+    [bwh: Backported to 3.2:
+     - Adjust filenames
+     - unthrottle_offline_cfs_rqs() is already static, but defined in sched.c
+       after including sched_fair.c, so add forward declaration
+     - unthrottle_offline_cfs_rqs() also needs to be defined for all CONFIG_SMP
+       configurations now]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit aee1f8b87e203b0525f340d2fde94f5a82f6c4bd
+Author: Mike Galbraith <efault@gmx.de>
+Date:   Tue Aug 7 10:02:38 2012 +0200
+
+    sched,rt: fix isolated CPUs leaving root_task_group indefinitely throttled
+    
+    commit e221d028bb08b47e624c5f0a31732c642db9d19a upstream.
+    
+    Root task group bandwidth replenishment must service all CPUs, regardless of
+    where the timer was last started, and regardless of the isolation mechanism,
+    lest 'Quoth the Raven, "Nevermore"' become rt scheduling policy.
+    
+    Signed-off-by: Mike Galbraith <efault@gmx.de>
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Link: http://lkml.kernel.org/r/1344326558.6968.25.camel@marge.simpson.net
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    [bwh: Backported to 3.2: adjust filename]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 13d8ff3f710fae656eb7c5648c1efce749bf8b52
+Author: Colin Cross <ccross@android.com>
+Date:   Wed May 16 21:34:23 2012 -0700
+
+    sched/rt: Fix SCHED_RR across cgroups
+    
+    commit 454c79999f7eaedcdf4c15c449e43902980cbdf5 upstream.
+    
+    task_tick_rt() has an optimization to only reschedule SCHED_RR tasks
+    if they were the only element on their rq.  However, with cgroups
+    a SCHED_RR task could be the only element on its per-cgroup rq but
+    still be competing with other SCHED_RR tasks in its parent's
+    cgroup.  In this case, the SCHED_RR task in the child cgroup would
+    never yield at the end of its timeslice.  If the child cgroup
+    rt_runtime_us was the same as the parent cgroup rt_runtime_us,
+    the task in the parent cgroup would starve completely.
+    
+    Modify task_tick_rt() to check that the task is the only task on its
+    rq, and that the each of the scheduling entities of its ancestors
+    is also the only entity on its rq.
+    
+    Signed-off-by: Colin Cross <ccross@android.com>
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Link: http://lkml.kernel.org/r/1337229266-15798-1-git-send-email-ccross@android.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    [bwh: Backported to 3.2: adjust filename]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 8ae94088319ea3047cdf68adc9fafdcf862e2790
+Author: Andrea Arcangeli <aarcange@redhat.com>
+Date:   Thu Nov 21 14:32:02 2013 -0800
+
+    mm: hugetlbfs: fix hugetlbfs optimization
+    
+    commit 27c73ae759774e63313c1fbfeb17ba076cea64c5 upstream.
+    
+    Commit 7cb2ef56e6a8 ("mm: fix aio performance regression for database
+    caused by THP") can cause dereference of a dangling pointer if
+    split_huge_page runs during PageHuge() if there are updates to the
+    tail_page->private field.
+    
+    Also it is repeating compound_head twice for hugetlbfs and it is running
+    compound_head+compound_trans_head for THP when a single one is needed in
+    both cases.
+    
+    The new code within the PageSlab() check doesn't need to verify that the
+    THP page size is never bigger than the smallest hugetlbfs page size, to
+    avoid memory corruption.
+    
+    A longstanding theoretical race condition was found while fixing the
+    above (see the change right after the skip_unlock label, that is
+    relevant for the compound_lock path too).
+    
+    By re-establishing the _mapcount tail refcounting for all compound
+    pages, this also fixes the below problem:
+    
+      echo 0 >/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+    
+      BUG: Bad page state in process bash  pfn:59a01
+      page:ffffea000139b038 count:0 mapcount:10 mapping:          (null) index:0x0
+      page flags: 0x1c00000000008000(tail)
+      Modules linked in:
+      CPU: 6 PID: 2018 Comm: bash Not tainted 3.12.0+ #25
+      Hardware name: Bochs Bochs, BIOS Bochs 01/01/2011
+      Call Trace:
+        dump_stack+0x55/0x76
+        bad_page+0xd5/0x130
+        free_pages_prepare+0x213/0x280
+        __free_pages+0x36/0x80
+        update_and_free_page+0xc1/0xd0
+        free_pool_huge_page+0xc2/0xe0
+        set_max_huge_pages.part.58+0x14c/0x220
+        nr_hugepages_store_common.isra.60+0xd0/0xf0
+        nr_hugepages_store+0x13/0x20
+        kobj_attr_store+0xf/0x20
+        sysfs_write_file+0x189/0x1e0
+        vfs_write+0xc5/0x1f0
+        SyS_write+0x55/0xb0
+        system_call_fastpath+0x16/0x1b
+    
+    Signed-off-by: Khalid Aziz <khalid.aziz@oracle.com>
+    Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+    Tested-by: Khalid Aziz <khalid.aziz@oracle.com>
+    Cc: Pravin Shelar <pshelar@nicira.com>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Cc: Ben Hutchings <bhutchings@solarflare.com>
+    Cc: Christoph Lameter <cl@linux.com>
+    Cc: Johannes Weiner <jweiner@redhat.com>
+    Cc: Mel Gorman <mgorman@suse.de>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Andi Kleen <andi@firstfloor.org>
+    Cc: Minchan Kim <minchan@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    [Khalid Aziz: Backported to 3.4]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit b64164444986619a93a59765538808abd562ccfa
+Author: Khalid Aziz <khalid.aziz@oracle.com>
+Date:   Wed Sep 11 14:22:20 2013 -0700
+
+    mm: fix aio performance regression for database caused by THP
+    
+    commit 7cb2ef56e6a8b7b368b2e883a0a47d02fed66911 upstream.
+    
+    I am working with a tool that simulates oracle database I/O workload.
+    This tool (orion to be specific -
+    <http://docs.oracle.com/cd/E11882_01/server.112/e16638/iodesign.htm#autoId24>)
+    allocates hugetlbfs pages using shmget() with SHM_HUGETLB flag.  It then
+    does aio into these pages from flash disks using various common block
+    sizes used by database.  I am looking at performance with two of the most
+    common block sizes - 1M and 64K.  aio performance with these two block
+    sizes plunged after Transparent HugePages was introduced in the kernel.
+    Here are performance numbers:
+    
+                    pre-THP         2.6.39          3.11-rc5
+    1M read         8384 MB/s       5629 MB/s       6501 MB/s
+    64K read        7867 MB/s       4576 MB/s       4251 MB/s
+    
+    I have narrowed the performance impact down to the overheads introduced by
+    THP in __get_page_tail() and put_compound_page() routines.  perf top shows
+    >40% of cycles being spent in these two routines.  Every time direct I/O
+    to hugetlbfs pages starts, kernel calls get_page() to grab a reference to
+    the pages and calls put_page() when I/O completes to put the reference
+    away.  THP introduced significant amount of locking overhead to get_page()
+    and put_page() when dealing with compound pages because hugepages can be
+    split underneath get_page() and put_page().  It added this overhead
+    irrespective of whether it is dealing with hugetlbfs pages or transparent
+    hugepages.  This resulted in 20%-45% drop in aio performance when using
+    hugetlbfs pages.
+    
+    Since hugetlbfs pages can not be split, there is no reason to go through
+    all the locking overhead for these pages from what I can see.  I added
+    code to __get_page_tail() and put_compound_page() to bypass all the
+    locking code when working with hugetlbfs pages.  This improved performance
+    significantly.  Performance numbers with this patch:
+    
+                    pre-THP         3.11-rc5        3.11-rc5 + Patch
+    1M read         8384 MB/s       6501 MB/s       8371 MB/s
+    64K read        7867 MB/s       4251 MB/s       6510 MB/s
+    
+    Performance with 64K read is still lower than what it was before THP, but
+    still a 53% improvement.  It does mean there is more work to be done but I
+    will take a 53% improvement for now.
+    
+    Please take a look at the following patch and let me know if it looks
+    reasonable.
+    
+    [akpm@linux-foundation.org: tweak comments]
+    Signed-off-by: Khalid Aziz <khalid.aziz@oracle.com>
+    Cc: Pravin B Shelar <pshelar@nicira.com>
+    Cc: Christoph Lameter <cl@linux.com>
+    Cc: Andrea Arcangeli <aarcange@redhat.com>
+    Cc: Johannes Weiner <hannes@cmpxchg.org>
+    Cc: Mel Gorman <mel@csn.ul.ie>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Minchan Kim <minchan@kernel.org>
+    Cc: Andi Kleen <andi@firstfloor.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit e07518e9ce84547ef7a81478dbd3fed1539726da
+Author: Robert Richter <rric@kernel.org>
+Date:   Wed Jan 15 15:57:29 2014 +0100
+
+    perf/x86/amd/ibs: Fix waking up from S3 for AMD family 10h
+    
+    commit bee09ed91cacdbffdbcd3b05de8409c77ec9fcd6 upstream.
+    
+    On AMD family 10h we see following error messages while waking up from
+    S3 for all non-boot CPUs leading to a failed IBS initialization:
+    
+     Enabling non-boot CPUs ...
+     smpboot: Booting Node 0 Processor 1 APIC 0x1
+     [Firmware Bug]: cpu 1, try to use APIC500 (LVT offset 0) for vector 0x400, but the register is already in use for vector 0xf9 on another cpu
+     perf: IBS APIC setup failed on cpu #1
+     process: Switch to broadcast mode on CPU1
+     CPU1 is up
+     ...
+     ACPI: Waking up from system sleep state S3
+    
+    Reason for this is that during suspend the LVT offset for the IBS
+    vector gets lost and needs to be reinialized while resuming.
+    
+    The offset is read from the IBSCTL msr. On family 10h the offset needs
+    to be 1 as offset 0 is used for the MCE threshold interrupt, but
+    firmware assings it for IBS to 0 too. The kernel needs to reprogram
+    the vector. The msr is a readonly node msr, but a new value can be
+    written via pci config space access. The reinitialization is
+    implemented for family 10h in setup_ibs_ctl() which is forced during
+    IBS setup.
+    
+    This patch fixes IBS setup after waking up from S3 by adding
+    resume/supend hooks for the boot cpu which does the offset
+    reinitialization.
+    
+    Marking it as stable to let distros pick up this fix.
+    
+    Signed-off-by: Robert Richter <rric@kernel.org>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Link: http://lkml.kernel.org/r/1389797849-5565-1-git-send-email-rric.net@gmail.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    [bwh: Backported to 3.2: adjust context]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 028d56ae6da361de5e0e36df2623ece176142181
+Author: Andreas Rohner <andreas.rohner@gmx.net>
+Date:   Tue Jan 14 17:56:36 2014 -0800
+
+    nilfs2: fix segctor bug that causes file system corruption
+    
+    commit 70f2fe3a26248724d8a5019681a869abdaf3e89a upstream.
+    
+    There is a bug in the function nilfs_segctor_collect, which results in
+    active data being written to a segment, that is marked as clean.  It is
+    possible, that this segment is selected for a later segment
+    construction, whereby the old data is overwritten.
+    
+    The problem shows itself with the following kernel log message:
+    
+      nilfs_sufile_do_cancel_free: segment 6533 must be clean
+    
+    Usually a few hours later the file system gets corrupted:
+    
+      NILFS: bad btree node (blocknr=8748107): level = 0, flags = 0x0, nchildren = 0
+      NILFS error (device sdc1): nilfs_bmap_last_key: broken bmap (inode number=114660)
+    
+    The issue can be reproduced with a file system that is nearly full and
+    with the cleaner running, while some IO intensive task is running.
+    Although it is quite hard to reproduce.
+    
+    This is what happens:
+    
+     1. The cleaner starts the segment construction
+     2. nilfs_segctor_collect is called
+     3. sc_stage is on NILFS_ST_SUFILE and segments are freed
+     4. sc_stage is on NILFS_ST_DAT current segment is full
+     5. nilfs_segctor_extend_segments is called, which
+        allocates a new segment
+     6. The new segment is one of the segments freed in step 3
+     7. nilfs_sufile_cancel_freev is called and produces an error message
+     8. Loop around and the collection starts again
+     9. sc_stage is on NILFS_ST_SUFILE and segments are freed
+        including the newly allocated segment, which will contain active
+        data and can be allocated at a later time
+    10. A few hours later another segment construction allocates the
+        segment and causes file system corruption
+    
+    This can be prevented by simply reordering the statements.  If
+    nilfs_sufile_cancel_freev is called before nilfs_segctor_extend_segments
+    the freed segments are marked as dirty and cannot be allocated any more.
+    
+    Signed-off-by: Andreas Rohner <andreas.rohner@gmx.net>
+    Reviewed-by: Ryusuke Konishi <konishi.ryusuke@lab.ntt.co.jp>
+    Tested-by: Andreas Rohner <andreas.rohner@gmx.net>
+    Signed-off-by: Ryusuke Konishi <konishi.ryusuke@lab.ntt.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit ded881cc1a89f5da729cab818d01055b15d0b07f
+Author: Jean Delvare <khali@linux-fr.org>
+Date:   Tue Jan 14 15:59:55 2014 +0100
+
+    hwmon: (coretemp) Fix truncated name of alarm attributes
+    
+    commit 3f9aec7610b39521c7c69d754de7265f6994c194 upstream.
+    
+    When the core number exceeds 9, the size of the buffer storing the
+    alarm attribute name is insufficient and the attribute name is
+    truncated. This causes libsensors to skip these attributes as the
+    truncated name is not recognized.
+    
+    Reported-by: Andreas Hollmann <hollmann@in.tum.de>
+    Signed-off-by: Jean Delvare <khali@linux-fr.org>
+    Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 8ea69324fe0ff7b7a7d0424b8518c63358971f68
+Author: NeilBrown <neilb@suse.de>
+Date:   Mon Jan 6 10:35:34 2014 +1100
+
+    md/raid10: fix bug when raid10 recovery fails to recover a block.
+    
+    commit e8b849158508565e0cd6bc80061124afc5879160 upstream.
+    
+    commit e875ecea266a543e643b19e44cf472f1412708f9
+        md/raid10 record bad blocks as needed during recovery.
+    
+    added code to the "cannot recover this block" path to record a bad
+    block rather than fail the whole recovery.
+    Unfortunately this new case was placed *after* r10bio was freed rather
+    than *before*, yet it still uses r10bio.
+    This is will crash with a null dereference.
+    
+    So move the freeing of r10bio down where it is safe.
+    
+    Fixes: e875ecea266a543e643b19e44cf472f1412708f9
+    Reported-by: Damian Nowak <spam@nowaker.net>
+    URL: https://bugzilla.kernel.org/show_bug.cgi?id=68181
+    Signed-off-by: NeilBrown <neilb@suse.de>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 11bbcdfc5e8d7983403952f37543d085be5d6f58
+Author: NeilBrown <neilb@suse.de>
+Date:   Tue Jan 14 10:38:09 2014 +1100
+
+    md/raid10: fix two bugs in handling of known-bad-blocks.
+    
+    commit b50c259e25d9260b9108dc0c2964c26e5ecbe1c1 upstream.
+    
+    If we discover a bad block when reading we split the request and
+    potentially read some of it from a different device.
+    
+    The code path of this has two bugs in RAID10.
+    1/ we get a spin_lock with _irq, but unlock without _irq!!
+    2/ The calculation of 'sectors_handled' is wrong, as can be clearly
+       seen by comparison with raid1.c
+    
+    This leads to at least 2 warnings and a probable crash is a RAID10
+    ever had known bad blocks.
+    
+    Fixes: 856e08e23762dfb92ffc68fd0a8d228f9e152160
+    Reported-by: Damian Nowak <spam@nowaker.net>
+    URL: https://bugzilla.kernel.org/show_bug.cgi?id=68181
+    Signed-off-by: NeilBrown <neilb@suse.de>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 861e3781037f4f7bafe6ae4967bd551157c8fcfc
+Author: NeilBrown <neilb@suse.de>
+Date:   Mon Jan 6 13:19:42 2014 +1100
+
+    md/raid5: Fix possible confusion when multiple write errors occur.
+    
+    commit 1cc03eb93245e63b0b7a7832165efdc52e25b4e6 upstream.
+    
+    commit 5d8c71f9e5fbdd95650be00294d238e27a363b5c
+        md: raid5 crash during degradation
+    
+    Fixed a crash in an overly simplistic way which could leave
+    R5_WriteError or R5_MadeGood set in the stripe cache for devices
+    for which it is no longer relevant.
+    When those devices are removed and spares added the flags are still
+    set and can cause incorrect behaviour.
+    
+    commit 14a75d3e07c784c004b4b44b34af996b8e4ac453
+        md/raid5: preferentially read from replacement device if possible.
+    
+    Fixed the same bug if a more effective way, so we can now revert
+    the original commit.
+    
+    Reported-and-tested-by: Alexander Lyakas <alex.bolshoy@gmail.com>
+    Fixes: 5d8c71f9e5fbdd95650be00294d238e27a363b5c
+    Signed-off-by: NeilBrown <neilb@suse.de>
+    [bwh: Backported to 3.2: adjust context]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 2ab27c173dcb3a2ea2e957f06231307c464ba334
+Author: Steven Rostedt <rostedt@goodmis.org>
+Date:   Thu Jan 9 21:46:34 2014 -0500
+
+    SELinux: Fix possible NULL pointer dereference in selinux_inode_permission()
+    
+    commit 3dc91d4338d698ce77832985f9cb183d8eeaf6be upstream.
+    
+    While running stress tests on adding and deleting ftrace instances I hit
+    this bug:
+    
+      BUG: unable to handle kernel NULL pointer dereference at 0000000000000020
+      IP: selinux_inode_permission+0x85/0x160
+      PGD 63681067 PUD 7ddbe067 PMD 0
+      Oops: 0000 [#1] PREEMPT
+      CPU: 0 PID: 5634 Comm: ftrace-test-mki Not tainted 3.13.0-rc4-test-00033-gd2a6dde-dirty #20
+      Hardware name:                  /DG965MQ, BIOS MQ96510J.86A.0372.2006.0605.1717 06/05/2006
+      task: ffff880078375800 ti: ffff88007ddb0000 task.ti: ffff88007ddb0000
+      RIP: 0010:[<ffffffff812d8bc5>]  [<ffffffff812d8bc5>] selinux_inode_permission+0x85/0x160
+      RSP: 0018:ffff88007ddb1c48  EFLAGS: 00010246
+      RAX: 0000000000000000 RBX: 0000000000800000 RCX: ffff88006dd43840
+      RDX: 0000000000000001 RSI: 0000000000000081 RDI: ffff88006ee46000
+      RBP: ffff88007ddb1c88 R08: 0000000000000000 R09: ffff88007ddb1c54
+      R10: 6e6576652f6f6f66 R11: 0000000000000003 R12: 0000000000000000
+      R13: 0000000000000081 R14: ffff88006ee46000 R15: 0000000000000000
+      FS:  00007f217b5b6700(0000) GS:ffffffff81e21000(0000) knlGS:0000000000000000
+      CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033^M
+      CR2: 0000000000000020 CR3: 000000006a0fe000 CR4: 00000000000007f0
+      Call Trace:
+        security_inode_permission+0x1c/0x30
+        __inode_permission+0x41/0xa0
+        inode_permission+0x18/0x50
+        link_path_walk+0x66/0x920
+        path_openat+0xa6/0x6c0
+        do_filp_open+0x43/0xa0
+        do_sys_open+0x146/0x240
+        SyS_open+0x1e/0x20
+        system_call_fastpath+0x16/0x1b
+      Code: 84 a1 00 00 00 81 e3 00 20 00 00 89 d8 83 c8 02 40 f6 c6 04 0f 45 d8 40 f6 c6 08 74 71 80 cf 02 49 8b 46 38 4c 8d 4d cc 45 31 c0 <0f> b7 50 20 8b 70 1c 48 8b 41 70 89 d9 8b 78 04 e8 36 cf ff ff
+      RIP  selinux_inode_permission+0x85/0x160
+      CR2: 0000000000000020
+    
+    Investigating, I found that the inode->i_security was NULL, and the
+    dereference of it caused the oops.
+    
+    in selinux_inode_permission():
+    
+            isec = inode->i_security;
+    
+            rc = avc_has_perm_noaudit(sid, isec->sid, isec->sclass, perms, 0, &avd);
+    
+    Note, the crash came from stressing the deletion and reading of debugfs
+    files.  I was not able to recreate this via normal files.  But I'm not
+    sure they are safe.  It may just be that the race window is much harder
+    to hit.
+    
+    What seems to have happened (and what I have traced), is the file is
+    being opened at the same time the file or directory is being deleted.
+    As the dentry and inode locks are not held during the path walk, nor is
+    the inodes ref counts being incremented, there is nothing saving these
+    structures from being discarded except for an rcu_read_lock().
+    
+    The rcu_read_lock() protects against freeing of the inode, but it does
+    not protect freeing of the inode_security_struct.  Now if the freeing of
+    the i_security happens with a call_rcu(), and the i_security field of
+    the inode is not changed (it gets freed as the inode gets freed) then
+    there will be no issue here.  (Linus Torvalds suggested not setting the
+    field to NULL such that we do not need to check if it is NULL in the
+    permission check).
+    
+    Note, this is a hack, but it fixes the problem at hand.  A real fix is
+    to restructure the destroy_inode() to call all the destructor handlers
+    from the RCU callback.  But that is a major job to do, and requires a
+    lot of work.  For now, we just band-aid this bug with this fix (it
+    works), and work on a more maintainable solution in the future.
+    
+    Link: http://lkml.kernel.org/r/20140109101932.0508dec7@gandalf.local.home
+    Link: http://lkml.kernel.org/r/20140109182756.17abaaa8@gandalf.local.home
+    
+    Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 878c9368e00731b4d0ca95c402c5caa9468f1d62
+Author: Russell King <rmk+kernel@arm.linux.org.uk>
+Date:   Fri Jan 3 15:01:39 2014 +0000
+
+    ARM: fix "bad mode in ... handler" message for undefined instructions
+    
+    commit 29c350bf28da333e41e30497b649fe335712a2ab upstream.
+    
+    The array was missing the final entry for the undefined instruction
+    exception handler; this commit adds it.
+    
+    Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 261746390873b6266a38691442bf52ee6c6ebba6
+Author: Simon Guinot <sguinot@lacie.com>
+Date:   Mon Dec 23 13:24:35 2013 +0100
+
+    ahci: add PCI ID for Marvell 88SE9170 SATA controller
+    
+    commit e098f5cbe9d410e7878b50f524dce36cc83ec40e upstream.
+    
+    This patch adds support for the PCI ID provided by the Marvell 88SE9170
+    SATA controller.
+    
+    Signed-off-by: Simon Guinot <sguinot@lacie.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit ef0d53ff3d8cf6630d38f61f1a071740714be7af
+Author: Ben Hutchings <ben@decadent.org.uk>
+Date:   Sun Feb 9 23:34:11 2014 +0000
+
+    pci: Add PCI_DEVICE_SUB() macro
+    
+    This was added as part of commit 3d567e0e291c ('tg3: Set 10_100_ONLY
+    flag for additional 10/100 Mbps devices') upstream and is needed by
+    the following patch to ahci.
+    
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 87ca19a6b005ebe848dedeecebf4ffe2bf714bcd
+Author: George Spelvin <linux@horizon.com>
+Date:   Wed May 29 10:20:35 2013 +0900
+
+    ahci: add an observed PCI ID for Marvell 88se9172 SATA controller
+    
+    commit fcce9a35f8faaa1f52236c554ef1b15d99a7537e upstream.
+    
+    A third possible PCI ID, as personally observed, and found in the
+    pci.ids list.
+    
+    Signed-off-by: George Spelvin <linux@horizon.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 18e9b936120de9c21ca5289c2f4bf5866c3be536
+Author: Myron Stowe <myron.stowe@redhat.com>
+Date:   Mon Apr 8 11:32:49 2013 -0600
+
+    ahci: Use PCI_VENDOR_ID_MARVELL_EXT for 0x1b4b
+    
+    commit 69fd3157363935b1e052bd76b8f8ec65e494306e upstream.
+    
+    With the 0x1b4b vendor ID #define in place, convert hard-coded ID
+    values.
+    
+    Signed-off-by: Myron Stowe <myron.stowe@redhat.com>
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Acked-by: Jeff Garzik <jgarzik@pobox.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit c58ad1af9efe5fedc1e35362e53d4329a9e288e7
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Mon Dec 16 15:12:43 2013 +1100
+
+    powerpc: Fix bad stack check in exception entry
+    
+    commit 90ff5d688e61f49f23545ffab6228bd7e87e6dc7 upstream.
+    
+    In EXCEPTION_PROLOG_COMMON() we check to see if the stack pointer (r1)
+    is valid when coming from the kernel.  If it's not valid, we die but
+    with a nice oops message.
+    
+    Currently we allocate a stack frame (subtract INT_FRAME_SIZE) before we
+    check to see if the stack pointer is negative.  Unfortunately, this
+    won't detect a bad stack where r1 is less than INT_FRAME_SIZE.
+    
+    This patch fixes the check to compare the modified r1 with
+    -INT_FRAME_SIZE.  With this, bad kernel stack pointers (including NULL
+    pointers) are correctly detected again.
+    
+    Kudos to Paulus for finding this.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit d9bd24c3bc422acf43f744124d6537921719352f
+Author: Russell King <rmk+kernel@arm.linux.org.uk>
+Date:   Sun Dec 29 12:39:50 2013 +0000
+
+    ARM: fix footbridge clockevent device
+    
+    commit 4ff859fe1dc0da0f87bbdfff78f527898878fa4a upstream.
+    
+    The clockevents code was being told that the footbridge clock event
+    device ticks at 16x the rate which it actually does.  This leads to
+    timekeeping problems since it allows the clocksource to wrap before
+    the kernel notices.  Fix this by using the correct clock.
+    
+    Fixes: 4e8d76373c9fd ("ARM: footbridge: convert to clockevents/clocksource")
+    Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+    [bwh: Backported to 3.2: fold in the relevant parts of commit 838a2ae80a6a
+     ('ARM: use clockevents_config_and_register() where possible')]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 5826e620694c056e27dae2f1e1e31005c93ab7e0
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Mon Dec 23 17:45:01 2013 -0500
+
+    selinux: selinux_setprocattr()->ptrace_parent() needs rcu_read_lock()
+    
+    commit c0c1439541f5305b57a83d599af32b74182933fe upstream.
+    
+    selinux_setprocattr() does ptrace_parent(p) under task_lock(p),
+    but task_struct->alloc_lock doesn't pin ->parent or ->ptrace,
+    this looks confusing and triggers the "suspicious RCU usage"
+    warning because ptrace_parent() does rcu_dereference_check().
+    
+    And in theory this is wrong, spin_lock()->preempt_disable()
+    doesn't necessarily imply rcu_read_lock() we need to access
+    the ->parent.
+    
+    Reported-by: Evan McNabb <emcnabb@redhat.com>
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Signed-off-by: Paul Moore <pmoore@redhat.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 3831c7b4d90558d946d67c83cc04c6eca2a9ef99
+Author: Chad Hanson <chanson@trustedcs.com>
+Date:   Mon Dec 23 17:45:01 2013 -0500
+
+    selinux: fix broken peer recv check
+    
+    commit 46d01d63221c3508421dd72ff9c879f61053cffc upstream.
+    
+    Fix a broken networking check. Return an error if peer recv fails.  If
+    secmark is active and the packet recv succeeds the peer recv error is
+    ignored.
+    
+    Signed-off-by: Chad Hanson <chanson@trustedcs.com>
+    Signed-off-by: Paul Moore <pmoore@redhat.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 1af2979ff5d42c46e1e542d64184f100028132c1
+Author: Alex Deucher <alexander.deucher@amd.com>
+Date:   Mon Dec 23 09:31:58 2013 -0500
+
+    drm/radeon: 0x9649 is SUMO2 not SUMO
+    
+    commit d00adcc8ae9e22eca9d8af5f66c59ad9a74c90ec upstream.
+    
+    Fixes rendering corruption due to incorrect
+    gfx configuration.
+    
+    bug:
+    https://bugs.freedesktop.org/show_bug.cgi?id=63599
+    
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit f3f8d67db827d4206999fc81bca6df60c96c9448
+Author: Theodore Ts'o <tytso@mit.edu>
+Date:   Fri Dec 20 09:29:35 2013 -0500
+
+    ext4: add explicit casts when masking cluster sizes
+    
+    commit f5a44db5d2d677dfbf12deee461f85e9ec633961 upstream.
+    
+    The missing casts can cause the high 64-bits of the physical blocks to
+    be lost.  Set up new macros which allows us to make sure the right
+    thing happen, even if at some point we end up supporting larger
+    logical block numbers.
+    
+    Thanks to the Emese Revfy and the PaX security team for reporting this
+    issue.
+    
+    Reported-by: PaX Team <pageexec@freemail.hu>
+    Reported-by: Emese Revfy <re.emese@gmail.com>
+    Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+    [bwh: Backported to 3.2:
+     - Adjust context
+     - Drop inapplicable change to ext4_ext_rm_leaf()]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit db2d65517d27bda1164ab41aba72e13a2e56b468
+Author: Peter Korsgaard <peter@korsgaard.com>
+Date:   Mon Dec 16 11:35:35 2013 +0100
+
+    dm9601: work around tx fifo sync issue on dm962x
+    
+    commit 4263c86dca5198da6bd3ad826d0b2304fbe25776 upstream.
+    
+    Certain dm962x revisions contain an bug, where if a USB bulk transfer retry
+    (E.G. if bulk crc mismatch) happens right after a transfer with odd or
+    maxpacket length, the internal tx hardware fifo gets out of sync causing
+    the interface to stop working.
+    
+    Work around it by adding up to 3 bytes of padding to ensure this situation
+    cannot trigger.
+    
+    This workaround also means we never pass multiple-of-maxpacket size skb's
+    to usbnet, so the length adjustment to handle usbnet's padding of those can
+    be removed.
+    
+    Reported-by: Joseph Chang <joseph_chang@davicom.com.tw>
+    Signed-off-by: Peter Korsgaard <peter@korsgaard.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit bb840e15efa58c6a827fc79703a9ee1165d543fd
+Author: Peter Korsgaard <peter@korsgaard.com>
+Date:   Mon Dec 16 11:35:33 2013 +0100
+
+    dm9601: fix reception of full size ethernet frames on dm9620/dm9621a
+    
+    commit 407900cfb54bdb2cfa228010b6697305f66b2948 upstream.
+    
+    dm9620/dm9621a require room for 4 byte padding even in dm9601 (3 byte
+    header) mode.
+    
+    Signed-off-by: Peter Korsgaard <peter@korsgaard.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit f4118c967b80fb55a7d54ec149294ea4477e5963
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Tue Dec 17 10:09:32 2013 -0800
+
+    net_dma: mark broken
+    
+    commit 77873803363c9e831fc1d1e6895c084279090c22 upstream.
+    
+    net_dma can cause data to be copied to a stale mapping if a
+    copy-on-write fault occurs during dma.  The application sees missing
+    data.
+    
+    The following trace is triggered by modifying the kernel to WARN if it
+    ever triggers copy-on-write on a page that is undergoing dma:
+    
+     WARNING: CPU: 24 PID: 2529 at lib/dma-debug.c:485 debug_dma_assert_idle+0xd2/0x120()
+     ioatdma 0000:00:04.0: DMA-API: cpu touching an active dma mapped page [pfn=0x16bcd9]
+     Modules linked in: iTCO_wdt iTCO_vendor_support ioatdma lpc_ich pcspkr dca
+     CPU: 24 PID: 2529 Comm: linbug Tainted: G        W    3.13.0-rc1+ #353
+      00000000000001e5 ffff88016f45f688 ffffffff81751041 ffff88017ab0ef70
+      ffff88016f45f6d8 ffff88016f45f6c8 ffffffff8104ed9c ffffffff810f3646
+      ffff8801768f4840 0000000000000282 ffff88016f6cca10 00007fa2bb699349
+     Call Trace:
+      [<ffffffff81751041>] dump_stack+0x46/0x58
+      [<ffffffff8104ed9c>] warn_slowpath_common+0x8c/0xc0
+      [<ffffffff810f3646>] ? ftrace_pid_func+0x26/0x30
+      [<ffffffff8104ee86>] warn_slowpath_fmt+0x46/0x50
+      [<ffffffff8139c062>] debug_dma_assert_idle+0xd2/0x120
+      [<ffffffff81154a40>] do_wp_page+0xd0/0x790
+      [<ffffffff811582ac>] handle_mm_fault+0x51c/0xde0
+      [<ffffffff813830b9>] ? copy_user_enhanced_fast_string+0x9/0x20
+      [<ffffffff8175fc2c>] __do_page_fault+0x19c/0x530
+      [<ffffffff8175c196>] ? _raw_spin_lock_bh+0x16/0x40
+      [<ffffffff810f3539>] ? trace_clock_local+0x9/0x10
+      [<ffffffff810fa1f4>] ? rb_reserve_next_event+0x64/0x310
+      [<ffffffffa0014c00>] ? ioat2_dma_prep_memcpy_lock+0x60/0x130 [ioatdma]
+      [<ffffffff8175ffce>] do_page_fault+0xe/0x10
+      [<ffffffff8175c862>] page_fault+0x22/0x30
+      [<ffffffff81643991>] ? __kfree_skb+0x51/0xd0
+      [<ffffffff813830b9>] ? copy_user_enhanced_fast_string+0x9/0x20
+      [<ffffffff81388ea2>] ? memcpy_toiovec+0x52/0xa0
+      [<ffffffff8164770f>] skb_copy_datagram_iovec+0x5f/0x2a0
+      [<ffffffff8169d0f4>] tcp_rcv_established+0x674/0x7f0
+      [<ffffffff816a68c5>] tcp_v4_do_rcv+0x2e5/0x4a0
+      [..]
+     ---[ end trace e30e3b01191b7617 ]---
+     Mapped at:
+      [<ffffffff8139c169>] debug_dma_map_page+0xb9/0x160
+      [<ffffffff8142bf47>] dma_async_memcpy_pg_to_pg+0x127/0x210
+      [<ffffffff8142cce9>] dma_memcpy_pg_to_iovec+0x119/0x1f0
+      [<ffffffff81669d3c>] dma_skb_copy_datagram_iovec+0x11c/0x2b0
+      [<ffffffff8169d1ca>] tcp_rcv_established+0x74a/0x7f0:
+    
+    ...the problem is that the receive path falls back to cpu-copy in
+    several locations and this trace is just one of the areas.  A few
+    options were considered to fix this:
+    
+    1/ sync all dma whenever a cpu copy branch is taken
+    
+    2/ modify the page fault handler to hold off while dma is in-flight
+    
+    Option 1 adds yet more cpu overhead to an "offload" that struggles to compete
+    with cpu-copy.  Option 2 adds checks for behavior that is already documented as
+    broken when using get_user_pages().  At a minimum a debug mode is warranted to
+    catch and flag these violations of the dma-api vs get_user_pages().
+    
+    Thanks to David for his reproducer.
+    
+    Cc: Dave Jiang <dave.jiang@intel.com>
+    Cc: Vinod Koul <vinod.koul@intel.com>
+    Cc: Alexander Duyck <alexander.h.duyck@intel.com>
+    Reported-by: David Whipple <whipple@securedatainnovations.ch>
+    Acked-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit bec9013a0525abbbe392f9a05c0f87cf2966592d
+Author: Bo Shen <voice.shen@atmel.com>
+Date:   Wed Dec 18 11:26:23 2013 +0800
+
+    ASoC: wm8904: fix DSP mode B configuration
+    
+    commit f0199bc5e3a3ec13f9bc938556517ec430b36437 upstream.
+    
+    When wm8904 work in DSP mode B, we still need to configure it to
+    work in DSP mode. Or else, it will work in Right Justified mode.
+    
+    Signed-off-by: Bo Shen <voice.shen@atmel.com>
+    Acked-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+    Signed-off-by: Mark Brown <broonie@linaro.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 509ec6b9b497aaac9cbf6a7c7ecdf08116807e8f
+Author: Josh Boyer <jwboyer@redhat.com>
+Date:   Fri Oct 11 08:45:51 2013 -0400
+
+    cpupower: Fix segfault due to incorrect getopt_long arugments
+    
+    commit f447ef4a56dee4b68a91460bcdfe06b5011085f2 upstream.
+    
+    If a user calls 'cpupower set --perf-bias 15', the process will end with
+    a SIGSEGV in libc because cpupower-set passes a NULL optarg to the atoi
+    call.  This is because the getopt_long structure currently has all of
+    the options as having an optional_argument when they really have a
+    required argument.  We change the structure to use required_argument to
+    match the short options and it resolves the issue.
+    
+    This fixes https://bugzilla.redhat.com/show_bug.cgi?id=1000439
+    
+    Signed-off-by: Josh Boyer <jwboyer@fedoraproject.org>
+    Cc: Dominik Brodowski <linux@dominikbrodowski.net>
+    Cc: Thomas Renninger <trenn@suse.de>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 5982c7fe4acf612e50738475c2c7f2eb47ec7ec2
+Author: Sujith Manoharan <c_manoha@qca.qualcomm.com>
+Date:   Mon Dec 16 07:04:59 2013 +0530
+
+    ath9k: Fix interrupt handling for the AR9002 family
+    
+    commit 73f0b56a1ff64e7fb6c3a62088804bab93bcedc2 upstream.
+    
+    This patch adds a driver workaround for a HW issue.
+    
+    A race condition in the HW results in missing interrupts,
+    which can be avoided by a read/write with the ISR register.
+    All chips in the AR9002 series are affected by this bug - AR9003
+    and above do not have this problem.
+    
+    Cc: Felix Fietkau <nbd@openwrt.org>
+    Signed-off-by: Sujith Manoharan <c_manoha@qca.qualcomm.com>
+    Signed-off-by: John W. Linville <linville@tuxdriver.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit b1d579f59db6b84485497e0c15237348f15c60f2
+Author: Larry Finger <Larry.Finger@lwfinger.net>
+Date:   Wed Dec 11 17:13:10 2013 -0600
+
+    rtlwifi: pci: Fix oops on driver unload
+    
+    commit 9278db6279e28d4d433bc8a848e10b4ece8793ed upstream.
+    
+    On Fedora systems, unloading rtl8192ce causes an oops. This patch fixes the
+    problem reported at https://bugzilla.redhat.com/show_bug.cgi?id=852761.
+    
+    Signed-off-by: Larry Finger <Larry.Finger@lwfinger.net>
+    Signed-off-by: John W. Linville <linville@tuxdriver.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit cee7e2f6b271c36ee0bf3cc3836cbde77301d10e
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue Dec 17 14:34:50 2013 +0000
+
+    drm/i915: Use the correct GMCH_CTRL register for Sandybridge+
+    
+    commit a885b3ccc74d8e38074e1c43a47c354c5ea0b01e upstream.
+    
+    The GMCH_CTRL register (or MGCC in the spec) is at a different address
+    on Sandybridge, and the address to which we currently write to is
+    undefined. These stray writes appear to upset (hard hang) my Ivybridge
+    machine whilst it is in UEFI mode.
+    
+    Note that the register is still marked as locked RO on Sandybridge, so
+    vgaarb is still dysfunctional.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Jani Nikula <jani.nikula@linux.intel.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    [bwh: Backported to 3.2: add definition of SNB_GMCH_CTRL in i915_reg.h]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 2fd7b46281e382ea7e35ac120efa73d9fa912ee7
+Author: JongHo Kim <furmuwon@gmail.com>
+Date:   Tue Dec 17 23:02:24 2013 +0900
+
+    ALSA: Add SNDRV_PCM_STATE_PAUSED case in wait_for_avail function
+    
+    commit ed697e1aaf7237b1a62af39f64463b05c262808d upstream.
+    
+    When the process is sleeping at the SNDRV_PCM_STATE_PAUSED
+    state from the wait_for_avail function, the sleep process will be woken by
+    timeout(10 seconds). Even if the sleep process wake up by timeout, by this
+    patch, the process will continue with sleep and wait for the other state.
+    
+    Signed-off-by: JongHo Kim <furmuwon@gmail.com>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 069623122342d660364e011d1d3e2dfaad18b75d
+Author: Kirill Tkhai <tkhai@yandex.ru>
+Date:   Wed Nov 27 19:59:13 2013 +0400
+
+    sched/rt: Fix rq's cpupri leak while enqueue/dequeue child RT entities
+    
+    commit 757dfcaa41844595964f1220f1d33182dae49976 upstream.
+    
+    This patch touches the RT group scheduling case.
+    
+    Functions inc_rt_prio_smp() and dec_rt_prio_smp() change (global) rq's
+    priority, while rt_rq passed to them may be not the top-level rt_rq.
+    This is wrong, because changing of priority on a child level does not
+    guarantee that the priority is the highest all over the rq. So, this
+    leak makes RT balancing unusable.
+    
+    The short example: the task having the highest priority among all rq's
+    RT tasks (no one other task has the same priority) are waking on a
+    throttle rt_rq.  The rq's cpupri is set to the task's priority
+    equivalent, but real rq->rt.highest_prio.curr is less.
+    
+    The patch below fixes the problem.
+    
+    Signed-off-by: Kirill Tkhai <tkhai@yandex.ru>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    CC: Steven Rostedt <rostedt@goodmis.org>
+    Link: http://lkml.kernel.org/r/49231385567953@web4m.yandex.ru
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    [bwh: Backported to 3.2: adjust filename]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 882f85b5380e13093710f5a7ffbe575e85ba8fd8
+Author: Thomas Hellstrom <thellstrom@vmware.com>
+Date:   Sun Dec 8 23:23:57 2013 -0800
+
+    drm/ttm: Fix accesses through vmas with only partial coverage
+    
+    commit d386735588c3e22129c2bc6eb64fc1d37a8f805c upstream.
+    
+    VMAs covering a bo but that didn't start at the same address space offset as
+    the bo they were mapping were incorrectly generating SEGFAULT errors in
+    the fault handler.
+    
+    Reported-by: Joseph Dolinak <kanilo2@yahoo.com>
+    Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+    Reviewed-by: Jakob Bornecrantz <jakob@vmware.com>
+    [bwh: Backported to 3.2: drm_vma_node_start() is open-coded;
+     vma_pages() was open-coded]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 536b1f2107eddfd94b7ab11a787b460b1ac4941a
+Author: Robin H. Johnson <robbat2@gentoo.org>
+Date:   Mon Dec 16 09:31:19 2013 -0800
+
+    libata: disable a disk via libata.force params
+    
+    commit b8bd6dc36186fe99afa7b73e9e2d9a98ad5c4865 upstream.
+    
+    A user on StackExchange had a failing SSD that's soldered directly
+    onto the motherboard of his system. The BIOS does not give any option
+    to disable it at all, so he can't just hide it from the OS via the
+    BIOS.
+    
+    The old IDE layer had hdX=noprobe override for situations like this,
+    but that was never ported to the libata layer.
+    
+    This patch implements a disable flag for libata.force.
+    
+    Example use:
+    
+     libata.force=2.0:disable
+    
+    [v2 of the patch, removed the nodisable flag per Tejun Heo]
+    
+    Signed-off-by: Robin H. Johnson <robbat2@gentoo.org>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Link: http://unix.stackexchange.com/questions/102648/how-to-tell-linux-kernel-3-0-to-completely-ignore-a-failing-disk
+    Link: http://askubuntu.com/questions/352836/how-can-i-tell-linux-kernel-to-completely-ignore-a-disk-as-if-it-was-not-even-co
+    Link: http://superuser.com/questions/599333/how-to-disable-kernel-probing-for-drive
+    [bwh: Backported to 3.2: adjust context]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit fac003d581af1a7b2922d723c2cd078e533a2fb6
+Author: Miao Xie <miaox@cn.fujitsu.com>
+Date:   Mon Dec 16 15:20:01 2013 +0800
+
+    ftrace: Initialize the ftrace profiler for each possible cpu
+    
+    commit c4602c1c818bd6626178d6d3fcc152d9f2f48ac0 upstream.
+    
+    Ftrace currently initializes only the online CPUs. This implementation has
+    two problems:
+    - If we online a CPU after we enable the function profile, and then run the
+      test, we will lose the trace information on that CPU.
+      Steps to reproduce:
+      # echo 0 > /sys/devices/system/cpu/cpu1/online
+      # cd <debugfs>/tracing/
+      # echo <some function name> >> set_ftrace_filter
+      # echo 1 > function_profile_enabled
+      # echo 1 > /sys/devices/system/cpu/cpu1/online
+      # run test
+    - If we offline a CPU before we enable the function profile, we will not clear
+      the trace information when we enable the function profile. It will trouble
+      the users.
+      Steps to reproduce:
+      # cd <debugfs>/tracing/
+      # echo <some function name> >> set_ftrace_filter
+      # echo 1 > function_profile_enabled
+      # run test
+      # cat trace_stat/function*
+      # echo 0 > /sys/devices/system/cpu/cpu1/online
+      # echo 0 > function_profile_enabled
+      # echo 1 > function_profile_enabled
+      # cat trace_stat/function*
+      # run test
+      # cat trace_stat/function*
+    
+    So it is better that we initialize the ftrace profiler for each possible cpu
+    every time we enable the function profile instead of just the online ones.
+    
+    Link: http://lkml.kernel.org/r/1387178401-10619-1-git-send-email-miaox@cn.fujitsu.com
+    
+    Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+    Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 39e87a9623c8b1fe690dccc18b885b56a2891aca
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Mon Dec 16 12:04:36 2013 +0100
+
+    radiotap: fix bitmap-end-finding buffer overrun
+    
+    commit bd02cd2549cfcdfc57cb5ce57ffc3feb94f70575 upstream.
+    
+    Evan Huus found (by fuzzing in wireshark) that the radiotap
+    iterator code can access beyond the length of the buffer if
+    the first bitmap claims an extension but then there's no
+    data at all. Fix this.
+    
+    Reported-by: Evan Huus <eapache@gmail.com>
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 50226b9992e79d43579b92650ecbfdbc1479980c
+Author: Stephen Boyd <sboyd@codeaurora.org>
+Date:   Tue Dec 10 15:19:03 2013 -0800
+
+    gpio: msm: Fix irq mask/unmask by writing bits instead of numbers
+    
+    commit 4cc629b7a20945ce35628179180329b6bc9e552b upstream.
+    
+    We should be writing bits here but instead we're writing the
+    numbers that correspond to the bits we want to write. Fix it by
+    wrapping the numbers in the BIT() macro. This fixes gpios acting
+    as interrupts.
+    
+    Signed-off-by: Stephen Boyd <sboyd@codeaurora.org>
+    Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit f40c79b50c8fa5fb1391acf8e10bcef05c9f4433
+Author: David Henningsson <david.henningsson@canonical.com>
+Date:   Thu Dec 12 09:52:03 2013 +0100
+
+    ALSA: hda - Add enable_msi=0 workaround for four HP machines
+    
+    commit 693e0cb052c607e2d41edf9e9f1fa99ff8c266c1 upstream.
+    
+    While enabling these machines, we found we would sometimes lose an
+    interrupt if we change hardware volume during playback, and that
+    disabling msi fixed this issue. (Losing the interrupt caused underruns
+    and crackling audio, as the one second timeout is usually bigger than
+    the period size.)
+    
+    The machines were all machines from HP, running AMD Hudson controller,
+    and Realtek ALC282 codec.
+    
+    BugLink: https://bugs.launchpad.net/bugs/1260225
+    Signed-off-by: David Henningsson <david.henningsson@canonical.com>
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    [bwh: Backported to 3.2: adjust context]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit e5fdcafb4a311d2b37f00ed425f27f67834eb64b
+Author: Alex Deucher <alexander.deucher@amd.com>
+Date:   Mon Dec 2 18:15:51 2013 -0500
+
+    drm/radeon: Fix sideport problems on certain RS690 boards
+    
+    commit 8333f0fe133be420ce3fcddfd568c3a559ab274e upstream.
+    
+    Some RS690 boards with 64MB of sideport memory show up as
+    having 128MB sideport + 256MB of UMA.  In this case,
+    just skip the sideport memory and use UMA.  This fixes
+    rendering corruption and should improve performance.
+    
+    bug:
+    https://bugs.freedesktop.org/show_bug.cgi?id=35457
+    
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+    [bwh: Backported to 3.2: adjust context]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit d92055f130b4f4d4c88f2029783fceab31c2577b
+Author: Nicholas Bellinger <nab@linux-iscsi.org>
+Date:   Mon Nov 25 14:53:57 2013 -0800
+
+    iscsi-target: Fix-up all zero data-length CDBs with R/W_BIT set
+    
+    commit 4454b66cb67f14c33cd70ddcf0ff4985b26324b7 upstream.
+    
+    This patch changes special case handling for ISCSI_OP_SCSI_CMD
+    where an initiator sends a zero length Expected Data Transfer
+    Length (EDTL), but still sets the WRITE and/or READ flag bits
+    when no payload transfer is requested.
+    
+    Many, many moons ago two special cases where added for an ancient
+    version of ESX that has long since been fixed, so instead of adding
+    a new special case for the reported bug with a Broadcom 57800 NIC,
+    go ahead and always strip off the incorrect WRITE + READ flag bits.
+    
+    Also, avoid sending a reject here, as RFC-3720 does mandate this
+    case be handled without protocol error.
+    
+    Reported-by: Witold Bazakbal <865perl@wp.pl>
+    Tested-by: Witold Bazakbal <865perl@wp.pl>
+    Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+    [bwh: Backported to 3.2: adjust context]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit fb73858992fd24bad482aa5f4ceb839776d7c307
+Author: Takashi Iwai <tiwai@suse.de>
+Date:   Mon Dec 9 14:53:36 2013 +0100
+
+    xhci: Limit the spurious wakeup fix only to HP machines
+    
+    commit 6962d914f317b119e0db7189199b21ec77a4b3e0 upstream.
+    
+    We've got regression reports that my previous fix for spurious wakeups
+    after S5 on HP Haswell machines leads to the automatic reboot at
+    shutdown on some machines.  It turned out that the fix for one side
+    triggers another BIOS bug in other side.  So, it's exclusive.
+    
+    Since the original S5 wakeups have been confirmed only on HP machines,
+    it'd be safer to apply it only to limited machines.  As a wild guess,
+    limiting to machines with HP PCI SSID should suffice.
+    
+    This patch should be backported to kernels as old as 3.12, that
+    contain the commit 638298dc66ea36623dbc2757a24fc2c4ab41b016 "xhci: Fix
+    spurious wakeups after S5 on Haswell".
+    
+    Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=66171
+    Signed-off-by: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+    Tested-by: <dashing.meng@gmail.com>
+    Reported-by: Niklas Schnelle <niklas@komani.de>
+    Reported-by: Giorgos <ganastasiouGR@gmail.com>
+    Reported-by: <art1@vhex.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit f09946daaea5c088d8dc0883e30c643f5e5684db
+Author: Al Viro <viro@ZenIV.linux.org.uk>
+Date:   Sun Dec 8 20:52:31 2013 -0500
+
+    ext4: fix del_timer() misuse for ->s_err_report
+    
+    commit 9105bb149bbbc555d2e11ba5166dfe7a24eae09e upstream.
+    
+    That thing should be del_timer_sync(); consider what happens
+    if ext4_put_super() call of del_timer() happens to come just as it's
+    getting run on another CPU.  Since that timer reschedules itself
+    to run next day, you are pretty much guaranteed that you'll end up
+    with kfree'd scheduled timer, with usual fun consequences.  AFAICS,
+    that's -stable fodder all way back to 2010... [the second del_timer_sync()
+    is almost certainly not needed, but it doesn't hurt either]
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+    [bwh: Backported to 3.2: adjust context]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit f5b4f2e824dec9808d55287576a7b83d80bae937
+Author: Jan Kara <jack@suse.cz>
+Date:   Tue Dec 3 11:20:06 2013 +0100
+
+    ext2: Fix oops in ext2_get_block() called from ext2_quota_write()
+    
+    commit df4e7ac0bb70abc97fbfd9ef09671fc084b3f9db upstream.
+    
+    ext2_quota_write() doesn't properly setup bh it passes to
+    ext2_get_block() and thus we hit assertion BUG_ON(maxblocks == 0) in
+    ext2_get_blocks() (or we could actually ask for mapping arbitrary number
+    of blocks depending on whatever value was on stack).
+    
+    Fix ext2_quota_write() to properly fill in number of blocks to map.
+    
+    Reviewed-by: "Theodore Ts'o" <tytso@mit.edu>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reported-by: Christoph Hellwig <hch@infradead.org>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 4645e4ee32aee01a85bdc03348982a65c65ce216
+Author: Eryu Guan <guaneryu@gmail.com>
+Date:   Tue Dec 3 21:22:21 2013 -0500
+
+    ext4: check for overlapping extents in ext4_valid_extent_entries()
+    
+    commit 5946d089379a35dda0e531710b48fca05446a196 upstream.
+    
+    A corrupted ext4 may have out of order leaf extents, i.e.
+    
+    extent: lblk 0--1023, len 1024, pblk 9217, flags: LEAF UNINIT
+    extent: lblk 1000--2047, len 1024, pblk 10241, flags: LEAF UNINIT
+                 ^^^^ overlap with previous extent
+    
+    Reading such extent could hit BUG_ON() in ext4_es_cache_extent().
+    
+            BUG_ON(end < lblk);
+    
+    The problem is that __read_extent_tree_block() tries to cache holes as
+    well but assumes 'lblk' is greater than 'prev' and passes underflowed
+    length to ext4_es_cache_extent(). Fix it by checking for overlapping
+    extents in ext4_valid_extent_entries().
+    
+    I hit this when fuzz testing ext4, and am able to reproduce it by
+    modifying the on-disk extent by hand.
+    
+    Also add the check for (ee_block + len - 1) in ext4_valid_extent() to
+    make sure the value is not overflow.
+    
+    Ran xfstests on patched ext4 and no regression.
+    
+    Cc: Lukáš Czerner <lczerner@redhat.com>
+    Signed-off-by: Eryu Guan <guaneryu@gmail.com>
+    Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit ec94b7aba9ced72a96cfdf0cdf693b30ff604039
+Author: Junho Ryu <jayr@google.com>
+Date:   Tue Dec 3 18:10:28 2013 -0500
+
+    ext4: fix use-after-free in ext4_mb_new_blocks
+    
+    commit 4e8d2139802ce4f41936a687f06c560b12115247 upstream.
+    
+    ext4_mb_put_pa should hold pa->pa_lock before accessing pa->pa_count.
+    While ext4_mb_use_preallocated checks pa->pa_deleted first and then
+    increments pa->count later, ext4_mb_put_pa decrements pa->pa_count
+    before holding pa->pa_lock and then sets pa->pa_deleted.
+    
+    * Free sequence
+    ext4_mb_put_pa (1):             atomic_dec_and_test pa->pa_count
+    ext4_mb_put_pa (2):             lock pa->pa_lock
+    ext4_mb_put_pa (3):                     check pa->pa_deleted
+    ext4_mb_put_pa (4):                     set pa->pa_deleted=1
+    ext4_mb_put_pa (5):             unlock pa->pa_lock
+    ext4_mb_put_pa (6):             remove pa from a list
+    ext4_mb_pa_callback:            free pa
+    
+    * Use sequence
+    ext4_mb_use_preallocated (1):   iterate over preallocation
+    ext4_mb_use_preallocated (2):   lock pa->pa_lock
+    ext4_mb_use_preallocated (3):           check pa->pa_deleted
+    ext4_mb_use_preallocated (4):           increase pa->pa_count
+    ext4_mb_use_preallocated (5):   unlock pa->pa_lock
+    ext4_mb_release_context:        access pa
+    
+    * Use-after-free sequence
+    [initial status]                <pa->pa_deleted = 0, pa_count = 1>
+    ext4_mb_use_preallocated (1):   iterate over preallocation
+    ext4_mb_use_preallocated (2):   lock pa->pa_lock
+    ext4_mb_use_preallocated (3):           check pa->pa_deleted
+    ext4_mb_put_pa (1):             atomic_dec_and_test pa->pa_count
+    [pa_count decremented]          <pa->pa_deleted = 0, pa_count = 0>
+    ext4_mb_use_preallocated (4):           increase pa->pa_count
+    [pa_count incremented]          <pa->pa_deleted = 0, pa_count = 1>
+    ext4_mb_use_preallocated (5):   unlock pa->pa_lock
+    ext4_mb_put_pa (2):             lock pa->pa_lock
+    ext4_mb_put_pa (3):                     check pa->pa_deleted
+    ext4_mb_put_pa (4):                     set pa->pa_deleted=1
+    [race condition!]               <pa->pa_deleted = 1, pa_count = 1>
+    ext4_mb_put_pa (5):             unlock pa->pa_lock
+    ext4_mb_put_pa (6):             remove pa from a list
+    ext4_mb_pa_callback:            free pa
+    ext4_mb_release_context:        access pa
+    
+    AddressSanitizer has detected use-after-free in ext4_mb_new_blocks
+    Bug report: http://goo.gl/rG1On3
+    
+    Signed-off-by: Junho Ryu <jayr@google.com>
+    Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 9eb492b82ccf9900c85af95276b60dd1ba1b7d2a
+Author: Theodore Ts'o <tytso@mit.edu>
+Date:   Mon Dec 2 09:31:36 2013 -0500
+
+    ext4: call ext4_error_inode() if jbd2_journal_dirty_metadata() fails
+    
+    commit ae1495b12df1897d4f42842a7aa7276d920f6290 upstream.
+    
+    While it's true that errors can only happen if there is a bug in
+    jbd2_journal_dirty_metadata(), if a bug does happen, we need to halt
+    the kernel or remount the file system read-only in order to avoid
+    further data loss.  The ext4_journal_abort_handle() function doesn't
+    do any of this, and while it's likely that this call (since it doesn't
+    adjust refcounts) will likely result in the file system eventually
+    deadlocking since the current transaction will never be able to close,
+    it's much cleaner to call let ext4's error handling system deal with
+    this situation.
+    
+    There's a separate bug here which is that if certain jbd2 errors
+    errors occur and file system is mounted errors=continue, the file
+    system will probably eventually end grind to a halt as described
+    above.  But things have been this way in a long time, and usually when
+    we have these sorts of errors it's pretty much a disaster --- and
+    that's why the jbd2 layer aggressively retries memory allocations,
+    which is the most likely cause of these jbd2 errors.
+    
+    Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+    Reviewed-by: Jan Kara <jack@suse.cz>
+    [bwh: Backported to 3.2: drop logging of missing transaction debug data]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit cbeb052c8edcf6bda7ef916f14bc1ac030ba8f42
+Author: Michele Baldessari <michele@acksyn.org>
+Date:   Mon Nov 25 19:00:14 2013 +0000
+
+    libata: add ATA_HORKAGE_BROKEN_FPDMA_AA quirk for Seagate Momentus SpinPoint M8
+    
+    commit 87809942d3fa60bafb7a58d0bdb1c79e90a6821d upstream.
+    
+    We've received multiple reports in Fedora via (BZ 907193)
+    that the Seagate Momentus SpinPoint M8 errors out when enabling AA:
+    [    2.555905] ata2.00: failed to enable AA (error_mask=0x1)
+    [    2.568482] ata2.00: failed to enable AA (error_mask=0x1)
+    
+    Add the ATA_HORKAGE_BROKEN_FPDMA_AA for this specific harddisk.
+    
+    Reported-by: Nicholas <arealityfarbetween@googlemail.com>
+    Signed-off-by: Michele Baldessari <michele@acksyn.org>
+    Tested-by: Nicholas <arealityfarbetween@googlemail.com>
+    Acked-by: Alan Cox <gnomes@lxorguk.ukuu.org.uk>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit bed3dd5996d716ae26a3974cbfca6153fb8556b8
+Author: Geert Uytterhoeven <geert@linux-m68k.org>
+Date:   Wed Dec 18 17:08:48 2013 -0800
+
+    sh: always link in helper functions extracted from libgcc
+    
+    commit 84ed8a99058e61567f495cc43118344261641c5f upstream.
+    
+    E.g. landisk_defconfig, which has CONFIG_NTFS_FS=m:
+    
+      ERROR: "__ashrdi3" [fs/ntfs/ntfs.ko] undefined!
+    
+    For "lib-y", if no symbols in a compilation unit are referenced by other
+    units, the compilation unit will not be included in vmlinux.  This
+    breaks modules that do reference those symbols.
+    
+    Use "obj-y" instead to fix this.
+    
+    http://kisskb.ellerman.id.au/kisskb/buildresult/8838077/
+    
+    This doesn't fix all cases. There are others, e.g. udivsi3.
+    This is also not limited to sh, many architectures handle this in the
+    same way.
+    
+    A simple solution is to unconditionally include all helper functions.
+    A more complex solution is to make the choice of "lib-y" or "obj-y" depend
+    on CONFIG_MODULES:
+    
+      obj-$(CONFIG_MODULES) += ...
+      lib-y($CONFIG_MODULES) += ...
+    
+    Signed-off-by: Geert Uytterhoeven <geert@linux-m68k.org>
+    Cc: Paul Mundt <lethal@linux-sh.org>
+    Tested-by: Nobuhiro Iwamatsu <nobuhiro.iwamatsu.yj@renesas.com>
+    Reviewed-by: Nobuhiro Iwamatsu <nobuhiro.iwamatsu.yj@renesas.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit f4ca736c52df0cff20c52415e313bdf77f5631d0
+Author: Yan, Zheng <zheng.z.yan@intel.com>
+Date:   Thu Oct 31 09:10:47 2013 +0800
+
+    ceph: wake up 'safe' waiters when unregistering request
+    
+    commit fc55d2c9448b34218ca58733a6f51fbede09575b upstream.
+    
+    We also need to wake up 'safe' waiters if error occurs or request
+    aborted. Otherwise sync(2)/fsync(2) may hang forever.
+    
+    Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+    Signed-off-by: Sage Weil <sage@inktank.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit b072f9cad8d6d04fea08d3aafc88e4d9e2d95959
+Author: Yan, Zheng <zheng.z.yan@intel.com>
+Date:   Thu Sep 26 14:25:36 2013 +0800
+
+    ceph: cleanup aborted requests when re-sending requests.
+    
+    commit eb1b8af33c2e42a9a57fc0a7588f4a7b255d2e79 upstream.
+    
+    Aborted requests usually get cleared when the reply is received.
+    If MDS crashes, no reply will be received. So we need to cleanup
+    aborted requests when re-sending requests.
+    
+    Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+    Reviewed-by: Greg Farnum <greg@inktank.com>
+    Signed-off-by: Sage Weil <sage@inktank.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 7f4d246009352e5c95a472fdf3fb28fb8a8bd414
+Author: Akira Takeuchi <takeuchi.akr@jp.panasonic.com>
+Date:   Tue Nov 12 15:08:21 2013 -0800
+
+    mm: ensure get_unmapped_area() returns higher address than mmap_min_addr
+    
+    commit 2afc745f3e3079ab16c826be4860da2529054dd2 upstream.
+    
+    This patch fixes the problem that get_unmapped_area() can return illegal
+    address and result in failing mmap(2) etc.
+    
+    In case that the address higher than PAGE_SIZE is set to
+    /proc/sys/vm/mmap_min_addr, the address lower than mmap_min_addr can be
+    returned by get_unmapped_area(), even if you do not pass any virtual
+    address hint (i.e.  the second argument).
+    
+    This is because the current get_unmapped_area() code does not take into
+    account mmap_min_addr.
+    
+    This leads to two actual problems as follows:
+    
+    1. mmap(2) can fail with EPERM on the process without CAP_SYS_RAWIO,
+       although any illegal parameter is not passed.
+    
+    2. The bottom-up search path after the top-down search might not work in
+       arch_get_unmapped_area_topdown().
+    
+    Note: The first and third chunk of my patch, which changes "len" check,
+    are for more precise check using mmap_min_addr, and not for solving the
+    above problem.
+    
+    [How to reproduce]
+    
+            --- test.c -------------------------------------------------
+            #include <stdio.h>
+            #include <unistd.h>
+            #include <sys/mman.h>
+            #include <sys/errno.h>
+    
+            int main(int argc, char *argv[])
+            {
+                    void *ret = NULL, *last_map;
+                    size_t pagesize = sysconf(_SC_PAGESIZE);
+    
+                    do {
+                            last_map = ret;
+                            ret = mmap(0, pagesize, PROT_NONE,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            //              printf("ret=%p\n", ret);
+                    } while (ret != MAP_FAILED);
+    
+                    if (errno != ENOMEM) {
+                            printf("ERR: unexpected errno: %d (last map=%p)\n",
+                            errno, last_map);
+                    }
+    
+                    return 0;
+            }
+            ---------------------------------------------------------------
+    
+            $ gcc -m32 -o test test.c
+            $ sudo sysctl -w vm.mmap_min_addr=65536
+            vm.mmap_min_addr = 65536
+            $ ./test  (run as non-priviledge user)
+            ERR: unexpected errno: 1 (last map=0x10000)
+    
+    Signed-off-by: Akira Takeuchi <takeuchi.akr@jp.panasonic.com>
+    Signed-off-by: Kiyoshi Owada <owada.kiyoshi@jp.panasonic.com>
+    Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    [bwh: Backported to 3.2:
+     As we do not have vm_unmapped_area(), make arch_get_unmapped_area_topdown()
+     calculate the lower limit for the new area's end address and then compare
+     addresses with this instead of with len.  In the process, fix an off-by-one
+     error which could result in returning 0 if mm->mmap_base == len.]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit bbc220abf9c3e4dbfb7372596661f580fb15a7c8
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Sat Jan 11 19:15:52 2014 -0800
+
+    x86, fpu, amd: Clear exceptions in AMD FXSAVE workaround
+    
+    commit 26bef1318adc1b3a530ecc807ef99346db2aa8b0 upstream.
+    
+    Before we do an EMMS in the AMD FXSAVE information leak workaround we
+    need to clear any pending exceptions, otherwise we trap with a
+    floating-point exception inside this code.
+    
+    Reported-by: halfdog <me@halfdog.net>
+    Tested-by: Borislav Petkov <bp@suse.de>
+    Link: http://lkml.kernel.org/r/CA%2B55aFxQnY_PCG_n4=0w-VG=YLXL-yr7oMxyy0WU2gCBAf3ydg@mail.gmail.com
+    Signed-off-by: H. Peter Anvin <hpa@zytor.com>
+    [bwh: Backported to 3.2: adjust filename, context]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 6aa82e036079eaf208bd581c201dc61c9200bb2e
+Author: Andy Honig <ahonig@google.com>
+Date:   Wed Nov 20 10:23:22 2013 -0800
+
+    KVM: x86: Convert vapic synchronization to _cached functions (CVE-2013-6368)
+    
+    commit fda4e2e85589191b123d31cdc21fd33ee70f50fd upstream.
+    
+    In kvm_lapic_sync_from_vapic and kvm_lapic_sync_to_vapic there is the
+    potential to corrupt kernel memory if userspace provides an address that
+    is at the end of a page.  This patches concerts those functions to use
+    kvm_write_guest_cached and kvm_read_guest_cached.  It also checks the
+    vapic_address specified by userspace during ioctl processing and returns
+    an error to userspace if the address is not a valid GPA.
+    
+    This is generally not guest triggerable, because the required write is
+    done by firmware that runs before the guest.  Also, it only affects AMD
+    processors and oldish Intel that do not have the FlexPriority feature
+    (unless you disable FlexPriority, of course; then newer processors are
+    also affected).
+    
+    Fixes: b93463aa59d6 ('KVM: Accelerated apic support')
+    
+    Reported-by: Andrew Honig <ahonig@google.com>
+    Signed-off-by: Andrew Honig <ahonig@google.com>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+    [dannf: backported to Debian's 3.2]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit f7a9877cc68188252558001c9f6907fcb8af0b0f
+Author: Mathy Vanhoef <vanhoefm@gmail.com>
+Date:   Thu Nov 28 12:21:45 2013 +0100
+
+    ath9k_htc: properly set MAC address and BSSID mask
+    
+    commit 657eb17d87852c42b55c4b06d5425baa08b2ddb3 upstream.
+    
+    Pick the MAC address of the first virtual interface as the new hardware MAC
+    address. Set BSSID mask according to this MAC address. This fixes CVE-2013-4579.
+    
+    Signed-off-by: Mathy Vanhoef <vanhoefm@gmail.com>
+    Signed-off-by: John W. Linville <linville@tuxdriver.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit bfefd2a8c3db2a537c7effa34ab84cadbcadbd9e
+Author: Mikulas Patocka <mikulas@artax.karlin.mff.cuni.cz>
+Date:   Sun Jun 9 01:25:57 2013 +0200
+
+    hpfs: fix warnings when the filesystem fills up
+    
+    commit bbd465df73f0d8ba41b8a0732766a243d0f5b356 upstream.
+    
+    This patch fixes warnings due to missing lock on write error path.
+    
+      WARNING: at fs/hpfs/hpfs_fn.h:353 hpfs_truncate+0x75/0x80 [hpfs]()
+      Hardware name: empty
+      Pid: 26563, comm: dd Tainted: P           O 3.9.4 #12
+      Call Trace:
+        hpfs_truncate+0x75/0x80 [hpfs]
+        hpfs_write_begin+0x84/0x90 [hpfs]
+        _hpfs_bmap+0x10/0x10 [hpfs]
+        generic_file_buffered_write+0x121/0x2c0
+        __generic_file_aio_write+0x1c7/0x3f0
+        generic_file_aio_write+0x7c/0x100
+        do_sync_write+0x98/0xd0
+        hpfs_file_write+0xd/0x50 [hpfs]
+        vfs_write+0xa2/0x160
+        sys_write+0x51/0xa0
+        page_fault+0x22/0x30
+        system_call_fastpath+0x1a/0x1f
+    
+    Signed-off-by: Mikulas Patocka <mikulas@artax.karlin.mff.cuni.cz>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    [Mikulas Patocka: This is backport of upstream commit
+     bbd465df73f0d8ba41b8a0732766a243d0f5b356, modified for stable kernels
+     2.6.39 - 3.7.]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 6512274fd268149c1205c5fa7b69beecb9b93bb7
+Author: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date:   Sat Feb 25 18:24:31 2012 -0500
+
+    Fix warning from machine_kexec.c
+    
+    commit c19ce0ab53ad9698968a154647f3dc22aad6c45b upstream.
+    
+    Use proper cpp defined(...) constructs to avoid this:
+    
+    arch/ia64/kernel/machine_kexec.c: In function 'arch_crash_save_vmcoreinfo':
+    arch/ia64/kernel/machine_kexec.c:160:8: warning: "CONFIG_PGTABLE_4" is not defined
+    
+    Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+    Signed-off-by: Tony Luck <tony.luck@intel.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 11e106ef107462af1802066a8008f9930837c869
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Mon Jan 20 16:47:24 2014 +0000
+
+    staging: comedi: cb_pcidio: fix for newer PCI-DIO48H
+    
+    commit 0283f7a100882684ad32b768f9f1ad81658a0b92 upstream.
+    
+    At some point, Measurement Computing / ComputerBoards redesigned the
+    PCI-DIO48H to use a PLX PCI interface chip instead of an AMCC chip.
+    This meant they had to put their hardware registers in the PCI BAR 2
+    region instead of PCI BAR 1.  Unfortunately, they kept the same PCI
+    device ID for the new design.  This means the driver recognizes the
+    newer cards, but doesn't work (and is likely to screw up the local
+    configuration registers of the PLX chip) because it's using the wrong
+    region.
+    
+    Since all the supported boards have the DIO registers in the PCI BAR 2
+    region except for older PCI-DIO48H boards which have an empty PCI BAR 2
+    region and the DIO registers in PCI BAR 1, determine which PCI BAR
+    region to use based on whether the PCI BAR 2 region is empty or not.
+    
+    This change makes the `dioregs_badrindex` member of `struct
+    pcidio_board` redundant.  The `pcicontroler_badrindex` member is also
+    unused, so remove both members.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Cc: kernel-team@lists.ubuntu.com
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 0ebf55cff9dbe3202a9ad98d3e9f1b3dc3b4fabe
+Author: Jianguo Wu <wujianguo@huawei.com>
+Date:   Wed Dec 18 17:08:54 2013 -0800
+
+    mm/memory-failure.c: recheck PageHuge() after hugetlb page migrate successfully
+    
+    commit a49ecbcd7b0d5a1cda7d60e03df402dd0ef76ac8 upstream.
+    
+    After a successful hugetlb page migration by soft offline, the source
+    page will either be freed into hugepage_freelists or buddy(over-commit
+    page).  If page is in buddy, page_hstate(page) will be NULL.  It will
+    hit a NULL pointer dereference in dequeue_hwpoisoned_huge_page().
+    
+      BUG: unable to handle kernel NULL pointer dereference at 0000000000000058
+      IP: [<ffffffff81163761>] dequeue_hwpoisoned_huge_page+0x131/0x1d0
+      PGD c23762067 PUD c24be2067 PMD 0
+      Oops: 0000 [#1] SMP
+    
+    So check PageHuge(page) after call migrate_pages() successfully.
+    
+    Signed-off-by: Jianguo Wu <wujianguo@huawei.com>
+    Tested-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+    Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    [wujg: backport to 3.4:
+     - adjust context
+     - s/num_poisoned_pages/mce_bad_pages/]
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 3a6ac4b93f6c2fb3d2b1aa95f32c6729fa4e9676
+Author: Yijing Wang <wangyijing@huawei.com>
+Date:   Tue Jan 15 11:12:16 2013 +0800
+
+    PCI: Enable ARI if dev and upstream bridge support it; disable otherwise
+    
+    commit b0cc6020e1cc62f1253215f189611b34be4a83c7 upstream.
+    
+    Currently, we enable ARI in a device's upstream bridge if the bridge and
+    the device support it.  But we never disable ARI, even if the device is
+    removed and replaced with a device that doesn't support ARI.
+    
+    This means that if we hot-remove an ARI device and replace it with a
+    non-ARI multi-function device, we find only function 0 of the new device
+    because the upstream bridge still has ARI enabled, and next_ari_fn()
+    only returns function 0 for the new non-ARI device.
+    
+    This patch disables ARI in the upstream bridge if the device doesn't
+    support ARI.  See the PCIe spec, r3.0, sec 6.13.
+    
+    [bhelgaas: changelog, function comment]
+    [yijing: replace PCIe Cap accessor with legacy PCI accessor]
+    Signed-off-by: Yijing Wang <wangyijing@huawei.com>
+    Signed-off-by: Jiang Liu <jiang.liu@huawei.com>
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 1c7a9417edf13a32244bba86cf8197073ebad9a7
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Thu Mar 22 05:15:11 2012 +0000
+
+    xfs: Account log unmount transaction correctly
+    
+    commit 3948659e30808fbaa7673bbe89de2ae9769e20a7 upstream.
+    
+    There have been a few reports of this warning appearing recently:
+    
+    XFS (dm-4): xlog_space_left: head behind tail
+     tail_cycle = 129, tail_bytes = 20163072
+     GH   cycle = 129, GH   bytes = 20162880
+    
+    The common cause appears to be lots of freeze and unfreeze cycles,
+    and the output from the warnings indicates that we are leaking
+    around 8 bytes of log space per freeze/unfreeze cycle.
+    
+    When we freeze the filesystem, we write an unmount record and that
+    uses xlog_write directly - a special type of transaction,
+    effectively. What it doesn't do, however, is correctly account for
+    the log space it uses. The unmount record writes an 8 byte structure
+    with a special magic number into the log, and the space this
+    consumes is not accounted for in the log ticket tracking the
+    operation. Hence we leak 8 bytes every unmount record that is
+    written.
+    
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Ben Myers <bpm@sgi.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 609365b9ea77703c6be6e3cae5d5f31fa54fef90
+Author: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date:   Mon Jan 13 02:45:22 2014 +0100
+
+    net: avoid reference counter overflows on fib_rules in multicast forwarding
+    
+    [ Upstream commit 95f4a45de1a0f172b35451fc52283290adb21f6e ]
+    
+    Bob Falken reported that after 4G packets, multicast forwarding stopped
+    working. This was because of a rule reference counter overflow which
+    freed the rule as soon as the overflow happend.
+    
+    This patch solves this by adding the FIB_LOOKUP_NOREF flag to
+    fib_rules_lookup calls. This is safe even from non-rcu locked sections
+    as in this case the flag only implies not taking a reference to the rule,
+    which we don't need at all.
+    
+    Rules only hold references to the namespace, which are guaranteed to be
+    available during the call of the non-rcu protected function reg_vif_xmit
+    because of the interface reference which itself holds a reference to
+    the net namespace.
+    
+    Fixes: f0ad0860d01e47 ("ipv4: ipmr: support multiple tables")
+    Fixes: d1db275dd3f6e4 ("ipv6: ip6mr: support multiple tables")
+    Reported-by: Bob Falken <NetFestivalHaveFun@gmx.com>
+    Cc: Patrick McHardy <kaber@trash.net>
+    Cc: Thomas Graf <tgraf@suug.ch>
+    Cc: Julian Anastasov <ja@ssi.bg>
+    Cc: Eric Dumazet <eric.dumazet@gmail.com>
+    Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Acked-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 96a042c27e22876b68e64c648cb79226b38d3b70
+Author: Neal Cardwell <ncardwell@google.com>
+Date:   Sun Feb 2 20:40:13 2014 -0500
+
+    inet_diag: fix inet_diag_dump_icsk() timewait socket state logic
+    
+    [ Based upon upstream commit 70315d22d3c7383f9a508d0aab21e2eb35b2303a ]
+    
+    Fix inet_diag_dump_icsk() to reflect the fact that both TIME_WAIT and
+    FIN_WAIT2 connections are represented by inet_timewait_sock (not just
+    TIME_WAIT). Thus:
+    
+    (a) We need to iterate through the time_wait buckets if the user wants
+    either TIME_WAIT or FIN_WAIT2. (Before fixing this, "ss -nemoi state
+    fin-wait-2" would not return any sockets, even if there were some in
+    FIN_WAIT2.)
+    
+    (b) We need to check tw_substate to see if the user wants to dump
+    sockets in the particular substate (TIME_WAIT or FIN_WAIT2) that a
+    given connection is in. (Before fixing this, "ss -nemoi state
+    time-wait" would actually return sockets in state FIN_WAIT2.)
+    
+    An analogous fix is in v3.13: 70315d22d3c7383f9a508d0aab21e2eb35b2303a
+    ("inet_diag: fix inet_diag_dump_icsk() to use correct state for
+    timewait sockets") but that patch is quite different because 3.13 code
+    is very different in this area due to the unification of TCP hash
+    tables in 05dbc7b ("tcp/dccp: remove twchain") in v3.13-rc1.
+    
+    I tested that this applies cleanly between v3.3 and v3.12, and tested
+    that it works in both 3.3 and 3.12. It does not apply cleanly to 3.2
+    and earlier (though it makes semantic sense), and semantically is not
+    the right fix for 3.13 and beyond (as mentioned above).
+    
+    Signed-off-by: Neal Cardwell <ncardwell@google.com>
+    Cc: Eric Dumazet <edumazet@google.com>
+    Acked-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 46bdd0fd529bdb96ffb50530aee3346160ca8372
+Author: Michal Schmidt <mschmidt@redhat.com>
+Date:   Thu Jan 9 14:36:27 2014 +0100
+
+    bnx2x: fix DMA unmapping of TSO split BDs
+    
+    [ Upstream commit 95e92fd40c967c363ad66b2fd1ce4dcd68132e54 ]
+    
+    bnx2x triggers warnings with CONFIG_DMA_API_DEBUG=y:
+    
+      WARNING: CPU: 0 PID: 2253 at lib/dma-debug.c:887 check_unmap+0xf8/0x920()
+      bnx2x 0000:28:00.0: DMA-API: device driver frees DMA memory with
+      different size [device address=0x00000000da2b389e] [map size=1490 bytes]
+      [unmap size=66 bytes]
+    
+    The reason is that bnx2x splits a TSO BD into two BDs (headers + data)
+    using one DMA mapping for both, but it uses only the length of the first
+    BD when unmapping.
+    
+    This patch fixes the bug by unmapping the whole length of the two BDs.
+    
+    Signed-off-by: Michal Schmidt <mschmidt@redhat.com>
+    Reviewed-by: Eric Dumazet <edumazet@google.com>
+    Acked-by: Dmitry Kravkov <dmitry@broadcom.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit f5d992e9ac16141f536d8cb96618df5b2a315667
+Author: Curt Brune <curt@cumulusnetworks.com>
+Date:   Mon Jan 6 11:00:32 2014 -0800
+
+    bridge: use spin_lock_bh() in br_multicast_set_hash_max
+    
+    [ Upstream commit fe0d692bbc645786bce1a98439e548ae619269f5 ]
+    
+    br_multicast_set_hash_max() is called from process context in
+    net/bridge/br_sysfs_br.c by the sysfs store_hash_max() function.
+    
+    br_multicast_set_hash_max() calls spin_lock(&br->multicast_lock),
+    which can deadlock the CPU if a softirq that also tries to take the
+    same lock interrupts br_multicast_set_hash_max() while the lock is
+    held .  This can happen quite easily when any of the bridge multicast
+    timers expire, which try to take the same lock.
+    
+    The fix here is to use spin_lock_bh(), preventing other softirqs from
+    executing on this CPU.
+    
+    Steps to reproduce:
+    
+    1. Create a bridge with several interfaces (I used 4).
+    2. Set the "multicast query interval" to a low number, like 2.
+    3. Enable the bridge as a multicast querier.
+    4. Repeatedly set the bridge hash_max parameter via sysfs.
+    
+      # brctl addbr br0
+      # brctl addif br0 eth1 eth2 eth3 eth4
+      # brctl setmcqi br0 2
+      # brctl setmcquerier br0 1
+    
+      # while true ; do echo 4096 > /sys/class/net/br0/bridge/hash_max; done
+    
+    Signed-off-by: Curt Brune <curt@cumulusnetworks.com>
+    Signed-off-by: Scott Feldman <sfeldma@cumulusnetworks.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 10cc99961394c0e62e0742d5459f4b347f540d30
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Mon Dec 30 23:40:50 2013 +0100
+
+    net: llc: fix use after free in llc_ui_recvmsg
+    
+    [ Upstream commit 4d231b76eef6c4a6bd9c96769e191517765942cb ]
+    
+    While commit 30a584d944fb fixes datagram interface in LLC, a use
+    after free bug has been introduced for SOCK_STREAM sockets that do
+    not make use of MSG_PEEK.
+    
+    The flow is as follow ...
+    
+      if (!(flags & MSG_PEEK)) {
+        ...
+        sk_eat_skb(sk, skb, false);
+        ...
+      }
+      ...
+      if (used + offset < skb->len)
+        continue;
+    
+    ... where sk_eat_skb() calls __kfree_skb(). Therefore, cache
+    original length and work on skb_len to check partial reads.
+    
+    Fixes: 30a584d944fb ("[LLX]: SOCK_DGRAM interface fixes")
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Cc: Stephen Hemminger <stephen@networkplumber.org>
+    Cc: Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 31da359741b539fb236d5781b46ee7c5c6d8f14c
+Author: David S. Miller <davem@davemloft.net>
+Date:   Tue Dec 31 16:23:35 2013 -0500
+
+    vlan: Fix header ops passthru when doing TX VLAN offload.
+    
+    [ Upstream commit 2205369a314e12fcec4781cc73ac9c08fc2b47de ]
+    
+    When the vlan code detects that the real device can do TX VLAN offloads
+    in hardware, it tries to arrange for the real device's header_ops to
+    be invoked directly.
+    
+    But it does so illegally, by simply hooking the real device's
+    header_ops up to the VLAN device.
+    
+    This doesn't work because we will end up invoking a set of header_ops
+    routines which expect a device type which matches the real device, but
+    will see a VLAN device instead.
+    
+    Fix this by providing a pass-thru set of header_ops which will arrange
+    to pass the proper real device instead.
+    
+    To facilitate this add a dev_rebuild_header().  There are
+    implementations which provide a ->cache and ->create but not a
+    ->rebuild (f.e. PLIP).  So we need a helper function just like
+    dev_hard_header() to avoid crashes.
+    
+    Use this helper in the one existing place where the
+    header_ops->rebuild was being invoked, the neighbour code.
+    
+    With lots of help from Florian Westphal.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 5299412590050caf9b8192a5914a54be792ff7ee
+Author: Florian Westphal <fw@strlen.de>
+Date:   Mon Dec 23 00:32:31 2013 +0100
+
+    net: rose: restore old recvmsg behavior
+    
+    [ Upstream commit f81152e35001e91997ec74a7b4e040e6ab0acccf ]
+    
+    recvmsg handler in net/rose/af_rose.c performs size-check ->msg_namelen.
+    
+    After commit f3d3342602f8bcbf37d7c46641cb9bca7618eb1c
+    (net: rework recvmsg handler msg_name and msg_namelen logic), we now
+    always take the else branch due to namelen being initialized to 0.
+    
+    Digging in netdev-vger-cvs git repo shows that msg_namelen was
+    initialized with a fixed-size since at least 1995, so the else branch
+    was never taken.
+    
+    Compile tested only.
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 95ae36775c086d7549bc65281d22a54b4788f933
+Author: Sasha Levin <sasha.levin@oracle.com>
+Date:   Wed Dec 18 23:49:42 2013 -0500
+
+    rds: prevent dereference of a NULL device
+    
+    [ Upstream commit c2349758acf1874e4c2b93fe41d072336f1a31d0 ]
+    
+    Binding might result in a NULL device, which is dereferenced
+    causing this BUG:
+    
+    [ 1317.260548] BUG: unable to handle kernel NULL pointer dereference at 000000000000097
+    4
+    [ 1317.261847] IP: [<ffffffff84225f52>] rds_ib_laddr_check+0x82/0x110
+    [ 1317.263315] PGD 418bcb067 PUD 3ceb21067 PMD 0
+    [ 1317.263502] Oops: 0000 [#1] PREEMPT SMP DEBUG_PAGEALLOC
+    [ 1317.264179] Dumping ftrace buffer:
+    [ 1317.264774]    (ftrace buffer empty)
+    [ 1317.265220] Modules linked in:
+    [ 1317.265824] CPU: 4 PID: 836 Comm: trinity-child46 Tainted: G        W    3.13.0-rc4-
+    next-20131218-sasha-00013-g2cebb9b-dirty #4159
+    [ 1317.267415] task: ffff8803ddf33000 ti: ffff8803cd31a000 task.ti: ffff8803cd31a000
+    [ 1317.268399] RIP: 0010:[<ffffffff84225f52>]  [<ffffffff84225f52>] rds_ib_laddr_check+
+    0x82/0x110
+    [ 1317.269670] RSP: 0000:ffff8803cd31bdf8  EFLAGS: 00010246
+    [ 1317.270230] RAX: 0000000000000000 RBX: ffff88020b0dd388 RCX: 0000000000000000
+    [ 1317.270230] RDX: ffffffff8439822e RSI: 00000000000c000a RDI: 0000000000000286
+    [ 1317.270230] RBP: ffff8803cd31be38 R08: 0000000000000000 R09: 0000000000000000
+    [ 1317.270230] R10: 0000000000000000 R11: 0000000000000001 R12: 0000000000000000
+    [ 1317.270230] R13: 0000000054086700 R14: 0000000000a25de0 R15: 0000000000000031
+    [ 1317.270230] FS:  00007ff40251d700(0000) GS:ffff88022e200000(0000) knlGS:000000000000
+    0000
+    [ 1317.270230] CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
+    [ 1317.270230] CR2: 0000000000000974 CR3: 00000003cd478000 CR4: 00000000000006e0
+    [ 1317.270230] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+    [ 1317.270230] DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000090602
+    [ 1317.270230] Stack:
+    [ 1317.270230]  0000000054086700 5408670000a25de0 5408670000000002 0000000000000000
+    [ 1317.270230]  ffffffff84223542 00000000ea54c767 0000000000000000 ffffffff86d26160
+    [ 1317.270230]  ffff8803cd31be68 ffffffff84223556 ffff8803cd31beb8 ffff8800c6765280
+    [ 1317.270230] Call Trace:
+    [ 1317.270230]  [<ffffffff84223542>] ? rds_trans_get_preferred+0x42/0xa0
+    [ 1317.270230]  [<ffffffff84223556>] rds_trans_get_preferred+0x56/0xa0
+    [ 1317.270230]  [<ffffffff8421c9c3>] rds_bind+0x73/0xf0
+    [ 1317.270230]  [<ffffffff83e4ce62>] SYSC_bind+0x92/0xf0
+    [ 1317.270230]  [<ffffffff812493f8>] ? context_tracking_user_exit+0xb8/0x1d0
+    [ 1317.270230]  [<ffffffff8119313d>] ? trace_hardirqs_on+0xd/0x10
+    [ 1317.270230]  [<ffffffff8107a852>] ? syscall_trace_enter+0x32/0x290
+    [ 1317.270230]  [<ffffffff83e4cece>] SyS_bind+0xe/0x10
+    [ 1317.270230]  [<ffffffff843a6ad0>] tracesys+0xdd/0xe2
+    [ 1317.270230] Code: 00 8b 45 cc 48 8d 75 d0 48 c7 45 d8 00 00 00 00 66 c7 45 d0 02 00
+    89 45 d4 48 89 df e8 78 49 76 ff 41 89 c4 85 c0 75 0c 48 8b 03 <80> b8 74 09 00 00 01 7
+    4 06 41 bc 9d ff ff ff f6 05 2a b6 c2 02
+    [ 1317.270230] RIP  [<ffffffff84225f52>] rds_ib_laddr_check+0x82/0x110
+    [ 1317.270230]  RSP <ffff8803cd31bdf8>
+    [ 1317.270230] CR2: 0000000000000974
+    
+    Signed-off-by: Sasha Levin <sasha.levin@oracle.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 794ce89c4585d8679fae8c06ddabf8d3a4c4fa53
+Author: Salva Peiró <speiro@ai2.upv.es>
+Date:   Tue Dec 17 10:06:30 2013 +0100
+
+    hamradio/yam: fix info leak in ioctl
+    
+    [ Upstream commit 8e3fbf870481eb53b2d3a322d1fc395ad8b367ed ]
+    
+    The yam_ioctl() code fails to initialise the cmd field
+    of the struct yamdrv_ioctl_cfg. Add an explicit memset(0)
+    before filling the structure to avoid the 4-byte info leak.
+    
+    Signed-off-by: Salva Peiró <speiro@ai2.upv.es>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 6ea9c09b5c3b6248ae4fed3240e6aefbefa2169b
+Author: Wenliang Fan <fanwlexca@gmail.com>
+Date:   Tue Dec 17 11:25:28 2013 +0800
+
+    drivers/net/hamradio: Integer overflow in hdlcdrv_ioctl()
+    
+    [ Upstream commit e9db5c21d3646a6454fcd04938dd215ac3ab620a ]
+    
+    The local variable 'bi' comes from userspace. If userspace passed a
+    large number to 'bi.data.calibrate', there would be an integer overflow
+    in the following line:
+            s->hdlctx.calibrate = bi.data.calibrate * s->par.bitrate / 16;
+    
+    Signed-off-by: Wenliang Fan <fanwlexca@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 9229facbdf76c2a13bcc5eacdcccb89ea49a6f92
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Tue Dec 17 00:38:39 2013 +0100
+
+    net: inet_diag: zero out uninitialized idiag_{src,dst} fields
+    
+    [ Upstream commit b1aac815c0891fe4a55a6b0b715910142227700f ]
+    
+    Jakub reported while working with nlmon netlink sniffer that parts of
+    the inet_diag_sockid are not initialized when r->idiag_family != AF_INET6.
+    That is, fields of r->id.idiag_src[1 ... 3], r->id.idiag_dst[1 ... 3].
+    
+    In fact, it seems that we can leak 6 * sizeof(u32) byte of kernel [slab]
+    memory through this. At least, in udp_dump_one(), we allocate a skb in ...
+    
+      rep = nlmsg_new(sizeof(struct inet_diag_msg) + ..., GFP_KERNEL);
+    
+    ... and then pass that to inet_sk_diag_fill() that puts the whole struct
+    inet_diag_msg into the skb, where we only fill out r->id.idiag_src[0],
+    r->id.idiag_dst[0] and leave the rest untouched:
+    
+      r->id.idiag_src[0] = inet->inet_rcv_saddr;
+      r->id.idiag_dst[0] = inet->inet_daddr;
+    
+    struct inet_diag_msg embeds struct inet_diag_sockid that is correctly /
+    fully filled out in IPv6 case, but for IPv4 not.
+    
+    So just zero them out by using plain memset (for this little amount of
+    bytes it's probably not worth the extra check for idiag_family == AF_INET).
+    
+    Similarly, fix also other places where we fill that out.
+    
+    Reported-by: Jakub Zawadzki <darkjames-ws@darkjames.pl>
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 2e737a8ace4d0ad5f15aec3fd4367282d0273321
+Author: Sasha Levin <sasha.levin@oracle.com>
+Date:   Fri Dec 13 10:54:22 2013 -0500
+
+    net: unix: allow bind to fail on mutex lock
+    
+    [ Upstream commit 37ab4fa7844a044dc21fde45e2a0fc2f3c3b6490 ]
+    
+    This is similar to the set_peek_off patch where calling bind while the
+    socket is stuck in unix_dgram_recvmsg() will block and cause a hung task
+    spew after a while.
+    
+    This is also the last place that did a straightforward mutex_lock(), so
+    there shouldn't be any more of these patches.
+    
+    Signed-off-by: Sasha Levin <sasha.levin@oracle.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 6e890b0aa10bfdd826139cae3cefc856db151028
+Author: Nat Gurumoorthy <natg@google.com>
+Date:   Mon Dec 9 10:43:21 2013 -0800
+
+    tg3: Initialize REG_BASE_ADDR at PCI config offset 120 to 0
+    
+    [ Upstream commit 388d3335575f4c056dcf7138a30f1454e2145cd8 ]
+    
+    The new tg3 driver leaves REG_BASE_ADDR (PCI config offset 120)
+    uninitialized. From power on reset this register may have garbage in it. The
+    Register Base Address register defines the device local address of a
+    register. The data pointed to by this location is read or written using
+    the Register Data register (PCI config offset 128). When REG_BASE_ADDR has
+    garbage any read or write of Register Data Register (PCI 128) will cause the
+    PCI bus to lock up. The TCO watchdog will fire and bring down the system.
+    
+    Signed-off-by: Nat Gurumoorthy <natg@google.com>
+    Acked-by: Michael Chan <mchan@broadcom.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 9898c396f98f315d4013c95cf18e0295ee8b1cd4
+Author: Changli Gao <xiaosuo@gmail.com>
+Date:   Sun Dec 8 09:36:56 2013 -0500
+
+    net: drop_monitor: fix the value of maxattr
+    
+    [ Upstream commit d323e92cc3f4edd943610557c9ea1bb4bb5056e8 ]
+    
+    maxattr in genl_family should be used to save the max attribute
+    type, but not the max command type. Drop monitor doesn't support
+    any attributes, so we should leave it as zero.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 66d66a815db0a0f42c01031c3e010cf183ae0979
+Author: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date:   Sat Dec 7 03:33:45 2013 +0100
+
+    ipv6: don't count addrconf generated routes against gc limit
+    
+    [ Upstream commit a3300ef4bbb1f1e33ff0400e1e6cf7733d988f4f ]
+    
+    Brett Ciphery reported that new ipv6 addresses failed to get installed
+    because the addrconf generated dsts where counted against the dst gc
+    limit. We don't need to count those routes like we currently don't count
+    administratively added routes.
+    
+    Because the max_addresses check enforces a limit on unbounded address
+    generation first in case someone plays with router advertisments, we
+    are still safe here.
+    
+    Reported-by: Brett Ciphery <brett.ciphery@windriver.com>
+    Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit 2c3178865b995398e3516a3e260c23c65efad90f
+Author: Venkat Venkatsubra <venkat.x.venkatsubra@oracle.com>
+Date:   Mon Dec 2 15:41:39 2013 -0800
+
+    rds: prevent BUG_ON triggered on congestion update to loopback
+    
+    [ Upstream commit 18fc25c94eadc52a42c025125af24657a93638c0 ]
+    
+    After congestion update on a local connection, when rds_ib_xmit returns
+    less bytes than that are there in the message, rds_send_xmit calls
+    back rds_ib_xmit with an offset that causes BUG_ON(off & RDS_FRAG_SIZE)
+    to trigger.
+    
+    For a 4Kb PAGE_SIZE rds_ib_xmit returns min(8240,4096)=4096 when actually
+    the message contains 8240 bytes. rds_send_xmit thinks there is more to send
+    and calls rds_ib_xmit again with a data offset "off" of 4096-48(rds header)
+    =4048 bytes thus hitting the BUG_ON(off & RDS_FRAG_SIZE) [RDS_FRAG_SIZE=4k].
+    
+    The commit 6094628bfd94323fc1cea05ec2c6affd98c18f7f
+    "rds: prevent BUG_ON triggering on congestion map updates" introduced
+    this regression. That change was addressing the triggering of a different
+    BUG_ON in rds_send_xmit() on PowerPC architecture with 64Kbytes PAGE_SIZE:
+            BUG_ON(ret != 0 &&
+                     conn->c_xmit_sg == rm->data.op_nents);
+    This was the sequence it was going through:
+    (rds_ib_xmit)
+    /* Do not send cong updates to IB loopback */
+    if (conn->c_loopback
+       && rm->m_inc.i_hdr.h_flags & RDS_FLAG_CONG_BITMAP) {
+            rds_cong_map_updated(conn->c_fcong, ~(u64) 0);
+            return sizeof(struct rds_header) + RDS_CONG_MAP_BYTES;
+    }
+    rds_ib_xmit returns 8240
+    rds_send_xmit:
+      c_xmit_data_off = 0 + 8240 - 48 (rds header accounted only the first time)
+                     = 8192
+      c_xmit_data_off < 65536 (sg->length), so calls rds_ib_xmit again
+    rds_ib_xmit returns 8240
+    rds_send_xmit:
+      c_xmit_data_off = 8192 + 8240 = 16432, calls rds_ib_xmit again
+      and so on (c_xmit_data_off 24672,32912,41152,49392,57632)
+    rds_ib_xmit returns 8240
+    On this iteration this sequence causes the BUG_ON in rds_send_xmit:
+        while (ret) {
+            tmp = min_t(int, ret, sg->length - conn->c_xmit_data_off);
+            [tmp = 65536 - 57632 = 7904]
+            conn->c_xmit_data_off += tmp;
+            [c_xmit_data_off = 57632 + 7904 = 65536]
+            ret -= tmp;
+            [ret = 8240 - 7904 = 336]
+            if (conn->c_xmit_data_off == sg->length) {
+                    conn->c_xmit_data_off = 0;
+                    sg++;
+                    conn->c_xmit_sg++;
+                    BUG_ON(ret != 0 &&
+                            conn->c_xmit_sg == rm->data.op_nents);
+                    [c_xmit_sg = 1, rm->data.op_nents = 1]
+    
+    What the current fix does:
+    Since the congestion update over loopback is not actually transmitted
+    as a message, all that rds_ib_xmit needs to do is let the caller think
+    the full message has been transmitted and not return partial bytes.
+    It will return 8240 (RDS_CONG_MAP_BYTES+48) when PAGE_SIZE is 4Kb.
+    And 64Kb+48 when page size is 64Kb.
+    
+    Reported-by: Josh Hunt <joshhunt00@gmail.com>
+    Tested-by: Honggang Li <honli@redhat.com>
+    Acked-by: Bang Nguyen <bang.nguyen@oracle.com>
+    Signed-off-by: Venkat Venkatsubra <venkat.x.venkatsubra@oracle.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+
+commit b0809483ba2f4a65246c8766924f937bf38192ce
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Mon Dec 2 08:51:13 2013 -0800
+
+    net: do not pretend FRAGLIST support
+    
+    [ Upstream commit 28e24c62ab3062e965ef1b3bcc244d50aee7fa85 ]
+    
+    Few network drivers really supports frag_list : virtual drivers.
+    
+    Some drivers wrongly advertise NETIF_F_FRAGLIST feature.
+    
+    If skb with a frag_list is given to them, packet on the wire will be
+    corrupt.
+    
+    Remove this flag, as core networking stack will make sure to
+    provide packets that can be sent without corruption.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Cc: Thadeu Lima de Souza Cascardo <cascardo@linux.vnet.ibm.com>
+    Cc: Anirudha Sarangi <anirudh@xilinx.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
