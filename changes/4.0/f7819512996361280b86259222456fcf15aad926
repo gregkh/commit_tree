@@ -1,0 +1,52 @@
+kvm: add halt_poll_ns module parameter
+
+This patch introduces a new module parameter for the KVM module; when it
+is present, KVM attempts a bit of polling on every HLT before scheduling
+itself out via kvm_vcpu_block.
+
+This parameter helps a lot for latency-bound workloads---in particular
+I tested it with O_DSYNC writes with a battery-backed disk in the host.
+In this case, writes are fast (because the data doesn't have to go all
+the way to the platters) but they cannot be merged by either the host or
+the guest.  KVM's performance here is usually around 30% of bare metal,
+or 50% if you use cache=directsync or cache=writethrough (these
+parameters avoid that the guest sends pointless flush requests, and
+at the same time they are not slow because of the battery-backed cache).
+The bad performance happens because on every halt the host CPU decides
+to halt itself too.  When the interrupt comes, the vCPU thread is then
+migrated to a new physical CPU, and in general the latency is horrible
+because the vCPU thread has to be scheduled back in.
+
+With this patch performance reaches 60-65% of bare metal and, more
+important, 99% of what you get if you use idle=poll in the guest.  This
+means that the tunable gets rid of this particular bottleneck, and more
+work can be done to improve performance in the kernel or QEMU.
+
+Of course there is some price to pay; every time an otherwise idle vCPUs
+is interrupted by an interrupt, it will poll unnecessarily and thus
+impose a little load on the host.  The above results were obtained with
+a mostly random value of the parameter (500000), and the load was around
+1.5-2.5% CPU usage on one of the host's core for each idle guest vCPU.
+
+The patch also adds a new stat, /sys/kernel/debug/kvm/halt_successful_poll,
+that can be used to tune the parameter.  It counts how many HLT
+instructions received an interrupt during the polling period; each
+successful poll avoids that Linux schedules the VCPU thread out and back
+in, and may also avoid a likely trip to C1 and back for the physical CPU.
+
+While the VM is idle, a Linux 4 VCPU VM halts around 10 times per second.
+Of these halts, almost all are failed polls.  During the benchmark,
+instead, basically all halts end within the polling period, except a more
+or less constant stream of 50 per second coming from vCPUs that are not
+running the benchmark.  The wasted time is thus very low.  Things may
+be slightly different for Windows VMs, which have a ~10 ms timer tick.
+
+The effect is also visible on Marcelo's recently-introduced latency
+test for the TSC deadline timer.  Though of course a non-RT kernel has
+awful latency bounds, the latency of the timer is around 8000-10000 clock
+cycles compared to 20000-120000 without setting halt_poll_ns.  For the TSC
+deadline timer, thus, the effect is both a smaller average latency and
+a smaller variance.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+

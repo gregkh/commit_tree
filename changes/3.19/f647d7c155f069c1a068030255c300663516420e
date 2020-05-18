@@ -1,0 +1,156 @@
+x86_64, switch_to(): Load TLS descriptors before switching DS and ES
+
+Otherwise, if buggy user code points DS or ES into the TLS
+array, they would be corrupted after a context switch.
+
+This also significantly improves the comments and documents some
+gotchas in the code.
+
+Before this patch, the both tests below failed.  With this
+patch, the es test passes, although the gsbase test still fails.
+
+ ----- begin es test -----
+
+/*
+ * Copyright (c) 2014 Andy Lutomirski
+ * GPL v2
+ */
+
+static unsigned short GDT3(int idx)
+{
+	return (idx << 3) | 3;
+}
+
+static int create_tls(int idx, unsigned int base)
+{
+	struct user_desc desc = {
+		.entry_number    = idx,
+		.base_addr       = base,
+		.limit           = 0xfffff,
+		.seg_32bit       = 1,
+		.contents        = 0, /* Data, grow-up */
+		.read_exec_only  = 0,
+		.limit_in_pages  = 1,
+		.seg_not_present = 0,
+		.useable         = 0,
+	};
+
+	if (syscall(SYS_set_thread_area, &desc) != 0)
+		err(1, "set_thread_area");
+
+	return desc.entry_number;
+}
+
+int main()
+{
+	int idx = create_tls(-1, 0);
+	printf("Allocated GDT index %d\n", idx);
+
+	unsigned short orig_es;
+	asm volatile ("mov %%es,%0" : "=rm" (orig_es));
+
+	int errors = 0;
+	int total = 1000;
+	for (int i = 0; i < total; i++) {
+		asm volatile ("mov %0,%%es" : : "rm" (GDT3(idx)));
+		usleep(100);
+
+		unsigned short es;
+		asm volatile ("mov %%es,%0" : "=rm" (es));
+		asm volatile ("mov %0,%%es" : : "rm" (orig_es));
+		if (es != GDT3(idx)) {
+			if (errors == 0)
+				printf("[FAIL]\tES changed from 0x%hx to 0x%hx\n",
+				       GDT3(idx), es);
+			errors++;
+		}
+	}
+
+	if (errors) {
+		printf("[FAIL]\tES was corrupted %d/%d times\n", errors, total);
+		return 1;
+	} else {
+		printf("[OK]\tES was preserved\n");
+		return 0;
+	}
+}
+
+ ----- end es test -----
+
+ ----- begin gsbase test -----
+
+/*
+ * gsbase.c, a gsbase test
+ * Copyright (c) 2014 Andy Lutomirski
+ * GPL v2
+ */
+
+static unsigned char *testptr, *testptr2;
+
+static unsigned char read_gs_testvals(void)
+{
+	unsigned char ret;
+	asm volatile ("movb %%gs:%1, %0" : "=r" (ret) : "m" (*testptr));
+	return ret;
+}
+
+int main()
+{
+	int errors = 0;
+
+	testptr = mmap((void *)0x200000000UL, 1, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+	if (testptr == MAP_FAILED)
+		err(1, "mmap");
+
+	testptr2 = mmap((void *)0x300000000UL, 1, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+	if (testptr2 == MAP_FAILED)
+		err(1, "mmap");
+
+	*testptr = 0;
+	*testptr2 = 1;
+
+	if (syscall(SYS_arch_prctl, ARCH_SET_GS,
+		    (unsigned long)testptr2 - (unsigned long)testptr) != 0)
+		err(1, "ARCH_SET_GS");
+
+	usleep(100);
+
+	if (read_gs_testvals() == 1) {
+		printf("[OK]\tARCH_SET_GS worked\n");
+	} else {
+		printf("[FAIL]\tARCH_SET_GS failed\n");
+		errors++;
+	}
+
+	asm volatile ("mov %0,%%gs" : : "r" (0));
+
+	if (read_gs_testvals() == 0) {
+		printf("[OK]\tWriting 0 to gs worked\n");
+	} else {
+		printf("[FAIL]\tWriting 0 to gs failed\n");
+		errors++;
+	}
+
+	usleep(100);
+
+	if (read_gs_testvals() == 0) {
+		printf("[OK]\tgsbase is still zero\n");
+	} else {
+		printf("[FAIL]\tgsbase was corrupted\n");
+		errors++;
+	}
+
+	return errors == 0 ? 0 : 1;
+}
+
+ ----- end gsbase test -----
+
+Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+Cc: <stable@vger.kernel.org>
+Cc: Andi Kleen <andi@firstfloor.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/509d27c9fec78217691c3dad91cec87e1006b34a.1418075657.git.luto@amacapital.net
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

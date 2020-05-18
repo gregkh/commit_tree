@@ -1,0 +1,57 @@
+Btrfs: fix race between fs trimming and block group remove/allocation
+
+Our fs trim operation, which is completely transactionless (doesn't start
+or joins an existing transaction) consists of visiting all block groups
+and then for each one to iterate its free space entries and perform a
+discard operation against the space range represented by the free space
+entries. However before performing a discard, the corresponding free space
+entry is removed from the free space rbtree, and when the discard completes
+it is added back to the free space rbtree.
+
+If a block group remove operation happens while the discard is ongoing (or
+before it starts and after a free space entry is hidden), we end up not
+waiting for the discard to complete, remove the extent map that maps
+logical address to physical addresses and the corresponding chunk metadata
+from the the chunk and device trees. After that and before the discard
+completes, the current running transaction can finish and a new one start,
+allowing for new block groups that map to the same physical addresses to
+be allocated and written to.
+
+So fix this by keeping the extent map in memory until the discard completes
+so that the same physical addresses aren't reused before it completes.
+
+If the physical locations that are under a discard operation end up being
+used for a new metadata block group for example, and dirty metadata extents
+are written before the discard finishes (the VM might call writepages() of
+our btree inode's i_mapping for example, or an fsync log commit happens) we
+end up overwriting metadata with zeroes, which leads to errors from fsck
+like the following:
+
+        checking extents
+        Check tree block failed, want=833912832, have=0
+        Check tree block failed, want=833912832, have=0
+        Check tree block failed, want=833912832, have=0
+        Check tree block failed, want=833912832, have=0
+        Check tree block failed, want=833912832, have=0
+        read block failed check_tree_block
+        owner ref check failed [833912832 16384]
+        Errors found in extent allocation tree or chunk allocation
+        checking free space cache
+        checking fs roots
+        Check tree block failed, want=833912832, have=0
+        Check tree block failed, want=833912832, have=0
+        Check tree block failed, want=833912832, have=0
+        Check tree block failed, want=833912832, have=0
+        Check tree block failed, want=833912832, have=0
+        read block failed check_tree_block
+        root 5 root dir 256 error
+        root 5 inode 260 errors 2001, no inode item, link count wrong
+                unresolved ref dir 256 index 0 namelen 8 name foobar_3 filetype 1 errors 6, no dir index, no inode ref
+        root 5 inode 262 errors 2001, no inode item, link count wrong
+                unresolved ref dir 256 index 0 namelen 8 name foobar_5 filetype 1 errors 6, no dir index, no inode ref
+        root 5 inode 263 errors 2001, no inode item, link count wrong
+        (...)
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

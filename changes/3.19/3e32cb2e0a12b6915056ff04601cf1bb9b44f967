@@ -1,0 +1,87 @@
+mm: memcontrol: lockless page counters
+
+Memory is internally accounted in bytes, using spinlock-protected 64-bit
+counters, even though the smallest accounting delta is a page.  The
+counter interface is also convoluted and does too many things.
+
+Introduce a new lockless word-sized page counter API, then change all
+memory accounting over to it.  The translation from and to bytes then only
+happens when interfacing with userspace.
+
+The removed locking overhead is noticable when scaling beyond the per-cpu
+charge caches - on a 4-socket machine with 144-threads, the following test
+shows the performance differences of 288 memcgs concurrently running a
+page fault benchmark:
+
+vanilla:
+
+   18631648.500498      task-clock (msec)         #  140.643 CPUs utilized            ( +-  0.33% )
+         1,380,638      context-switches          #    0.074 K/sec                    ( +-  0.75% )
+            24,390      cpu-migrations            #    0.001 K/sec                    ( +-  8.44% )
+     1,843,305,768      page-faults               #    0.099 M/sec                    ( +-  0.00% )
+50,134,994,088,218      cycles                    #    2.691 GHz                      ( +-  0.33% )
+   <not supported>      stalled-cycles-frontend
+   <not supported>      stalled-cycles-backend
+ 8,049,712,224,651      instructions              #    0.16  insns per cycle          ( +-  0.04% )
+ 1,586,970,584,979      branches                  #   85.176 M/sec                    ( +-  0.05% )
+     1,724,989,949      branch-misses             #    0.11% of all branches          ( +-  0.48% )
+
+     132.474343877 seconds time elapsed                                          ( +-  0.21% )
+
+lockless:
+
+   12195979.037525      task-clock (msec)         #  133.480 CPUs utilized            ( +-  0.18% )
+           832,850      context-switches          #    0.068 K/sec                    ( +-  0.54% )
+            15,624      cpu-migrations            #    0.001 K/sec                    ( +- 10.17% )
+     1,843,304,774      page-faults               #    0.151 M/sec                    ( +-  0.00% )
+32,811,216,801,141      cycles                    #    2.690 GHz                      ( +-  0.18% )
+   <not supported>      stalled-cycles-frontend
+   <not supported>      stalled-cycles-backend
+ 9,999,265,091,727      instructions              #    0.30  insns per cycle          ( +-  0.10% )
+ 2,076,759,325,203      branches                  #  170.282 M/sec                    ( +-  0.12% )
+     1,656,917,214      branch-misses             #    0.08% of all branches          ( +-  0.55% )
+
+      91.369330729 seconds time elapsed                                          ( +-  0.45% )
+
+On top of improved scalability, this also gets rid of the icky long long
+types in the very heart of memcg, which is great for 32 bit and also makes
+the code a lot more readable.
+
+Notable differences between the old and new API:
+
+- res_counter_charge() and res_counter_charge_nofail() become
+  page_counter_try_charge() and page_counter_charge() resp. to match
+  the more common kernel naming scheme of try_do()/do()
+
+- res_counter_uncharge_until() is only ever used to cancel a local
+  counter and never to uncharge bigger segments of a hierarchy, so
+  it's replaced by the simpler page_counter_cancel()
+
+- res_counter_set_limit() is replaced by page_counter_limit(), which
+  expects its callers to serialize against themselves
+
+- res_counter_memparse_write_strategy() is replaced by
+  page_counter_limit(), which rounds down to the nearest page size -
+  rather than up.  This is more reasonable for explicitely requested
+  hard upper limits.
+
+- to keep charging light-weight, page_counter_try_charge() charges
+  speculatively, only to roll back if the result exceeds the limit.
+  Because of this, a failing bigger charge can temporarily lock out
+  smaller charges that would otherwise succeed.  The error is bounded
+  to the difference between the smallest and the biggest possible
+  charge size, so for memcg, this means that a failing THP charge can
+  send base page charges into reclaim upto 2MB (4MB) before the limit
+  would have been reached.  This should be acceptable.
+
+[akpm@linux-foundation.org: add includes for WARN_ON_ONCE and memparse]
+[akpm@linux-foundation.org: add includes for WARN_ON_ONCE, memparse, strncmp, and PAGE_SIZE]
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Michal Hocko <mhocko@suse.cz>
+Acked-by: Vladimir Davydov <vdavydov@parallels.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

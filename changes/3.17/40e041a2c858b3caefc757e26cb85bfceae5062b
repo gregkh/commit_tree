@@ -1,0 +1,95 @@
+shm: add sealing API
+
+If two processes share a common memory region, they usually want some
+guarantees to allow safe access. This often includes:
+  - one side cannot overwrite data while the other reads it
+  - one side cannot shrink the buffer while the other accesses it
+  - one side cannot grow the buffer beyond previously set boundaries
+
+If there is a trust-relationship between both parties, there is no need
+for policy enforcement.  However, if there's no trust relationship (eg.,
+for general-purpose IPC) sharing memory-regions is highly fragile and
+often not possible without local copies.  Look at the following two
+use-cases:
+
+  1) A graphics client wants to share its rendering-buffer with a
+     graphics-server. The memory-region is allocated by the client for
+     read/write access and a second FD is passed to the server. While
+     scanning out from the memory region, the server has no guarantee that
+     the client doesn't shrink the buffer at any time, requiring rather
+     cumbersome SIGBUS handling.
+  2) A process wants to perform an RPC on another process. To avoid huge
+     bandwidth consumption, zero-copy is preferred. After a message is
+     assembled in-memory and a FD is passed to the remote side, both sides
+     want to be sure that neither modifies this shared copy, anymore. The
+     source may have put sensible data into the message without a separate
+     copy and the target may want to parse the message inline, to avoid a
+     local copy.
+
+While SIGBUS handling, POSIX mandatory locking and MAP_DENYWRITE provide
+ways to achieve most of this, the first one is unproportionally ugly to
+use in libraries and the latter two are broken/racy or even disabled due
+to denial of service attacks.
+
+This patch introduces the concept of SEALING.  If you seal a file, a
+specific set of operations is blocked on that file forever.  Unlike locks,
+seals can only be set, never removed.  Hence, once you verified a specific
+set of seals is set, you're guaranteed that no-one can perform the blocked
+operations on this file, anymore.
+
+An initial set of SEALS is introduced by this patch:
+  - SHRINK: If SEAL_SHRINK is set, the file in question cannot be reduced
+            in size. This affects ftruncate() and open(O_TRUNC).
+  - GROW: If SEAL_GROW is set, the file in question cannot be increased
+          in size. This affects ftruncate(), fallocate() and write().
+  - WRITE: If SEAL_WRITE is set, no write operations (besides resizing)
+           are possible. This affects fallocate(PUNCH_HOLE), mmap() and
+           write().
+  - SEAL: If SEAL_SEAL is set, no further seals can be added to a file.
+          This basically prevents the F_ADD_SEAL operation on a file and
+          can be set to prevent others from adding further seals that you
+          don't want.
+
+The described use-cases can easily use these seals to provide safe use
+without any trust-relationship:
+
+  1) The graphics server can verify that a passed file-descriptor has
+     SEAL_SHRINK set. This allows safe scanout, while the client is
+     allowed to increase buffer size for window-resizing on-the-fly.
+     Concurrent writes are explicitly allowed.
+  2) For general-purpose IPC, both processes can verify that SEAL_SHRINK,
+     SEAL_GROW and SEAL_WRITE are set. This guarantees that neither
+     process can modify the data while the other side parses it.
+     Furthermore, it guarantees that even with writable FDs passed to the
+     peer, it cannot increase the size to hit memory-limits of the source
+     process (in case the file-storage is accounted to the source).
+
+The new API is an extension to fcntl(), adding two new commands:
+  F_GET_SEALS: Return a bitset describing the seals on the file. This
+               can be called on any FD if the underlying file supports
+               sealing.
+  F_ADD_SEALS: Change the seals of a given file. This requires WRITE
+               access to the file and F_SEAL_SEAL may not already be set.
+               Furthermore, the underlying file must support sealing and
+               there may not be any existing shared mapping of that file.
+               Otherwise, EBADF/EPERM is returned.
+               The given seals are _added_ to the existing set of seals
+               on the file. You cannot remove seals again.
+
+The fcntl() handler is currently specific to shmem and disabled on all
+files. A file needs to explicitly support sealing for this interface to
+work. A separate syscall is added in a follow-up, which creates files that
+support sealing. There is no intention to support this on other
+file-systems. Semantics are unclear for non-volatile files and we lack any
+use-case right now. Therefore, the implementation is specific to shmem.
+
+Signed-off-by: David Herrmann <dh.herrmann@gmail.com>
+Acked-by: Hugh Dickins <hughd@google.com>
+Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+Cc: Ryan Lortie <desrt@desrt.ca>
+Cc: Lennart Poettering <lennart@poettering.net>
+Cc: Daniel Mack <zonque@gmail.com>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

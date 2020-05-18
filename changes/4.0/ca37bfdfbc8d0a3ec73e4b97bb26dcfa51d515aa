@@ -1,0 +1,363 @@
+ACPI / EC: Fix several GPE handling issues by deploying ACPI_GPE_DISPATCH_RAW_HANDLER mode.
+
+This patch switches EC driver into ACPI_GPE_DISPATCH_RAW_HANDLER mode where
+the GPE lock is not held for acpi_ec_gpe_handler() and the ACPICA internal
+GPE enabling/disabling/clearing operations are bypassed so that further
+improvements are possible with the GPE APIs.
+
+There are 2 strong reasons for deploying raw GPE handler mode in the EC
+driver:
+1. Some hardware logics can control their interrupts via their own
+   registers, so their interrupts can be disabled/enabled/acknowledged
+   without using the super IRQ controller provided functions. While there
+   is no mean (EC commands) for the EC driver to achieve this.
+2. During suspending, the EC driver is still working for a while to
+   complete the platform firmware provided functionailities using ec_poll()
+   after all GPEs are disabled (see acpi_ec_block_transactions()), which
+   means the EC driver will drive the EC GPE out of the GPE core's control.
+
+Without deploying the raw GPE handler mode, we can see many races between
+the EC driver and the GPE core due to the above restrictions:
+1. There is a race condition due to ACPICA internal GPE
+   disabling/clearing/enabling logics in acpi_ev_gpe_dispatch():
+     Orignally EC GPE is disabled (EN=0), cleared (STS=0) before invoking a
+     GPE handler and re-enabled (EN=1) after invoking a GPE handler in
+     acpi_ev_gpe_dispatch(). When re-enabling appears, GPE may be flagged
+     (STS=1).
+       =================================================================
+       (event pending A)
+       =================================================================
+       acpi_ev_gpe_dispatch()    ec_poll()
+         EN=0
+         STS=0
+         acpi_ec_gpe_handler()
+       *****************************************************************
+       (event handling A)
+           Lock(EC)
+           advance_transaction()
+             EC_SC read
+       =================================================================
+       (event pending B)
+       =================================================================
+             EC_SC handled
+           Unlock(EC)
+       *****************************************************************
+       *****************************************************************
+       (event handling B)
+                                   Lock(EC)
+                                   advance_transaction()
+                                     EC_SC read
+       =================================================================
+       (event pending C)
+       =================================================================
+                                     EC_SC handled
+                                   Unlock(EC)
+       *****************************************************************
+           EN=1
+   This race condition is the root cause of different issues on different
+   silicon variations.
+   A. Silicon variation A:
+      On some platforms, GPE will be triggered due to "writing 1 to EN when
+      STS=1". This is because both EN and STS lines are wired to the GPE
+      trigger line.
+      1. Issue 1:
+         We can see no-op acpi_ec_gpe_handler() invoked on such platforms.
+         This is because:
+         a. event pending B: An event can arrive after ACPICA's GPE
+            clearing performed in acpi_ev_gpe_dispatch(), this event may
+            fail to be detected by EC_SC read that is performed before its
+            arrival;
+         b. event handling B: The event can be handled in ec_poll() because
+            EC lock is released after acpi_ec_gpe_handler() invocation;
+         c. There is no code in ec_poll() to clear STS but the GPE can
+            still be triggered by the EN=1 write performed in
+            acpi_ev_finish_gpe(), this leads to a no-op EC GPE handler
+            invocation;
+         d. As no-op GPE handler invocations are counted by the EC driver
+            to trigger the command storming conditions, the wrong no-op
+            GPE handler invocations thus can easily trigger wrong command
+            storming conditions.
+         Note 1:
+         If we removed GPE disabling/enabling code from
+         acpi_ev_gpe_dispatch(), we could still see no-op GPE handlers
+         triggered by the event arriving after the GPE clearing and before
+         the GPE handling on both silicon variation A and B. This can only
+         occur if the CPU is very slow (timing slice between STS=0 write
+         and EC_SC read should be short enough before hardware sets another
+         GPE indication). Thus this is very rare and is not what we need to
+         fix.
+   B. Silicon variation B:
+      On other platforms, GPE may not be triggered due to "writing 1 to EN
+      when STS=1". This is because only STS line is wired to the GPE
+      trigger line.
+      2. Issue 2:
+         We can see GPE loss on such platforms. This is because:
+         a. event pending B vs. event handling A: An event can arrive after
+            ACPICA's GPE handling performed in acpi_ev_gpe_dispatch(), or
+            event pending C vs. event handling B: An event can arrive after
+            Linux's GPE handling performed in ec_poll(),
+            these events may fail to be detected by EC_SC read that is
+            performed before their arrival;
+         b. The GPE cannot be triggered by EN=1 write performed in
+            acpi_ev_finish_gpe();
+         c. If no polling mechanism is implemented in the driver for the
+            pending event (for example, SCI_EVT), this event is lost due to
+            no GPE being triggered.
+         Note 2:
+         On most platforms, there might be another rule that GPE may not be
+         triggered due to "writing 1 to STS when STS=1 and EN=1".
+         Then on silicon variation B, an even worse case is if the issue 2
+         event loss happens, further events may never trigger GPE again on
+         such platforms due to being blocked by the current STS=1. Unless
+         someone clears STS, all events have to be polled.
+2. There is a race condition due to lacking in GPE status checking in EC
+   driver:
+     Originally, GPE status is checked in ACPICA core but not checked in
+     the GPE handler. Thus since the status checking and handling is not
+     locked, it can be interrupted by another handling path.
+       =================================================================
+       (event pending A)
+       =================================================================
+       acpi_ev_gpe_detect()        ec_poll()
+         if (EN==1 && STS==1)
+       *****************************************************************
+       (event handling A)
+                                     Lock(EC)
+                                     advance_transaction()
+                                       EC_SC read
+                                       EC_SC handled
+                                     Unlock(EC)
+       *****************************************************************
+         acpi_ev_gpe_dispatch()
+           EN=0
+           STS=0
+           acpi_ec_gpe_handler()
+       *****************************************************************
+       (event handling B)
+             Lock(EC)
+             advance_transaction()
+               EC_SC read
+             Unlock(EC)
+       *****************************************************************
+      3. Issue 3:
+         We can see no-op acpi_ec_gpe_handler() invoked on both silicon
+         variation A and B. This is because:
+         a. event pending A: An event can arrive to trigger an EC GPE and
+            ACPICA checks it and is about to invoke the EC GPE handler;
+         b. event handling A: The event can be handled in ec_poll() because
+            EC lock is not held after the GPE status checking;
+         c. event handling B: Then when the EC GPE handler is invoked, it
+            becomes a no-op GPE handler invocation.
+         d. As no-op GPE handler invocations are counted by the EC driver
+            to trigger the command storming conditions, the wrong no-op
+            GPE handler invocations thus can easily trigger wrong command
+            storming conditions.
+      Note 3:
+      This no-op GPE handler invocation is rare because the time between
+      the IRQ arrival and the acpi_ec_gpe_handler() invocation is less than
+      the timeout value waited in ec_poll(). So most of the no-op GPE
+      handler invocations are caused by the reason described in issue 1.
+3. There is a race condition due to ACPICA internal GPE clearing logic in
+   acpi_enable_gpe():
+     During runtime, acpi_enable_gpe() can be invoked by the EC storming
+     prevention code. When it is invoked, GPE may be flagged (STS=1).
+       =================================================================
+       (event pending A)
+       =================================================================
+       acpi_ev_gpe_dispatch()    acpi_ec_transaction()
+         EN=0
+         STS=0
+         acpi_ec_gpe_handler()
+       *****************************************************************
+       (event handling A)
+           Lock(EC)
+           advance_transaction()
+             EC_SC read
+             EC_SC handled
+           Unlock(EC)
+       *****************************************************************
+         EN=1 ?
+                                   Lock(EC)
+                                   Unlock(EC)
+       =================================================================
+       (event pending B)
+       =================================================================
+                                   acpi_enable_gpe()
+                                     STS=0
+                                     EN=1
+    4. Issue 4:
+       We can see GPE loss on both silicon variation A and B platforms.
+       This is because:
+       a. event pending B: An event can arrive right before ACPICA's GPE
+          clearing performed in acpi_enable_gpe();
+       b. If the GPE is cleared when GPE is disabled, then EN=1 write in
+          acpi_enable_gpe() cannot trigger this GPE;
+       c. If no polling mechanism is implemented in the driver for this
+          event (for example, SCI_EVT), this event is lost due to no GPE
+          being triggered.
+       Note 4:
+       Currently we don't have this issue, but after we switch the EC
+       driver into ACPI_GPE_DISPATCH_RAW_HANDLER mode, we need to take care
+       of handling this because the EN=1 write in acpi_ev_gpe_dispatch()
+       will be abandoned.
+
+There might be more race issues for the current GPE handler usages. This is
+because the EC IRQ's enabling/disabling/checking/clearing/handling
+operations should be locked by a single lock that is under the EC driver's
+control to achieve the serialization. Which means we need to invoke GPE
+APIs with EC driver's lock held and all ACPICA internal GPE operations
+related to the GPE handler should be abandoned. Invoking GPE APIs inside of
+the EC driver lock and bypassing ACPICA internal GPE operations requires
+the ACPI_GPE_DISPATCH_RAW_HANDLER mode where the same lock used by the APIs
+are released prior than invoking the handlers. Otherwise, we can see dead
+locks due to circular locking dependencies (see Reference below).
+
+This patch then switches the EC driver into the
+ACPI_GPE_DISPATCH_RAW_HANDLER mode so that it can perform correct GPE
+operations using the GPE APIs:
+1. Bypasses EN modifications performed in acpi_ev_gpe_dispatch() by
+   using acpi_install_gpe_raw_handler() and invoking all GPE APIs with EC
+   spin lock held. This can fix issue 1 as it makes a non frequent GPE
+   enabling/disabling environment.
+2. Bypasses STS clearing performed in acpi_enable_gpe() by replacing
+   acpi_enable_gpe()/acpi_disable_gpe() with acpi_set_gpe(). This can fix
+   issue 4. And this can also help to fix issue 1 as it makes a no sudden
+   GPE clearing environment when GPE is frequently enabled/disabled.
+3. Ensures STS acknowledged before handling by invoking acpi_clear_gpe()
+   in advance_transaction(). This can finally fix issue 1 even in a
+   frequent GPE enabling/disabling environment. And this can also finally
+   fix issue 3 when issue 2 is fixed.
+   Note 3:
+   GPE clearing is edge triggered W1C, which means we can clear it right
+   before handling it. Since all EC GPE indications are handled in
+   advance_transaction() by previous commits, we can now move GPE clearing
+   into it to implement the correct GPE clearing.
+   Note 4:
+   We can use acpi_set_gpe() which is not shared GPE safer instead of
+   acpi_enable_gpe()/acpi_disable_gpe() because EC GPE is not shared by
+   other hardware, which is mentioned in the ACPI specification 5.0, 12.6
+   Interrupt Model: "OSPM driver treats this as an edge event (the EC SCI
+   cannot be shared)". So we can stop using shared GPE safer APIs
+   acpi_enable_gpe()/acpi_disable_gpe() in the EC driver. Otherwise
+   cleanups need to be made in acpi_ev_enable_gpe() to bypass the GPE
+   clearing logic before keeping acpi_enable_gpe().
+This patch also invokes advance_transaction() when GPE is re-enabled in the
+task context which:
+1. Ensures EN=1 can trigger GPE by checking and handling EC status register
+   right after EN=1 writes. This can fix issue 2.
+
+After applying this patch, without frequent GPE enablings considered:
+       =================================================================
+       (event pending A)
+       =================================================================
+       acpi_ec_gpe_handler()     ec_poll()
+       *****************************************************************
+       (event handling A)
+         Lock(EC)
+           advance_transaction()
+             if STS==1
+               STS=0
+             EC_SC read
+       =================================================================
+       (event pending B)
+       =================================================================
+             EC_SC handled
+         Unlock(EC)
+       *****************************************************************
+       *****************************************************************
+       (event handling B)
+                                   Lock(EC)
+                                     advance_transaction()
+                                       if STS==1
+                                         STS=0
+                                       EC_SC read
+       =================================================================
+       (event pending C)
+       =================================================================
+                                       EC_SC handled
+                                   Unlock(EC)
+       *****************************************************************
+The event pending for issue 1 (event pending B) can arrive as a next GPE
+due to the previous IRQ context STS=0 write. And if it is handled by
+ec_poll() (event handling B), as it is also acknowledged by ec_poll(), the
+event pending for issue 2 (event pending C) can properly arrive as a next
+GPE after the task context STS=0 write. So no GPE will be lost and never
+triggered due to GPE clearing performed in the wrong position. And since
+all GPE handling is performed after a locked GPE status checking, we can
+hardly see no-op GPE handler invocations due to issue 1 and 3. We may still
+see no-op GPE handler invocations due to "Note 1", but as it is inevitable,
+it needn't be fixed.
+
+After applying this patch, with frequent GPE enablings considered:
+       =================================================================
+       (event pending A)
+       =================================================================
+       acpi_ec_gpe_handler()     acpi_ec_transaction()
+       *****************************************************************
+       (event handling A)
+         Lock(EC)
+           advance_transaction()
+             if STS==1
+               STS=0
+             EC_SC read
+       =================================================================
+       (event pending B)
+       =================================================================
+             EC_SC handled
+         Unlock(EC)
+       *****************************************************************
+       *****************************************************************
+       (event handling B)
+                                   Lock(EC)
+                                     EN=1
+                                     if STS==1
+                                       advance_transaction()
+                                         if STS==1
+                                           STS=0
+                                         EC_SC read
+       =================================================================
+       (event pending C)
+       =================================================================
+                                         EC_SC handled
+                                   Unlock(EC)
+       *****************************************************************
+The event pending for issue 2 can be manually handled by
+advance_transaction(). And after the STS=0 write performed in the manual
+triggered advance_transaction(), GPE can always arrive. So no GPE will be
+lost due to frequent GPE disabling/enabling performed in the driver like
+issue 4.
+Note 5:
+It's ideally when EN=1 write occurred, an IRQ thread should be woken up to
+handle the GPE when the GPE was raised. But this requires the IRQ thread to
+contain the poller code for all EC GPE indications, while currently some of
+the indications are handled in the user tasks. It then is very hard for the
+code to determine whether a user task should be invoked or the poller work
+item should be scheduled. So we have to invoke advance_transaction()
+directly now and it leaves us such a restriction for the GPE re-enabling:
+it must be performed in the task context to avoid starving the GPEs.
+
+As a conclusion: we can see the EC GPE is always handled in serial after
+deploying the raw GPE handler mode:
+  Lock(EC)
+  if (STS==1)
+    STS=0
+  EC_SC read
+  EC_SC handled
+  Unlock(EC)
+The EC driver specific lock is responsible to make the EC GPE handling
+processes serialized so that EC can handle its GPE from both IRQ and task
+contexts and the next IRQ can be ensured to arrive after this process.
+
+Note 6:
+We have many EC_FLAGS_MSI qurik users in the current driver. They all seem
+to be suffering from unexpected GPE triggering source lost. And they are
+false root caused to a timing issue. Since EC communication protocol has
+already flow control defined, timing shouldn't be the root cause, while
+this fix might be fixing the root cause of the old bugs.
+
+Link: https://lkml.org/lkml/2014/11/4/974
+Link: https://lkml.org/lkml/2014/11/18/316
+Link: https://www.spinics.net/lists/linux-acpi/msg54340.html
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

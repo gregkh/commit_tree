@@ -1,0 +1,110 @@
+x86, mpx: On-demand kernel allocation of bounds tables
+
+This is really the meat of the MPX patch set.  If there is one patch to
+review in the entire series, this is the one.  There is a new ABI here
+and this kernel code also interacts with userspace memory in a
+relatively unusual manner.  (small FAQ below).
+
+Long Description:
+
+This patch adds two prctl() commands to provide enable or disable the
+management of bounds tables in kernel, including on-demand kernel
+allocation (See the patch "on-demand kernel allocation of bounds tables")
+and cleanup (See the patch "cleanup unused bound tables"). Applications
+do not strictly need the kernel to manage bounds tables and we expect
+some applications to use MPX without taking advantage of this kernel
+support. This means the kernel can not simply infer whether an application
+needs bounds table management from the MPX registers.  The prctl() is an
+explicit signal from userspace.
+
+PR_MPX_ENABLE_MANAGEMENT is meant to be a signal from userspace to
+require kernel's help in managing bounds tables.
+
+PR_MPX_DISABLE_MANAGEMENT is the opposite, meaning that userspace don't
+want kernel's help any more. With PR_MPX_DISABLE_MANAGEMENT, the kernel
+won't allocate and free bounds tables even if the CPU supports MPX.
+
+PR_MPX_ENABLE_MANAGEMENT will fetch the base address of the bounds
+directory out of a userspace register (bndcfgu) and then cache it into
+a new field (->bd_addr) in  the 'mm_struct'.  PR_MPX_DISABLE_MANAGEMENT
+will set "bd_addr" to an invalid address.  Using this scheme, we can
+use "bd_addr" to determine whether the management of bounds tables in
+kernel is enabled.
+
+Also, the only way to access that bndcfgu register is via an xsaves,
+which can be expensive.  Caching "bd_addr" like this also helps reduce
+the cost of those xsaves when doing table cleanup at munmap() time.
+Unfortunately, we can not apply this optimization to #BR fault time
+because we need an xsave to get the value of BNDSTATUS.
+
+==== Why does the hardware even have these Bounds Tables? ====
+
+MPX only has 4 hardware registers for storing bounds information.
+If MPX-enabled code needs more than these 4 registers, it needs to
+spill them somewhere. It has two special instructions for this
+which allow the bounds to be moved between the bounds registers
+and some new "bounds tables".
+
+They are similar conceptually to a page fault and will be raised by
+the MPX hardware during both bounds violations or when the tables
+are not present. This patch handles those #BR exceptions for
+not-present tables by carving the space out of the normal processes
+address space (essentially calling the new mmap() interface indroduced
+earlier in this patch set.) and then pointing the bounds-directory
+over to it.
+
+The tables *need* to be accessed and controlled by userspace because
+the instructions for moving bounds in and out of them are extremely
+frequent. They potentially happen every time a register pointing to
+memory is dereferenced. Any direct kernel involvement (like a syscall)
+to access the tables would obviously destroy performance.
+
+==== Why not do this in userspace? ====
+
+This patch is obviously doing this allocation in the kernel.
+However, MPX does not strictly *require* anything in the kernel.
+It can theoretically be done completely from userspace. Here are
+a few ways this *could* be done. I don't think any of them are
+practical in the real-world, but here they are.
+
+Q: Can virtual space simply be reserved for the bounds tables so
+   that we never have to allocate them?
+A: As noted earlier, these tables are *HUGE*. An X-GB virtual
+   area needs 4*X GB of virtual space, plus 2GB for the bounds
+   directory. If we were to preallocate them for the 128TB of
+   user virtual address space, we would need to reserve 512TB+2GB,
+   which is larger than the entire virtual address space today.
+   This means they can not be reserved ahead of time. Also, a
+   single process's pre-popualated bounds directory consumes 2GB
+   of virtual *AND* physical memory. IOW, it's completely
+   infeasible to prepopulate bounds directories.
+
+Q: Can we preallocate bounds table space at the same time memory
+   is allocated which might contain pointers that might eventually
+   need bounds tables?
+A: This would work if we could hook the site of each and every
+   memory allocation syscall. This can be done for small,
+   constrained applications. But, it isn't practical at a larger
+   scale since a given app has no way of controlling how all the
+   parts of the app might allocate memory (think libraries). The
+   kernel is really the only place to intercept these calls.
+
+Q: Could a bounds fault be handed to userspace and the tables
+   allocated there in a signal handler instead of in the kernel?
+A: (thanks to tglx) mmap() is not on the list of safe async
+   handler functions and even if mmap() would work it still
+   requires locking or nasty tricks to keep track of the
+   allocation state there.
+
+Having ruled out all of the userspace-only approaches for managing
+bounds tables that we could think of, we create them on demand in
+the kernel.
+
+Based-on-patch-by: Qiaowei Ren <qiaowei.ren@intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: linux-mm@kvack.org
+Cc: linux-mips@linux-mips.org
+Cc: Dave Hansen <dave@sr71.net>
+Link: http://lkml.kernel.org/r/20141114151829.AD4310DE@viggo.jf.intel.com
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+

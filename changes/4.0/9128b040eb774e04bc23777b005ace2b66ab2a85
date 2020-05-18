@@ -1,0 +1,97 @@
+drm/i915: Fix modeset state confusion in the load detect code
+
+This is a tricky story of the new atomic state handling and the legacy
+code fighting over each another. The bug at hand is an underrun of the
+framebuffer reference with subsequent hilarity caused by the load
+detect code. Which is peculiar since the the exact same code works
+fine as the implementation of the legacy setcrtc ioctl.
+
+Let's look at the ingredients:
+
+- Currently our code is a crazy mix of legacy modeset interfaces to
+  set the parameters and half-baked atomic state tracking underneath.
+  While this transition is going we're using the transitional plane
+  helpers to update the atomic side (drm_plane_helper_disable/update
+  and friends), i.e. plane->state->fb. Since the state structure owns
+  the fb those functions take care of that themselves.
+
+  The legacy state (specifically crtc->primary->fb) is still managed
+  by the old code (and mostly by the drm core), with the fb reference
+  counting done by callers (core drm for the ioctl or the i915 load
+  detect code). The relevant commit is
+
+  commit ea2c67bb4affa84080c616920f3899f123786e56
+  Author: Matt Roper <matthew.d.roper@intel.com>
+  Date:   Tue Dec 23 10:41:52 2014 -0800
+
+      drm/i915: Move to atomic plane helpers (v9)
+
+- drm_plane_helper_disable has special code to handle multiple calls
+  in a row - it checks plane->crtc == NULL and bails out. This is to
+  match the proper atomic implementation which needs the crtc to get
+  at the implied locking context atomic updates always need. See
+
+  commit acf24a395c5a9290189b080383564437101d411c
+  Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+  Date:   Tue Jul 29 15:33:05 2014 +0200
+
+      drm/plane-helper: transitional atomic plane helpers
+
+- The universal plane code split out the implicit primary plane from
+  the CRTC into it's own full-blown drm_plane object. As part of that
+  the setcrtc ioctl (which updated both the crtc mode and primary
+  plane) learned to set crtc->primary->crtc on modeset to make sure
+  the plane->crtc assignments statate up to date in
+
+  commit e13161af80c185ecd8dc4641d0f5df58f9e3e0af
+  Author: Matt Roper <matthew.d.roper@intel.com>
+  Date:   Tue Apr 1 15:22:38 2014 -0700
+
+      drm: Add drm_crtc_init_with_planes() (v2)
+
+  Unfortunately we've forgotten to update the load detect code. Which
+  wasn't a problem since the load detect modeset is temporary and
+  always undone before we drop the locks.
+
+- Finally there is a organically grown history (i.e. don't ask) around
+  who sets the legacy plane->fb for the various driver entry points.
+  Originally updating that was the drivers duty, but for almost all
+  places we've moved that (plus updating the refcounts) into the core.
+  Again the exception is the load detect code.
+
+Taking all together the following happens:
+- The load detect code doesn't set crtc->primary->crtc. This is only
+  really an issue on crtcs never before used or when userspace
+  explicitly disabled the primary plane.
+
+- The plane helper glue code short-circuits because of that and leaves
+  a non-NULL fb behind in plane->state->fb and plane->fb. The state
+  fb isn't a real problem (it's properly refcounted on its own), it's
+  just the canary.
+
+- Load detect code drops the reference for that fb, but doesn't set
+  plane->fb = NULL. This is ok since it's still living in that old
+  world where drivers had to clear the pointer but the core/callers
+  handled the refcounting.
+
+- On the next modeset the drm core notices plane->fb and takes care of
+  refcounting it properly by doing another unref. This drops the
+  refcount to zero, leaving state->plane now pointing at freed memory.
+
+- intel_plane_duplicate_state still assume it owns a reference to that
+  very state->fb and bad things start to happen.
+
+Fix this all by applying the same duct-tape as for the legacy setcrtc
+ioctl code and set crtc->primary->crtc properly.
+
+Cc: Matt Roper <matthew.d.roper@intel.com>
+Cc: Paul Bolle <pebolle@tiscali.nl>
+Cc: Rob Clark <robdclark@gmail.com>
+Cc: Paulo Zanoni <przanoni@gmail.com>
+Cc: Sean Paul <seanpaul@chromium.org>
+Cc: Matt Roper <matthew.d.roper@intel.com>
+Reported-and-tested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Reported-by: Paul Bolle <pebolle@tiscali.nl>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

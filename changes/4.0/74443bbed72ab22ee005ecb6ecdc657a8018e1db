@@ -1,0 +1,62 @@
+ACPI / EC: Fix issues related to the SCI_EVT handling
+
+This patch fixes 2 issues related to the draining behavior. But it doesn't
+implement the draining support, it only cleans up code so that further
+draining support is possible.
+
+The draining behavior is expected by some platforms (for example, Samsung)
+where SCI_EVT is set only once for a set of events and might be cleared for
+the very first QR_EC command issued after SCI_EVT is set. EC firmware on
+such platforms will return 0x00 to indicate "no outstanding event". Thus
+after seeing an SCI_EVT indication, EC driver need to fetch events until
+0x00 returned (see acpi_ec_clear()).
+
+Issue 1 - acpi_ec_submit_query():
+It's reported on Samsung laptops that SCI_EVT isn't checked when the
+transactions are advanced in ec_poll(), which leads to SCI_EVT triggering
+source lost:
+ If no EC GPE IRQs are arrived after that, EC driver cannot detect this
+ event and handle it.
+See comment 244/247 for kernel bugzilla 44161.
+This patch fixes this issue by moving SCI_EVT checks into
+advance_transaction(). So that SCI_EVT is checked each time we are going to
+handle the EC firmware indications. And this check will happen for both IRQ
+context and task context.
+Since after doing that, SCI_EVT is also checked after completing a
+transaction, ec_check_sci() and ec_check_sci_sync() can be removed.
+
+Issue 2 - acpi_ec_complete_query():
+We expect to clear EC_FLAGS_QUERY_PENDING to allow queuing another draining
+QR_EC after writing a QR_EC command and before reading the event. After
+reading the event, SCI_EVT might be cleared by the firmware, thus it may
+not be possible to queue such a draining QR_EC at that time.
+But putting the EC_FLAGS_QUERY_PENDING clearing code after
+start_transaction() is wrong as there are chances that after
+start_transaction(), QR_EC can fail to be sent. If this happens,
+EC_FLAG_QUERY_PENDING will be cleared earlier. As a consequence, the
+draining QR_EC will also be queued earlier than expected.
+This patch also moves this code into advance_transaction() where QR_EC is
+just sent (ACPI_EC_COMMAND_POLL flagged) to fix this issue.
+
+Notes:
+1. After introducing the 2 SCI_EVT related handlings into
+   advance_transaction(), a next QR_EC can be queued right after writing
+   the current QR_EC command and before reading the event. But this still
+   hasn't implemented the draining behavior as the draining support
+   requires:
+     If a previous returned event value isn't 0x00, a draining QR_EC need
+     to be issued even when SCI_EVT isn't set.
+2. In this patch, acpi_os_execute() is also converted into a seperate work
+   item to avoid invoking kmalloc() in the atomic context. We can do this
+   because of the previous global lock fix.
+3. Originally, EC_FLAGS_EVENT_PENDING is also used to avoid queuing up
+   multiple work items (created by acpi_os_execute()), this can be covered
+   by only using a single work item. But this patch still keeps this flag
+   as there are different usages in the driver initialization steps relying
+   on this flag.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=44161
+Reported-by: Kieran Clancy <clancy.kieran@gmail.com>
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

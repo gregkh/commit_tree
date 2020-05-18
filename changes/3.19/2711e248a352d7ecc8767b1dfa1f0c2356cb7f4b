@@ -1,0 +1,66 @@
+KVM: PPC: Book3S HV: Simplify locking around stolen time calculations
+
+Currently the calculations of stolen time for PPC Book3S HV guests
+uses fields in both the vcpu struct and the kvmppc_vcore struct.  The
+fields in the kvmppc_vcore struct are protected by the
+vcpu->arch.tbacct_lock of the vcpu that has taken responsibility for
+running the virtual core.  This works correctly but confuses lockdep,
+because it sees that the code takes the tbacct_lock for a vcpu in
+kvmppc_remove_runnable() and then takes another vcpu's tbacct_lock in
+vcore_stolen_time(), and it thinks there is a possibility of deadlock,
+causing it to print reports like this:
+
+=============================================
+[ INFO: possible recursive locking detected ]
+3.18.0-rc7-kvm-00016-g8db4bc6 #89 Not tainted
+---------------------------------------------
+qemu-system-ppc/6188 is trying to acquire lock:
+ (&(&vcpu->arch.tbacct_lock)->rlock){......}, at: [<d00000000ecb1fe8>] .vcore_stolen_time+0x48/0xd0 [kvm_hv]
+
+but task is already holding lock:
+ (&(&vcpu->arch.tbacct_lock)->rlock){......}, at: [<d00000000ecb25a0>] .kvmppc_remove_runnable.part.3+0x30/0xd0 [kvm_hv]
+
+other info that might help us debug this:
+ Possible unsafe locking scenario:
+
+       CPU0
+       ----
+  lock(&(&vcpu->arch.tbacct_lock)->rlock);
+  lock(&(&vcpu->arch.tbacct_lock)->rlock);
+
+ *** DEADLOCK ***
+
+ May be due to missing lock nesting notation
+
+3 locks held by qemu-system-ppc/6188:
+ #0:  (&vcpu->mutex){+.+.+.}, at: [<d00000000eb93f98>] .vcpu_load+0x28/0xe0 [kvm]
+ #1:  (&(&vcore->lock)->rlock){+.+...}, at: [<d00000000ecb41b0>] .kvmppc_vcpu_run_hv+0x530/0x1530 [kvm_hv]
+ #2:  (&(&vcpu->arch.tbacct_lock)->rlock){......}, at: [<d00000000ecb25a0>] .kvmppc_remove_runnable.part.3+0x30/0xd0 [kvm_hv]
+
+stack backtrace:
+CPU: 40 PID: 6188 Comm: qemu-system-ppc Not tainted 3.18.0-rc7-kvm-00016-g8db4bc6 #89
+Call Trace:
+[c000000b2754f3f0] [c000000000b31b6c] .dump_stack+0x88/0xb4 (unreliable)
+[c000000b2754f470] [c0000000000faeb8] .__lock_acquire+0x1878/0x2190
+[c000000b2754f600] [c0000000000fbf0c] .lock_acquire+0xcc/0x1a0
+[c000000b2754f6d0] [c000000000b2954c] ._raw_spin_lock_irq+0x4c/0x70
+[c000000b2754f760] [d00000000ecb1fe8] .vcore_stolen_time+0x48/0xd0 [kvm_hv]
+[c000000b2754f7f0] [d00000000ecb25b4] .kvmppc_remove_runnable.part.3+0x44/0xd0 [kvm_hv]
+[c000000b2754f880] [d00000000ecb43ec] .kvmppc_vcpu_run_hv+0x76c/0x1530 [kvm_hv]
+[c000000b2754f9f0] [d00000000eb9f46c] .kvmppc_vcpu_run+0x2c/0x40 [kvm]
+[c000000b2754fa60] [d00000000eb9c9a4] .kvm_arch_vcpu_ioctl_run+0x54/0x160 [kvm]
+[c000000b2754faf0] [d00000000eb94538] .kvm_vcpu_ioctl+0x498/0x760 [kvm]
+[c000000b2754fcb0] [c000000000267eb4] .do_vfs_ioctl+0x444/0x770
+[c000000b2754fd90] [c0000000002682a4] .SyS_ioctl+0xc4/0xe0
+[c000000b2754fe30] [c0000000000092e4] syscall_exit+0x0/0x98
+
+In order to make the locking easier to analyse, we change the code to
+use a spinlock in the kvmppc_vcore struct to protect the stolen_tb and
+preempt_tb fields.  This lock needs to be an irq-safe lock since it is
+used in the kvmppc_core_vcpu_load_hv() and kvmppc_core_vcpu_put_hv()
+functions, which are called with the scheduler rq lock held, which is
+an irq-safe lock.
+
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+

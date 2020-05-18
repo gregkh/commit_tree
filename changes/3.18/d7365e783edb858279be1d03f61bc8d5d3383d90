@@ -1,0 +1,52 @@
+mm: memcontrol: fix missed end-writeback page accounting
+
+Commit 0a31bc97c80c ("mm: memcontrol: rewrite uncharge API") changed
+page migration to uncharge the old page right away.  The page is locked,
+unmapped, truncated, and off the LRU, but it could race with writeback
+ending, which then doesn't unaccount the page properly:
+
+test_clear_page_writeback()              migration
+                                           wait_on_page_writeback()
+  TestClearPageWriteback()
+                                           mem_cgroup_migrate()
+                                             clear PCG_USED
+  mem_cgroup_update_page_stat()
+    if (PageCgroupUsed(pc))
+      decrease memcg pages under writeback
+
+  release pc->mem_cgroup->move_lock
+
+The per-page statistics interface is heavily optimized to avoid a
+function call and a lookup_page_cgroup() in the file unmap fast path,
+which means it doesn't verify whether a page is still charged before
+clearing PageWriteback() and it has to do it in the stat update later.
+
+Rework it so that it looks up the page's memcg once at the beginning of
+the transaction and then uses it throughout.  The charge will be
+verified before clearing PageWriteback() and migration can't uncharge
+the page as long as that is still set.  The RCU lock will protect the
+memcg past uncharge.
+
+As far as losing the optimization goes, the following test results are
+from a microbenchmark that maps, faults, and unmaps a 4GB sparse file
+three times in a nested fashion, so that there are two negative passes
+that don't account but still go through the new transaction overhead.
+There is no actual difference:
+
+ old:     33.195102545 seconds time elapsed       ( +-  0.01% )
+ new:     33.199231369 seconds time elapsed       ( +-  0.03% )
+
+The time spent in page_remove_rmap()'s callees still adds up to the
+same, but the time spent in the function itself seems reduced:
+
+     # Children      Self  Command        Shared Object       Symbol
+ old:     0.12%     0.11%  filemapstress  [kernel.kallsyms]   [k] page_remove_rmap
+ new:     0.12%     0.08%  filemapstress  [kernel.kallsyms]   [k] page_remove_rmap
+
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Michal Hocko <mhocko@suse.cz>
+Cc: Vladimir Davydov <vdavydov@parallels.com>
+Cc: <stable@vger.kernel.org>	[3.17.x]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

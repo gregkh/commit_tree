@@ -1,0 +1,90 @@
+Btrfs: fix task hang under heavy compressed write
+
+This has been reported and discussed for a long time, and this hang occurs in
+both 3.15 and 3.16.
+
+Btrfs now migrates to use kernel workqueue, but it introduces this hang problem.
+
+Btrfs has a kind of work queued as an ordered way, which means that its
+ordered_func() must be processed in the way of FIFO, so it usually looks like --
+
+normal_work_helper(arg)
+    work = container_of(arg, struct btrfs_work, normal_work);
+
+    work->func() <---- (we name it work X)
+    for ordered_work in wq->ordered_list
+            ordered_work->ordered_func()
+            ordered_work->ordered_free()
+
+The hang is a rare case, first when we find free space, we get an uncached block
+group, then we go to read its free space cache inode for free space information,
+so it will
+
+file a readahead request
+    btrfs_readpages()
+         for page that is not in page cache
+                __do_readpage()
+                     submit_extent_page()
+                           btrfs_submit_bio_hook()
+                                 btrfs_bio_wq_end_io()
+                                 submit_bio()
+                                 end_workqueue_bio() <--(ret by the 1st endio)
+                                      queue a work(named work Y) for the 2nd
+                                      also the real endio()
+
+So the hang occurs when work Y's work_struct and work X's work_struct happens
+to share the same address.
+
+A bit more explanation,
+
+A,B,C -- struct btrfs_work
+arg   -- struct work_struct
+
+kthread:
+worker_thread()
+    pick up a work_struct from @worklist
+    process_one_work(arg)
+	worker->current_work = arg;  <-- arg is A->normal_work
+	worker->current_func(arg)
+		normal_work_helper(arg)
+		     A = container_of(arg, struct btrfs_work, normal_work);
+
+		     A->func()
+		     A->ordered_func()
+		     A->ordered_free()  <-- A gets freed
+
+		     B->ordered_func()
+			  submit_compressed_extents()
+			      find_free_extent()
+				  load_free_space_inode()
+				      ...   <-- (the above readhead stack)
+				      end_workqueue_bio()
+					   btrfs_queue_work(work C)
+		     B->ordered_free()
+
+As if work A has a high priority in wq->ordered_list and there are more ordered
+works queued after it, such as B->ordered_func(), its memory could have been
+freed before normal_work_helper() returns, which means that kernel workqueue
+code worker_thread() still has worker->current_work pointer to be work
+A->normal_work's, ie. arg's address.
+
+Meanwhile, work C is allocated after work A is freed, work C->normal_work
+and work A->normal_work are likely to share the same address(I confirmed this
+with ftrace output, so I'm not just guessing, it's rare though).
+
+When another kthread picks up work C->normal_work to process, and finds our
+kthread is processing it(see find_worker_executing_work()), it'll think
+work C as a collision and skip then, which ends up nobody processing work C.
+
+So the situation is that our kthread is waiting forever on work C.
+
+Besides, there're other cases that can lead to deadlock, but the real problem
+is that all btrfs workqueue shares one work->func, -- normal_work_helper,
+so this makes each workqueue to have its own helper function, but only a
+wraper pf normal_work_helper.
+
+With this patch, I no long hit the above hang.
+
+Signed-off-by: Liu Bo <bo.li.liu@oracle.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

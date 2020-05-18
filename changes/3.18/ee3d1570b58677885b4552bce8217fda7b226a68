@@ -1,0 +1,60 @@
+kvm: fix potentially corrupt mmio cache
+
+vcpu exits and memslot mutations can run concurrently as long as the
+vcpu does not aquire the slots mutex. Thus it is theoretically possible
+for memslots to change underneath a vcpu that is handling an exit.
+
+If we increment the memslot generation number again after
+synchronize_srcu_expedited(), vcpus can safely cache memslot generation
+without maintaining a single rcu_dereference through an entire vm exit.
+And much of the x86/kvm code does not maintain a single rcu_dereference
+of the current memslots during each exit.
+
+We can prevent the following case:
+
+   vcpu (CPU 0)                             | thread (CPU 1)
+--------------------------------------------+--------------------------
+1  vm exit                                  |
+2  srcu_read_unlock(&kvm->srcu)             |
+3  decide to cache something based on       |
+     old memslots                           |
+4                                           | change memslots
+                                            | (increments generation)
+5                                           | synchronize_srcu(&kvm->srcu);
+6  retrieve generation # from new memslots  |
+7  tag cache with new memslot generation    |
+8  srcu_read_unlock(&kvm->srcu)             |
+...                                         |
+   <action based on cache occurs even       |
+    though the caching decision was based   |
+    on the old memslots>                    |
+...                                         |
+   <action *continues* to occur until next  |
+    memslot generation change, which may    |
+    be never>                               |
+                                            |
+
+By incrementing the generation after synchronizing with kvm->srcu readers,
+we ensure that the generation retrieved in (6) will become invalid soon
+after (8).
+
+Keeping the existing increment is not strictly necessary, but we
+do keep it and just move it for consistency from update_memslots to
+install_new_memslots.  It invalidates old cached MMIOs immediately,
+instead of having to wait for the end of synchronize_srcu_expedited,
+which makes the code more clearly correct in case CPU 1 is preempted
+right after synchronize_srcu() returns.
+
+To avoid halving the generation space in SPTEs, always presume that the
+low bit of the generation is zero when reconstructing a generation number
+out of an SPTE.  This effectively disables MMIO caching in SPTEs during
+the call to synchronize_srcu_expedited.  Using the low bit this way is
+somewhat like a seqcount---where the protected thing is a cache, and
+instead of retrying we can simply punt if we observe the low bit to be 1.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: David Matlack <dmatlack@google.com>
+Reviewed-by: Xiao Guangrong <xiaoguangrong@linux.vnet.ibm.com>
+Reviewed-by: David Matlack <dmatlack@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+

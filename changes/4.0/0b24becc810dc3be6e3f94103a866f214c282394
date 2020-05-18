@@ -1,0 +1,168 @@
+kasan: add kernel address sanitizer infrastructure
+
+Kernel Address sanitizer (KASan) is a dynamic memory error detector.  It
+provides fast and comprehensive solution for finding use-after-free and
+out-of-bounds bugs.
+
+KASAN uses compile-time instrumentation for checking every memory access,
+therefore GCC > v4.9.2 required.  v4.9.2 almost works, but has issues with
+putting symbol aliases into the wrong section, which breaks kasan
+instrumentation of globals.
+
+This patch only adds infrastructure for kernel address sanitizer.  It's
+not available for use yet.  The idea and some code was borrowed from [1].
+
+Basic idea:
+
+The main idea of KASAN is to use shadow memory to record whether each byte
+of memory is safe to access or not, and use compiler's instrumentation to
+check the shadow memory on each memory access.
+
+Address sanitizer uses 1/8 of the memory addressable in kernel for shadow
+memory and uses direct mapping with a scale and offset to translate a
+memory address to its corresponding shadow address.
+
+Here is function to translate address to corresponding shadow address:
+
+     unsigned long kasan_mem_to_shadow(unsigned long addr)
+     {
+                return (addr >> KASAN_SHADOW_SCALE_SHIFT) + KASAN_SHADOW_OFFSET;
+     }
+
+where KASAN_SHADOW_SCALE_SHIFT = 3.
+
+So for every 8 bytes there is one corresponding byte of shadow memory.
+The following encoding used for each shadow byte: 0 means that all 8 bytes
+of the corresponding memory region are valid for access; k (1 <= k <= 7)
+means that the first k bytes are valid for access, and other (8 - k) bytes
+are not; Any negative value indicates that the entire 8-bytes are
+inaccessible.  Different negative values used to distinguish between
+different kinds of inaccessible memory (redzones, freed memory) (see
+mm/kasan/kasan.h).
+
+To be able to detect accesses to bad memory we need a special compiler.
+Such compiler inserts a specific function calls (__asan_load*(addr),
+__asan_store*(addr)) before each memory access of size 1, 2, 4, 8 or 16.
+
+These functions check whether memory region is valid to access or not by
+checking corresponding shadow memory.  If access is not valid an error
+printed.
+
+Historical background of the address sanitizer from Dmitry Vyukov:
+
+	"We've developed the set of tools, AddressSanitizer (Asan),
+	ThreadSanitizer and MemorySanitizer, for user space. We actively use
+	them for testing inside of Google (continuous testing, fuzzing,
+	running prod services). To date the tools have found more than 10'000
+	scary bugs in Chromium, Google internal codebase and various
+	open-source projects (Firefox, OpenSSL, gcc, clang, ffmpeg, MySQL and
+	lots of others): [2] [3] [4].
+	The tools are part of both gcc and clang compilers.
+
+	We have not yet done massive testing under the Kernel AddressSanitizer
+	(it's kind of chicken and egg problem, you need it to be upstream to
+	start applying it extensively). To date it has found about 50 bugs.
+	Bugs that we've found in upstream kernel are listed in [5].
+	We've also found ~20 bugs in out internal version of the kernel. Also
+	people from Samsung and Oracle have found some.
+
+	[...]
+
+	As others noted, the main feature of AddressSanitizer is its
+	performance due to inline compiler instrumentation and simple linear
+	shadow memory. User-space Asan has ~2x slowdown on computational
+	programs and ~2x memory consumption increase. Taking into account that
+	kernel usually consumes only small fraction of CPU and memory when
+	running real user-space programs, I would expect that kernel Asan will
+	have ~10-30% slowdown and similar memory consumption increase (when we
+	finish all tuning).
+
+	I agree that Asan can well replace kmemcheck. We have plans to start
+	working on Kernel MemorySanitizer that finds uses of unitialized
+	memory. Asan+Msan will provide feature-parity with kmemcheck. As
+	others noted, Asan will unlikely replace debug slab and pagealloc that
+	can be enabled at runtime. Asan uses compiler instrumentation, so even
+	if it is disabled, it still incurs visible overheads.
+
+	Asan technology is easily portable to other architectures. Compiler
+	instrumentation is fully portable. Runtime has some arch-dependent
+	parts like shadow mapping and atomic operation interception. They are
+	relatively easy to port."
+
+Comparison with other debugging features:
+========================================
+
+KMEMCHECK:
+
+  - KASan can do almost everything that kmemcheck can.  KASan uses
+    compile-time instrumentation, which makes it significantly faster than
+    kmemcheck.  The only advantage of kmemcheck over KASan is detection of
+    uninitialized memory reads.
+
+    Some brief performance testing showed that kasan could be
+    x500-x600 times faster than kmemcheck:
+
+$ netperf -l 30
+		MIGRATED TCP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to localhost (127.0.0.1) port 0 AF_INET
+		Recv   Send    Send
+		Socket Socket  Message  Elapsed
+		Size   Size    Size     Time     Throughput
+		bytes  bytes   bytes    secs.    10^6bits/sec
+
+no debug:	87380  16384  16384    30.00    41624.72
+
+kasan inline:	87380  16384  16384    30.00    12870.54
+
+kasan outline:	87380  16384  16384    30.00    10586.39
+
+kmemcheck: 	87380  16384  16384    30.03      20.23
+
+  - Also kmemcheck couldn't work on several CPUs.  It always sets
+    number of CPUs to 1.  KASan doesn't have such limitation.
+
+DEBUG_PAGEALLOC:
+	- KASan is slower than DEBUG_PAGEALLOC, but KASan works on sub-page
+	  granularity level, so it able to find more bugs.
+
+SLUB_DEBUG (poisoning, redzones):
+	- SLUB_DEBUG has lower overhead than KASan.
+
+	- SLUB_DEBUG in most cases are not able to detect bad reads,
+	  KASan able to detect both reads and writes.
+
+	- In some cases (e.g. redzone overwritten) SLUB_DEBUG detect
+	  bugs only on allocation/freeing of object. KASan catch
+	  bugs right before it will happen, so we always know exact
+	  place of first bad read/write.
+
+[1] https://code.google.com/p/address-sanitizer/wiki/AddressSanitizerForKernel
+[2] https://code.google.com/p/address-sanitizer/wiki/FoundBugs
+[3] https://code.google.com/p/thread-sanitizer/wiki/FoundBugs
+[4] https://code.google.com/p/memory-sanitizer/wiki/FoundBugs
+[5] https://code.google.com/p/address-sanitizer/wiki/AddressSanitizerForKernel#Trophies
+
+Based on work by Andrey Konovalov.
+
+Signed-off-by: Andrey Ryabinin <a.ryabinin@samsung.com>
+Acked-by: Michal Marek <mmarek@suse.cz>
+Signed-off-by: Andrey Konovalov <adech.fo@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Konstantin Serebryany <kcc@google.com>
+Cc: Dmitry Chernenkov <dmitryc@google.com>
+Cc: Yuri Gribov <tetra2005@gmail.com>
+Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+Cc: Sasha Levin <sasha.levin@oracle.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Andi Kleen <andi@firstfloor.org>
+Cc: Ingo Molnar <mingo@elte.hu>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

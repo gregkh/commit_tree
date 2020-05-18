@@ -1,0 +1,49 @@
+nilfs2: fix deadlock of segment constructor over I_SYNC flag
+
+Nilfs2 eventually hangs in a stress test with fsstress program.  This
+issue was caused by the following deadlock over I_SYNC flag between
+nilfs_segctor_thread() and writeback_sb_inodes():
+
+  nilfs_segctor_thread()
+    nilfs_segctor_thread_construct()
+      nilfs_segctor_unlock()
+        nilfs_dispose_list()
+          iput()
+            iput_final()
+              evict()
+                inode_wait_for_writeback()  * wait for I_SYNC flag
+
+  writeback_sb_inodes()
+     * set I_SYNC flag on inode->i_state
+    __writeback_single_inode()
+      do_writepages()
+        nilfs_writepages()
+          nilfs_construct_dsync_segment()
+            nilfs_segctor_sync()
+               * wait for completion of segment constructor
+    inode_sync_complete()
+       * clear I_SYNC flag after __writeback_single_inode() completed
+
+writeback_sb_inodes() calls do_writepages() for dirty inodes after
+setting I_SYNC flag on inode->i_state.  do_writepages() in turn calls
+nilfs_writepages(), which can run segment constructor and wait for its
+completion.  On the other hand, segment constructor calls iput(), which
+can call evict() and wait for the I_SYNC flag on
+inode_wait_for_writeback().
+
+Since segment constructor doesn't know when I_SYNC will be set, it
+cannot know whether iput() will block or not unless inode->i_nlink has a
+non-zero count.  We can prevent evict() from being called in iput() by
+implementing sop->drop_inode(), but it's not preferable to leave inodes
+with i_nlink == 0 for long periods because it even defers file
+truncation and inode deallocation.  So, this instead resolves the
+deadlock by calling iput() asynchronously with a workqueue for inodes
+with i_nlink == 0.
+
+Signed-off-by: Ryusuke Konishi <konishi.ryusuke@lab.ntt.co.jp>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Tested-by: Ryusuke Konishi <konishi.ryusuke@lab.ntt.co.jp>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

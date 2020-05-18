@@ -1,0 +1,70 @@
+Btrfs: improve free space cache management and space allocation
+
+While under random IO, a block group's free space cache eventually reaches
+a state where it has a mix of extent entries and bitmap entries representing
+free space regions.
+
+As later free space regions are returned to the cache, some of them are merged
+with existing extent entries if they are contiguous with them. But others are
+not merged, because despite the existence of adjacent free space regions in
+the cache, the merging doesn't happen because the existing free space regions
+are represented in bitmap extents. Even when new free space regions are merged
+with existing extent entries (enlarging the free space range they represent),
+we create chances of having after an enlarged region that is contiguous with
+some other region represented in a bitmap entry.
+
+Both clustered and non-clustered space allocation work by iterating over our
+extent and bitmap entries and skipping any that represents a region smaller
+then the allocation request (and giving preference to extent entries before
+bitmap entries). By having a contiguous free space region that is represented
+by 2 (or more) entries (mix of extent and bitmap entries), we end up not
+satisfying an allocation request with a size larger than the size of any of
+the entries but no larger than the sum of their sizes. Making the caller assume
+we're under a ENOSPC condition or force it to allocate multiple smaller space
+regions (as we do for file data writes), which adds extra overhead and more
+chances of causing fragmentation due to the smaller regions being all spread
+apart from each other (more likely when under concurrency).
+
+For example, if we have the following in the cache:
+
+* extent entry representing free space range: [128Mb - 256Kb, 128Mb[
+
+* bitmap entry covering the range [128Mb, 256Mb[, but only with the bits
+  representing the range [128Mb, 128Mb + 768Kb[ set - that is, only that
+  space in this 128Mb area is marked as free
+
+An allocation request for 1Mb, starting at offset not greater than 128Mb - 256Kb,
+would fail before, despite the existence of such contiguous free space area in the
+cache. The caller could only allocate up to 768Kb of space at once and later another
+256Kb (or vice-versa). In between each smaller allocation request, another task
+working on a different file/inode might come in and take that space, preventing the
+former task of getting a contiguous 1Mb region of free space.
+
+Therefore this change implements the ability to move free space from bitmap
+entries into existing and new free space regions represented with extent
+entries. This is done when a space region is added to the cache.
+
+A test was added to the sanity tests that explains in detail the issue too.
+
+Some performance test results with compilebench on a 4 cores machine, with
+32Gb of ram and using an HDD follow.
+
+Test: compilebench -D /mnt -i 30 -r 1000 --makej
+
+Before this change:
+
+   intial create total runs 30 avg 69.02 MB/s (user 0.28s sys 0.57s)
+   compile total runs 30 avg 314.96 MB/s (user 0.12s sys 0.25s)
+   read compiled tree total runs 3 avg 27.14 MB/s (user 1.52s sys 0.90s)
+   delete compiled tree total runs 30 avg 3.14 seconds (user 0.15s sys 0.66s)
+
+After this change:
+
+   intial create total runs 30 avg 68.37 MB/s (user 0.29s sys 0.55s)
+   compile total runs 30 avg 382.83 MB/s (user 0.12s sys 0.24s)
+   read compiled tree total runs 3 avg 27.82 MB/s (user 1.45s sys 0.97s)
+   delete compiled tree total runs 30 avg 3.18 seconds (user 0.17s sys 0.65s)
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

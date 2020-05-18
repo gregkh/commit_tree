@@ -1,0 +1,86 @@
+KVM: PPC: Book3S HV: Fix spinlock/mutex ordering issue in kvmppc_set_lpcr()
+
+Currently, kvmppc_set_lpcr() has a spinlock around the whole function,
+and inside that does mutex_lock(&kvm->lock).  It is not permitted to
+take a mutex while holding a spinlock, because the mutex_lock might
+call schedule().  In addition, this causes lockdep to warn about a
+lock ordering issue:
+
+======================================================
+[ INFO: possible circular locking dependency detected ]
+3.18.0-kvm-04645-gdfea862-dirty #131 Not tainted
+-------------------------------------------------------
+qemu-system-ppc/8179 is trying to acquire lock:
+ (&kvm->lock){+.+.+.}, at: [<d00000000ecc1f54>] .kvmppc_set_lpcr+0xf4/0x1c0 [kvm_hv]
+
+but task is already holding lock:
+ (&(&vcore->lock)->rlock){+.+...}, at: [<d00000000ecc1ea0>] .kvmppc_set_lpcr+0x40/0x1c0 [kvm_hv]
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #1 (&(&vcore->lock)->rlock){+.+...}:
+       [<c000000000b3c120>] .mutex_lock_nested+0x80/0x570
+       [<d00000000ecc7a14>] .kvmppc_vcpu_run_hv+0xc4/0xe40 [kvm_hv]
+       [<d00000000eb9f5cc>] .kvmppc_vcpu_run+0x2c/0x40 [kvm]
+       [<d00000000eb9cb24>] .kvm_arch_vcpu_ioctl_run+0x54/0x160 [kvm]
+       [<d00000000eb94478>] .kvm_vcpu_ioctl+0x4a8/0x7b0 [kvm]
+       [<c00000000026cbb4>] .do_vfs_ioctl+0x444/0x770
+       [<c00000000026cfa4>] .SyS_ioctl+0xc4/0xe0
+       [<c000000000009264>] syscall_exit+0x0/0x98
+
+-> #0 (&kvm->lock){+.+.+.}:
+       [<c0000000000ff28c>] .lock_acquire+0xcc/0x1a0
+       [<c000000000b3c120>] .mutex_lock_nested+0x80/0x570
+       [<d00000000ecc1f54>] .kvmppc_set_lpcr+0xf4/0x1c0 [kvm_hv]
+       [<d00000000ecc510c>] .kvmppc_set_one_reg_hv+0x4dc/0x990 [kvm_hv]
+       [<d00000000eb9f234>] .kvmppc_set_one_reg+0x44/0x330 [kvm]
+       [<d00000000eb9c9dc>] .kvm_vcpu_ioctl_set_one_reg+0x5c/0x150 [kvm]
+       [<d00000000eb9ced4>] .kvm_arch_vcpu_ioctl+0x214/0x2c0 [kvm]
+       [<d00000000eb940b0>] .kvm_vcpu_ioctl+0xe0/0x7b0 [kvm]
+       [<c00000000026cbb4>] .do_vfs_ioctl+0x444/0x770
+       [<c00000000026cfa4>] .SyS_ioctl+0xc4/0xe0
+       [<c000000000009264>] syscall_exit+0x0/0x98
+
+other info that might help us debug this:
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&(&vcore->lock)->rlock);
+                               lock(&kvm->lock);
+                               lock(&(&vcore->lock)->rlock);
+  lock(&kvm->lock);
+
+ *** DEADLOCK ***
+
+2 locks held by qemu-system-ppc/8179:
+ #0:  (&vcpu->mutex){+.+.+.}, at: [<d00000000eb93f18>] .vcpu_load+0x28/0x90 [kvm]
+ #1:  (&(&vcore->lock)->rlock){+.+...}, at: [<d00000000ecc1ea0>] .kvmppc_set_lpcr+0x40/0x1c0 [kvm_hv]
+
+stack backtrace:
+CPU: 4 PID: 8179 Comm: qemu-system-ppc Not tainted 3.18.0-kvm-04645-gdfea862-dirty #131
+Call Trace:
+[c000001a66c0f310] [c000000000b486ac] .dump_stack+0x88/0xb4 (unreliable)
+[c000001a66c0f390] [c0000000000f8bec] .print_circular_bug+0x27c/0x3d0
+[c000001a66c0f440] [c0000000000fe9e8] .__lock_acquire+0x2028/0x2190
+[c000001a66c0f5d0] [c0000000000ff28c] .lock_acquire+0xcc/0x1a0
+[c000001a66c0f6a0] [c000000000b3c120] .mutex_lock_nested+0x80/0x570
+[c000001a66c0f7c0] [d00000000ecc1f54] .kvmppc_set_lpcr+0xf4/0x1c0 [kvm_hv]
+[c000001a66c0f860] [d00000000ecc510c] .kvmppc_set_one_reg_hv+0x4dc/0x990 [kvm_hv]
+[c000001a66c0f8d0] [d00000000eb9f234] .kvmppc_set_one_reg+0x44/0x330 [kvm]
+[c000001a66c0f960] [d00000000eb9c9dc] .kvm_vcpu_ioctl_set_one_reg+0x5c/0x150 [kvm]
+[c000001a66c0f9f0] [d00000000eb9ced4] .kvm_arch_vcpu_ioctl+0x214/0x2c0 [kvm]
+[c000001a66c0faf0] [d00000000eb940b0] .kvm_vcpu_ioctl+0xe0/0x7b0 [kvm]
+[c000001a66c0fcb0] [c00000000026cbb4] .do_vfs_ioctl+0x444/0x770
+[c000001a66c0fd90] [c00000000026cfa4] .SyS_ioctl+0xc4/0xe0
+[c000001a66c0fe30] [c000000000009264] syscall_exit+0x0/0x98
+
+This fixes it by moving the mutex_lock()/mutex_unlock() pair outside
+the spin-locked region.
+
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+

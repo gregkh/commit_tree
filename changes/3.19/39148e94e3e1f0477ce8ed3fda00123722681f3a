@@ -1,0 +1,66 @@
+MIPS: fork: Fix MSA/FPU/DSP context duplication race
+
+There is a race in the MIPS fork code which allows the child to get a
+stale copy of parent MSA/FPU/DSP state that is active in hardware
+registers when the fork() is called. This is because copy_thread() saves
+the live register state into the child context only if the hardware is
+currently in use, apparently on the assumption that the hardware state
+cannot have been saved and disabled since the initial duplication of the
+task_struct. However preemption is certainly possible during this
+window.
+
+An example sequence of events is as follows:
+
+1) The parent userland process puts important data into saved floating
+   point registers ($f20-$f31), which are then dirty compared to the
+   process' stored context.
+
+2) The parent process calls fork() which does a clone system call.
+
+3) In the kernel, do_fork() -> copy_process() -> dup_task_struct() ->
+   arch_dup_task_struct() (which uses the weakly defined default
+   implementation). This duplicates the parent process' task context,
+   which includes a stale version of its FP context from when it was
+   last saved, probably some time before (1).
+
+4) At some point before copy_process() calls copy_thread(), such as when
+   duplicating the memory map, the process is desceduled. Perhaps it is
+   preempted asynchronously, or perhaps it sleeps while blocked on a
+   mutex. The dirty FP state in the FP registers is saved to the parent
+   process' context and the FPU is disabled.
+
+5) When the process is rescheduled again it continues copying state
+   until it gets to copy_thread(), which checks whether the FPU is in
+   use, so that it can copy that dirty state to the child process' task
+   context. Because of the deschedule however the FPU is not in use, so
+   the child process' context is left with stale FP context from the
+   last time the parent saved it (some time before (1)).
+
+6) When the new child process is scheduled it reads the important data
+   from the saved floating point register, and ends up doing a NULL
+   pointer dereference as a result of the stale data.
+
+This use of saved floating point registers across function calls can be
+triggered fairly easily by explicitly using inline asm with a current
+(MIPS R2) compiler, but is far more likely to happen unintentionally
+with a MIPS R6 compiler where the FP registers are more likely to get
+used as scratch registers for storing non-fp data.
+
+It is easily fixed, in the same way that other architectures do it, by
+overriding the implementation of arch_dup_task_struct() to sync the
+dirty hardware state to the parent process' task context *prior* to
+duplicating it, rather than copying straight to the child process' task
+context in copy_thread(). Note, the FPU hardware is not disabled so the
+parent process may continue executing with the live register context,
+but now the child process is guaranteed to have an identical copy of it
+at that point.
+
+Signed-off-by: James Hogan <james.hogan@imgtec.com>
+Reported-by: Matthew Fortune <matthew.fortune@imgtec.com>
+Tested-by: Markos Chandras <markos.chandras@imgtec.com>
+Cc: Ralf Baechle <ralf@linux-mips.org>
+Cc: Paul Burton <paul.burton@imgtec.com>
+Cc: linux-mips@linux-mips.org
+Patchwork: https://patchwork.linux-mips.org/patch/9075/
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+

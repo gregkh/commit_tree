@@ -1,0 +1,52 @@
+sched/numa: Fix unsafe get_task_struct() in task_numa_assign()
+
+Unlocked access to dst_rq->curr in task_numa_compare() is racy.
+If curr task is exiting this may be a reason of use-after-free:
+
+task_numa_compare()                    do_exit()
+    ...                                        current->flags |= PF_EXITING;
+    ...                                    release_task()
+    ...                                        ~~delayed_put_task_struct()~~
+    ...                                    schedule()
+    rcu_read_lock()                        ...
+    cur = ACCESS_ONCE(dst_rq->curr)        ...
+        ...                                rq->curr = next;
+        ...                                    context_switch()
+        ...                                        finish_task_switch()
+        ...                                            put_task_struct()
+        ...                                                __put_task_struct()
+        ...                                                    free_task_struct()
+        task_numa_assign()                                     ...
+            get_task_struct()                                  ...
+
+As noted by Oleg:
+
+  <<The lockless get_task_struct(tsk) is only safe if tsk == current
+    and didn't pass exit_notify(), or if this tsk was found on a rcu
+    protected list (say, for_each_process() or find_task_by_vpid()).
+    IOW, it is only safe if release_task() was not called before we
+    take rcu_read_lock(), in this case we can rely on the fact that
+    delayed_put_pid() can not drop the (potentially) last reference
+    until rcu_read_unlock().
+
+    And as Kirill pointed out task_numa_compare()->task_numa_assign()
+    path does get_task_struct(dst_rq->curr) and this is not safe. The
+    task_struct itself can't go away, but rcu_read_lock() can't save
+    us from the final put_task_struct() in finish_task_switch(); this
+    reference goes away without rcu gp>>
+
+The patch provides simple check of PF_EXITING flag. If it's not set,
+this guarantees that call_rcu() of delayed_put_task_struct() callback
+hasn't happened yet, so we can safely do get_task_struct() in
+task_numa_assign().
+
+Locked dst_rq->lock protects from concurrency with the last schedule().
+Reusing or unmapping of cur's memory may happen without it.
+
+Suggested-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Kirill Tkhai <ktkhai@parallels.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/1413962231.19914.130.camel@tkhai
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+

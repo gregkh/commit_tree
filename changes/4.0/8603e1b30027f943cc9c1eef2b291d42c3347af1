@@ -1,0 +1,67 @@
+workqueue: fix hang involving racing cancel[_delayed]_work_sync()'s for PREEMPT_NONE
+
+cancel[_delayed]_work_sync() are implemented using
+__cancel_work_timer() which grabs the PENDING bit using
+try_to_grab_pending() and then flushes the work item with PENDING set
+to prevent the on-going execution of the work item from requeueing
+itself.
+
+try_to_grab_pending() can always grab PENDING bit without blocking
+except when someone else is doing the above flushing during
+cancelation.  In that case, try_to_grab_pending() returns -ENOENT.  In
+this case, __cancel_work_timer() currently invokes flush_work().  The
+assumption is that the completion of the work item is what the other
+canceling task would be waiting for too and thus waiting for the same
+condition and retrying should allow forward progress without excessive
+busy looping
+
+Unfortunately, this doesn't work if preemption is disabled or the
+latter task has real time priority.  Let's say task A just got woken
+up from flush_work() by the completion of the target work item.  If,
+before task A starts executing, task B gets scheduled and invokes
+__cancel_work_timer() on the same work item, its try_to_grab_pending()
+will return -ENOENT as the work item is still being canceled by task A
+and flush_work() will also immediately return false as the work item
+is no longer executing.  This puts task B in a busy loop possibly
+preventing task A from executing and clearing the canceling state on
+the work item leading to a hang.
+
+task A			task B			worker
+
+						executing work
+__cancel_work_timer()
+  try_to_grab_pending()
+  set work CANCELING
+  flush_work()
+    block for work completion
+						completion, wakes up A
+			__cancel_work_timer()
+			while (forever) {
+			  try_to_grab_pending()
+			    -ENOENT as work is being canceled
+			  flush_work()
+			    false as work is no longer executing
+			}
+
+This patch removes the possible hang by updating __cancel_work_timer()
+to explicitly wait for clearing of CANCELING rather than invoking
+flush_work() after try_to_grab_pending() fails with -ENOENT.
+
+Link: http://lkml.kernel.org/g/20150206171156.GA8942@axis.com
+
+v3: bit_waitqueue() can't be used for work items defined in vmalloc
+    area.  Switched to custom wake function which matches the target
+    work item and exclusive wait and wakeup.
+
+v2: v1 used wake_up() on bit_waitqueue() which leads to NULL deref if
+    the target bit waitqueue has wait_bit_queue's on it.  Use
+    DEFINE_WAIT_BIT() and __wake_up_bit() instead.  Reported by Tomeu
+    Vizoso.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Rabin Vincent <rabin.vincent@axis.com>
+Cc: Tomeu Vizoso <tomeu.vizoso@gmail.com>
+Cc: stable@vger.kernel.org
+Tested-by: Jesper Nilsson <jesper.nilsson@axis.com>
+Tested-by: Rabin Vincent <rabin.vincent@axis.com>
+

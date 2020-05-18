@@ -1,0 +1,61 @@
+ACPI / PAD: call schedule() when need_resched() is true
+
+The purpose of the acpi_pad driver is to implement the "processor power
+aggregator" device as described in the ACPI 4.0 spec section 8.5. It
+takes requests from the BIOS (via ACPI) to put a specified number of
+CPUs into idle, in order to save power, until further notice.
+
+It does this by creating high-priority threads that try to keep the CPUs
+in a high C-state (using the monitor/mwait CPU instructions). The
+mwait() call is in a loop that checks periodically if the thread should
+end and a few other things.
+
+It was discovered through testing that the power_saving threads were
+causing the system to consume more power than the system was consuming
+before the threads were created. A counter in the main loop of
+power_saving_thread() revealed that it was spinning. The mwait()
+instruction was not keeping the CPU in a high C state very much if at
+all.
+
+Here is a simplification of the loop in function power_saving_thread() in
+drivers/acpi/acpi_pad.c
+
+    while (!kthread_should_stop()) {
+         :
+        try_to_freeze()
+         :
+        while (!need_resched()) {
+             :
+            if (!need_resched())
+                __mwait(power_saving_mwait_eax, 1);
+             :
+            if (jiffies > expire_time) {
+                do_sleep = 1;
+                break;
+            }
+        }
+    }
+
+If need_resched() returns true, then mwait() is not called. It was
+returning true because of things like timer interrupts, as in the
+following sequence.
+
+hrtimer_interrupt->__run_hrtimer->tick_sched_timer-> update_process_times->
+rcu_check_callbacks->rcu_pending->__rcu_pending->set_need_resched
+
+Kernels 3.5.0-rc2+ do not exhibit this problem, because a patch to
+try_to_freeze() in include/linux/freezer.h introduces a call to
+might_sleep(), which ultimately calls schedule() to clear the reschedule
+flag and allows the the loop to execute the call to mwait().
+
+However, the changes to try_to_freeze are unrelated to acpi_pad, and it
+does not seem like a good idea to rely on an unrelated patch in a
+function that could later be changed and reintroduce this bug.
+
+Therefore, it seems better to make an explicit call to schedule() in the
+outer loop when the need_resched flag is set.
+
+Reported-and-tested-by: Stuart Hayes <stuart_hayes@dell.com>
+Signed-off-by: Tony Camuso <tcamuso@redhat.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

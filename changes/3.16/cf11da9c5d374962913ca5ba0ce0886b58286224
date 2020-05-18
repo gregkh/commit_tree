@@ -1,0 +1,83 @@
+xfs: refine the allocation stack switch
+
+The allocation stack switch at xfs_bmapi_allocate() has served it's
+purpose, but is no longer a sufficient solution to the stack usage
+problem we have in the XFS allocation path.
+
+Whilst the kernel stack size is now 16k, that is not a valid reason
+for undoing all our "keep stack usage down" modifications. What it
+does allow us to do is have the freedom to refine and perfect the
+modifications knowing that if we get it wrong it won't blow up in
+our faces - we have a safety net now.
+
+This is important because we still have the issue of older kernels
+having smaller stacks and that they are still supported and are
+demonstrating a wide range of different stack overflows.  Red Hat
+has several open bugs for allocation based stack overflows from
+directory modifications and direct IO block allocation and these
+problems still need to be solved. If we can solve them upstream,
+then distro's won't need to bake their own unique solutions.
+
+To that end, I've observed that every allocation based stack
+overflow report has had a specific characteristic - it has happened
+during or directly after a bmap btree block split. That event
+requires a new block to be allocated to the tree, and so we
+effectively stack one allocation stack on top of another, and that's
+when we get into trouble.
+
+A further observation is that bmap btree block splits are much rarer
+than writeback allocation - over a range of different workloads I've
+observed the ratio of bmap btree inserts to splits ranges from 100:1
+(xfstests run) to 10000:1 (local VM image server with sparse files
+that range in the hundreds of thousands to millions of extents).
+Either way, bmap btree split events are much, much rarer than
+allocation events.
+
+Finally, we have to move the kswapd state to the allocation workqueue
+work when allocation is done on behalf of kswapd. This is proving to
+cause significant perturbation in performance under memory pressure
+and appears to be generating allocation deadlock warnings under some
+workloads, so avoiding the use of a workqueue for the majority of
+kswapd writeback allocation will minimise the impact of such
+behaviour.
+
+Hence it makes sense to move the stack switch to xfs_btree_split()
+and only do it for bmap btree splits. Stack switches during
+allocation will be much rarer, so there won't be significant
+performacne overhead caused by switching stacks. The worse case
+stack from all allocation paths will be split, not just writeback.
+And the majority of memory allocations will be done in the correct
+context (e.g. kswapd) without causing additional latency, and so we
+simplify the memory reclaim interactions between processes,
+workqueues and kswapd.
+
+The worst stack I've been able to generate with this patch in place
+is 5600 bytes deep. It's very revealing because we exit XFS at:
+
+37)     1768      64   kmem_cache_alloc+0x13b/0x170
+
+about 1800 bytes of stack consumed, and the remaining 3800 bytes
+(and 36 functions) is memory reclaim, swap and the IO stack. And
+this occurs in the inode allocation from an open(O_CREAT) syscall,
+not writeback.
+
+The amount of stack being used is much less than I've previously be
+able to generate - fs_mark testing has been able to generate stack
+usage of around 7k without too much trouble; with this patch it's
+only just getting to 5.5k. This is primarily because the metadata
+allocation paths (e.g. directory blocks) are no longer causing
+double splits on the same stack, and hence now stack tracing is
+showing swapping being the worst stack consumer rather than XFS.
+
+Performance of fs_mark inode create workloads is unchanged.
+Performance of fs_mark async fsync workloads is consistently good
+with context switches reduced by around 150,000/s (30%).
+Performance of dbench, streaming IO and postmark is unchanged.
+Allocation deadlock warnings have not been seen on the workloads
+that generated them since adding this patch.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+

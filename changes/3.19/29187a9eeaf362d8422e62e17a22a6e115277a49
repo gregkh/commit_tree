@@ -1,0 +1,56 @@
+workqueue: fix subtle pool management issue which can stall whole worker_pool
+
+A worker_pool's forward progress is guaranteed by the fact that the
+last idle worker assumes the manager role to create more workers and
+summon the rescuers if creating workers doesn't succeed in timely
+manner before proceeding to execute work items.
+
+This manager role is implemented in manage_workers(), which indicates
+whether the worker may proceed to work item execution with its return
+value.  This is necessary because multiple workers may contend for the
+manager role, and, if there already is a manager, others should
+proceed to work item execution.
+
+Unfortunately, the function also indicates that the worker may proceed
+to work item execution if need_to_create_worker() is false at the head
+of the function.  need_to_create_worker() tests the following
+conditions.
+
+	pending work items && !nr_running && !nr_idle
+
+The first and third conditions are protected by pool->lock and thus
+won't change while holding pool->lock; however, nr_running can change
+asynchronously as other workers block and resume and while it's likely
+to be zero, as someone woke this worker up in the first place, some
+other workers could have become runnable inbetween making it non-zero.
+
+If this happens, manage_worker() could return false even with zero
+nr_idle making the worker, the last idle one, proceed to execute work
+items.  If then all workers of the pool end up blocking on a resource
+which can only be released by a work item which is pending on that
+pool, the whole pool can deadlock as there's no one to create more
+workers or summon the rescuers.
+
+This patch fixes the problem by removing the early exit condition from
+maybe_create_worker() and making manage_workers() return false iff
+there's already another manager, which ensures that the last worker
+doesn't start executing work items.
+
+We can leave the early exit condition alone and just ignore the return
+value but the only reason it was put there is because the
+manage_workers() used to perform both creations and destructions of
+workers and thus the function may be invoked while the pool is trying
+to reduce the number of workers.  Now that manage_workers() is called
+only when more workers are needed, the only case this early exit
+condition is triggered is rare race conditions rendering it pointless.
+
+Tested with simulated workload and modified workqueue code which
+trigger the pool deadlock reliably without this patch.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Eric Sandeen <sandeen@sandeen.net>
+Link: http://lkml.kernel.org/g/54B019F4.8030009@sandeen.net
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Lai Jiangshan <laijs@cn.fujitsu.com>
+Cc: stable@vger.kernel.org
+

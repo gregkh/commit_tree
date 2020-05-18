@@ -1,0 +1,48 @@
+rcu: Make callers awaken grace-period kthread
+
+The rcu_start_gp_advanced() function currently uses irq_work_queue()
+to defer wakeups of the RCU grace-period kthread.  This deferring
+is necessary to avoid RCU-scheduler deadlocks involving the rcu_node
+structure's lock, meaning that RCU cannot call any of the scheduler's
+wake-up functions while holding one of these locks.
+
+Unfortunately, the second and subsequent calls to irq_work_queue() are
+ignored, and the first call will be ignored (aside from queuing the work
+item) if the scheduler-clock tick is turned off.  This is OK for many
+uses, especially those where irq_work_queue() is called from an interrupt
+or softirq handler, because in those cases the scheduler-clock-tick state
+will be re-evaluated, which will turn the scheduler-clock tick back on.
+On the next tick, any deferred work will then be processed.
+
+However, this strategy does not always work for RCU, which can be invoked
+at process level from idle CPUs.  In this case, the tick might never
+be turned back on, indefinitely defering a grace-period start request.
+Note that the RCU CPU stall detector cannot see this condition, because
+there is no RCU grace period in progress.  Therefore, we can (and do!)
+see long tens-of-seconds stalls in grace-period handling.  In theory,
+we could see a full grace-period hang, but rcutorture testing to date
+has seen only the tens-of-seconds stalls.  Event tracing demonstrates
+that irq_work_queue() is being called repeatedly to no effect during
+these stalls: The "newreq" event appears repeatedly from a task that is
+not one of the grace-period kthreads.
+
+In theory, irq_work_queue() might be fixed to avoid this sort of issue,
+but RCU's requirements are unusual and it is quite straightforward to pass
+wake-up responsibility up through RCU's call chain, so that the wakeup
+happens when the offending locks are released.
+
+This commit therefore makes this change.  The rcu_start_gp_advanced(),
+rcu_start_future_gp(), rcu_accelerate_cbs(), rcu_advance_cbs(),
+__note_gp_changes(), and rcu_start_gp() functions now return a boolean
+which indicates when a wake-up is needed.  A new rcu_gp_kthread_wake()
+does the wakeup when it is necessary and safe to do so: No self-wakes,
+no wake-ups if the ->gp_flags field indicates there is no need (as in
+someone else did the wake-up before we got around to it), and no wake-ups
+before the grace-period kthread has been created.
+
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Frederic Weisbecker <fweisbec@gmail.com>
+Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+

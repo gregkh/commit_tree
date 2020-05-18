@@ -1,0 +1,117 @@
+mm/hugetlb: take page table lock in follow_huge_pmd()
+
+We have a race condition between move_pages() and freeing hugepages, where
+move_pages() calls follow_page(FOLL_GET) for hugepages internally and
+tries to get its refcount without preventing concurrent freeing.  This
+race crashes the kernel, so this patch fixes it by moving FOLL_GET code
+for hugepages into follow_huge_pmd() with taking the page table lock.
+
+This patch intentionally removes page==NULL check after pte_page.
+This is justified because pte_page() never returns NULL for any
+architectures or configurations.
+
+This patch changes the behavior of follow_huge_pmd() for tail pages and
+then tail pages can be pinned/returned.  So the caller must be changed to
+properly handle the returned tail pages.
+
+We could have a choice to add the similar locking to
+follow_huge_(addr|pud) for consistency, but it's not necessary because
+currently these functions don't support FOLL_GET flag, so let's leave it
+for future development.
+
+Here is the reproducer:
+
+  $ cat movepages.c
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <numaif.h>
+
+  #define ADDR_INPUT      0x700000000000UL
+  #define HPS             0x200000
+  #define PS              0x1000
+
+  int main(int argc, char *argv[]) {
+          int i;
+          int nr_hp = strtol(argv[1], NULL, 0);
+          int nr_p  = nr_hp * HPS / PS;
+          int ret;
+          void **addrs;
+          int *status;
+          int *nodes;
+          pid_t pid;
+
+          pid = strtol(argv[2], NULL, 0);
+          addrs  = malloc(sizeof(char *) * nr_p + 1);
+          status = malloc(sizeof(char *) * nr_p + 1);
+          nodes  = malloc(sizeof(char *) * nr_p + 1);
+
+          while (1) {
+                  for (i = 0; i < nr_p; i++) {
+                          addrs[i] = (void *)ADDR_INPUT + i * PS;
+                          nodes[i] = 1;
+                          status[i] = 0;
+                  }
+                  ret = numa_move_pages(pid, nr_p, addrs, nodes, status,
+                                        MPOL_MF_MOVE_ALL);
+                  if (ret == -1)
+                          err("move_pages");
+
+                  for (i = 0; i < nr_p; i++) {
+                          addrs[i] = (void *)ADDR_INPUT + i * PS;
+                          nodes[i] = 0;
+                          status[i] = 0;
+                  }
+                  ret = numa_move_pages(pid, nr_p, addrs, nodes, status,
+                                        MPOL_MF_MOVE_ALL);
+                  if (ret == -1)
+                          err("move_pages");
+          }
+          return 0;
+  }
+
+  $ cat hugepage.c
+  #include <stdio.h>
+  #include <sys/mman.h>
+  #include <string.h>
+
+  #define ADDR_INPUT      0x700000000000UL
+  #define HPS             0x200000
+
+  int main(int argc, char *argv[]) {
+          int nr_hp = strtol(argv[1], NULL, 0);
+          char *p;
+
+          while (1) {
+                  p = mmap((void *)ADDR_INPUT, nr_hp * HPS, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+                  if (p != (void *)ADDR_INPUT) {
+                          perror("mmap");
+                          break;
+                  }
+                  memset(p, 0, nr_hp * HPS);
+                  munmap(p, nr_hp * HPS);
+          }
+  }
+
+  $ sysctl vm.nr_hugepages=40
+  $ ./hugepage 10 &
+  $ ./movepages 10 $(pgrep -f hugepage)
+
+Fixes: e632a938d914 ("mm: migrate: add hugepage migration code to move_pages()")
+Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Reported-by: Hugh Dickins <hughd@google.com>
+Cc: James Hogan <james.hogan@imgtec.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Mel Gorman <mel@csn.ul.ie>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Luiz Capitulino <lcapitulino@redhat.com>
+Cc: Nishanth Aravamudan <nacc@linux.vnet.ibm.com>
+Cc: Lee Schermerhorn <lee.schermerhorn@hp.com>
+Cc: Steve Capper <steve.capper@linaro.org>
+Cc: <stable@vger.kernel.org>	[3.12+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

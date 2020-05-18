@@ -1,0 +1,44 @@
+Btrfs: fix freeing used extent after removing empty block group
+
+Due to ignoring errors returned by clear_extent_bits (at the moment only
+-ENOMEM is possible), we can end up freeing an extent that is actually in
+use (i.e. return the extent to the free space cache).
+
+The sequence of steps that lead to this:
+
+1) Cleaner thread starts execution and calls btrfs_delete_unused_bgs(), with
+   the goal of freeing empty block groups;
+
+2) btrfs_delete_unused_bgs() finds an empty block group, joins the current
+   transaction (or starts a new one if none is running) and attempts to
+   clear the EXTENT_DIRTY bit for the block group's range from freed_extents[0]
+   and freed_extents[1] (of which one corresponds to fs_info->pinned_extents);
+
+3) Clearing the EXTENT_DIRTY bit (via clear_extent_bits()) fails with
+   -ENOMEM, but such error is ignored and btrfs_delete_unused_bgs() proceeds
+   to delete the block group and the respective chunk, while pinned_extents
+   remains with that bit set for the whole (or a part of the) range covered
+   by the block group;
+
+4) Later while the transaction is still running, the chunk ends up being reused
+   for a new block group (maybe for different purpose, data or metadata), and
+   extents belonging to the new block group are allocated for file data or btree
+   nodes/leafs;
+
+5) The current transaction is committed, meaning that we unpinned one or more
+   extents from the new block group (through btrfs_finish_extent_commit() and
+   unpin_extent_range()) which are now being used for new file data or new
+   metadata (through btrfs_finish_extent_commit() and unpin_extent_range()).
+   And unpinning means we returned the extents to the free space cache of the
+   new block group, which implies those extents can be used for future allocations
+   while they're still in use.
+
+Alternatively, we can hit a BUG_ON() when doing a lookup for a block group's cache
+object in unpin_extent_range() if a new block group didn't end up being allocated for
+the same chunk (step 4 above).
+
+Fix this by not freeing the block group and chunk if we fail to clear the dirty bit.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

@@ -1,0 +1,194 @@
+rcu: Make rcu_nmi_enter() handle nesting
+
+The x86 architecture has multiple types of NMI-like interrupts: real
+NMIs, machine checks, and, for some values of NMI-like, debugging
+and breakpoint interrupts.  These interrupts can nest inside each
+other.  Andy Lutomirski is adding RCU support to these interrupts,
+so rcu_nmi_enter() and rcu_nmi_exit() must now correctly handle nesting.
+
+This commit therefore introduces nesting, using a clever NMI-coordination
+algorithm suggested by Andy.  The trick is to atomically increment
+->dynticks (if needed) before manipulating ->dynticks_nmi_nesting on entry
+(and, accordingly, after on exit).  In addition, ->dynticks_nmi_nesting
+is incremented by one if ->dynticks was incremented and by two otherwise.
+This means that when rcu_nmi_exit() sees ->dynticks_nmi_nesting equal
+to one, it knows that ->dynticks must be atomically incremented.
+
+This NMI-coordination algorithms has been validated by the following
+Promela model:
+
+------------------------------------------------------------------------
+
+/*
+ * Promela model for Andy Lutomirski's suggested change to rcu_nmi_enter()
+ * that allows nesting.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, you can access it online at
+ * http://www.gnu.org/licenses/gpl-2.0.html.
+ *
+ * Copyright IBM Corporation, 2014
+ *
+ * Author: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+ */
+
+byte dynticks_nmi_nesting = 0;
+byte dynticks = 0;
+
+/*
+ * Promela verision of rcu_nmi_enter().
+ */
+inline rcu_nmi_enter()
+{
+	byte incby;
+	byte tmp;
+
+	incby = BUSY_INCBY;
+	assert(dynticks_nmi_nesting >= 0);
+	if
+	:: (dynticks & 1) == 0 ->
+		atomic {
+			dynticks = dynticks + 1;
+		}
+		assert((dynticks & 1) == 1);
+		incby = 1;
+	:: else ->
+		skip;
+	fi;
+	tmp = dynticks_nmi_nesting;
+	tmp = tmp + incby;
+	dynticks_nmi_nesting = tmp;
+	assert(dynticks_nmi_nesting >= 1);
+}
+
+/*
+ * Promela verision of rcu_nmi_exit().
+ */
+inline rcu_nmi_exit()
+{
+	byte tmp;
+
+	assert(dynticks_nmi_nesting > 0);
+	assert((dynticks & 1) != 0);
+	if
+	:: dynticks_nmi_nesting != 1 ->
+		tmp = dynticks_nmi_nesting;
+		tmp = tmp - BUSY_INCBY;
+		dynticks_nmi_nesting = tmp;
+	:: else ->
+		dynticks_nmi_nesting = 0;
+		atomic {
+			dynticks = dynticks + 1;
+		}
+		assert((dynticks & 1) == 0);
+	fi;
+}
+
+/*
+ * Base-level NMI runs non-atomically.  Crudely emulates process-level
+ * dynticks-idle entry/exit.
+ */
+proctype base_NMI()
+{
+	byte busy;
+
+	busy = 0;
+	do
+	::	/* Emulate base-level dynticks and not. */
+		if
+		:: 1 ->	atomic {
+				dynticks = dynticks + 1;
+			}
+			busy = 1;
+		:: 1 ->	skip;
+		fi;
+
+		/* Verify that we only sometimes have base-level dynticks. */
+		if
+		:: busy == 0 -> skip;
+		:: busy == 1 -> skip;
+		fi;
+
+		/* Model RCU's NMI entry and exit actions. */
+		rcu_nmi_enter();
+		assert((dynticks & 1) == 1);
+		rcu_nmi_exit();
+
+		/* Emulated re-entering base-level dynticks and not. */
+		if
+		:: !busy -> skip;
+		:: busy ->
+			atomic {
+				dynticks = dynticks + 1;
+			}
+			busy = 0;
+		fi;
+
+		/* We had better now be in dyntick-idle mode. */
+		assert((dynticks & 1) == 0);
+	od;
+}
+
+/*
+ * Nested NMI runs atomically to emulate interrupting base_level().
+ */
+proctype nested_NMI()
+{
+	do
+	::	/*
+		 * Use an atomic section to model a nested NMI.  This is
+		 * guaranteed to interleave into base_NMI() between a pair
+		 * of base_NMI() statements, just as a nested NMI would.
+		 */
+		atomic {
+			/* Verify that we only sometimes are in dynticks. */
+			if
+			:: (dynticks & 1) == 0 -> skip;
+			:: (dynticks & 1) == 1 -> skip;
+			fi;
+
+			/* Model RCU's NMI entry and exit actions. */
+			rcu_nmi_enter();
+			assert((dynticks & 1) == 1);
+			rcu_nmi_exit();
+		}
+	od;
+}
+
+init {
+	run base_NMI();
+	run nested_NMI();
+}
+
+------------------------------------------------------------------------
+
+The following script can be used to run this model if placed in
+rcu_nmi.spin:
+
+------------------------------------------------------------------------
+
+if ! spin -a rcu_nmi.spin
+then
+	echo Spin errors!!!
+	exit 1
+fi
+if ! cc -DSAFETY -o pan pan.c
+then
+	echo Compilation errors!!!
+	exit 1
+fi
+./pan -m100000
+
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Reviewed-by: Lai Jiangshan <laijs@cn.fujitsu.com>
+

@@ -1,0 +1,47 @@
+xfs: xlog_cil_force_lsn doesn't always wait correctly
+
+When running a tight mount/unmount loop on an older kernel, RedHat
+QE found that unmount would occasionally hang in
+xfs_buf_unpin_wait() on the superblock buffer. Tracing and other
+debug work by Eric Sandeen indicated that it was hanging on the
+writing of the superblock during unmount immediately after logging
+the superblock counters in a synchronous transaction. Further debug
+indicated that the synchronous transaction was not waiting for
+completion correctly, and we narrowed it down to
+xlog_cil_force_lsn() returning NULLCOMMITLSN and hence not pushing
+the transaction in the iclog buffer to disk correctly.
+
+While this unmount superblock write code is now very different in
+mainline kernels, the xlog_cil_force_lsn() code is identical, and it
+was bisected to the backport of commit f876e44 ("xfs: always do log
+forces via the workqueue"). This commit made the CIL push
+asynchronous for log forces and hence exposed a race condition that
+couldn't occur on a synchronous push.
+
+Essentially, the xlog_cil_force_lsn() relied implicitly on the fact
+that the sequence push would be complete by the time
+xlog_cil_push_now() returned, resulting in the context being pushed
+being in the committing list. When it was made asynchronous, it was
+recognised that there was a race condition in detecting whether an
+asynchronous push has started or not and code was added to handle
+it.
+
+Unfortunately, the fix was not quite right and left a race condition
+where it it would detect an empty CIL while a push was in progress
+before the context had been added to the committing list. This was
+incorrectly seen as a "nothing to do" condition and so would tell
+xfs_log_force_lsn() that there is nothing to wait for, and hence it
+would push the iclogbufs in memory.
+
+The fix is simple, but explaining the logic and the race condition
+is a lot more complex. The fix is to add the context to the
+committing list before we start emptying the CIL. This allows us to
+detect the difference between an empty "do nothing" push and a push
+that has not started by adding a discrete "emptying the CIL" state
+to avoid the transient, incorrect "empty" condition that the
+(unchanged) waiting code was seeing.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+

@@ -1,0 +1,75 @@
+[media] img-ir/hw: Fix potential deadlock stopping timer
+
+The end timer is used for switching back from repeat code timings when
+no repeat codes have been received for a certain amount of time. When
+the protocol is changed, the end timer is deleted synchronously with
+del_timer_sync(), however this takes place while holding the main spin
+lock, and the timer handler also needs to acquire the spin lock.
+
+This opens the possibility of a deadlock on an SMP system if the
+protocol is changed just as the repeat timer is expiring. One CPU could
+end up in img_ir_set_decoder() holding the lock and waiting for the end
+timer to complete, while the other CPU is stuck in the timer handler
+spinning on the lock held by the first CPU.
+
+Lockdep also spots a possible lock inversion in the same code, since
+img_ir_set_decoder() acquires the img-ir lock before the timer lock, but
+the timer handler will try and acquire them the other way around:
+
+=========================================================
+[ INFO: possible irq lock inversion dependency detected ]
+3.18.0-rc5+ #957 Not tainted
+---------------------------------------------------------
+swapper/0/0 just changed the state of lock:
+ (((&hw->end_timer))){+.-...}, at: [<4006ae5c>] _call_timer_fn+0x0/0xfc
+but this lock was taken by another, HARDIRQ-safe lock in the past:
+ (&(&priv->lock)->rlock#2){-.....}
+
+and interrupts could create inverse lock ordering between them.
+
+other info that might help us debug this:
+ Possible interrupt unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(((&hw->end_timer)));
+                               local_irq_disable();
+                               lock(&(&priv->lock)->rlock#2);
+                               lock(((&hw->end_timer)));
+  <Interrupt>
+    lock(&(&priv->lock)->rlock#2);
+
+ *** DEADLOCK ***
+
+This is fixed by releasing the main spin lock while performing the
+del_timer_sync() call. The timer is prevented from restarting before the
+lock is reacquired by a new "stopping" flag which img_ir_handle_data()
+checks before updating the timer.
+
+---------------------------------------------------------
+swapper/0/0 just changed the state of lock:
+ (((&hw->end_timer))){+.-...}, at: [<4006ae5c>] _call_timer_fn+0x0/0xfc
+but this lock was taken by another, HARDIRQ-safe lock in the past:
+ (&(&priv->lock)->rlock#2){-.....}
+and interrupts could create inverse lock ordering between them.
+other info that might help us debug this:
+ Possible interrupt unsafe locking scenario:
+       CPU0                    CPU1
+       ----                    ----
+  lock(((&hw->end_timer)));
+                               local_irq_disable();
+                               lock(&(&priv->lock)->rlock#2);
+                               lock(((&hw->end_timer)));
+  <Interrupt>
+    lock(&(&priv->lock)->rlock#2);
+ *** DEADLOCK ***
+This is fixed by releasing the main spin lock while performing the
+del_timer_sync() call. The timer is prevented from restarting before the
+lock is reacquired by a new "stopping" flag which img_ir_handle_data()
+checks before updating the timer.
+
+Signed-off-by: James Hogan <james.hogan@imgtec.com>
+Cc: Sifan Naeem <sifan.naeem@imgtec.com>
+Cc: <stable@vger.kernel.org> # v3.15+
+Signed-off-by: Mauro Carvalho Chehab <mchehab@osg.samsung.com>
+

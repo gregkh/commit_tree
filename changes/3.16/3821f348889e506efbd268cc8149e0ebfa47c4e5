@@ -1,0 +1,51 @@
+Btrfs: update commit root on snapshot creation after orphan cleanup
+
+On snapshot creation (either writable or read-only), we do orphan cleanup
+against the root of the snapshot. If the cleanup did remove any orphans,
+then the current root node will be different from the commit root node
+until the next transaction commit happens.
+
+A send operation always uses the commit root of a snapshot - this means
+it will see the orphans if it starts computing the send stream before the
+next transaction commit happens (triggered by a timer or sync() for .e.g),
+which is when the commit root gets assigned a reference to current root,
+where the orphans are not visible anymore. The consequence of send seeing
+the orphans is explained below.
+
+For example:
+
+    mkfs.btrfs -f /dev/sdd
+    mount -o commit=999 /dev/sdd /mnt
+
+    # open a file with O_TMPFILE and leave it open
+    # write some data to the file
+    btrfs subvolume snapshot -r /mnt /mnt/snap1
+
+    btrfs send /mnt/snap1 -f /tmp/send.data
+
+The send operation will fail with the following error:
+
+    ERROR: send ioctl failed with -116: Stale file handle
+
+What happens here is that our snapshot has an orphan inode still visible
+through the commit root, that corresponds to the tmpfile. However send
+will attempt to call inode.c:btrfs_iget(), with the goal of reading the
+file's data, which will return -ESTALE because it will use the current
+root (and not the commit root) of the snapshot.
+
+Of course, there are other cases where we can get orphans, but this
+example using a tmpfile makes it much easier to reproduce the issue.
+
+Therefore on snapshot creation, after calling btrfs_orphan_cleanup, if
+the commit root is different from the current root, just commit the
+transaction associated with the snapshot's root (if it exists), so that
+a send will not see any orphans that don't exist anymore. This also
+guarantees a send will always see the same content regardless of whether
+a transaction commit happened already before the send was requested and
+after the orphan cleanup (meaning the commit root and current roots are
+the same) or it hasn't happened yet (commit and current roots are
+different).
+
+Signed-off-by: Filipe David Borba Manana <fdmanana@gmail.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

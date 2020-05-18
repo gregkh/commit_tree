@@ -1,0 +1,72 @@
+uprobes/x86: Emulate relative call's
+
+See the previous "Emulate unconditional relative jmp's" which explains
+why we can not execute "jmp" out-of-line, the same applies to "call".
+
+Emulating of rip-relative call is trivial, we only need to additionally
+push the ret-address. If this fails, we execute this instruction out of
+line and this should trigger the trap, the probed application should die
+or the same insn will be restarted if a signal handler expands the stack.
+We do not even need ->post_xol() for this case.
+
+But there is a corner (and almost theoretical) case: another thread can
+expand the stack right before we execute this insn out of line. In this
+case it hit the same problem we are trying to solve. So we simply turn
+the probed insn into "call 1f; 1:" and add ->post_xol() which restores
+->sp and restarts.
+
+Many thanks to Jonathan who finally found the standalone reproducer,
+otherwise I would never resolve the "random SIGSEGV's under systemtap"
+bug-report. Now that the problem is clear we can write the simplified
+test-case:
+
+	void probe_func(void), callee(void);
+
+	int failed = 1;
+
+	asm (
+		".text\n"
+		".align 4096\n"
+		".globl probe_func\n"
+		"probe_func:\n"
+		"call callee\n"
+		"ret"
+	);
+
+	/*
+	 * This assumes that:
+	 *
+	 *	- &probe_func = 0x401000 + a_bit, aligned = 0x402000
+	 *
+	 *	- xol_vma->vm_start = TASK_SIZE_MAX - PAGE_SIZE = 0x7fffffffe000
+	 *	  as xol_add_vma() asks; the 1st slot = 0x7fffffffe080
+	 *
+	 * so we can target the non-canonical address from xol_vma using
+	 * the simple math below, 100 * 4096 is just the random offset
+	 */
+	asm (".org . + 0x800000000000 - 0x7fffffffe080 - 5 - 1  + 100 * 4096\n");
+
+	void callee(void)
+	{
+		failed = 0;
+	}
+
+	int main(void)
+	{
+		probe_func();
+		return failed;
+	}
+
+It SIGSEGV's if you probe "probe_func" (although this is not very reliable,
+randomize_va_space/etc can change the placement of xol area).
+
+Note: as Denys Vlasenko pointed out, amd and intel treat "callw" (0x66 0xe8)
+differently. This patch relies on lib/insn.c and thus implements the intel's
+behaviour: 0x66 is simply ignored. Fortunately nothing sane should ever use
+this insn, so we postpone the fix until we decide what should we do; emulate
+or not, support or not, etc.
+
+Reported-by: Jonathan Lebon <jlebon@redhat.com>
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+

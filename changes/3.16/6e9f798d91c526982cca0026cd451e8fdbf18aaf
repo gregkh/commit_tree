@@ -1,0 +1,83 @@
+drm: Split connection_mutex out of mode_config.mutex (v3)
+
+After the split-out of crtc locks from the big mode_config.mutex
+there's still two major areas it protects:
+- Various connector probe states, like connector->status, EDID
+  properties, probed mode lists and similar information.
+- The links from connector->encoder and encoder->crtc and other
+  modeset-relevant connector state (e.g. properties which control the
+  panel fitter).
+
+The later is used by modeset operations. But they don't really care
+about the former since it's allowed to e.g. enable a disconnected VGA
+output or with a mode not in the probed list.
+
+Thus far this hasn't been a problem, but for the atomic modeset
+conversion Rob Clark needs to convert all modeset relevant locks into
+w/w locks. This is required because the order of acquisition is
+determined by how userspace supplies the atomic modeset data. This has
+run into troubles in the detect path since the i915 load detect code
+needs _both_ protections offered by the mode_config.mutex: It updates
+probe state and it needs to change the modeset configuration to enable
+the temporary load detect pipe.
+
+The big deal here is that for the probe/detect users of this lock a
+plain mutex fits best, but for atomic modesets we really want a w/w
+mutex. To fix this lets split out a new connection_mutex lock for the
+modeset relevant parts.
+
+For simplicity I've decided to only add one additional lock for all
+connector/encoder links and modeset configuration states. We have
+piles of different modeset objects in addition to those (like bridges
+or panels), so adding per-object locks would be much more effort.
+
+Also, we're guaranteed (at least for now) to do a full modeset if we
+need to acquire this lock. Which means that fine-grained locking is
+fairly irrelevant compared to the amount of time the full modeset will
+take.
+
+I've done a full audit, and there's just a few things that justify
+special focus:
+- Locking in drm_sysfs.c is almost completely absent. We should
+  sprinkle mode_config.connection_mutex over this file a bit, but
+  since it already lacks mode_config.mutex this patch wont make the
+  situation any worse. This is material for a follow-up patch.
+
+- omap has a omap_framebuffer_flush function which walks the
+  connector->encoder->crtc links and is called from many contexts.
+  Some look like they don't acquire mode_config.mutex, so this is
+  already racy. Again fixing this is material for a separate patch.
+
+- The radeon hot_plug function to retrain DP links looks at
+  connector->dpms. Currently this happens without any locking, so is
+  already racy. I think radeon_hotplug_work_func should gain
+  mutex_lock/unlock calls for the mode_config.connection_mutex.
+
+- Same applies to i915's intel_dp_hot_plug. But again, this is already
+  racy.
+
+- i915 load_detect code needs to acquire this lock. Which means the
+  w/w dance due to Rob's work will be nicely contained to _just_ this
+  function.
+
+I've added fixme comments everywhere where it looks suspicious but in
+the sysfs code. After a quick irc discussion with Dave Airlie it
+sounds like the lack of locking in there is due to sysfs cleanup fun
+at module unload.
+
+v1: original (only compile tested)
+
+v2: missing mutex_init(), etc (from Rob Clark)
+
+v3: i915 needs more care in the conversion:
+- Protect the edp pp logic with the connection_mutex.
+- Use connection_mutex in the backlight code due to
+  get_pipe_from_connector.
+- Use drm_modeset_lock_all in suspend/resume paths.
+- Update lock checks in the overlay code.
+
+Cc: Alex Deucher <alexdeucher@gmail.com>
+Cc: Rob Clark <robdclark@gmail.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Reviewed-by: Rob Clark <robdclark@gmail.com>
+

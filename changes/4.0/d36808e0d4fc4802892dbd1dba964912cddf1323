@@ -1,0 +1,71 @@
+Btrfs: fix directory inconsistency after fsync log replay
+
+If we have an inode (file) with a link count greater than 1, remove
+one of its hard links, fsync the inode, power fail/crash and then
+replay the fsync log on the next mount, we end up getting the parent
+directory's metadata inconsistent - its i_size still reflects the
+deleted hard link and has dangling index entries (with no matching
+inode reference entries). This prevents the directory from ever being
+deletable, as its i_size can never decrease to BTRFS_EMPTY_DIR_SIZE
+even if all of its children inodes are deleted, and the dangling index
+entries can never be removed (as they point to an inode that does not
+exist anymore).
+
+This is easy to reproduce with the following excerpt from the test case
+for xfstests that I just made:
+
+    _scratch_mkfs >> $seqres.full 2>&1
+
+    _init_flakey
+    _mount_flakey
+
+    # Create a test file with 2 hard links in the same directory.
+    mkdir -p $SCRATCH_MNT/a/b
+    echo "hello world" > $SCRATCH_MNT/a/b/foo
+    ln $SCRATCH_MNT/a/b/foo $SCRATCH_MNT/a/b/bar
+
+    # Make sure all metadata and data are durably persisted.
+    sync
+
+    # Now remove one of the hard links and fsync the inode.
+    rm -f $SCRATCH_MNT/a/b/bar
+    $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/a/b/foo
+
+    # Simulate a crash/power loss. This makes sure the next mount
+    # will see an fsync log and will replay that log.
+
+    _load_flakey_table $FLAKEY_DROP_WRITES
+    _unmount_flakey
+
+    _load_flakey_table $FLAKEY_ALLOW_WRITES
+    _mount_flakey
+
+    # Remove the last hard link of the file and attempt to remove its parent
+    # directory - this failed in btrfs because the fsync log and replay code
+    # didn't decrement the parent directory's i_size and left dangling directory
+    # index entries - this made the btrfs rmdir implementation always fail with
+    # the error -ENOTEMPTY.
+    #
+    # The dangling directory index entries were visible to user space, but it was
+    # impossible to do anything on them (unlink, open, read, write, stat, etc)
+    # because the inode they pointed to did not exist anymore.
+    #
+    # The parent directory's metadata inconsistency (stale index entries) was
+    # also detected by btrfs' fsck tool, which is run automatically by the fstests
+    # framework when the test finishes. The error message reported by fsck was:
+    #
+    # root 5 inode 259 errors 2001, no inode item, link count wrong
+    #   unresolved ref dir 258 index 3 namelen 3 name bar filetype 1 errors 4, no inode ref
+    #
+    rm -f $SCRATCH_MNT/a/b/*
+    rmdir $SCRATCH_MNT/a/b
+    rmdir $SCRATCH_MNT/a
+
+To fix this just make sure that after an unlink, if the inode is fsync'ed,
+he parent inode is fully logged in the fsync log.
+
+A test case for xfstests follows soon.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

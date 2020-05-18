@@ -1,0 +1,56 @@
+sh_eth: Ensure DMA engines are stopped before freeing buffers
+
+Currently we try to clear EDRRR and EDTRR and immediately continue to
+free buffers.  This is unsafe because:
+
+- In general, register writes are not serialised with DMA, so we still
+  have to wait for DMA to complete somehow
+- The R8A7790 (R-Car H2) manual states that the TX running flag cannot
+  be cleared by writing to EDTRR
+- The same manual states that clearing the RX running flag only stops
+  RX DMA at the next packet boundary
+
+I applied this patch to the driver to detect DMA writes to freed
+buffers:
+
+> --- a/drivers/net/ethernet/renesas/sh_eth.c
+> +++ b/drivers/net/ethernet/renesas/sh_eth.c
+> @@ -1098,7 +1098,14 @@ static void sh_eth_ring_free(struct net_device *ndev)
+>  	/* Free Rx skb ringbuffer */
+>  	if (mdp->rx_skbuff) {
+>  		for (i = 0; i < mdp->num_rx_ring; i++)
+> +			memcpy(mdp->rx_skbuff[i]->data,
+> +			       "Hello, world", 12);
+> +		msleep(100);
+> +		for (i = 0; i < mdp->num_rx_ring; i++) {
+> +			WARN_ON(memcmp(mdp->rx_skbuff[i]->data,
+> +				       "Hello, world", 12));
+>  			dev_kfree_skb(mdp->rx_skbuff[i]);
+> +		}
+>  	}
+>  	kfree(mdp->rx_skbuff);
+>  	mdp->rx_skbuff = NULL;
+
+then ran the loop:
+
+    while ethtool -G eth0 rx 128 ; ethtool -G eth0 rx 64; do echo -n .; done
+
+and 'ping -f' toward the sh_eth port from another machine.  The
+warning fired several times a minute.
+
+To fix these issues:
+
+- Deactivate all TX descriptors rather than writing to EDTRR
+- As there seems to be no way of telling when RX DMA is stopped,
+  perform a soft reset to ensure that both DMA enginess are stopped
+- To reduce the possibility of the reset truncating a transmitted
+  frame, disable egress and wait a reasonable time to reach a
+  packet boundary before resetting
+- Update statistics before resetting
+
+(The 'reasonable time' does not allow for CS/CD in half-duplex
+mode, but half-duplex no longer seems reasonable!)
+
+Signed-off-by: Ben Hutchings <ben.hutchings@codethink.co.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

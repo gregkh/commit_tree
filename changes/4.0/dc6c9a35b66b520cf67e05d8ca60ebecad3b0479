@@ -1,0 +1,76 @@
+mm: account pmd page tables to the process
+
+Dave noticed that unprivileged process can allocate significant amount of
+memory -- >500 MiB on x86_64 -- and stay unnoticed by oom-killer and
+memory cgroup.  The trick is to allocate a lot of PMD page tables.  Linux
+kernel doesn't account PMD tables to the process, only PTE.
+
+The use-cases below use few tricks to allocate a lot of PMD page tables
+while keeping VmRSS and VmPTE low.  oom_score for the process will be 0.
+
+	#include <errno.h>
+	#include <stdio.h>
+	#include <stdlib.h>
+	#include <unistd.h>
+	#include <sys/mman.h>
+	#include <sys/prctl.h>
+
+	#define PUD_SIZE (1UL << 30)
+	#define PMD_SIZE (1UL << 21)
+
+	#define NR_PUD 130000
+
+	int main(void)
+	{
+		char *addr = NULL;
+		unsigned long i;
+
+		prctl(PR_SET_THP_DISABLE);
+		for (i = 0; i < NR_PUD ; i++) {
+			addr = mmap(addr + PUD_SIZE, PUD_SIZE, PROT_WRITE|PROT_READ,
+					MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+			if (addr == MAP_FAILED) {
+				perror("mmap");
+				break;
+			}
+			*addr = 'x';
+			munmap(addr, PMD_SIZE);
+			mmap(addr, PMD_SIZE, PROT_WRITE|PROT_READ,
+					MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED, -1, 0);
+			if (addr == MAP_FAILED)
+				perror("re-mmap"), exit(1);
+		}
+		printf("PID %d consumed %lu KiB in PMD page tables\n",
+				getpid(), i * 4096 >> 10);
+		return pause();
+	}
+
+The patch addresses the issue by account PMD tables to the process the
+same way we account PTE.
+
+The main place where PMD tables is accounted is __pmd_alloc() and
+free_pmd_range(). But there're few corner cases:
+
+ - HugeTLB can share PMD page tables. The patch handles by accounting
+   the table to all processes who share it.
+
+ - x86 PAE pre-allocates few PMD tables on fork.
+
+ - Architectures with FIRST_USER_ADDRESS > 0. We need to adjust sanity
+   check on exit(2).
+
+Accounting only happens on configuration where PMD page table's level is
+present (PMD is not folded).  As with nr_ptes we use per-mm counter.  The
+counter value is used to calculate baseline for badness score by
+oom-killer.
+
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reported-by: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Reviewed-by: Cyrill Gorcunov <gorcunov@openvz.org>
+Cc: Pavel Emelyanov <xemul@openvz.org>
+Cc: David Rientjes <rientjes@google.com>
+Tested-by: Sedat Dilek <sedat.dilek@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

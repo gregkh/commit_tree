@@ -1,0 +1,48 @@
+tcp: remove dst refcount false sharing for prequeue mode
+
+Alexander Duyck reported high false sharing on dst refcount in tcp stack
+when prequeue is used. prequeue is the mechanism used when a thread is
+blocked in recvmsg()/read() on a TCP socket, using a blocking model
+rather than select()/poll()/epoll() non blocking one.
+
+We already try to use RCU in input path as much as possible, but we were
+forced to take a refcount on the dst when skb escaped RCU protected
+region. When/if the user thread runs on different cpu, dst_release()
+will then touch dst refcount again.
+
+Commit 093162553c33 (tcp: force a dst refcount when prequeue packet)
+was an example of a race fix.
+
+It turns out the only remaining usage of skb->dst for a packet stored
+in a TCP socket prequeue is IP early demux.
+
+We can add a logic to detect when IP early demux is probably going
+to use skb->dst. Because we do an optimistic check rather than duplicate
+existing logic, we need to guard inet_sk_rx_dst_set() and
+inet6_sk_rx_dst_set() from using a NULL dst.
+
+Many thanks to Alexander for providing a nice bug report, git bisection,
+and reproducer.
+
+Tested using Alexander script on a 40Gb NIC, 8 RX queues.
+Hosts have 24 cores, 48 hyper threads.
+
+echo 0 >/proc/sys/net/ipv4/tcp_autocorking
+
+for i in `seq 0 47`
+do
+  for j in `seq 0 2`
+  do
+     netperf -H $DEST -t TCP_STREAM -l 1000 \
+             -c -C -T $i,$i -P 0 -- \
+             -m 64 -s 64K -D &
+  done
+done
+
+Before patch : ~6Mpps and ~95% cpu usage on receiver
+After patch : ~9Mpps and ~35% cpu usage on receiver.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

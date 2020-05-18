@@ -1,0 +1,75 @@
+mm: memcontrol: rewrite uncharge API
+
+The memcg uncharging code that is involved towards the end of a page's
+lifetime - truncation, reclaim, swapout, migration - is impressively
+complicated and fragile.
+
+Because anonymous and file pages were always charged before they had their
+page->mapping established, uncharges had to happen when the page type
+could still be known from the context; as in unmap for anonymous, page
+cache removal for file and shmem pages, and swap cache truncation for swap
+pages.  However, these operations happen well before the page is actually
+freed, and so a lot of synchronization is necessary:
+
+- Charging, uncharging, page migration, and charge migration all need
+  to take a per-page bit spinlock as they could race with uncharging.
+
+- Swap cache truncation happens during both swap-in and swap-out, and
+  possibly repeatedly before the page is actually freed.  This means
+  that the memcg swapout code is called from many contexts that make
+  no sense and it has to figure out the direction from page state to
+  make sure memory and memory+swap are always correctly charged.
+
+- On page migration, the old page might be unmapped but then reused,
+  so memcg code has to prevent untimely uncharging in that case.
+  Because this code - which should be a simple charge transfer - is so
+  special-cased, it is not reusable for replace_page_cache().
+
+But now that charged pages always have a page->mapping, introduce
+mem_cgroup_uncharge(), which is called after the final put_page(), when we
+know for sure that nobody is looking at the page anymore.
+
+For page migration, introduce mem_cgroup_migrate(), which is called after
+the migration is successful and the new page is fully rmapped.  Because
+the old page is no longer uncharged after migration, prevent double
+charges by decoupling the page's memcg association (PCG_USED and
+pc->mem_cgroup) from the page holding an actual charge.  The new bits
+PCG_MEM and PCG_MEMSW represent the respective charges and are transferred
+to the new page during migration.
+
+mem_cgroup_migrate() is suitable for replace_page_cache() as well,
+which gets rid of mem_cgroup_replace_page_cache().  However, care
+needs to be taken because both the source and the target page can
+already be charged and on the LRU when fuse is splicing: grab the page
+lock on the charge moving side to prevent changing pc->mem_cgroup of a
+page under migration.  Also, the lruvecs of both pages change as we
+uncharge the old and charge the new during migration, and putback may
+race with us, so grab the lru lock and isolate the pages iff on LRU to
+prevent races and ensure the pages are on the right lruvec afterward.
+
+Swap accounting is massively simplified: because the page is no longer
+uncharged as early as swap cache deletion, a new mem_cgroup_swapout() can
+transfer the page's memory+swap charge (PCG_MEMSW) to the swap entry
+before the final put_page() in page reclaim.
+
+Finally, page_cgroup changes are now protected by whatever protection the
+page itself offers: anonymous pages are charged under the page table lock,
+whereas page cache insertions, swapin, and migration hold the page lock.
+Uncharging happens under full exclusion with no outstanding references.
+Charging and uncharging also ensure that the page is off-LRU, which
+serializes against charge migration.  Remove the very costly page_cgroup
+lock and set pc->flags non-atomically.
+
+[mhocko@suse.cz: mem_cgroup_charge_statistics needs preempt_disable]
+[vdavydov@parallels.com: fix flags definition]
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Vladimir Davydov <vdavydov@parallels.com>
+Tested-by: Jet Chen <jet.chen@intel.com>
+Acked-by: Michal Hocko <mhocko@suse.cz>
+Tested-by: Felipe Balbi <balbi@ti.com>
+Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

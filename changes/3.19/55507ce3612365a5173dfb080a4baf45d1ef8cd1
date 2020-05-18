@@ -1,0 +1,74 @@
+Btrfs: fix race between writing free space cache and trimming
+
+Trimming is completely transactionless, and the way it operates consists
+of hiding free space entries from a block group, perform the trim/discard
+and then make the free space entries visible again.
+Therefore while a free space entry is being trimmed, we can have free space
+cache writing running in parallel (as part of a transaction commit) which
+will miss the free space entry. This means that an unmount (or crash/reboot)
+after that transaction commit and mount again before another transaction
+starts/commits after the discard finishes, we will have some free space
+that won't be used again unless the free space cache is rebuilt. After the
+unmount, fsck (btrfsck, btrfs check) reports the issue like the following
+example:
+
+        *** fsck.btrfs output ***
+        checking extents
+        checking free space cache
+        There is no free space entry for 521764864-521781248
+        There is no free space entry for 521764864-1103101952
+        cache appears valid but isnt 29360128
+        Checking filesystem on /dev/sdc
+        UUID: b4789e27-4774-4626-98e9-ae8dfbfb0fb5
+        found 1235681286 bytes used err is -22
+        (...)
+
+Another issue caused by this race is a crash while writing bitmap entries
+to the cache, because while the cache writeout task accesses the bitmaps,
+the trim task can be concurrently modifying the bitmap or worse might
+be freeing the bitmap. The later case results in the following crash:
+
+[55650.804460] general protection fault: 0000 [#1] SMP DEBUG_PAGEALLOC
+[55650.804835] Modules linked in: btrfs dm_flakey dm_mod crc32c_generic xor raid6_pq nfsd auth_rpcgss oid_registry nfs_acl nfs lockd fscache sunrpc loop parport_pc parport i2c_piix4 psmouse evdev pcspkr microcode processor i2ccore serio_raw thermal_sys button ext4 crc16 jbd2 mbcache sg sd_mod crc_t10dif sr_mod cdrom crct10dif_generic crct10dif_common ata_generic virtio_scsi floppy ata_piix libata virtio_pci virtio_ring virtio scsi_mod e1000 [last unloaded: btrfs]
+[55650.806169] CPU: 1 PID: 31002 Comm: btrfs-transacti Tainted: G        W      3.17.0-rc5-btrfs-next-1+ #1
+[55650.806493] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.7.5-0-ge51488c-20140602_164612-nilsson.home.kraxel.org 04/01/2014
+[55650.806867] task: ffff8800b12f6410 ti: ffff880071538000 task.ti: ffff880071538000
+[55650.807166] RIP: 0010:[<ffffffffa037cf45>]  [<ffffffffa037cf45>] write_bitmap_entries+0x65/0xbb [btrfs]
+[55650.807514] RSP: 0018:ffff88007153bc30  EFLAGS: 00010246
+[55650.807687] RAX: 000000005d1ec000 RBX: ffff8800a665df08 RCX: 0000000000000400
+[55650.807885] RDX: ffff88005d1ec000 RSI: 6b6b6b6b6b6b6b6b RDI: ffff88005d1ec000
+[55650.808017] RBP: ffff88007153bc58 R08: 00000000ddd51536 R09: 00000000000001e0
+[55650.808017] R10: 0000000000000000 R11: 0000000000000037 R12: 6b6b6b6b6b6b6b6b
+[55650.808017] R13: ffff88007153bca8 R14: 6b6b6b6b6b6b6b6b R15: ffff88007153bc98
+[55650.808017] FS:  0000000000000000(0000) GS:ffff88023ec80000(0000) knlGS:0000000000000000
+[55650.808017] CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
+[55650.808017] CR2: 0000000002273b88 CR3: 00000000b18f6000 CR4: 00000000000006e0
+[55650.808017] Stack:
+[55650.808017]  ffff88020e834e00 ffff880172d68db0 0000000000000000 ffff88019257c800
+[55650.808017]  ffff8801d42ea720 ffff88007153bd10 ffffffffa037d2fa ffff880224e99180
+[55650.808017]  ffff8801469a6188 ffff880224e99140 ffff880172d68c50 00000003000000b7
+[55650.808017] Call Trace:
+[55650.808017]  [<ffffffffa037d2fa>] __btrfs_write_out_cache+0x1ea/0x37f [btrfs]
+[55650.808017]  [<ffffffffa037d959>] btrfs_write_out_cache+0xa1/0xd8 [btrfs]
+[55650.808017]  [<ffffffffa033936b>] btrfs_write_dirty_block_groups+0x4b5/0x505 [btrfs]
+[55650.808017]  [<ffffffffa03aa98e>] commit_cowonly_roots+0x15e/0x1f7 [btrfs]
+[55650.808017]  [<ffffffff813eb9c7>] ? _raw_spin_lock+0xe/0x10
+[55650.808017]  [<ffffffffa0346e46>] btrfs_commit_transaction+0x411/0x882 [btrfs]
+[55650.808017]  [<ffffffffa03432a4>] transaction_kthread+0xf2/0x1a4 [btrfs]
+[55650.808017]  [<ffffffffa03431b2>] ? btrfs_cleanup_transaction+0x3d8/0x3d8 [btrfs]
+[55650.808017]  [<ffffffff8105966b>] kthread+0xb7/0xbf
+[55650.808017]  [<ffffffff810595b4>] ? __kthread_parkme+0x67/0x67
+[55650.808017]  [<ffffffff813ebeac>] ret_from_fork+0x7c/0xb0
+[55650.808017]  [<ffffffff810595b4>] ? __kthread_parkme+0x67/0x67
+[55650.808017] Code: 4c 89 ef 8d 70 ff e8 d4 fc ff ff 41 8b 45 34 41 39 45 30 7d 5c 31 f6 4c 89 ef e8 80 f6 ff ff 49 8b 7d 00 4c 89 f6 b9 00 04 00 00 <f3> a5 4c 89 ef 41 8b 45 30 8d 70 ff e8 a3 fc ff ff 41 8b 45 34
+[55650.808017] RIP  [<ffffffffa037cf45>] write_bitmap_entries+0x65/0xbb [btrfs]
+[55650.808017]  RSP <ffff88007153bc30>
+[55650.815725] ---[ end trace 1c032e96b149ff86 ]---
+
+Fix this by serializing both tasks in such a way that cache writeout
+doesn't wait for the trim/discard of free space entries to finish and
+doesn't miss any free space entry.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

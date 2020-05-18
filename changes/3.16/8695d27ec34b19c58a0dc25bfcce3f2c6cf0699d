@@ -1,0 +1,102 @@
+xfs: fix infinite loop at xfs_vm_writepage on 32bit system
+
+Write to a file with an offset greater than 16TB on 32-bit system and
+then trigger page write-back via sync(1) will cause task hang.
+
+# block_size=4096
+# offset=$(((2**32 - 1) * $block_size))
+# xfs_io -f -c "pwrite $offset $block_size" /storage/test_file
+# sync
+
+INFO: task sync:2590 blocked for more than 120 seconds.
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+sync            D c1064a28     0  2590   2097 0x00000000
+.....
+Call Trace:
+[<c1064a28>] ? ttwu_do_wakeup+0x18/0x130
+[<c1066d0e>] ? try_to_wake_up+0x1ce/0x220
+[<c1066dbf>] ? wake_up_process+0x1f/0x40
+[<c104fc2e>] ? wake_up_worker+0x1e/0x30
+[<c15b6083>] schedule+0x23/0x60
+[<c15b3c2d>] schedule_timeout+0x18d/0x1f0
+[<c12a143e>] ? do_raw_spin_unlock+0x4e/0x90
+[<c10515f1>] ? __queue_delayed_work+0x91/0x150
+[<c12a12ef>] ? do_raw_spin_lock+0x3f/0x100
+[<c12a143e>] ? do_raw_spin_unlock+0x4e/0x90
+[<c15b5b5d>] wait_for_completion+0x7d/0xc0
+[<c1066d60>] ? try_to_wake_up+0x220/0x220
+[<c116a4d2>] sync_inodes_sb+0x92/0x180
+[<c116fb05>] sync_inodes_one_sb+0x15/0x20
+[<c114a8f8>] iterate_supers+0xb8/0xc0
+[<c116faf0>] ? fdatawrite_one_bdev+0x20/0x20
+[<c116fc21>] sys_sync+0x31/0x80
+[<c15be18d>] sysenter_do_call+0x12/0x28
+
+This issue can be triggered via xfstests/generic/308.
+
+The reason is that the end_index is unsigned long with maximum value
+'2^32-1=4294967295' on 32-bit platform, and the given offset cause it
+wrapped to 0, so that the following codes will repeat again and again
+until the task schedule time out:
+
+end_index = offset >> PAGE_CACHE_SHIFT;
+last_index = (offset - 1) >> PAGE_CACHE_SHIFT;
+if (page->index >= end_index) {
+	unsigned offset_into_page = offset & (PAGE_CACHE_SIZE - 1);
+        /*
+         * Just skip the page if it is fully outside i_size, e.g. due
+         * to a truncate operation that is in progress.
+         */
+        if (page->index >= end_index + 1 || offset_into_page == 0) {
+	^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+		unlock_page(page);
+		return 0;
+	}
+
+In order to check if a page is fully outsids i_size or not, we can fix
+the code logic as below:
+	if (page->index > end_index ||
+	    (page->index == end_index && offset_into_page == 0))
+
+Secondly, there still has another similar issue when calculating the
+end offset for mapping the filesystem blocks to the file blocks for
+delalloc.  With the same tests to above, run unmount(8) will cause
+kernel panic if CONFIG_XFS_DEBUG is enabled:
+
+XFS: Assertion failed: XFS_FORCED_SHUTDOWN(ip->i_mount) || \
+	ip->i_delayed_blks == 0, file: fs/xfs/xfs_super.c, line: 964
+
+kernel BUG at fs/xfs/xfs_message.c:108!
+invalid opcode: 0000 [#1] SMP
+task: edddc100 ti: ec6ee000 task.ti: ec6ee000
+EIP: 0060:[<f83d87cb>] EFLAGS: 00010296 CPU: 1
+EIP is at assfail+0x2b/0x30 [xfs]
+..............
+Call Trace:
+[<f83d9cd4>] xfs_fs_destroy_inode+0x74/0x120 [xfs]
+[<c115ddf1>] destroy_inode+0x31/0x50
+[<c115deff>] evict+0xef/0x170
+[<c115dfb2>] dispose_list+0x32/0x40
+[<c115ea3a>] evict_inodes+0xca/0xe0
+[<c1149706>] generic_shutdown_super+0x46/0xd0
+[<c11497b9>] kill_block_super+0x29/0x70
+[<c1149a14>] deactivate_locked_super+0x44/0x70
+[<c114a427>] deactivate_super+0x47/0x60
+[<c1161c3d>] mntput_no_expire+0xcd/0x120
+[<c1162ae8>] SyS_umount+0xa8/0x370
+[<c1162dce>] SyS_oldumount+0x1e/0x20
+[<c15be18d>] sysenter_do_call+0x12/0x28
+
+That because the end_offset is evaluated to 0 which is the same reason
+to above, hence the mapping and covertion for dealloc file blocks to
+file system blocks did not happened.
+
+This patch just fixed both issues.
+
+Reported-by: Michael L. Semon <mlsemon35@gmail.com>
+Signed-off-by: Jie Liu <jeff.liu@oracle.com>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+

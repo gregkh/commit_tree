@@ -1,0 +1,43 @@
+drbd: close race when detaching from disk
+
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000058
+IP: bd_release+0x21/0x70
+Process drbd_w_t7146
+Call Trace:
+ close_bdev_exclusive
+ drbd_free_ldev		[drbd]
+ drbd_ldev_destroy	[drbd]
+ w_after_state_ch	[drbd]
+
+Race probably went like this:
+  state.disk = D_FAILED
+
+... first one to hit zero during D_FAILED:
+   put_ldev() /* ----------------> 0 */
+     i = atomic_dec_return()
+     if (i == 0)
+       if (state.disk == D_FAILED)
+         schedule_work(go_diskless)
+                                /* 1 <------ */ get_ldev_if_state()
+   go_diskless()
+      do_some_pre_cleanup()                     corresponding put_ldev():
+      force_state(D_DISKLESS)   /* 0 <------ */ i = atomic_dec_return()
+                                                if (i == 0)
+        atomic_inc() /* ---------> 1 */
+        state.disk = D_DISKLESS
+        schedule_work(after_state_ch)           /* execution pre-empted by IRQ ? */
+
+   after_state_ch()
+     put_ldev()
+       i = atomic_dec_return()  /* 0 */
+       if (i == 0)
+         if (state.disk == D_DISKLESS)            if (state.disk == D_DISKLESS)
+           drbd_ldev_destroy()                      drbd_ldev_destroy();
+
+Trying to fix this by checking the disk state *before* the
+atomic_dec_return(), which implies memory barriers, and by inserting
+extra memory barriers around the state assignment in __drbd_set_state().
+
+Signed-off-by: Philipp Reisner <philipp.reisner@linbit.com>
+Signed-off-by: Lars Ellenberg <lars.ellenberg@linbit.com>
+

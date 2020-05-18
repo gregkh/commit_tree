@@ -1,0 +1,77 @@
+zram: check bd_openers instead of bd_holders
+
+bd_holders is increased only when user open the device file as FMODE_EXCL
+so if something opens zram0 as !FMODE_EXCL and request I/O while another
+user reset zram0, we can see following warning.
+
+  zram0: detected capacity change from 0 to 64424509440
+  Buffer I/O error on dev zram0, logical block 180823, lost async page write
+  Buffer I/O error on dev zram0, logical block 180824, lost async page write
+  Buffer I/O error on dev zram0, logical block 180825, lost async page write
+  Buffer I/O error on dev zram0, logical block 180826, lost async page write
+  Buffer I/O error on dev zram0, logical block 180827, lost async page write
+  Buffer I/O error on dev zram0, logical block 180828, lost async page write
+  Buffer I/O error on dev zram0, logical block 180829, lost async page write
+  Buffer I/O error on dev zram0, logical block 180830, lost async page write
+  Buffer I/O error on dev zram0, logical block 180831, lost async page write
+  Buffer I/O error on dev zram0, logical block 180832, lost async page write
+  ------------[ cut here ]------------
+  WARNING: CPU: 11 PID: 1996 at fs/block_dev.c:57 __blkdev_put+0x1d7/0x210()
+  Modules linked in:
+  CPU: 11 PID: 1996 Comm: dd Not tainted 3.19.0-rc6-next-20150202+ #1125
+  Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs 01/01/2011
+  Call Trace:
+    dump_stack+0x45/0x57
+    warn_slowpath_common+0x8a/0xc0
+    warn_slowpath_null+0x1a/0x20
+    __blkdev_put+0x1d7/0x210
+    blkdev_put+0x50/0x130
+    blkdev_close+0x25/0x30
+    __fput+0xdf/0x1e0
+    ____fput+0xe/0x10
+    task_work_run+0xa7/0xe0
+    do_notify_resume+0x49/0x60
+    int_signal+0x12/0x17
+  ---[ end trace 274fbbc5664827d2 ]---
+
+The warning comes from bdev_write_node in blkdev_put path.
+
+   static void bdev_write_inode(struct inode *inode)
+   {
+        spin_lock(&inode->i_lock);
+        while (inode->i_state & I_DIRTY) {
+                spin_unlock(&inode->i_lock);
+                WARN_ON_ONCE(write_inode_now(inode, true)); <========= here.
+                spin_lock(&inode->i_lock);
+        }
+        spin_unlock(&inode->i_lock);
+   }
+
+The reason is dd process encounters I/O fails due to sudden block device
+disappear so in filemap_check_errors in __writeback_single_inode returns
+-EIO.
+
+If we check bd_openers instead of bd_holders, we could address the
+problem.  When I see the brd, it already have used it rather than
+bd_holders so although I'm not a expert of block layer, it seems to be
+better.
+
+I can make following warning with below simple script.  In addition, I
+added msleep(2000) below set_capacity(zram->disk, 0) after applying your
+patch to make window huge(Kudos to Ganesh!)
+
+script:
+
+   echo $((60<<30)) > /sys/block/zram0/disksize
+   setsid dd if=/dev/zero of=/dev/zram0 &
+   sleep 1
+   setsid echo 1 > /sys/block/zram0/reset
+
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Acked-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Cc: Nitin Gupta <ngupta@vflare.org>
+Cc: Jerome Marchand <jmarchan@redhat.com>
+Cc: Ganesh Mahendran <opensource.ganesh@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

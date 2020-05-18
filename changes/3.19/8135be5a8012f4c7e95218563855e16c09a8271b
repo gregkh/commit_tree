@@ -1,0 +1,56 @@
+memcg: fix possible use-after-free in memcg_kmem_get_cache()
+
+Suppose task @t that belongs to a memory cgroup @memcg is going to
+allocate an object from a kmem cache @c.  The copy of @c corresponding to
+@memcg, @mc, is empty.  Then if kmem_cache_alloc races with the memory
+cgroup destruction we can access the memory cgroup's copy of the cache
+after it was destroyed:
+
+CPU0				CPU1
+----				----
+[ current=@t
+  @mc->memcg_params->nr_pages=0 ]
+
+kmem_cache_alloc(@c):
+  call memcg_kmem_get_cache(@c);
+  proceed to allocation from @mc:
+    alloc a page for @mc:
+      ...
+
+				move @t from @memcg
+				destroy @memcg:
+				  mem_cgroup_css_offline(@memcg):
+				    memcg_unregister_all_caches(@memcg):
+				      kmem_cache_destroy(@mc)
+
+    add page to @mc
+
+We could fix this issue by taking a reference to a per-memcg cache, but
+that would require adding a per-cpu reference counter to per-memcg caches,
+which would look cumbersome.
+
+Instead, let's take a reference to a memory cgroup, which already has a
+per-cpu reference counter, in the beginning of kmem_cache_alloc to be
+dropped in the end, and move per memcg caches destruction from css offline
+to css free.  As a side effect, per-memcg caches will be destroyed not one
+by one, but all at once when the last page accounted to the memory cgroup
+is freed.  This doesn't sound as a high price for code readability though.
+
+Note, this patch does add some overhead to the kmem_cache_alloc hot path,
+but it is pretty negligible - it's just a function call plus a per cpu
+counter decrement, which is comparable to what we already have in
+memcg_kmem_get_cache.  Besides, it's only relevant if there are memory
+cgroups with kmem accounting enabled.  I don't think we can find a way to
+handle this race w/o it, because alloc_page called from kmem_cache_alloc
+may sleep so we can't flush all pending kmallocs w/o reference counting.
+
+Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+Acked-by: Christoph Lameter <cl@linux.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

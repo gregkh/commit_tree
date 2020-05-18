@@ -1,0 +1,42 @@
+sunrpc: convert to lockless lookup of queued server threads
+
+Testing has shown that the pool->sp_lock can be a bottleneck on a busy
+server. Every time data is received on a socket, the server must take
+that lock in order to dequeue a thread from the sp_threads list.
+
+Address this problem by eliminating the sp_threads list (which contains
+threads that are currently idle) and replacing it with a RQ_BUSY flag in
+svc_rqst. This allows us to walk the sp_all_threads list under the
+rcu_read_lock and find a suitable thread for the xprt by doing a
+test_and_set_bit.
+
+Note that we do still have a potential atomicity problem however with
+this approach.  We don't want svc_xprt_do_enqueue to set the
+rqst->rq_xprt pointer unless a test_and_set_bit of RQ_BUSY returned
+zero (which indicates that the thread was idle). But, by the time we
+check that, the bit could be flipped by a waking thread.
+
+To address this, we acquire a new per-rqst spinlock (rq_lock) and take
+that before doing the test_and_set_bit. If that returns false, then we
+can set rq_xprt and drop the spinlock. Then, when the thread wakes up,
+it must set the bit under the same spinlock and can trust that if it was
+already set then the rq_xprt is also properly set.
+
+With this scheme, the case where we have an idle thread no longer needs
+to take the highly contended pool->sp_lock at all, and that removes the
+bottleneck.
+
+That still leaves one issue: What of the case where we walk the whole
+sp_all_threads list and don't find an idle thread? Because the search is
+lockess, it's possible for the queueing to race with a thread that is
+going to sleep. To address that, we queue the xprt and then search again.
+
+If we find an idle thread at that point, we can't attach the xprt to it
+directly since that might race with a different thread waking up and
+finding it.  All we can do is wake the idle thread back up and let it
+attempt to find the now-queued xprt.
+
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Tested-by: Chris Worley <chris.worley@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+

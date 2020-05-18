@@ -1,0 +1,79 @@
+jiffies: Fix timeval conversion to jiffies
+
+timeval_to_jiffies tried to round a timeval up to an integral number
+of jiffies, but the logic for doing so was incorrect: intervals
+corresponding to exactly N jiffies would become N+1. This manifested
+itself particularly repeatedly stopping/starting an itimer:
+
+setitimer(ITIMER_PROF, &val, NULL);
+setitimer(ITIMER_PROF, NULL, &val);
+
+would add a full tick to val, _even if it was exactly representable in
+terms of jiffies_ (say, the result of a previous rounding.)  Doing
+this repeatedly would cause unbounded growth in val.  So fix the math.
+
+Here's what was wrong with the conversion: we essentially computed
+(eliding seconds)
+
+jiffies = usec  * (NSEC_PER_USEC/TICK_NSEC)
+
+by using scaling arithmetic, which took the best approximation of
+NSEC_PER_USEC/TICK_NSEC with denominator of 2^USEC_JIFFIE_SC =
+x/(2^USEC_JIFFIE_SC), and computed:
+
+jiffies = (usec * x) >> USEC_JIFFIE_SC
+
+and rounded this calculation up in the intermediate form (since we
+can't necessarily exactly represent TICK_NSEC in usec.) But the
+scaling arithmetic is a (very slight) *over*approximation of the true
+value; that is, instead of dividing by (1 usec/ 1 jiffie), we
+effectively divided by (1 usec/1 jiffie)-epsilon (rounding
+down). This would normally be fine, but we want to round timeouts up,
+and we did so by adding 2^USEC_JIFFIE_SC - 1 before the shift; this
+would be fine if our division was exact, but dividing this by the
+slightly smaller factor was equivalent to adding just _over_ 1 to the
+final result (instead of just _under_ 1, as desired.)
+
+In particular, with HZ=1000, we consistently computed that 10000 usec
+was 11 jiffies; the same was true for any exact multiple of
+TICK_NSEC.
+
+We could possibly still round in the intermediate form, adding
+something less than 2^USEC_JIFFIE_SC - 1, but easier still is to
+convert usec->nsec, round in nanoseconds, and then convert using
+time*spec*_to_jiffies.  This adds one constant multiplication, and is
+not observably slower in microbenchmarks on recent x86 hardware.
+
+Tested: the following program:
+
+int main() {
+  struct itimerval zero = {{0, 0}, {0, 0}};
+  /* Initially set to 10 ms. */
+  struct itimerval initial = zero;
+  initial.it_interval.tv_usec = 10000;
+  setitimer(ITIMER_PROF, &initial, NULL);
+  /* Save and restore several times. */
+  for (size_t i = 0; i < 10; ++i) {
+    struct itimerval prev;
+    setitimer(ITIMER_PROF, &zero, &prev);
+    /* on old kernels, this goes up by TICK_USEC every iteration */
+    printf("previous value: %ld %ld %ld %ld\n",
+           prev.it_interval.tv_sec, prev.it_interval.tv_usec,
+           prev.it_value.tv_sec, prev.it_value.tv_usec);
+    setitimer(ITIMER_PROF, &prev, NULL);
+  }
+    return 0;
+}
+
+Cc: stable@vger.kernel.org
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Paul Turner <pjt@google.com>
+Cc: Richard Cochran <richardcochran@gmail.com>
+Cc: Prarit Bhargava <prarit@redhat.com>
+Reviewed-by: Paul Turner <pjt@google.com>
+Reported-by: Aaron Jacobs <jacobsa@google.com>
+Signed-off-by: Andrew Hunter <ahh@google.com>
+[jstultz: Tweaked to apply to 3.17-rc]
+Signed-off-by: John Stultz <john.stultz@linaro.org>
+

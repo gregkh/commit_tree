@@ -1,0 +1,58 @@
+mm: let mm_find_pmd fix buggy race with THP fault
+
+Trinity has reported:
+
+    BUG: unable to handle kernel NULL pointer dereference at 0000000000000018
+    IP: __lock_acquire (kernel/locking/lockdep.c:3070 (discriminator 1))
+    CPU: 6 PID: 16173 Comm: trinity-c364 Tainted: G        W
+                            3.15.0-rc1-next-20140415-sasha-00020-gaa90d09 #398
+    lock_acquire (arch/x86/include/asm/current.h:14
+                  kernel/locking/lockdep.c:3602)
+    _raw_spin_lock (include/linux/spinlock_api_smp.h:143
+                    kernel/locking/spinlock.c:151)
+    remove_migration_pte (mm/migrate.c:137)
+    rmap_walk (mm/rmap.c:1628 mm/rmap.c:1699)
+    remove_migration_ptes (mm/migrate.c:224)
+    migrate_pages (mm/migrate.c:922 mm/migrate.c:960 mm/migrate.c:1126)
+    migrate_misplaced_page (mm/migrate.c:1733)
+    __handle_mm_fault (mm/memory.c:3762 mm/memory.c:3812 mm/memory.c:3925)
+    handle_mm_fault (mm/memory.c:3948)
+    __get_user_pages (mm/memory.c:1851)
+    __mlock_vma_pages_range (mm/mlock.c:255)
+    __mm_populate (mm/mlock.c:711)
+    SyS_mlockall (include/linux/mm.h:1799 mm/mlock.c:817 mm/mlock.c:791)
+
+I believe this comes about because, whereas collapsing and splitting THP
+functions take anon_vma lock in write mode (which excludes concurrent
+rmap walks), faulting THP functions (write protection and misplaced
+NUMA) do not - and mostly they do not need to.
+
+But they do use a pmdp_clear_flush(), set_pmd_at() sequence which, for
+an instant (indeed, for a long instant, given the inter-CPU TLB flush in
+there), leaves *pmd neither present not trans_huge.
+
+Which can confuse a concurrent rmap walk, as when removing migration
+ptes, seen in the dumped trace.  Although that rmap walk has a 4k page
+to insert, anon_vmas containing THPs are in no way segregated from
+4k-page anon_vmas, so the 4k-intent mm_find_pmd() does need to cope with
+that instant when a trans_huge pmd is temporarily absent.
+
+I don't think we need strengthen the locking at the THP end: it's easily
+handled with an ACCESS_ONCE() before testing both conditions.
+
+And since mm_find_pmd() had only one caller who wanted a THP rather than
+a pmd, let's slightly repurpose it to fail when it hits a THP or
+non-present pmd, and open code split_huge_page_address() again.
+
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Reported-by: Sasha Levin <sasha.levin@oracle.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Bob Liu <bob.liu@oracle.com>
+Cc: Christoph Lameter <cl@gentwo.org>
+Cc: Dave Jones <davej@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

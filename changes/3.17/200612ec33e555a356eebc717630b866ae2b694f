@@ -1,0 +1,45 @@
+dm table: propagate QUEUE_FLAG_NO_SG_MERGE
+
+Commit 05f1dd5 ("block: add queue flag for disabling SG merging")
+introduced a new queue flag: QUEUE_FLAG_NO_SG_MERGE.  This gets set by
+default in blk_mq_init_queue for mq-enabled devices.  The effect of
+the flag is to bypass the SG segment merging.  Instead, the
+bio->bi_vcnt is used as the number of hardware segments.
+
+With a device mapper target on top of a device with
+QUEUE_FLAG_NO_SG_MERGE set, we can end up sending down more segments
+than a driver is prepared to handle.  I ran into this when backporting
+the virtio_blk mq support.  It triggerred this BUG_ON, in
+virtio_queue_rq:
+
+        BUG_ON(req->nr_phys_segments + 2 > vblk->sg_elems);
+
+The queue's max is set here:
+        blk_queue_max_segments(q, vblk->sg_elems-2);
+
+Basically, what happens is that a bio is built up for the dm device
+(which does not have the QUEUE_FLAG_NO_SG_MERGE flag set) using
+bio_add_page.  That path will call into __blk_recalc_rq_segments, so
+what you end up with is bi_phys_segments being much smaller than bi_vcnt
+(and bi_vcnt grows beyond the maximum sg elements).  Then, when the bio
+is submitted, it gets cloned.  When the cloned bio is submitted, it will
+end up in blk_recount_segments, here:
+
+        if (test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags))
+                bio->bi_phys_segments = bio->bi_vcnt;
+
+and now we've set bio->bi_phys_segments to a number that is beyond what
+was registered as queue_max_segments by the driver.
+
+The right way to fix this is to propagate the queue flag up the stack.
+
+The rules for propagating the flag are simple:
+- if the flag is set for any underlying device, it must be set for the
+  upper device
+- consequently, if the flag is not set for any underlying device, it
+  should not be set for the upper device.
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Cc: stable@vger.kernel.org # 3.16+
+

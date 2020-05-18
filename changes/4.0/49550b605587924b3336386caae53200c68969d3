@@ -1,0 +1,103 @@
+oom: add helpers for setting and clearing TIF_MEMDIE
+
+This patchset addresses a race which was described in the changelog for
+5695be142e20 ("OOM, PM: OOM killed task shouldn't escape PM suspend"):
+
+: PM freezer relies on having all tasks frozen by the time devices are
+: getting frozen so that no task will touch them while they are getting
+: frozen.  But OOM killer is allowed to kill an already frozen task in order
+: to handle OOM situtation.  In order to protect from late wake ups OOM
+: killer is disabled after all tasks are frozen.  This, however, still keeps
+: a window open when a killed task didn't manage to die by the time
+: freeze_processes finishes.
+
+The original patch hasn't closed the race window completely because that
+would require a more complex solution as it can be seen by this patchset.
+
+The primary motivation was to close the race condition between OOM killer
+and PM freezer _completely_.  As Tejun pointed out, even though the race
+condition is unlikely the harder it would be to debug weird bugs deep in
+the PM freezer when the debugging options are reduced considerably.  I can
+only speculate what might happen when a task is still runnable
+unexpectedly.
+
+On a plus side and as a side effect the oom enable/disable has a better
+(full barrier) semantic without polluting hot paths.
+
+I have tested the series in KVM with 100M RAM:
+- many small tasks (20M anon mmap) which are triggering OOM continually
+- s2ram which resumes automatically is triggered in a loop
+	echo processors > /sys/power/pm_test
+	while true
+	do
+		echo mem > /sys/power/state
+		sleep 1s
+	done
+- simple module which allocates and frees 20M in 8K chunks. If it sees
+  freezing(current) then it tries another round of allocation before calling
+  try_to_freeze
+- debugging messages of PM stages and OOM killer enable/disable/fail added
+  and unmark_oom_victim is delayed by 1s after it clears TIF_MEMDIE and before
+  it wakes up waiters.
+- rebased on top of the current mmotm which means some necessary updates
+  in mm/oom_kill.c. mark_tsk_oom_victim is now called under task_lock but
+  I think this should be OK because __thaw_task shouldn't interfere with any
+  locking down wake_up_process. Oleg?
+
+As expected there are no OOM killed tasks after oom is disabled and
+allocations requested by the kernel thread are failing after all the tasks
+are frozen and OOM disabled.  I wasn't able to catch a race where
+oom_killer_disable would really have to wait but I kinda expected the race
+is really unlikely.
+
+[  242.609330] Killed process 2992 (mem_eater) total-vm:24412kB, anon-rss:2164kB, file-rss:4kB
+[  243.628071] Unmarking 2992 OOM victim. oom_victims: 1
+[  243.636072] (elapsed 2.837 seconds) done.
+[  243.641985] Trying to disable OOM killer
+[  243.643032] Waiting for concurent OOM victims
+[  243.644342] OOM killer disabled
+[  243.645447] Freezing remaining freezable tasks ... (elapsed 0.005 seconds) done.
+[  243.652983] Suspending console(s) (use no_console_suspend to debug)
+[  243.903299] kmem_eater: page allocation failure: order:1, mode:0x204010
+[...]
+[  243.992600] PM: suspend of devices complete after 336.667 msecs
+[  243.993264] PM: late suspend of devices complete after 0.660 msecs
+[  243.994713] PM: noirq suspend of devices complete after 1.446 msecs
+[  243.994717] ACPI: Preparing to enter system sleep state S3
+[  243.994795] PM: Saving platform NVS memory
+[  243.994796] Disabling non-boot CPUs ...
+
+The first 2 patches are simple cleanups for OOM.  They should go in
+regardless the rest IMO.
+
+Patches 3 and 4 are trivial printk -> pr_info conversion and they should
+go in ditto.
+
+The main patch is the last one and I would appreciate acks from Tejun and
+Rafael.  I think the OOM part should be OK (except for __thaw_task vs.
+task_lock where a look from Oleg would appreciated) but I am not so sure I
+haven't screwed anything in the freezer code.  I have found several
+surprises there.
+
+This patch (of 5):
+
+This patch is just a preparatory and it doesn't introduce any functional
+change.
+
+Note:
+I am utterly unhappy about lowmemory killer abusing TIF_MEMDIE just to
+wait for the oom victim and to prevent from new killing. This is
+just a side effect of the flag. The primary meaning is to give the oom
+victim access to the memory reserves and that shouldn't be necessary
+here.
+
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Cong Wang <xiyou.wangcong@gmail.com>
+Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

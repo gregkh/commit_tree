@@ -1,0 +1,290 @@
+net: tcp: add DCTCP congestion control algorithm
+
+This work adds the DataCenter TCP (DCTCP) congestion control
+algorithm [1], which has been first published at SIGCOMM 2010 [2],
+resp. follow-up analysis at SIGMETRICS 2011 [3] (and also, more
+recently as an informational IETF draft available at [4]).
+
+DCTCP is an enhancement to the TCP congestion control algorithm for
+data center networks. Typical data center workloads are i.e.
+i) partition/aggregate (queries; bursty, delay sensitive), ii) short
+messages e.g. 50KB-1MB (for coordination and control state; delay
+sensitive), and iii) large flows e.g. 1MB-100MB (data update;
+throughput sensitive). DCTCP has therefore been designed for such
+environments to provide/achieve the following three requirements:
+
+  * High burst tolerance (incast due to partition/aggregate)
+  * Low latency (short flows, queries)
+  * High throughput (continuous data updates, large file
+    transfers) with commodity, shallow buffered switches
+
+The basic idea of its design consists of two fundamentals: i) on the
+switch side, packets are being marked when its internal queue
+length > threshold K (K is chosen so that a large enough headroom
+for marked traffic is still available in the switch queue); ii) the
+sender/host side maintains a moving average of the fraction of marked
+packets, so each RTT, F is being updated as follows:
+
+ F := X / Y, where X is # of marked ACKs, Y is total # of ACKs
+ alpha := (1 - g) * alpha + g * F, where g is a smoothing constant
+
+The resulting alpha (iow: probability that switch queue is congested)
+is then being used in order to adaptively decrease the congestion
+window W:
+
+ W := (1 - (alpha / 2)) * W
+
+The means for receiving marked packets resp. marking them on switch
+side in DCTCP is the use of ECN.
+
+RFC3168 describes a mechanism for using Explicit Congestion Notification
+from the switch for early detection of congestion, rather than waiting
+for segment loss to occur.
+
+However, this method only detects the presence of congestion, not
+the *extent*. In the presence of mild congestion, it reduces the TCP
+congestion window too aggressively and unnecessarily affects the
+throughput of long flows [4].
+
+DCTCP, as mentioned, enhances Explicit Congestion Notification (ECN)
+processing to estimate the fraction of bytes that encounter congestion,
+rather than simply detecting that some congestion has occurred. DCTCP
+then scales the TCP congestion window based on this estimate [4],
+thus it can derive multibit feedback from the information present in
+the single-bit sequence of marks in its control law. And thus act in
+*proportion* to the extent of congestion, not its *presence*.
+
+Switches therefore set the Congestion Experienced (CE) codepoint in
+packets when internal queue lengths exceed threshold K. Resulting,
+DCTCP delivers the same or better throughput than normal TCP, while
+using 90% less buffer space.
+
+It was found in [2] that DCTCP enables the applications to handle 10x
+the current background traffic, without impacting foreground traffic.
+Moreover, a 10x increase in foreground traffic did not cause any
+timeouts, and thus largely eliminates TCP incast collapse problems.
+
+The algorithm itself has already seen deployments in large production
+data centers since then.
+
+We did a long-term stress-test and analysis in a data center, short
+summary of our TCP incast tests with iperf compared to cubic:
+
+This test measured DCTCP throughput and latency and compared it with
+CUBIC throughput and latency for an incast scenario. In this test, 19
+senders sent at maximum rate to a single receiver. The receiver simply
+ran iperf -s.
+
+The senders ran iperf -c <receiver> -t 30. All senders started
+simultaneously (using local clocks synchronized by ntp).
+
+This test was repeated multiple times. Below shows the results from a
+single test. Other tests are similar. (DCTCP results were extremely
+consistent, CUBIC results show some variance induced by the TCP timeouts
+that CUBIC encountered.)
+
+For this test, we report statistics on the number of TCP timeouts,
+flow throughput, and traffic latency.
+
+1) Timeouts (total over all flows, and per flow summaries):
+
+            CUBIC            DCTCP
+  Total     3227             25
+  Mean       169.842          1.316
+  Median     183              1
+  Max        207              5
+  Min        123              0
+  Stddev      28.991          1.600
+
+Timeout data is taken by measuring the net change in netstat -s
+"other TCP timeouts" reported. As a result, the timeout measurements
+above are not restricted to the test traffic, and we believe that it
+is likely that all of the "DCTCP timeouts" are actually timeouts for
+non-test traffic. We report them nevertheless. CUBIC will also include
+some non-test timeouts, but they are drawfed by bona fide test traffic
+timeouts for CUBIC. Clearly DCTCP does an excellent job of preventing
+TCP timeouts. DCTCP reduces timeouts by at least two orders of
+magnitude and may well have eliminated them in this scenario.
+
+2) Throughput (per flow in Mbps):
+
+            CUBIC            DCTCP
+  Mean      521.684          521.895
+  Median    464              523
+  Max       776              527
+  Min       403              519
+  Stddev    105.891            2.601
+  Fairness    0.962            0.999
+
+Throughput data was simply the average throughput for each flow
+reported by iperf. By avoiding TCP timeouts, DCTCP is able to
+achieve much better per-flow results. In CUBIC, many flows
+experience TCP timeouts which makes flow throughput unpredictable and
+unfair. DCTCP, on the other hand, provides very clean predictable
+throughput without incurring TCP timeouts. Thus, the standard deviation
+of CUBIC throughput is dramatically higher than the standard deviation
+of DCTCP throughput.
+
+Mean throughput is nearly identical because even though cubic flows
+suffer TCP timeouts, other flows will step in and fill the unused
+bandwidth. Note that this test is something of a best case scenario
+for incast under CUBIC: it allows other flows to fill in for flows
+experiencing a timeout. Under situations where the receiver is issuing
+requests and then waiting for all flows to complete, flows cannot fill
+in for timed out flows and throughput will drop dramatically.
+
+3) Latency (in ms):
+
+            CUBIC            DCTCP
+  Mean      4.0088           0.04219
+  Median    4.055            0.0395
+  Max       4.2              0.085
+  Min       3.32             0.028
+  Stddev    0.1666           0.01064
+
+Latency for each protocol was computed by running "ping -i 0.2
+<receiver>" from a single sender to the receiver during the incast
+test. For DCTCP, "ping -Q 0x6 -i 0.2 <receiver>" was used to ensure
+that traffic traversed the DCTCP queue and was not dropped when the
+queue size was greater than the marking threshold. The summary
+statistics above are over all ping metrics measured between the single
+sender, receiver pair.
+
+The latency results for this test show a dramatic difference between
+CUBIC and DCTCP. CUBIC intentionally overflows the switch buffer
+which incurs the maximum queue latency (more buffer memory will lead
+to high latency.) DCTCP, on the other hand, deliberately attempts to
+keep queue occupancy low. The result is a two orders of magnitude
+reduction of latency with DCTCP - even with a switch with relatively
+little RAM. Switches with larger amounts of RAM will incur increasing
+amounts of latency for CUBIC, but not for DCTCP.
+
+4) Convergence and stability test:
+
+This test measured the time that DCTCP took to fairly redistribute
+bandwidth when a new flow commences. It also measured DCTCP's ability
+to remain stable at a fair bandwidth distribution. DCTCP is compared
+with CUBIC for this test.
+
+At the commencement of this test, a single flow is sending at maximum
+rate (near 10 Gbps) to a single receiver. One second after that first
+flow commences, a new flow from a distinct server begins sending to
+the same receiver as the first flow. After the second flow has sent
+data for 10 seconds, the second flow is terminated. The first flow
+sends for an additional second. Ideally, the bandwidth would be evenly
+shared as soon as the second flow starts, and recover as soon as it
+stops.
+
+The results of this test are shown below. Note that the flow bandwidth
+for the two flows was measured near the same time, but not
+simultaneously.
+
+DCTCP performs nearly perfectly within the measurement limitations
+of this test: bandwidth is quickly distributed fairly between the two
+flows, remains stable throughout the duration of the test, and
+recovers quickly. CUBIC, in contrast, is slow to divide the bandwidth
+fairly, and has trouble remaining stable.
+
+  CUBIC                      DCTCP
+
+  Seconds  Flow 1  Flow 2    Seconds  Flow 1  Flow 2
+   0       9.93    0          0       9.92    0
+   0.5     9.87    0          0.5     9.86    0
+   1       8.73    2.25       1       6.46    4.88
+   1.5     7.29    2.8        1.5     4.9     4.99
+   2       6.96    3.1        2       4.92    4.94
+   2.5     6.67    3.34       2.5     4.93    5
+   3       6.39    3.57       3       4.92    4.99
+   3.5     6.24    3.75       3.5     4.94    4.74
+   4       6       3.94       4       5.34    4.71
+   4.5     5.88    4.09       4.5     4.99    4.97
+   5       5.27    4.98       5       4.83    5.01
+   5.5     4.93    5.04       5.5     4.89    4.99
+   6       4.9     4.99       6       4.92    5.04
+   6.5     4.93    5.1        6.5     4.91    4.97
+   7       4.28    5.8        7       4.97    4.97
+   7.5     4.62    4.91       7.5     4.99    4.82
+   8       5.05    4.45       8       5.16    4.76
+   8.5     5.93    4.09       8.5     4.94    4.98
+   9       5.73    4.2        9       4.92    5.02
+   9.5     5.62    4.32       9.5     4.87    5.03
+  10       6.12    3.2       10       4.91    5.01
+  10.5     6.91    3.11      10.5     4.87    5.04
+  11       8.48    0         11       8.49    4.94
+  11.5     9.87    0         11.5     9.9     0
+
+SYN/ACK ECT test:
+
+This test demonstrates the importance of ECT on SYN and SYN-ACK packets
+by measuring the connection probability in the presence of competing
+flows for a DCTCP connection attempt *without* ECT in the SYN packet.
+The test was repeated five times for each number of competing flows.
+
+              Competing Flows  1 |    2 |    4 |    8 |   16
+                               ------------------------------
+Mean Connection Probability    1 | 0.67 | 0.45 | 0.28 |    0
+Median Connection Probability  1 | 0.65 | 0.45 | 0.25 |    0
+
+As the number of competing flows moves beyond 1, the connection
+probability drops rapidly.
+
+Enabling DCTCP with this patch requires the following steps:
+
+DCTCP must be running both on the sender and receiver side in your
+data center, i.e.:
+
+  sysctl -w net.ipv4.tcp_congestion_control=dctcp
+
+Also, ECN functionality must be enabled on all switches in your
+data center for DCTCP to work. The default ECN marking threshold (K)
+heuristic on the switch for DCTCP is e.g., 20 packets (30KB) at
+1Gbps, and 65 packets (~100KB) at 10Gbps (K > 1/7 * C * RTT, [4]).
+
+In above tests, for each switch port, traffic was segregated into two
+queues. For any packet with a DSCP of 0x01 - or equivalently a TOS of
+0x04 - the packet was placed into the DCTCP queue. All other packets
+were placed into the default drop-tail queue. For the DCTCP queue,
+RED/ECN marking was enabled, here, with a marking threshold of 75 KB.
+More details however, we refer you to the paper [2] under section 3).
+
+There are no code changes required to applications running in user
+space. DCTCP has been implemented in full *isolation* of the rest of
+the TCP code as its own congestion control module, so that it can run
+without a need to expose code to the core of the TCP stack, and thus
+nothing changes for non-DCTCP users.
+
+Changes in the CA framework code are minimal, and DCTCP algorithm
+operates on mechanisms that are already available in most Silicon.
+The gain (dctcp_shift_g) is currently a fixed constant (1/16) from
+the paper, but we leave the option that it can be chosen carefully
+to a different value by the user.
+
+In case DCTCP is being used and ECN support on peer site is off,
+DCTCP falls back after 3WHS to operate in normal TCP Reno mode.
+
+ss {-4,-6} -t -i diag interface:
+
+  ... dctcp wscale:7,7 rto:203 rtt:2.349/0.026 mss:1448 cwnd:2054
+  ssthresh:1102 ce_state 0 alpha 15 ab_ecn 0 ab_tot 735584
+  send 10129.2Mbps pacing_rate 20254.1Mbps unacked:1822 retrans:0/15
+  reordering:101 rcv_space:29200
+
+  ... dctcp-reno wscale:7,7 rto:201 rtt:0.711/1.327 ato:40 mss:1448
+  cwnd:10 ssthresh:1102 fallback_mode send 162.9Mbps pacing_rate
+  325.5Mbps rcv_rtt:1.5 rcv_space:29200
+
+More information about DCTCP can be found in [1-4].
+
+  [1] http://simula.stanford.edu/~alizade/Site/DCTCP.html
+  [2] http://simula.stanford.edu/~alizade/Site/DCTCP_files/dctcp-final.pdf
+  [3] http://simula.stanford.edu/~alizade/Site/DCTCP_files/dctcp_analysis-full.pdf
+  [4] http://tools.ietf.org/html/draft-bensley-tcpm-dctcp-00
+
+Joint work with Florian Westphal and Glenn Judd.
+
+Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Glenn Judd <glenn.judd@morganstanley.com>
+Acked-by: Stephen Hemminger <stephen@networkplumber.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

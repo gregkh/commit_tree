@@ -1,0 +1,61 @@
+fsnotify: next_i is freed during fsnotify_unmount_inodes.
+
+During file system stress testing on 3.10 and 3.12 based kernels, the
+umount command occasionally hung in fsnotify_unmount_inodes in the
+section of code:
+
+                spin_lock(&inode->i_lock);
+                if (inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW)) {
+                        spin_unlock(&inode->i_lock);
+                        continue;
+                }
+
+As this section of code holds the global inode_sb_list_lock, eventually
+the system hangs trying to acquire the lock.
+
+Multiple crash dumps showed:
+
+The inode->i_state == 0x60 and i_count == 0 and i_sb_list would point
+back at itself.  As this is not the value of list upon entry to the
+function, the kernel never exits the loop.
+
+To help narrow down problem, the call to list_del_init in
+inode_sb_list_del was changed to list_del.  This poisons the pointers in
+the i_sb_list and causes a kernel to panic if it transverse a freed
+inode.
+
+Subsequent stress testing paniced in fsnotify_unmount_inodes at the
+bottom of the list_for_each_entry_safe loop showing next_i had become
+free.
+
+We believe the root cause of the problem is that next_i is being freed
+during the window of time that the list_for_each_entry_safe loop
+temporarily releases inode_sb_list_lock to call fsnotify and
+fsnotify_inode_delete.
+
+The code in fsnotify_unmount_inodes attempts to prevent the freeing of
+inode and next_i by calling __iget.  However, the code doesn't do the
+__iget call on next_i
+
+	if i_count == 0 or
+	if i_state & (I_FREEING | I_WILL_FREE)
+
+The patch addresses this issue by advancing next_i in the above two cases
+until we either find a next_i which we can __iget or we reach the end of
+the list.  This makes the handling of next_i more closely match the
+handling of the variable "inode."
+
+The time to reproduce the hang is highly variable (from hours to days.) We
+ran the stress test on a 3.10 kernel with the proposed patch for a week
+without failure.
+
+During list_for_each_entry_safe, next_i is becoming free causing
+the loop to never terminate.  Advance next_i in those cases where
+__iget is not done.
+
+Signed-off-by: Jerry Hoemann <jerry.hoemann@hp.com>
+Cc: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Cc: Ken Helias <kenhelias@firemail.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

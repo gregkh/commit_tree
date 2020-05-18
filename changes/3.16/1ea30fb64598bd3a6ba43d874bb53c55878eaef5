@@ -1,0 +1,103 @@
+uprobes/x86: Fix scratch register selection for rip-relative fixups
+
+Before this patch, instructions such as div, mul, shifts with count
+in CL, cmpxchg are mishandled.
+
+This patch adds vex prefix handling. In particular, it avoids colliding
+with register operand encoded in vex.vvvv field.
+
+Since we need to avoid two possible register operands, the selection of
+scratch register needs to be from at least three registers.
+
+After looking through a lot of CPU docs, it looks like the safest choice
+is SI,DI,BX. Selecting BX needs care to not collide with implicit use of
+BX by cmpxchg8b.
+
+Test-case:
+
+	#include <stdio.h>
+
+	static const char *const pass[] = { "FAIL", "pass" };
+
+	long two = 2;
+	void test1(void)
+	{
+		long ax = 0, dx = 0;
+		asm volatile("\n"
+	"			xor	%%edx,%%edx\n"
+	"			lea	2(%%edx),%%eax\n"
+	// We divide 2 by 2. Result (in eax) should be 1:
+	"	probe1:		.globl	probe1\n"
+	"			divl	two(%%rip)\n"
+	// If we have a bug (eax mangled on entry) the result will be 2,
+	// because eax gets restored by probe machinery.
+		: "=a" (ax), "=d" (dx) /*out*/
+		: "0" (ax), "1" (dx) /*in*/
+		: "memory" /*clobber*/
+		);
+		dprintf(2, "%s: %s\n", __func__,
+			pass[ax == 1]
+		);
+	}
+
+	long val2 = 0;
+	void test2(void)
+	{
+		long old_val = val2;
+		long ax = 0, dx = 0;
+		asm volatile("\n"
+	"			mov	val2,%%eax\n"     // eax := val2
+	"			lea	1(%%eax),%%edx\n" // edx := eax+1
+	// eax is equal to val2. cmpxchg should store edx to val2:
+	"	probe2:		.globl  probe2\n"
+	"			cmpxchg %%edx,val2(%%rip)\n"
+	// If we have a bug (eax mangled on entry), val2 will stay unchanged
+		: "=a" (ax), "=d" (dx) /*out*/
+		: "0" (ax), "1" (dx) /*in*/
+		: "memory" /*clobber*/
+		);
+		dprintf(2, "%s: %s\n", __func__,
+			pass[val2 == old_val + 1]
+		);
+	}
+
+	long val3[2] = {0,0};
+	void test3(void)
+	{
+		long old_val = val3[0];
+		long ax = 0, dx = 0;
+		asm volatile("\n"
+	"			mov	val3,%%eax\n"  // edx:eax := val3
+	"			mov	val3+4,%%edx\n"
+	"			mov	%%eax,%%ebx\n" // ecx:ebx := edx:eax + 1
+	"			mov	%%edx,%%ecx\n"
+	"			add	$1,%%ebx\n"
+	"			adc	$0,%%ecx\n"
+	// edx:eax is equal to val3. cmpxchg8b should store ecx:ebx to val3:
+	"	probe3:		.globl  probe3\n"
+	"			cmpxchg8b val3(%%rip)\n"
+	// If we have a bug (edx:eax mangled on entry), val3 will stay unchanged.
+	// If ecx:edx in mangled, val3 will get wrong value.
+		: "=a" (ax), "=d" (dx) /*out*/
+		: "0" (ax), "1" (dx) /*in*/
+		: "cx", "bx", "memory" /*clobber*/
+		);
+		dprintf(2, "%s: %s\n", __func__,
+			pass[val3[0] == old_val + 1 && val3[1] == 0]
+		);
+	}
+
+	int main(int argc, char **argv)
+	{
+		test1();
+		test2();
+		test3();
+		return 0;
+	}
+
+Before this change all tests fail if probe{1,2,3} are probed.
+
+Signed-off-by: Denys Vlasenko <dvlasenk@redhat.com>
+Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+

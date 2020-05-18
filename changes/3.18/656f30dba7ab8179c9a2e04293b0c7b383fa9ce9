@@ -1,0 +1,46 @@
+Btrfs: be aware of btree inode write errors to avoid fs corruption
+
+While we have a transaction ongoing, the VM might decide at any time
+to call btree_inode->i_mapping->a_ops->writepages(), which will start
+writeback of dirty pages belonging to btree nodes/leafs. This call
+might return an error or the writeback might finish with an error
+before we attempt to commit the running transaction. If this happens,
+we might have no way of knowing that such error happened when we are
+committing the transaction - because the pages might no longer be
+marked dirty nor tagged for writeback (if a subsequent modification
+to the extent buffer didn't happen before the transaction commit) which
+makes filemap_fdata[write|wait]_range unable to find such pages (even
+if they're marked with SetPageError).
+So if this happens we must abort the transaction, otherwise we commit
+a super block with btree roots that point to btree nodes/leafs whose
+content on disk is invalid - either garbage or the content of some
+node/leaf from a past generation that got cowed or deleted and is no
+longer valid (for this later case we end up getting error messages like
+"parent transid verify failed on 10826481664 wanted 25748 found 29562"
+when reading btree nodes/leafs from disk).
+
+Note that setting and checking AS_EIO/AS_ENOSPC in the btree inode's
+i_mapping would not be enough because we need to distinguish between
+log tree extents (not fatal) vs non-log tree extents (fatal) and
+because the next call to filemap_fdatawait_range() will catch and clear
+such errors in the mapping - and that call might be from a log sync and
+not from a transaction commit, which means we would not know about the
+error at transaction commit time. Also, checking for the eb flag
+EXTENT_BUFFER_IOERR at transaction commit time isn't done and would
+not be completely reliable, as the eb might be removed from memory and
+read back when trying to get it, which clears that flag right before
+reading the eb's pages from disk, making us not know about the previous
+write error.
+
+Using the new 3 flags for the btree inode also makes us achieve the
+goal of AS_EIO/AS_ENOSPC when writepages() returns success, started
+writeback for all dirty pages and before filemap_fdatawait_range() is
+called, the writeback for all dirty pages had already finished with
+errors - because we were not using AS_EIO/AS_ENOSPC,
+filemap_fdatawait_range() would return success, as it could not know
+that writeback errors happened (the pages were no longer tagged for
+writeback).
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

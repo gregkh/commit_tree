@@ -1,0 +1,67 @@
+memcg, slab: do not schedule cache destruction when last page goes away
+
+This patchset is a part of preparations for kmemcg re-parenting.  It
+targets at simplifying kmemcg work-flows and synchronization.
+
+First, it removes async per memcg cache destruction (see patches 1, 2).
+Now caches are only destroyed on memcg offline.  That means the caches
+that are not empty on memcg offline will be leaked.  However, they are
+already leaked, because memcg_cache_params::nr_pages normally never drops
+to 0 so the destruction work is never scheduled except kmem_cache_shrink
+is called explicitly.  In the future I'm planning reaping such dead caches
+on vmpressure or periodically.
+
+Second, it substitutes per memcg slab_caches_mutex's with the global
+memcg_slab_mutex, which should be taken during the whole per memcg cache
+creation/destruction path before the slab_mutex (see patch 3).  This
+greatly simplifies synchronization among various per memcg cache
+creation/destruction paths.
+
+I'm still not quite sure about the end picture, in particular I don't know
+whether we should reap dead memcgs' kmem caches periodically or try to
+merge them with their parents (see https://lkml.org/lkml/2014/4/20/38 for
+more details), but whichever way we choose, this set looks like a
+reasonable change to me, because it greatly simplifies kmemcg work-flows
+and eases further development.
+
+This patch (of 3):
+
+After a memcg is offlined, we mark its kmem caches that cannot be deleted
+right now due to pending objects as dead by setting the
+memcg_cache_params::dead flag, so that memcg_release_pages will schedule
+cache destruction (memcg_cache_params::destroy) as soon as the last slab
+of the cache is freed (memcg_cache_params::nr_pages drops to zero).
+
+I guess the idea was to destroy the caches as soon as possible, i.e.
+immediately after freeing the last object.  However, it just doesn't work
+that way, because kmem caches always preserve some pages for the sake of
+performance, so that nr_pages never gets to zero unless the cache is
+shrunk explicitly using kmem_cache_shrink.  Of course, we could account
+the total number of objects on the cache or check if all the slabs
+allocated for the cache are empty on kmem_cache_free and schedule
+destruction if so, but that would be too costly.
+
+Thus we have a piece of code that works only when we explicitly call
+kmem_cache_shrink, but complicates the whole picture a lot.  Moreover,
+it's racy in fact.  For instance, kmem_cache_shrink may free the last slab
+and thus schedule cache destruction before it finishes checking that the
+cache is empty, which can lead to use-after-free.
+
+So I propose to remove this async cache destruction from
+memcg_release_pages, and check if the cache is empty explicitly after
+calling kmem_cache_shrink instead.  This will simplify things a lot w/o
+introducing any functional changes.
+
+And regarding dead memcg caches (i.e.  those that are left hanging around
+after memcg offline for they have objects), I suppose we should reap them
+either periodically or on vmpressure as Glauber suggested initially.  I'm
+going to implement this later.
+
+Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Glauber Costa <glommer@gmail.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

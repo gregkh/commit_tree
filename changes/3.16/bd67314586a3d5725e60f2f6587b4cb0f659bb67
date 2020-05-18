@@ -1,0 +1,72 @@
+memcg, slab: simplify synchronization scheme
+
+At present, we have the following mutexes protecting data related to per
+memcg kmem caches:
+
+ - slab_mutex.  This one is held during the whole kmem cache creation
+   and destruction paths.  We also take it when updating per root cache
+   memcg_caches arrays (see memcg_update_all_caches).  As a result, taking
+   it guarantees there will be no changes to any kmem cache (including per
+   memcg).  Why do we need something else then?  The point is it is
+   private to slab implementation and has some internal dependencies with
+   other mutexes (get_online_cpus).  So we just don't want to rely upon it
+   and prefer to introduce additional mutexes instead.
+
+ - activate_kmem_mutex.  Initially it was added to synchronize
+   initializing kmem limit (memcg_activate_kmem).  However, since we can
+   grow per root cache memcg_caches arrays only on kmem limit
+   initialization (see memcg_update_all_caches), we also employ it to
+   protect against memcg_caches arrays relocation (e.g.  see
+   __kmem_cache_destroy_memcg_children).
+
+ - We have a convention not to take slab_mutex in memcontrol.c, but we
+   want to walk over per memcg memcg_slab_caches lists there (e.g.  for
+   destroying all memcg caches on offline).  So we have per memcg
+   slab_caches_mutex's protecting those lists.
+
+The mutexes are taken in the following order:
+
+   activate_kmem_mutex -> slab_mutex -> memcg::slab_caches_mutex
+
+Such a syncrhonization scheme has a number of flaws, for instance:
+
+ - We can't call kmem_cache_{destroy,shrink} while walking over a
+   memcg::memcg_slab_caches list due to locking order.  As a result, in
+   mem_cgroup_destroy_all_caches we schedule the
+   memcg_cache_params::destroy work shrinking and destroying the cache.
+
+ - We don't have a mutex to synchronize per memcg caches destruction
+   between memcg offline (mem_cgroup_destroy_all_caches) and root cache
+   destruction (__kmem_cache_destroy_memcg_children).  Currently we just
+   don't bother about it.
+
+This patch simplifies it by substituting per memcg slab_caches_mutex's
+with the global memcg_slab_mutex.  It will be held whenever a new per
+memcg cache is created or destroyed, so it protects per root cache
+memcg_caches arrays and per memcg memcg_slab_caches lists.  The locking
+order is following:
+
+   activate_kmem_mutex -> memcg_slab_mutex -> slab_mutex
+
+This allows us to call kmem_cache_{create,shrink,destroy} under the
+memcg_slab_mutex.  As a result, we don't need memcg_cache_params::destroy
+work any more - we can simply destroy caches while iterating over a per
+memcg slab caches list.
+
+Also using the global mutex simplifies synchronization between concurrent
+per memcg caches creation/destruction, e.g.  mem_cgroup_destroy_all_caches
+vs __kmem_cache_destroy_memcg_children.
+
+The downside of this is that we substitute per-memcg slab_caches_mutex's
+with a hummer-like global mutex, but since we already take either the
+slab_mutex or the cgroup_mutex along with a memcg::slab_caches_mutex, it
+shouldn't hurt concurrency a lot.
+
+Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Glauber Costa <glommer@gmail.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,73 @@
+usb: resume child device when port is powered on
+
+Unconditionally wake up the child device when the power session is
+recovered.
+
+This addresses the following scenarios:
+
+1/ The device may need a reset on power-session loss, without this
+   change port power-on recovery exposes khubd to scenarios that
+   usb_port_resume() is set to handle.  Prior to port power control the
+   only time a power session would be lost is during dpm_suspend of the
+   hub.  In that scenario usb_port_resume() is guaranteed to be called
+   prior to khubd running for that port.  With this change we wakeup the
+   child device as soon as possible (prior to khubd running again for this
+   port).
+
+   Although khubd has facilities to wake a child device it will only do
+   so if the portstatus / portchange indicates a suspend state.  In the
+   case of port power control we are not coming from a hub-port-suspend
+   state.  This implementation simply uses pm_request_resume() to wake the
+   device and relies on the port_dev->status_lock to prevent any collisions
+   between khubd and usb_port_resume().
+
+2/ This mechanism rate limits port power toggling.  The minimum port
+   power on/off period is now gated by the child device suspend/resume
+   latency.  Empirically this mitigates devices downgrading their connection
+   on perceived instability of the host connection.  This ratelimiting is
+   really only relevant to port power control testing, but it is a nice
+   side effect of closing the above race.  Namely, the race of khubd for
+   the given port running while a usb_port_resume() event is pending.
+
+3/ Going forward we are finding that power-session recovery requires
+   warm-resets (http://marc.info/?t=138659232900003&r=1&w=2).  This
+   mechanism allows for warm-resets to be requested at the same point in
+   the resume path for hub dpm_suspend power session losses, or port
+   rpm_suspend power session losses.
+
+4/ If the device *was* disconnected the only time we'll know for sure is
+   after a failed resume, so it's necessary for usb_port_runtime_resume()
+   to expedite a usb_port_resume() to clean up the removed device.  The
+   reasoning for this is "least surprise" for the user. Turning on a port
+   means that hotplug detection is again enabled for the port, it is
+   surprising that devices that were removed while the port was off are not
+   disconnected until they are attempted to be used.  As a user "why would
+   I try to use a device I removed from the system?"
+
+1, 2, and 4 are not a problem in the system dpm_resume() case because,
+although the power-session is lost, khubd is frozen until after device
+resume.  For the rpm_resume() case pm_request_resume() is used to
+request re-validation of the device, and if it happens to collide with a
+khubd run we rely on the port_dev->status_lock to synchronize those
+operations.
+
+Besides testing, the primary scenario where this mechanism is expected
+to be triggered is when the user changes the port power policy
+(control/pm_qos_no_poweroff, or power/control).   Each time power is
+enabled want to revalidate the child device, where the revalidation is
+handled by usb_port_resume().
+
+Given that this arranges for port_dev->child to be de-referenced in
+usb_port_runtime_resume() we need to make sure not to collide with
+usb_disconnect() that frees the usb_device.  To this end we hold the
+port active with the "child_usage" reference across the disconnect
+event.  Subsequently, the need to access hub->child_usage_bits lead to
+the creation of hub_disconnect_children() to remove any ambiguity of
+which "hub" is being acted on in usb_disconnect() (prompted-by sharp
+eyes from Alan).
+
+Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

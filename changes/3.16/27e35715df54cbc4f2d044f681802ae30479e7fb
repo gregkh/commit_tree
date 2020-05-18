@@ -1,0 +1,69 @@
+rtmutex: Plug slow unlock race
+
+When the rtmutex fast path is enabled the slow unlock function can
+create the following situation:
+
+spin_lock(foo->m->wait_lock);
+foo->m->owner = NULL;
+	    			rt_mutex_lock(foo->m); <-- fast path
+				free = atomic_dec_and_test(foo->refcnt);
+				rt_mutex_unlock(foo->m); <-- fast path
+				if (free)
+				   kfree(foo);
+
+spin_unlock(foo->m->wait_lock); <--- Use after free.
+
+Plug the race by changing the slow unlock to the following scheme:
+
+     while (!rt_mutex_has_waiters(m)) {
+     	    /* Clear the waiters bit in m->owner */
+	    clear_rt_mutex_waiters(m);
+      	    owner = rt_mutex_owner(m);
+      	    spin_unlock(m->wait_lock);
+      	    if (cmpxchg(m->owner, owner, 0) == owner)
+      	       return;
+      	    spin_lock(m->wait_lock);
+     }
+
+So in case of a new waiter incoming while the owner tries the slow
+path unlock we have two situations:
+
+ unlock(wait_lock);
+					lock(wait_lock);
+ cmpxchg(p, owner, 0) == owner
+ 	    	   			mark_rt_mutex_waiters(lock);
+	 				acquire(lock);
+
+Or:
+
+ unlock(wait_lock);
+					lock(wait_lock);
+	 				mark_rt_mutex_waiters(lock);
+ cmpxchg(p, owner, 0) != owner
+					enqueue_waiter();
+					unlock(wait_lock);
+ lock(wait_lock);
+ wakeup_next waiter();
+ unlock(wait_lock);
+					lock(wait_lock);
+					acquire(lock);
+
+If the fast path is disabled, then the simple
+
+   m->owner = NULL;
+   unlock(m->wait_lock);
+
+is sufficient as all access to m->owner is serialized via
+m->wait_lock;
+
+Also document and clarify the wakeup_next_waiter function as suggested
+by Oleg Nesterov.
+
+Reported-by: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Steven Rostedt <rostedt@goodmis.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20140611183852.937945560@linutronix.de
+Cc: stable@vger.kernel.org
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+

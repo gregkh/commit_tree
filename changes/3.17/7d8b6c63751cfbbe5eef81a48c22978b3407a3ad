@@ -1,0 +1,81 @@
+CAPABILITIES: remove undefined caps from all processes
+
+This is effectively a revert of 7b9a7ec565505699f503b4fcf61500dceb36e744
+plus fixing it a different way...
+
+We found, when trying to run an application from an application which
+had dropped privs that the kernel does security checks on undefined
+capability bits.  This was ESPECIALLY difficult to debug as those
+undefined bits are hidden from /proc/$PID/status.
+
+Consider a root application which drops all capabilities from ALL 4
+capability sets.  We assume, since the application is going to set
+eff/perm/inh from an array that it will clear not only the defined caps
+less than CAP_LAST_CAP, but also the higher 28ish bits which are
+undefined future capabilities.
+
+The BSET gets cleared differently.  Instead it is cleared one bit at a
+time.  The problem here is that in security/commoncap.c::cap_task_prctl()
+we actually check the validity of a capability being read.  So any task
+which attempts to 'read all things set in bset' followed by 'unset all
+things set in bset' will not even attempt to unset the undefined bits
+higher than CAP_LAST_CAP.
+
+So the 'parent' will look something like:
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	ffffffc000000000
+
+All of this 'should' be fine.  Given that these are undefined bits that
+aren't supposed to have anything to do with permissions.  But they do...
+
+So lets now consider a task which cleared the eff/perm/inh completely
+and cleared all of the valid caps in the bset (but not the invalid caps
+it couldn't read out of the kernel).  We know that this is exactly what
+the libcap-ng library does and what the go capabilities library does.
+They both leave you in that above situation if you try to clear all of
+you capapabilities from all 4 sets.  If that root task calls execve()
+the child task will pick up all caps not blocked by the bset.  The bset
+however does not block bits higher than CAP_LAST_CAP.  So now the child
+task has bits in eff which are not in the parent.  These are
+'meaningless' undefined bits, but still bits which the parent doesn't
+have.
+
+The problem is now in cred_cap_issubset() (or any operation which does a
+subset test) as the child, while a subset for valid cap bits, is not a
+subset for invalid cap bits!  So now we set durring commit creds that
+the child is not dumpable.  Given it is 'more priv' than its parent.  It
+also means the parent cannot ptrace the child and other stupidity.
+
+The solution here:
+1) stop hiding capability bits in status
+	This makes debugging easier!
+
+2) stop giving any task undefined capability bits.  it's simple, it you
+don't put those invalid bits in CAP_FULL_SET you won't get them in init
+and you won't get them in any other task either.
+	This fixes the cap_issubset() tests and resulting fallout (which
+	made the init task in a docker container untraceable among other
+	things)
+
+3) mask out undefined bits when sys_capset() is called as it might use
+~0, ~0 to denote 'all capabilities' for backward/forward compatibility.
+	This lets 'capsh --caps="all=eip" -- -c /bin/bash' run.
+
+4) mask out undefined bit when we read a file capability off of disk as
+again likely all bits are set in the xattr for forward/backward
+compatibility.
+	This lets 'setcap all+pe /bin/bash; /bin/bash' run
+
+Signed-off-by: Eric Paris <eparis@redhat.com>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+Cc: Andrew Vagin <avagin@openvz.org>
+Cc: Andrew G. Morgan <morgan@kernel.org>
+Cc: Serge E. Hallyn <serge.hallyn@canonical.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Steve Grubb <sgrubb@redhat.com>
+Cc: Dan Walsh <dwalsh@redhat.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: James Morris <james.l.morris@oracle.com>
+

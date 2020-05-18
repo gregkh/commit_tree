@@ -1,0 +1,166 @@
+drm: Atomic crtc/connector updates using crtc/plane helper interfaces
+
+So this is finally the integration of the crtc and plane helper
+interfaces into the atomic helper functions.
+
+In the check function we now have a few steps:
+
+- First we update the output routing and figure out which crtcs need a
+  full mode set. Suitable encoders are selected using ->best_encoder,
+  with the same semantics as the crtc helpers of implicitly disabling
+  all connectors currently using the encoder.
+
+- Then we pull all other connectors into the state update which feed
+  from a crtc which changes. This must be done do catch mode changes
+  and similar updates - atomic updates are differences on top of the
+  current state.
+
+- Then we call all the various ->mode_fixup to compute the adjusted
+  mode. Note that here we have a slight semantic difference compared
+  to the crtc helpers: We have not yet updated the encoder->crtc link
+  when calling the encoder's ->mode_fixup function. But that's a
+  requirement when converting to atomic since we want to prepare the
+  entire state completely contained with the over drm_atomic_state
+  structure. So this must be carefully checked when converting drivers
+  over to atomic helpers.
+
+- Finally we do call the atomic_check functions on planes and crtcs.
+
+The commit function is also quite a beast:
+
+- The only step that can fail is done first, namely pinning the
+  framebuffers. After that we cross the point of no return, an async
+  commit would push all that into the worker thread.
+
+- The disabling of encoders and connectors is a bit tricky, since
+  depending upon the final state we need to select different crtc
+  helper functions.
+
+- Software tracking is a bit clarified compared to the crtc helpers:
+  We commit the software state before starting to touch the hardware,
+  like crtc helpers. But since we just swap them we still have the old
+  state (i.e. the current hw state) around, which is really handy to
+  write simple disable functions. So no more
+  drm_crtc_helper_disable_all_unused_functions kind of fun because
+  we're leaving unused crtcs/encoders behind. Everything gets shut
+  down in-order now, which is one of the key differences of the i915
+  helpers compared to crtc helpers and a really nice additional
+  guarantee.
+
+- Like with the plane helpers the atomic commit function waits for one
+  vblank to pass before calling the framebuffer cleanup function.
+
+Compared to Rob's helper approach there's a bunch of upsides:
+
+- All the interfaces which can fail are called in the ->check hook
+  (i.e. ->best_match and the various ->mode_fixup hooks). This means
+  that drivers can just reuse those functions and don't need to move
+  everything into ->atomic_check callbacks. If drivers have no need
+  for additional constraint checking beyong their existing crtc
+  helper callbacks they don't need to do anything.
+
+- The actual commit operation is properly stage: First we prepare
+  framebuffers, which can potentially still fail (due to memory
+  exhausting). This is important for the async case, where this must
+  be done synchronously to correctly return errors.
+
+- The output configuration changes (done with crtc helper functions)
+  and the plane update (using atomic plane helpers) are correctly
+  interleaved: First we shut down any crtcs that need changing, then
+  we update planes and finally we enable everything again. Hardware
+  without GO bits must be more careful with ordering, which this
+  sequence enables.
+
+- Also for hardware with shared output resources (like display PLLs)
+  we first must shut down the old configuration before we can enable
+  the new one. Otherwise we can hit an impossible intermediate state
+  where there's not enough PLLs (which is the point behind atomic
+  updates).
+
+v2:
+- Ensure that users of ->check update crtc_state->enable correctly.
+- Update the legacy state in crtc/plane structures. Eventually we want
+  to remove that, but for now the drm core still expects this (especially
+  the plane->fb pointer).
+
+v3: A few changes for better async handling:
+
+- Reorder the software side state commit so that it happens all before
+  we touch the hardware. This way async support becomes very easy
+  since we can punt all the actual hw touching to a worker thread. And
+  as long as we synchronize with that thread (flushing or cancelling,
+  depending upon what the driver can handle) before we commit the next
+  software state there's no need for any locking in the worker thread
+  at all. Which greatly simplifies things.
+
+  And as long as we synchronize with all relevant threads we can have
+  a lot of them (e.g. per-crtc for per-crtc updates) running in
+  parallel.
+
+- Expose pre/post plane commit steps separately. We need to expose the
+  actual hw commit step anyway for drivers to be able to implement
+  asynchronous commit workers. But if we expose pre/post and plane
+  commit steps individually we allow drivers to selectively use atomic
+  helpers.
+
+- I've forgotten to call encoder/bridge ->mode_set functions, fix
+  this.
+
+v4: Add debug output and fix a mixup between current and new state
+that resulted in crtcs not getting updated correctly. And in an
+Oops ...
+
+v5:
+- Be kind to driver writers in the vblank wait functions.. if thing
+  aren't working yet, and vblank irq will never come, then let's not
+  block forever.. especially under console-lock.
+- Correctly clear connector_state->best_encoder when disabling.
+  Spotted while trying to understand a report from Rob Clark.
+- Only steal encoder if it actually changed, otherwise hilarity ensues
+  if we steal from the current connector and so set the ->crtc pointer
+  unexpectedly to NULL. Reported by Rob Clark.
+- Bail out in disable_outputs if an output currently doesn't have a
+  best_encoder - this means it's already disabled.
+
+v6: Fixupe kerneldoc as reported by Paulo. And also fix up kerneldoc
+in drm_crtc.h.
+
+v7: Take ownership of the atomic state and clean it up with
+drm_atomic_state_free().
+
+v8 Various improvements all over:
+- Polish code comments and kerneldoc.
+- Improve debug output to make sure all failure cases are logged.
+- Treat enabled crtc with no connectors as invalid input from userspace.
+- Don't ignore the return value from mode_fixup().
+
+v9:
+- Improve debug output for crtc_state->mode_changed.
+
+v10:
+- Fixup the vblank waiting code to properly balance the vblank_get/put
+  calls.
+- Better comments when checking/computing crtc->mode_changed
+
+v11: Fixup the encoder stealing logic: We can't look at encoder->crtc
+since that's not in the atomic state structures and might be updated
+asynchronously in and async commit. Instead we need to inspect all the
+connector states and check whether the encoder is currently in used
+and if so, on which crtc.
+
+v12: Review from Sean:
+- A few spelling fixes.
+- Flatten control flow indent by converting if blocks to early
+  continue/return in 2 places.
+- Capture connectors_for_crtc return value in int num_connectors
+  instead of bool has_connectors and do an explicit int->bool
+  conversion with !!. I think the helper is more useful for drivers if
+  it returns the number of connectors (e.g. to detect cloning
+  configurations), so decided to keep that return value.
+
+Cc: Sean Paul <seanpaul@chromium.org>
+Cc: Paulo Zanoni <przanoni@gmail.com>
+Cc: Rob Clark <robdclark@gmail.com>
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+

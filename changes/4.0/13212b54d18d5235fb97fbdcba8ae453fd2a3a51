@@ -1,0 +1,106 @@
+btrfs: Fix out-of-space bug
+
+Btrfs will report NO_SPACE when we create and remove files for several times,
+and we can't write to filesystem until mount it again.
+
+Steps to reproduce:
+ 1: Create a single-dev btrfs fs with default option
+ 2: Write a file into it to take up most fs space
+ 3: Delete above file
+ 4: Wait about 100s to let chunk removed
+ 5: goto 2
+
+Script is like following:
+ #!/bin/bash
+
+ # Recommend 1.2G space, too large disk will make test slow
+ DEV="/dev/sda16"
+ MNT="/mnt/tmp"
+
+ dev_size="$(lsblk -bn -o SIZE "$DEV")" || exit 2
+ file_size_m=$((dev_size * 75 / 100 / 1024 / 1024))
+
+ echo "Loop write ${file_size_m}M file on $((dev_size / 1024 / 1024))M dev"
+
+ for ((i = 0; i < 10; i++)); do umount "$MNT" 2>/dev/null; done
+ echo "mkfs $DEV"
+ mkfs.btrfs -f "$DEV" >/dev/null || exit 2
+ echo "mount $DEV $MNT"
+ mount "$DEV" "$MNT" || exit 2
+
+ for ((loop_i = 0; loop_i < 20; loop_i++)); do
+     echo
+     echo "loop $loop_i"
+
+     echo "dd file..."
+     cmd=(dd if=/dev/zero of="$MNT"/file0 bs=1M count="$file_size_m")
+     "${cmd[@]}" 2>/dev/null || {
+         # NO_SPACE error triggered
+         echo "dd failed: ${cmd[*]}"
+         exit 1
+     }
+
+     echo "rm file..."
+     rm -f "$MNT"/file0 || exit 2
+
+     for ((i = 0; i < 10; i++)); do
+         df "$MNT" | tail -1
+         sleep 10
+     done
+ done
+
+Reason:
+ It is triggered by commit: 47ab2a6c689913db23ccae38349714edf8365e0a
+ which is used to remove empty block groups automatically, but the
+ reason is not in that patch. Code before works well because btrfs
+ don't need to create and delete chunks so many times with high
+ complexity.
+ Above bug is caused by many reason, any of them can trigger it.
+
+Reason1:
+ When we remove some continuous chunks but leave other chunks after,
+ these disk space should be used by chunk-recreating, but in current
+ code, only first create will successed.
+ Fixed by Forrest Liu <forrestl@synology.com> in:
+ Btrfs: fix find_free_dev_extent() malfunction in case device tree has hole
+
+Reason2:
+ contains_pending_extent() return wrong value in calculation.
+ Fixed by Forrest Liu <forrestl@synology.com> in:
+ Btrfs: fix find_free_dev_extent() malfunction in case device tree has hole
+
+Reason3:
+ btrfs_check_data_free_space() try to commit transaction and retry
+ allocating chunk when the first allocating failed, but space_info->full
+ is set in first allocating, and prevent second allocating in retry.
+ Fixed in this patch by clear space_info->full in commit transaction.
+
+ Tested for severial times by above script.
+
+Changelog v3->v4:
+ use light weight int instead of atomic_t to record have_remove_bgs in
+ transaction, suggested by:
+ Josef Bacik <jbacik@fb.com>
+
+Changelog v2->v3:
+ v2 fixed the bug by adding more commit-transaction, but we
+ only need to reclaim space when we are really have no space for
+ new chunk, noticed by:
+ Filipe David Manana <fdmanana@gmail.com>
+
+ Actually, our code already have this type of commit-and-retry,
+ we only need to make it working with removed-bgs.
+ v3 fixed the bug with above way.
+
+Changelog v1->v2:
+ v1 will introduce a new bug when delete and create chunk in same disk
+ space in same transaction, noticed by:
+ Filipe David Manana <fdmanana@gmail.com>
+ V2 fix this bug by commit transaction after remove block grops.
+
+Reported-by: Tsutomu Itoh <t-itoh@jp.fujitsu.com>
+Suggested-by: Filipe David Manana <fdmanana@gmail.com>
+Suggested-by: Josef Bacik <jbacik@fb.com>
+Signed-off-by: Zhao Lei <zhaolei@cn.fujitsu.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+

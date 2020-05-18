@@ -1,0 +1,87 @@
+IPoIB: fix MCAST_FLAG_BUSY usage
+
+Commit a9c8ba5884 ("IPoIB: Fix usage of uninitialized multicast
+objects") added a new flag MCAST_JOIN_STARTED, but was not very strict
+in how it was used.  We didn't always initialize the completion struct
+before we set the flag, and we didn't always call complete on the
+completion struct from all paths that complete it.  This made it less
+than totally effective, and certainly made its use confusing.  And in
+the flush function we would use the presence of this flag to signal
+that we should wait on the completion struct, but we never cleared
+this flag, ever.  This is further muddied by the fact that we overload
+the MCAST_FLAG_BUSY flag to mean two different things: we have a join
+in flight, and we have succeeded in getting an ib_sa_join_multicast.
+
+In order to make things clearer and aid in resolving the rtnl deadlock
+bug I've been chasing, I cleaned this up a bit.
+
+ 1) Remove the MCAST_JOIN_STARTED flag entirely
+ 2) Un-overload MCAST_FLAG_BUSY so it now only means a join is in-flight
+ 3) Test on mcast->mc directly to see if we have completed
+    ib_sa_join_multicast (using IS_ERR_OR_NULL)
+ 4) Make sure that before setting MCAST_FLAG_BUSY we always initialize
+    the mcast->done completion struct
+ 5) Make sure that before calling complete(&mcast->done), we always clear
+    the MCAST_FLAG_BUSY bit
+ 6) Take the mcast_mutex before we call ib_sa_multicast_join and also
+    take the mutex in our join callback.  This forces
+    ib_sa_multicast_join to return and set mcast->mc before we process
+    the callback.  This way, our callback can safely clear mcast->mc
+    if there is an error on the join and we will do the right thing as
+    a result in mcast_dev_flush.
+ 7) Because we need the mutex to synchronize mcast->mc, we can no
+    longer call mcast_sendonly_join directly from mcast_send and
+    instead must add sendonly join processing to the mcast_join_task
+
+A number of different races are resolved with these changes.  These
+races existed with the old MCAST_FLAG_BUSY usage, the
+MCAST_JOIN_STARTED flag was an attempt to address them, and while it
+helped, a determined effort could still trip things up.
+
+One race looks something like this:
+
+Thread 1                             Thread 2
+ib_sa_join_multicast (as part of running restart mcast task)
+  alloc member
+  call callback
+                                     ifconfig ib0 down
+				     wait_for_completion
+    callback call completes
+                                     wait_for_completion in
+				     mcast_dev_flush completes
+				       mcast->mc is PTR_ERR_OR_NULL
+				       so we skip ib_sa_leave_multicast
+    return from callback
+  return from ib_sa_join_multicast
+set mcast->mc = return from ib_sa_multicast
+
+We now have a permanently unbalanced join/leave issue that trips up the
+refcounting in core/multicast.c
+
+Another like this:
+
+Thread 1                   Thread 2         Thread 3
+ib_sa_multicast_join
+                                            ifconfig ib0 down
+					    priv->broadcast = NULL
+                           join_complete
+			                    wait_for_completion
+			   mcast->mc is not yet set, so don't clear
+return from ib_sa_join_multicast and set mcast->mc
+			   complete
+			   return -EAGAIN (making mcast->mc invalid)
+			   		    call ib_sa_multicast_leave
+					    on invalid mcast->mc, hang
+					    forever
+
+By holding the mutex around ib_sa_multicast_join and taking the mutex
+early in the callback, we force mcast->mc to be valid at the time we
+run the callback.  This allows us to clear mcast->mc if there is an
+error and the join is going to fail.  We do this before we complete
+the mcast.  In this way, mcast_dev_flush always sees consistent state
+in regards to mcast->mc membership at the time that the
+wait_for_completion() returns.
+
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+

@@ -1,0 +1,64 @@
+mm, compaction: khugepaged should not give up due to need_resched()
+
+Async compaction aborts when it detects zone lock contention or
+need_resched() is true.  David Rientjes has reported that in practice,
+most direct async compactions for THP allocation abort due to
+need_resched().  This means that a second direct compaction is never
+attempted, which might be OK for a page fault, but khugepaged is intended
+to attempt a sync compaction in such case and in these cases it won't.
+
+This patch replaces "bool contended" in compact_control with an int that
+distinguishes between aborting due to need_resched() and aborting due to
+lock contention.  This allows propagating the abort through all compaction
+functions as before, but passing the abort reason up to
+__alloc_pages_slowpath() which decides when to continue with direct
+reclaim and another compaction attempt.
+
+Another problem is that try_to_compact_pages() did not act upon the
+reported contention (both need_resched() or lock contention) immediately
+and would proceed with another zone from the zonelist.  When
+need_resched() is true, that means initializing another zone compaction,
+only to check again need_resched() in isolate_migratepages() and aborting.
+ For zone lock contention, the unintended consequence is that the lock
+contended status reported back to the allocator is detrmined from the last
+zone where compaction was attempted, which is rather arbitrary.
+
+This patch fixes the problem in the following way:
+- async compaction of a zone aborting due to need_resched() or fatal signal
+  pending means that further zones should not be tried. We report
+  COMPACT_CONTENDED_SCHED to the allocator.
+- aborting zone compaction due to lock contention means we can still try
+  another zone, since it has different set of locks. We report back
+  COMPACT_CONTENDED_LOCK only if *all* zones where compaction was attempted,
+  it was aborted due to lock contention.
+
+As a result of these fixes, khugepaged will proceed with second sync
+compaction as intended, when the preceding async compaction aborted due to
+need_resched().  Page fault compactions aborting due to need_resched()
+will spare some cycles previously wasted by initializing another zone
+compaction only to abort again.  Lock contention will be reported only
+when compaction in all zones aborted due to lock contention, and therefore
+it's not a good idea to try again after reclaim.
+
+In stress-highalloc from mmtests configured to use __GFP_NO_KSWAPD, this
+has improved number of THP collapse allocations by 10%, which shows
+positive effect on khugepaged.  The benchmark's success rates are
+unchanged as it is not recognized as khugepaged.  Numbers of compact_stall
+and compact_fail events have however decreased by 20%, with
+compact_success still a bit improved, which is good.  With benchmark
+configured not to use __GFP_NO_KSWAPD, there is 6% improvement in THP
+collapse allocations, and only slight improvement in stalls and failures.
+
+[akpm@linux-foundation.org: fix warnings]
+Reported-by: David Rientjes <rientjes@google.com>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Minchan Kim <minchan@kernel.org>
+Acked-by: Mel Gorman <mgorman@suse.de>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Michal Nazarewicz <mina86@mina86.com>
+Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Rik van Riel <riel@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

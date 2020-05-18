@@ -1,0 +1,85 @@
+Btrfs: fix fsync log replay for inodes with a mix of regular refs and extrefs
+
+If we have an inode with a large number of hard links, some of which may
+be extrefs, turn a regular ref into an extref, fsync the inode and then
+replay the fsync log (after a crash/reboot), we can endup with an fsync
+log that makes the replay code always fail with -EOVERFLOW when processing
+the inode's references.
+
+This is easy to reproduce with the test case I made for xfstests. Its steps
+are the following:
+
+   _scratch_mkfs "-O extref" >> $seqres.full 2>&1
+   _init_flakey
+   _mount_flakey
+
+   # Create a test file with 3001 hard links. This number is large enough to
+   # make btrfs start using extrefs at some point even if the fs has the maximum
+   # possible leaf/node size (64Kb).
+   echo "hello world" > $SCRATCH_MNT/foo
+   for i in `seq 1 3000`; do
+       ln $SCRATCH_MNT/foo $SCRATCH_MNT/foo_link_`printf "%04d" $i`
+   done
+
+   # Make sure all metadata and data are durably persisted.
+   sync
+
+   # Now remove one link, add a new one with a new name, add another new one with
+   # the same name as the one we just removed and fsync the inode.
+   rm -f $SCRATCH_MNT/foo_link_0001
+   ln $SCRATCH_MNT/foo $SCRATCH_MNT/foo_link_3001
+   ln $SCRATCH_MNT/foo $SCRATCH_MNT/foo_link_0001
+   rm -f $SCRATCH_MNT/foo_link_0002
+   ln $SCRATCH_MNT/foo $SCRATCH_MNT/foo_link_3002
+   ln $SCRATCH_MNT/foo $SCRATCH_MNT/foo_link_3003
+   $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foo
+
+   # Simulate a crash/power loss. This makes sure the next mount
+   # will see an fsync log and will replay that log.
+
+   _load_flakey_table $FLAKEY_DROP_WRITES
+   _unmount_flakey
+
+   _load_flakey_table $FLAKEY_ALLOW_WRITES
+   _mount_flakey
+
+   # Check that the number of hard links is correct, we are able to remove all
+   # the hard links and read the file's data. This is just to verify we don't
+   # get stale file handle errors (due to dangling directory index entries that
+   # point to inodes that no longer exist).
+   echo "Link count: $(stat --format=%h $SCRATCH_MNT/foo)"
+   [ -f $SCRATCH_MNT/foo ] || echo "Link foo is missing"
+   for ((i = 1; i <= 3003; i++)); do
+       name=foo_link_`printf "%04d" $i`
+       if [ $i -eq 2 ]; then
+           [ -f $SCRATCH_MNT/$name ] && echo "Link $name found"
+       else
+           [ -f $SCRATCH_MNT/$name ] || echo "Link $name is missing"
+       fi
+   done
+   rm -f $SCRATCH_MNT/foo_link_*
+   cat $SCRATCH_MNT/foo
+   rm -f $SCRATCH_MNT/foo
+
+   status=0
+   exit
+
+The fix is simply to correct the overflow condition when overwriting a
+reference item because it was wrong, trying to increase the item in the
+fs/subvol tree by an impossible amount. Also ensure that we don't insert
+one normal ref and one ext ref for the same dentry - this happened because
+processing a dir index entry from the parent in the log happened when
+the normal ref item was full, which made the logic insert an extref and
+later when the normal ref had enough room, it would be inserted again
+when processing the ref item from the child inode in the log.
+
+This issue has been present since the introduction of the extrefs feature
+(2012).
+
+A test case for xfstests follows soon. This test only passes if the previous
+patch titled "Btrfs: fix fsync when extend references are added to an inode"
+is applied too.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+
