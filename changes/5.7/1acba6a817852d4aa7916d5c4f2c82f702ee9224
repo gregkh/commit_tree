@@ -1,0 +1,88 @@
+IB/ipoib: Fix double free of skb in case of multicast traffic in CM mode
+
+When connected mode is set, and we have connected and datagram traffic in
+parallel, ipoib might crash with double free of datagram skb.
+
+The current mechanism assumes that the order in the completion queue is
+the same as the order of sent packets for all QPs. Order is kept only for
+specific QP, in case of mixed UD and CM traffic we have few QPs (one UD and
+few CM's) in parallel.
+
+The problem:
+----------------------------------------------------------
+
+Transmit queue:
+-----------------
+UD skb pointer kept in queue itself, CM skb kept in spearate queue and
+uses transmit queue as a placeholder to count the number of total
+transmitted packets.
+
+0   1   2   3   4  5  6  7  8   9  10  11 12 13 .........127
+------------------------------------------------------------
+NL ud1 UD2 CM1 ud3 cm2 cm3 ud4 cm4 ud5 NL NL NL ...........
+------------------------------------------------------------
+    ^                                  ^
+   tail                               head
+
+Completion queue (problematic scenario) - the order not the same as in
+the transmit queue:
+
+  1  2  3  4  5  6  7  8  9
+------------------------------------
+ ud1 CM1 UD2 ud3 cm2 cm3 ud4 cm4 ud5
+------------------------------------
+
+1. CM1 'wc' processing
+   - skb freed in cm separate ring.
+   - tx_tail of transmit queue increased although UD2 is not freed.
+     Now driver assumes UD2 index is already freed and it could be used for
+     new transmitted skb.
+
+0   1   2   3   4  5  6  7  8   9  10  11 12 13 .........127
+------------------------------------------------------------
+NL NL  UD2 CM1 ud3 cm2 cm3 ud4 cm4 ud5 NL NL NL ...........
+------------------------------------------------------------
+        ^   ^                       ^
+      (Bad)tail                    head
+(Bad - Could be used for new SKB)
+
+In this case (due to heavy load) UD2 skb pointer could be replaced by new
+transmitted packet UD_NEW, as the driver assumes its free.  At this point
+we will have to process two 'wc' with same index but we have only one
+pointer to free.
+
+During second attempt to free the same skb we will have NULL pointer
+exception.
+
+2. UD2 'wc' processing
+   - skb freed according the index we got from 'wc', but it was already
+     overwritten by mistake. So actually the skb that was released is the
+     skb of the new transmitted packet and not the original one.
+
+3. UD_NEW 'wc' processing
+   - attempt to free already freed skb. NUll pointer exception.
+
+The fix:
+-----------------------------------------------------------------------
+
+The fix is to stop using the UD ring as a placeholder for CM packets, the
+cyclic ring variables tx_head and tx_tail will manage the UD tx_ring, a
+new cyclic variables global_tx_head and global_tx_tail are introduced for
+managing and counting the overall outstanding sent packets, then the send
+queue will be stopped and waken based on these variables only.
+
+Note that no locking is needed since global_tx_head is updated in the xmit
+flow and global_tx_tail is updated in the NAPI flow only.  A previous
+attempt tried to use one variable to count the outstanding sent packets,
+but it did not work since xmit and NAPI flows can run at the same time and
+the counter will be updated wrongly. Thus, we use the same simple cyclic
+head and tail scheme that we have today for the UD tx_ring.
+
+Fixes: 2c104ea68350 ("IB/ipoib: Get rid of the tx_outstanding variable in all modes")
+Link: https://lore.kernel.org/r/20200527134705.480068-1-leon@kernel.org
+Signed-off-by: Valentine Fatiev <valentinef@mellanox.com>
+Signed-off-by: Alaa Hleihel <alaa@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Acked-by: Doug Ledford <dledford@redhat.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+

@@ -1,0 +1,41 @@
+net/tls: fix race condition causing kernel panic
+
+tls_sw_recvmsg() and tls_decrypt_done() can be run concurrently.
+// tls_sw_recvmsg()
+	if (atomic_read(&ctx->decrypt_pending))
+		crypto_wait_req(-EINPROGRESS, &ctx->async_wait);
+	else
+		reinit_completion(&ctx->async_wait.completion);
+
+//tls_decrypt_done()
+  	pending = atomic_dec_return(&ctx->decrypt_pending);
+
+  	if (!pending && READ_ONCE(ctx->async_notify))
+  		complete(&ctx->async_wait.completion);
+
+Consider the scenario tls_decrypt_done() is about to run complete()
+
+	if (!pending && READ_ONCE(ctx->async_notify))
+
+and tls_sw_recvmsg() reads decrypt_pending == 0, does reinit_completion(),
+then tls_decrypt_done() runs complete(). This sequence of execution
+results in wrong completion. Consequently, for next decrypt request,
+it will not wait for completion, eventually on connection close, crypto
+resources freed, there is no way to handle pending decrypt response.
+
+This race condition can be avoided by having atomic_read() mutually
+exclusive with atomic_dec_return(),complete().Intoduced spin lock to
+ensure the mutual exclution.
+
+Addressed similar problem in tx direction.
+
+v1->v2:
+- More readable commit message.
+- Corrected the lock to fix new race scenario.
+- Removed barrier which is not needed now.
+
+Fixes: a42055e8d2c3 ("net/tls: Add support for async encryption of records for performance")
+Signed-off-by: Vinay Kumar Yadav <vinay.yadav@chelsio.com>
+Reviewed-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
