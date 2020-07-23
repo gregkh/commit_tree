@@ -1,0 +1,107 @@
+net: dsa: sja1105: implement tc-gate using time-triggered virtual links
+
+Restrict the TTEthernet hardware support on this switch to operate as
+closely as possible to IEEE 802.1Qci as possible. This means that it can
+perform PTP-time-based ingress admission control on streams identified
+by {DMAC, VID, PCP}, which is useful when trying to ensure the
+determinism of traffic scheduled via IEEE 802.1Qbv.
+
+The oddity comes from the fact that in hardware (and in TTEthernet at
+large), virtual links always need a full-blown action, including not
+only the type of policing, but also the list of destination ports. So in
+practice, a single tc-gate action will result in all packets getting
+dropped. Additional actions (either "trap" or "redirect") need to be
+specified in the same filter rule such that the conforming packets are
+actually forwarded somewhere.
+
+Apart from the VL Lookup, Policing and Forwarding tables which need to
+be programmed for each flow (virtual link), the Schedule engine also
+needs to be told to open/close the admission gates for each individual
+virtual link. A fairly accurate (and detailed) description of how that
+works is already present in sja1105_tas.c, since it is already used to
+trigger the egress gates for the tc-taprio offload (IEEE 802.1Qbv). Key
+point here, we remember that the schedule engine supports 8
+"subschedules" (execution threads that iterate through the global
+schedule in parallel, and that no 2 hardware threads must execute a
+schedule entry at the same time). For tc-taprio, each egress port used
+one of these 8 subschedules, leaving a total of 4 subschedules unused.
+In principle we could have allocated 1 subschedule for the tc-gate
+offload of each ingress port, but actually the schedules of all virtual
+links installed on each ingress port would have needed to be merged
+together, before they could have been programmed to hardware. So
+simplify our life and just merge the entire tc-gate configuration, for
+all virtual links on all ingress ports, into a single subschedule. Be
+sure to check that against the usual hardware scheduling conflicts, and
+program it to hardware alongside any tc-taprio subschedule that may be
+present.
+
+The following scenarios were tested:
+
+1. Quantitative testing:
+
+   tc qdisc add dev swp2 clsact
+   tc filter add dev swp2 ingress flower skip_sw \
+           dst_mac 42:be:24:9b:76:20 \
+           action gate index 1 base-time 0 \
+           sched-entry OPEN 1200 -1 -1 \
+           sched-entry CLOSE 1200 -1 -1 \
+           action trap
+
+   ping 192.168.1.2 -f
+   PING 192.168.1.2 (192.168.1.2) 56(84) bytes of data.
+   .............................
+   --- 192.168.1.2 ping statistics ---
+   948 packets transmitted, 467 received, 50.7384% packet loss, time 9671ms
+
+2. Qualitative testing (with a phase-aligned schedule - the clocks are
+   synchronized by ptp4l, not shown here):
+
+   Receiver (sja1105):
+
+   tc qdisc add dev swp2 clsact
+   now=$(phc_ctl /dev/ptp1 get | awk '/clock time is/ {print $5}') && \
+           sec=$(echo $now | awk -F. '{print $1}') && \
+           base_time="$(((sec + 2) * 1000000000))" && \
+           echo "base time ${base_time}"
+   tc filter add dev swp2 ingress flower skip_sw \
+           dst_mac 42:be:24:9b:76:20 \
+           action gate base-time ${base_time} \
+           sched-entry OPEN  60000 -1 -1 \
+           sched-entry CLOSE 40000 -1 -1 \
+           action trap
+
+   Sender (enetc):
+   now=$(phc_ctl /dev/ptp0 get | awk '/clock time is/ {print $5}') && \
+           sec=$(echo $now | awk -F. '{print $1}') && \
+           base_time="$(((sec + 2) * 1000000000))" && \
+           echo "base time ${base_time}"
+   tc qdisc add dev eno0 parent root taprio \
+           num_tc 8 \
+           map 0 1 2 3 4 5 6 7 \
+           queues 1@0 1@1 1@2 1@3 1@4 1@5 1@6 1@7 \
+           base-time ${base_time} \
+           sched-entry S 01  50000 \
+           sched-entry S 00  50000 \
+           flags 2
+
+   ping -A 192.168.1.1
+   PING 192.168.1.1 (192.168.1.1): 56 data bytes
+   ...
+   ^C
+   --- 192.168.1.1 ping statistics ---
+   1425 packets transmitted, 1424 packets received, 0% packet loss
+   round-trip min/avg/max = 0.322/0.361/0.990 ms
+
+   And just for comparison, with the tc-taprio schedule deleted:
+
+   ping -A 192.168.1.1
+   PING 192.168.1.1 (192.168.1.1): 56 data bytes
+   ...
+   ^C
+   --- 192.168.1.1 ping statistics ---
+   33 packets transmitted, 19 packets received, 42% packet loss
+   round-trip min/avg/max = 0.336/0.464/0.597 ms
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

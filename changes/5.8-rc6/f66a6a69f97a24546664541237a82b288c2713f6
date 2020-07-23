@@ -1,0 +1,117 @@
+net: dsa: permit cross-chip bridging between all trees in the system
+
+One way of utilizing DSA is by cascading switches which do not all have
+compatible taggers. Consider the following real-life topology:
+
+      +---------------------------------------------------------------+
+      | LS1028A                                                       |
+      |               +------------------------------+                |
+      |               |      DSA master for Felix    |                |
+      |               |(internal ENETC port 2: eno2))|                |
+      |  +------------+------------------------------+-------------+  |
+      |  | Felix embedded L2 switch                                |  |
+      |  |                                                         |  |
+      |  | +--------------+   +--------------+   +--------------+  |  |
+      |  | |DSA master for|   |DSA master for|   |DSA master for|  |  |
+      |  | |  SJA1105 1   |   |  SJA1105 2   |   |  SJA1105 3   |  |  |
+      |  | |(Felix port 1)|   |(Felix port 2)|   |(Felix port 3)|  |  |
+      +--+-+--------------+---+--------------+---+--------------+--+--+
+
++-----------------------+ +-----------------------+ +-----------------------+
+|   SJA1105 switch 1    | |   SJA1105 switch 2    | |   SJA1105 switch 3    |
++-----+-----+-----+-----+ +-----+-----+-----+-----+ +-----+-----+-----+-----+
+|sw1p0|sw1p1|sw1p2|sw1p3| |sw2p0|sw2p1|sw2p2|sw2p3| |sw3p0|sw3p1|sw3p2|sw3p3|
++-----+-----+-----+-----+ +-----+-----+-----+-----+ +-----+-----+-----+-----+
+
+The above can be described in the device tree as follows (obviously not
+complete):
+
+mscc_felix {
+	dsa,member = <0 0>;
+	ports {
+		port@4 {
+			ethernet = <&enetc_port2>;
+		};
+	};
+};
+
+sja1105_switch1 {
+	dsa,member = <1 1>;
+	ports {
+		port@4 {
+			ethernet = <&mscc_felix_port1>;
+		};
+	};
+};
+
+sja1105_switch2 {
+	dsa,member = <2 2>;
+	ports {
+		port@4 {
+			ethernet = <&mscc_felix_port2>;
+		};
+	};
+};
+
+sja1105_switch3 {
+	dsa,member = <3 3>;
+	ports {
+		port@4 {
+			ethernet = <&mscc_felix_port3>;
+		};
+	};
+};
+
+Basically we instantiate one DSA switch tree for every hardware switch
+in the system, but we still give them globally unique switch IDs (will
+come back to that later). Having 3 disjoint switch trees makes the
+tagger drivers "just work", because net devices are registered for the
+3 Felix DSA master ports, and they are also DSA slave ports to the ENETC
+port. So packets received on the ENETC port are stripped of their
+stacked DSA tags one by one.
+
+Currently, hardware bridging between ports on the same sja1105 chip is
+possible, but switching between sja1105 ports on different chips is
+handled by the software bridge. This is fine, but we can do better.
+
+In fact, the dsa_8021q tag used by sja1105 is compatible with cascading.
+In other words, a sja1105 switch can correctly parse and route a packet
+containing a dsa_8021q tag. So if we could enable hardware bridging on
+the Felix DSA master ports, cross-chip bridging could be completely
+offloaded.
+
+Such as system would be used as follows:
+
+ip link add dev br0 type bridge && ip link set dev br0 up
+for port in sw0p0 sw0p1 sw0p2 sw0p3 \
+	    sw1p0 sw1p1 sw1p2 sw1p3 \
+	    sw2p0 sw2p1 sw2p2 sw2p3; do
+	ip link set dev $port master br0
+done
+
+The above makes switching between ports on the same row be performed in
+hardware, and between ports on different rows in software. Now assume
+the Felix switch ports are called swp0, swp1, swp2. By running the
+following extra commands:
+
+ip link add dev br1 type bridge && ip link set dev br1 up
+for port in swp0 swp1 swp2; do
+	ip link set dev $port master br1
+done
+
+the CPU no longer sees packets which traverse sja1105 switch boundaries
+and can be forwarded directly by Felix. The br1 bridge would not be used
+for any sort of traffic termination.
+
+For this to work, we need to give drivers an opportunity to listen for
+bridging events on DSA trees other than their own, and pass that other
+tree index as argument. I have made the assumption, for the moment, that
+the other existing DSA notifiers don't need to be broadcast to other
+trees. That assumption might turn out to be incorrect. But in the
+meantime, introduce a dsa_broadcast function, similar in purpose to
+dsa_port_notify, which is used only by the bridging notifiers.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+

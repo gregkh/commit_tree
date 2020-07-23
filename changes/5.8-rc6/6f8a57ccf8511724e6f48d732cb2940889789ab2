@@ -1,0 +1,134 @@
+bpf: Make verifier log more relevant by default
+
+To make BPF verifier verbose log more releavant and easier to use to debug
+verification failures, "pop" parts of log that were successfully verified.
+This has effect of leaving only verifier logs that correspond to code branches
+that lead to verification failure, which in practice should result in much
+shorter and more relevant verifier log dumps. This behavior is made the
+default behavior and can be overriden to do exhaustive logging by specifying
+BPF_LOG_LEVEL2 log level.
+
+Using BPF_LOG_LEVEL2 to disable this behavior is not ideal, because in some
+cases it's good to have BPF_LOG_LEVEL2 per-instruction register dump
+verbosity, but still have only relevant verifier branches logged. But for this
+patch, I didn't want to add any new flags. It might be worth-while to just
+rethink how BPF verifier logging is performed and requested and streamline it
+a bit. But this trimming of successfully verified branches seems to be useful
+and a good default behavior.
+
+To test this, I modified runqslower slightly to introduce read of
+uninitialized stack variable. Log (**truncated in the middle** to save many
+lines out of this commit message) BEFORE this change:
+
+; int handle__sched_switch(u64 *ctx)
+0: (bf) r6 = r1
+; struct task_struct *prev = (struct task_struct *)ctx[1];
+1: (79) r1 = *(u64 *)(r6 +8)
+func 'sched_switch' arg1 has btf_id 151 type STRUCT 'task_struct'
+2: (b7) r2 = 0
+; struct event event = {};
+3: (7b) *(u64 *)(r10 -24) = r2
+last_idx 3 first_idx 0
+regs=4 stack=0 before 2: (b7) r2 = 0
+4: (7b) *(u64 *)(r10 -32) = r2
+5: (7b) *(u64 *)(r10 -40) = r2
+6: (7b) *(u64 *)(r10 -48) = r2
+; if (prev->state == TASK_RUNNING)
+
+[ ... instruction dump from insn #7 through #50 are cut out ... ]
+
+51: (b7) r2 = 16
+52: (85) call bpf_get_current_comm#16
+last_idx 52 first_idx 42
+regs=4 stack=0 before 51: (b7) r2 = 16
+; bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
+53: (bf) r1 = r6
+54: (18) r2 = 0xffff8881f3868800
+56: (18) r3 = 0xffffffff
+58: (bf) r4 = r7
+59: (b7) r5 = 32
+60: (85) call bpf_perf_event_output#25
+last_idx 60 first_idx 53
+regs=20 stack=0 before 59: (b7) r5 = 32
+61: (bf) r2 = r10
+; event.pid = pid;
+62: (07) r2 += -16
+; bpf_map_delete_elem(&start, &pid);
+63: (18) r1 = 0xffff8881f3868000
+65: (85) call bpf_map_delete_elem#3
+; }
+66: (b7) r0 = 0
+67: (95) exit
+
+from 44 to 66: safe
+
+from 34 to 66: safe
+
+from 11 to 28: R1_w=inv0 R2_w=inv0 R6_w=ctx(id=0,off=0,imm=0) R10=fp0 fp-8=mmmm???? fp-24_w=00000000 fp-32_w=00000000 fp-40_w=00000000 fp-48_w=00000000
+; bpf_map_update_elem(&start, &pid, &ts, 0);
+28: (bf) r2 = r10
+;
+29: (07) r2 += -16
+; tsp = bpf_map_lookup_elem(&start, &pid);
+30: (18) r1 = 0xffff8881f3868000
+32: (85) call bpf_map_lookup_elem#1
+invalid indirect read from stack off -16+0 size 4
+processed 65 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 5 mark_read 4
+
+Notice how there is a successful code path from instruction 0 through 67, few
+successfully verified jumps (44->66, 34->66), and only after that 11->28 jump
+plus error on instruction #32.
+
+AFTER this change (full verifier log, **no truncation**):
+
+; int handle__sched_switch(u64 *ctx)
+0: (bf) r6 = r1
+; struct task_struct *prev = (struct task_struct *)ctx[1];
+1: (79) r1 = *(u64 *)(r6 +8)
+func 'sched_switch' arg1 has btf_id 151 type STRUCT 'task_struct'
+2: (b7) r2 = 0
+; struct event event = {};
+3: (7b) *(u64 *)(r10 -24) = r2
+last_idx 3 first_idx 0
+regs=4 stack=0 before 2: (b7) r2 = 0
+4: (7b) *(u64 *)(r10 -32) = r2
+5: (7b) *(u64 *)(r10 -40) = r2
+6: (7b) *(u64 *)(r10 -48) = r2
+; if (prev->state == TASK_RUNNING)
+7: (79) r2 = *(u64 *)(r1 +16)
+; if (prev->state == TASK_RUNNING)
+8: (55) if r2 != 0x0 goto pc+19
+ R1_w=ptr_task_struct(id=0,off=0,imm=0) R2_w=inv0 R6_w=ctx(id=0,off=0,imm=0) R10=fp0 fp-24_w=00000000 fp-32_w=00000000 fp-40_w=00000000 fp-48_w=00000000
+; trace_enqueue(prev->tgid, prev->pid);
+9: (61) r1 = *(u32 *)(r1 +1184)
+10: (63) *(u32 *)(r10 -4) = r1
+; if (!pid || (targ_pid && targ_pid != pid))
+11: (15) if r1 == 0x0 goto pc+16
+
+from 11 to 28: R1_w=inv0 R2_w=inv0 R6_w=ctx(id=0,off=0,imm=0) R10=fp0 fp-8=mmmm???? fp-24_w=00000000 fp-32_w=00000000 fp-40_w=00000000 fp-48_w=00000000
+; bpf_map_update_elem(&start, &pid, &ts, 0);
+28: (bf) r2 = r10
+;
+29: (07) r2 += -16
+; tsp = bpf_map_lookup_elem(&start, &pid);
+30: (18) r1 = 0xffff8881db3ce800
+32: (85) call bpf_map_lookup_elem#1
+invalid indirect read from stack off -16+0 size 4
+processed 65 insns (limit 1000000) max_states_per_insn 1 total_states 5 peak_states 5 mark_read 4
+
+Notice how in this case, there are 0-11 instructions + jump from 11 to
+28 is recorded + 28-32 instructions with error on insn #32.
+
+test_verifier test runner was updated to specify BPF_LOG_LEVEL2 for
+VERBOSE_ACCEPT expected result due to potentially "incomplete" success verbose
+log at BPF_LOG_LEVEL1.
+
+On success, verbose log will only have a summary of number of processed
+instructions, etc, but no branch tracing log. Having just a last succesful
+branch tracing seemed weird and confusing. Having small and clean summary log
+in success case seems quite logical and nice, though.
+
+Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200423195850.1259827-1-andriin@fb.com
+

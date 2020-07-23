@@ -1,0 +1,144 @@
+scsi: zfcp: Move allocation of the shost object to after xconf- and xport-data
+
+At the moment we allocate and register the Scsi_Host object corresponding
+to a zfcp adapter (FCP device) very early in the life cycle of the adapter
+- even before we fully discover and initialize the underlying
+firmware/hardware. This had the advantage that we could already use the
+Scsi_Host object, and fill in all its information during said discover and
+initialize.
+
+Due to commit 737eb78e82d5 ("block: Delay default elevator initialization")
+(first released in v5.4), we noticed a regression that would prevent us
+from using any storage volume if zfcp is configured with support for DIF or
+DIX (zfcp.dif=1 || zfcp.dix=1). Doing so would result in an illegal memory
+access as soon as the first request is sent with such an configuration. As
+example for a crash resulting from this:
+
+  scsi host0: scsi_eh_0: sleeping
+  scsi host0: zfcp
+  qdio: 0.0.1900 ZFCP on SC 4bd using AI:1 QEBSM:0 PRI:1 TDD:1 SIGA: W AP
+  scsi 0:0:0:0: scsi scan: INQUIRY pass 1 length 36
+  Unable to handle kernel pointer dereference in virtual kernel address space
+  Failing address: 0000000000000000 TEID: 0000000000000483
+  Fault in home space mode while using kernel ASCE.
+  AS:0000000035c7c007 R3:00000001effcc007 S:00000001effd1000 P:000000000000003d
+  Oops: 0004 ilc:3 [#1] PREEMPT SMP DEBUG_PAGEALLOC
+  Modules linked in: ...
+  CPU: 1 PID: 783 Comm: kworker/u760:5 Kdump: loaded Not tainted 5.6.0-rc2-bb-next+ #1
+  Hardware name: ...
+  Workqueue: scsi_wq_0 fc_scsi_scan_rport [scsi_transport_fc]
+  Krnl PSW : 0704e00180000000 000003ff801fcdae (scsi_queue_rq+0x436/0x740 [scsi_mod])
+             R:0 T:1 IO:1 EX:1 Key:0 M:1 W:0 P:0 AS:3 CC:2 PM:0 RI:0 EA:3
+  Krnl GPRS: 0fffffffffffffff 0000000000000000 0000000187150120 0000000000000000
+             000003ff80223d20 000000000000018e 000000018adc6400 0000000187711000
+             000003e0062337e8 00000001ae719000 0000000187711000 0000000187150000
+             00000001ab808100 0000000187150120 000003ff801fcd74 000003e0062336a0
+  Krnl Code: 000003ff801fcd9e: e310a35c0012        lt      %r1,860(%r10)
+             000003ff801fcda4: a7840010           brc     8,000003ff801fcdc4
+            #000003ff801fcda8: e310b2900004       lg      %r1,656(%r11)
+            >000003ff801fcdae: d71710001000       xc      0(24,%r1),0(%r1)
+             000003ff801fcdb4: e310b2900004       lg      %r1,656(%r11)
+             000003ff801fcdba: 41201018           la      %r2,24(%r1)
+             000003ff801fcdbe: e32010000024       stg     %r2,0(%r1)
+             000003ff801fcdc4: b904002b           lgr     %r2,%r11
+  Call Trace:
+   [<000003ff801fcdae>] scsi_queue_rq+0x436/0x740 [scsi_mod]
+  ([<000003ff801fcd74>] scsi_queue_rq+0x3fc/0x740 [scsi_mod])
+   [<00000000349c9970>] blk_mq_dispatch_rq_list+0x390/0x680
+   [<00000000349d1596>] blk_mq_sched_dispatch_requests+0x196/0x1a8
+   [<00000000349c7a04>] __blk_mq_run_hw_queue+0x144/0x160
+   [<00000000349c7ab6>] __blk_mq_delay_run_hw_queue+0x96/0x228
+   [<00000000349c7d5a>] blk_mq_run_hw_queue+0xd2/0xe0
+   [<00000000349d194a>] blk_mq_sched_insert_request+0x192/0x1d8
+   [<00000000349c17b8>] blk_execute_rq_nowait+0x80/0x90
+   [<00000000349c1856>] blk_execute_rq+0x6e/0xb0
+   [<000003ff801f8ac2>] __scsi_execute+0xe2/0x1f0 [scsi_mod]
+   [<000003ff801fef98>] scsi_probe_and_add_lun+0x358/0x840 [scsi_mod]
+   [<000003ff8020001c>] __scsi_scan_target+0xc4/0x228 [scsi_mod]
+   [<000003ff80200254>] scsi_scan_target+0xd4/0x100 [scsi_mod]
+   [<000003ff802d8b96>] fc_scsi_scan_rport+0x96/0xc0 [scsi_transport_fc]
+   [<0000000034245ce8>] process_one_work+0x458/0x7d0
+   [<00000000342462a2>] worker_thread+0x242/0x448
+   [<0000000034250994>] kthread+0x15c/0x170
+   [<0000000034e1979c>] ret_from_fork+0x30/0x38
+  INFO: lockdep is turned off.
+  Last Breaking-Event-Address:
+   [<000003ff801fbc36>] scsi_add_cmd_to_list+0x9e/0xa8 [scsi_mod]
+  Kernel panic - not syncing: Fatal exception: panic_on_oops
+
+While this issue is exposed by the commit named above, this is only by
+accident. The real issue exists for longer already - basically since it's
+possible to use blk-mq via scsi-mq, and blk-mq pre-allocates all requests
+for a tag-set during initialization of the same. For a given Scsi_Host
+object this is done when adding the object to the midlayer
+(`scsi_add_host()` and such). In `scsi_mq_setup_tags()` the midlayer
+calculates how much memory is required for a single scsi_cmnd, and its
+additional data, which also might include space for additional protection
+data - depending on whether the Scsi_Host has any form of protection
+capabilities (`scsi_host_get_prot()`).
+
+The problem is now thus, because zfcp does this step before we actually
+know whether the firmware/hardware has these capabilities, we don't set any
+protection capabilities in the Scsi_Host object. And so, no space is
+allocated for additional protection data for requests in the Scsi_Host
+tag-set.
+
+Once we go through discover and initialize the FCP device firmware/hardware
+fully (this is done via the firmware commands "Exchange Config Data" and
+"Exchange Port Data") we find out whether it actually supports DIF and DIX,
+and we set the corresponding capabilities in the Scsi_Host object (in
+`zfcp_scsi_set_prot()`). Now the Scsi_Host potentially has protection
+capabilities, but the already allocated requests in the tag-set don't have
+any space allocated for that.
+
+When we then trigger target scanning or add scsi_devices manually, the
+midlayer will use requests from that tag-set, and before sending most
+requests, it will also call `scsi_mq_prep_fn()`. To prepare the scsi_cmnd
+this function will check again whether the used Scsi_Host has any
+protection capabilities - and now it potentially has - and if so, it will
+try to initialize the assumed to be preallocated structures and thus it
+causes the crash, like shown above.
+
+Before delaying the default elevator initialization with the commit named
+above, we always would also allocate an elevator for any scsi_device before
+ever sending any requests - in contrast to now, where we do it after
+device-probing. That elevator in turn would have its own tag-set, and that
+is initialized after we went through discovery and initialization of the
+underlying firmware/hardware. So requests from that tag-set can be
+allocated properly, and if used - unless the user changes/disabled the
+default elevator - this would hide the underlying issue.
+
+To fix this for any configuration - with or without an elevator - we move
+the allocation and registration of the Scsi_Host object for a given FCP
+device to after the first complete discovery and initialization of the
+underlying firmware/hardware. By doing that we can make all basic
+properties of the Scsi_Host known to the midlayer by the time we call
+`scsi_add_host()`, including whether we have any protection capabilities.
+
+To do that we have to delay all the accesses that we would have done in the
+past during discovery and initialization, and do them instead once we are
+finished with it. The previous patches ramp up to this by fencing and
+factoring out all these accesses, and make it possible to re-do them later
+on. In addition we make also use of the diagnostic buffers we recently
+added with
+
+commit 92953c6e0aa7 ("scsi: zfcp: signal incomplete or error for sync exchange config/port data")
+commit 7e418833e689 ("scsi: zfcp: diagnostics buffer caching and use for exchange port data")
+commit 088210233e6f ("scsi: zfcp: add diagnostics buffer for exchange config data")
+
+(first released in v5.5), because these already cache all the information
+we need for that "re-do operation" - the information cached are always
+updated during xconf or xport data, so it won't be stale.
+
+In addition to the move and re-do, this patch also updates the
+function-documentation of `zfcp_scsi_adapter_register()` and changes how it
+reports if a Scsi_Host object already exists. In that case future
+recovery-operations can skip this step completely and behave much like they
+would do in the past - zfcp does not release a once allocated Scsi_Host
+object unless the corresponding FCP device is deconstructed completely.
+
+Link: https://lore.kernel.org/r/030dd6da318bbb529f0b5268ec65cebcd20fc0a3.1588956679.git.bblock@linux.ibm.com
+Reviewed-by: Steffen Maier <maier@linux.ibm.com>
+Signed-off-by: Benjamin Block <bblock@linux.ibm.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+

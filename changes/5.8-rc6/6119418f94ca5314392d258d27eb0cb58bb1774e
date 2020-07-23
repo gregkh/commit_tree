@@ -1,0 +1,74 @@
+kcsan: Avoid blocking producers in prepare_report()
+
+To avoid deadlock in case watchers can be interrupted, we need to ensure
+that producers of the struct other_info can never be blocked by an
+unrelated consumer. (Likely to occur with KCSAN_INTERRUPT_WATCHER.)
+
+There are several cases that can lead to this scenario, for example:
+
+	1. A watchpoint A was set up by task T1, but interrupted by
+	   interrupt I1. Some other thread (task or interrupt) finds
+	   watchpoint A consumes it, and sets other_info. Then I1 also
+	   finds some unrelated watchpoint B, consumes it, but is blocked
+	   because other_info is in use. T1 cannot consume other_info
+	   because I1 never returns -> deadlock.
+
+	2. A watchpoint A was set up by task T1, but interrupted by
+	   interrupt I1, which also sets up a watchpoint B. Some other
+	   thread finds watchpoint A, and consumes it and sets up
+	   other_info with its information. Similarly some other thread
+	   finds watchpoint B and consumes it, but is then blocked because
+	   other_info is in use. When I1 continues it sees its watchpoint
+	   was consumed, and that it must wait for other_info, which
+	   currently contains information to be consumed by T1. However, T1
+	   cannot unblock other_info because I1 never returns -> deadlock.
+
+To avoid this, we need to ensure that producers of struct other_info
+always have a usable other_info entry. This is obviously not the case
+with only a single instance of struct other_info, as concurrent
+producers must wait for the entry to be released by some consumer (which
+may be locked up as illustrated above).
+
+While it would be nice if producers could simply call kmalloc() and
+append their instance of struct other_info to a list, we are very
+limited in this code path: since KCSAN can instrument the allocators
+themselves, calling kmalloc() could lead to deadlock or corrupted
+allocator state.
+
+Since producers of the struct other_info will always succeed at
+try_consume_watchpoint(), preceding the call into kcsan_report(), we
+know that the particular watchpoint slot cannot simply be reused or
+consumed by another potential other_info producer. If we move removal of
+a watchpoint after reporting (by the consumer of struct other_info), we
+can see a consumed watchpoint as a held lock on elements of other_info,
+if we create a one-to-one mapping of a watchpoint to an other_info
+element.
+
+Therefore, the simplest solution is to create an array of struct
+other_info that is as large as the watchpoints array in core.c, and pass
+the watchpoint index to kcsan_report() for producers and consumers, and
+change watchpoints to be removed after reporting is done.
+
+With a default config on a 64-bit system, the array other_infos consumes
+~37KiB. For most systems today this is not a problem. On smaller memory
+constrained systems, the config value CONFIG_KCSAN_NUM_WATCHPOINTS can
+be reduced appropriately.
+
+Overall, this change is a simplification of the prepare_report() code,
+and makes some of the checks (such as checking if at least one access is
+a write) redundant.
+
+Tested:
+$ tools/testing/selftests/rcutorture/bin/kvm.sh \
+	--cpus 12 --duration 10 --kconfig "CONFIG_DEBUG_INFO=y \
+	CONFIG_KCSAN=y CONFIG_KCSAN_ASSUME_PLAIN_WRITES_ATOMIC=n \
+	CONFIG_KCSAN_REPORT_VALUE_CHANGE_ONLY=n \
+	CONFIG_KCSAN_REPORT_ONCE_IN_MS=100000 CONFIG_KCSAN_VERBOSE=y \
+	CONFIG_KCSAN_INTERRUPT_WATCHER=y CONFIG_PROVE_LOCKING=y" \
+	--configs TREE03
+=> No longer hangs and runs to completion as expected.
+
+Reported-by: Paul E. McKenney <paulmck@kernel.org>
+Signed-off-by: Marco Elver <elver@google.com>
+Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+

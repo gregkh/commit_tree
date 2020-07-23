@@ -1,0 +1,50 @@
+bpf: Fix running sk_skb program types with ktls
+
+KTLS uses a stream parser to collect TLS messages and send them to
+the upper layer tls receive handler. This ensures the tls receiver
+has a full TLS header to parse when it is run. However, when a
+socket has BPF_SK_SKB_STREAM_VERDICT program attached before KTLS
+is enabled we end up with two stream parsers running on the same
+socket.
+
+The result is both try to run on the same socket. First the KTLS
+stream parser runs and calls read_sock() which will tcp_read_sock
+which in turn calls tcp_rcv_skb(). This dequeues the skb from the
+sk_receive_queue. When this is done KTLS code then data_ready()
+callback which because we stacked KTLS on top of the bpf stream
+verdict program has been replaced with sk_psock_start_strp(). This
+will in turn kick the stream parser again and eventually do the
+same thing KTLS did above calling into tcp_rcv_skb() and dequeuing
+a skb from the sk_receive_queue.
+
+At this point the data stream is broke. Part of the stream was
+handled by the KTLS side some other bytes may have been handled
+by the BPF side. Generally this results in either missing data
+or more likely a "Bad Message" complaint from the kTLS receive
+handler as the BPF program steals some bytes meant to be in a
+TLS header and/or the TLS header length is no longer correct.
+
+We've already broke the idealized model where we can stack ULPs
+in any order with generic callbacks on the TX side to handle this.
+So in this patch we do the same thing but for RX side. We add
+a sk_psock_strp_enabled() helper so TLS can learn a BPF verdict
+program is running and add a tls_sw_has_ctx_rx() helper so BPF
+side can learn there is a TLS ULP on the socket.
+
+Then on BPF side we omit calling our stream parser to avoid
+breaking the data stream for the KTLS receiver. Then on the
+KTLS side we call BPF_SK_SKB_STREAM_VERDICT once the KTLS
+receiver is done with the packet but before it posts the
+msg to userspace. This gives us symmetry between the TX and
+RX halfs and IMO makes it usable again. On the TX side we
+process packets in this order BPF -> TLS -> TCP and on
+the receive side in the reverse order TCP -> TLS -> BPF.
+
+Discovered while testing OpenSSL 3.0 Alpha2.0 release.
+
+Fixes: d829e9c4112b5 ("tls: convert to generic sk_msg interface")
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/159079361946.5745.605854335665044485.stgit@john-Precision-5820-Tower
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

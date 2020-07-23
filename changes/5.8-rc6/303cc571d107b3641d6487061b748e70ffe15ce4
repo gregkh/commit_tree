@@ -1,0 +1,111 @@
+nsproxy: attach to namespaces via pidfds
+
+For quite a while we have been thinking about using pidfds to attach to
+namespaces. This patchset has existed for about a year already but we've
+wanted to wait to see how the general api would be received and adopted.
+Now that more and more programs in userspace have started using pidfds
+for process management it's time to send this one out.
+
+This patch makes it possible to use pidfds to attach to the namespaces
+of another process, i.e. they can be passed as the first argument to the
+setns() syscall. When only a single namespace type is specified the
+semantics are equivalent to passing an nsfd. That means
+setns(nsfd, CLONE_NEWNET) equals setns(pidfd, CLONE_NEWNET). However,
+when a pidfd is passed, multiple namespace flags can be specified in the
+second setns() argument and setns() will attach the caller to all the
+specified namespaces all at once or to none of them. Specifying 0 is not
+valid together with a pidfd.
+
+Here are just two obvious examples:
+setns(pidfd, CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET);
+setns(pidfd, CLONE_NEWUSER);
+Allowing to also attach subsets of namespaces supports various use-cases
+where callers setns to a subset of namespaces to retain privilege, perform
+an action and then re-attach another subset of namespaces.
+
+If the need arises, as Eric suggested, we can extend this patchset to
+assume even more context than just attaching all namespaces. His suggestion
+specifically was about assuming the process' root directory when
+setns(pidfd, 0) or setns(pidfd, SETNS_PIDFD) is specified. For now, just
+keep it flexible in terms of supporting subsets of namespaces but let's
+wait until we have users asking for even more context to be assumed. At
+that point we can add an extension.
+
+The obvious example where this is useful is a standard container
+manager interacting with a running container: pushing and pulling files
+or directories, injecting mounts, attaching/execing any kind of process,
+managing network devices all these operations require attaching to all
+or at least multiple namespaces at the same time. Given that nowadays
+most containers are spawned with all namespaces enabled we're currently
+looking at at least 14 syscalls, 7 to open the /proc/<pid>/ns/<ns>
+nsfds, another 7 to actually perform the namespace switch. With time
+namespaces we're looking at about 16 syscalls.
+(We could amortize the first 7 or 8 syscalls for opening the nsfds by
+ stashing them in each container's monitor process but that would mean
+ we need to send around those file descriptors through unix sockets
+ everytime we want to interact with the container or keep on-disk
+ state. Even in scenarios where a caller wants to join a particular
+ namespace in a particular order callers still profit from batching
+ other namespaces. That mostly applies to the user namespace but
+ all container runtimes I found join the user namespace first no matter
+ if it privileges or deprivileges the container similar to how unshare
+ behaves.)
+With pidfds this becomes a single syscall no matter how many namespaces
+are supposed to be attached to.
+
+A decently designed, large-scale container manager usually isn't the
+parent of any of the containers it spawns so the containers don't die
+when it crashes or needs to update or reinitialize. This means that
+for the manager to interact with containers through pids is inherently
+racy especially on systems where the maximum pid number is not
+significicantly bumped. This is even more problematic since we often spawn
+and manage thousands or ten-thousands of containers. Interacting with a
+container through a pid thus can become risky quite quickly. Especially
+since we allow for an administrator to enable advanced features such as
+syscall interception where we're performing syscalls in lieu of the
+container. In all of those cases we use pidfds if they are available and
+we pass them around as stable references. Using them to setns() to the
+target process' namespaces is as reliable as using nsfds. Either the
+target process is already dead and we get ESRCH or we manage to attach
+to its namespaces but we can't accidently attach to another process'
+namespaces. So pidfds lend themselves to be used with this api.
+The other main advantage is that with this change the pidfd becomes the
+only relevant token for most container interactions and it's the only
+token we need to create and send around.
+
+Apart from significiantly reducing the number of syscalls from double
+digit to single digit which is a decent reason post-spectre/meltdown
+this also allows to switch to a set of namespaces atomically, i.e.
+either attaching to all the specified namespaces succeeds or we fail. If
+we fail we haven't changed a single namespace. There are currently three
+namespaces that can fail (other than for ENOMEM which really is not
+very interesting since we then have other problems anyway) for
+non-trivial reasons, user, mount, and pid namespaces. We can fail to
+attach to a pid namespace if it is not our current active pid namespace
+or a descendant of it. We can fail to attach to a user namespace because
+we are multi-threaded or because our current mount namespace shares
+filesystem state with other tasks, or because we're trying to setns()
+to the same user namespace, i.e. the target task has the same user
+namespace as we do. We can fail to attach to a mount namespace because
+it shares filesystem state with other tasks or because we fail to lookup
+the new root for the new mount namespace. In most non-pathological
+scenarios these issues can be somewhat mitigated. But there are cases where
+we're half-attached to some namespace and failing to attach to another one.
+I've talked about some of these problem during the hallway track (something
+only the pre-COVID-19 generation will remember) of Plumbers in Los Angeles
+in 2018(?). Even if all these issues could be avoided with super careful
+userspace coding it would be nicer to have this done in-kernel. Pidfds seem
+to lend themselves nicely for this.
+
+The other neat thing about this is that setns() becomes an actual
+counterpart to the namespace bits of unshare().
+
+Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+Reviewed-by: Serge Hallyn <serge@hallyn.com>
+Cc: Eric W. Biederman <ebiederm@xmission.com>
+Cc: Serge Hallyn <serge@hallyn.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+Cc: Aleksa Sarai <cyphar@cyphar.com>
+Link: https://lore.kernel.org/r/20200505140432.181565-3-christian.brauner@ubuntu.com
+

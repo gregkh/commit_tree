@@ -1,0 +1,61 @@
+sched: Fix loadavg accounting race
+
+The recent commit:
+
+  c6e7bd7afaeb ("sched/core: Optimize ttwu() spinning on p->on_cpu")
+
+moved these lines in ttwu():
+
+	p->sched_contributes_to_load = !!task_contributes_to_load(p);
+	p->state = TASK_WAKING;
+
+up before:
+
+	smp_cond_load_acquire(&p->on_cpu, !VAL);
+
+into the 'p->on_rq == 0' block, with the thinking that once we hit
+schedule() the current task cannot change it's ->state anymore. And
+while this is true, it is both incorrect and flawed.
+
+It is incorrect in that we need at least an ACQUIRE on 'p->on_rq == 0'
+to avoid weak hardware from re-ordering things for us. This can fairly
+easily be achieved by relying on the control-dependency already in
+place.
+
+The second problem, which makes the flaw in the original argument, is
+that while schedule() will not change prev->state, it will read it a
+number of times (arguably too many times since it's marked volatile).
+The previous condition 'p->on_cpu == 0' was sufficient because that
+indicates schedule() has completed, and will no longer read
+prev->state. So now the trick is to make this same true for the (much)
+earlier 'prev->on_rq == 0' case.
+
+Furthermore, in order to make the ordering stick, the 'prev->on_rq = 0'
+assignment needs to he a RELEASE, but adding additional ordering to
+schedule() is an unwelcome proposition at the best of times, doubly so
+for mere accounting.
+
+Luckily we can push the prev->state load up before rq->lock, with the
+only caveat that we then have to re-read the state after. However, we
+know that if it changed, we no longer have to worry about the blocking
+path. This gives us the required ordering, if we block, we did the
+prev->state load before an (effective) smp_mb() and the p->on_rq store
+needs not change.
+
+With this we end up with the effective ordering:
+
+	LOAD p->state           LOAD-ACQUIRE p->on_rq == 0
+	MB
+	STORE p->on_rq, 0       STORE p->state, TASK_WAKING
+
+which ensures the TASK_WAKING store happens after the prev->state
+load, and all is well again.
+
+Fixes: c6e7bd7afaeb ("sched/core: Optimize ttwu() spinning on p->on_cpu")
+Reported-by: Dave Jones <davej@codemonkey.org.uk>
+Reported-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Dave Jones <davej@codemonkey.org.uk>
+Tested-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+Link: https://lkml.kernel.org/r/20200707102957.GN117543@hirez.programming.kicks-ass.net
+

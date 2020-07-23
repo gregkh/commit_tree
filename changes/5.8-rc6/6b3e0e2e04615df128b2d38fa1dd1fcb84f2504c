@@ -1,0 +1,153 @@
+perf tools: Support CAP_PERFMON capability
+
+Extend error messages to mention CAP_PERFMON capability as an option to
+substitute CAP_SYS_ADMIN capability for secure system performance
+monitoring and observability operations. Make
+perf_event_paranoid_check() and __cmd_ftrace() to be aware of
+CAP_PERFMON capability.
+
+CAP_PERFMON implements the principle of least privilege for performance
+monitoring and observability operations (POSIX IEEE 1003.1e 2.2.2.39
+principle of least privilege: A security design principle that states
+that a process or program be granted only those privileges (e.g.,
+capabilities) necessary to accomplish its legitimate function, and only
+for the time that such privileges are actually required)
+
+For backward compatibility reasons access to perf_events subsystem remains
+open for CAP_SYS_ADMIN privileged processes but CAP_SYS_ADMIN usage for
+secure perf_events monitoring is discouraged with respect to CAP_PERFMON
+capability.
+
+Committer testing:
+
+Using a libcap with this patch:
+
+  diff --git a/libcap/include/uapi/linux/capability.h b/libcap/include/uapi/linux/capability.h
+  index 78b2fd4c8a95..89b5b0279b60 100644
+  --- a/libcap/include/uapi/linux/capability.h
+  +++ b/libcap/include/uapi/linux/capability.h
+  @@ -366,8 +366,9 @@ struct vfs_ns_cap_data {
+
+   #define CAP_AUDIT_READ       37
+
+  +#define CAP_PERFMON	     38
+
+  -#define CAP_LAST_CAP         CAP_AUDIT_READ
+  +#define CAP_LAST_CAP         CAP_PERFMON
+
+   #define cap_valid(x) ((x) >= 0 && (x) <= CAP_LAST_CAP)
+
+Note that using '38' in place of 'cap_perfmon' works to some degree with
+an old libcap, its only when cap_get_flag() is called that libcap
+performs an error check based on the maximum value known for
+capabilities that it will fail.
+
+This makes determining the default of perf_event_attr.exclude_kernel to
+fail, as it can't determine if CAP_PERFMON is in place.
+
+Using 'perf top -e cycles' avoids the default check and sets
+perf_event_attr.exclude_kernel to 1.
+
+As root, with a libcap supporting CAP_PERFMON:
+
+  # groupadd perf_users
+  # adduser perf -g perf_users
+  # mkdir ~perf/bin
+  # cp ~acme/bin/perf ~perf/bin/
+  # chgrp perf_users ~perf/bin/perf
+  # setcap "cap_perfmon,cap_sys_ptrace,cap_syslog=ep" ~perf/bin/perf
+  # getcap ~perf/bin/perf
+  /home/perf/bin/perf = cap_sys_ptrace,cap_syslog,cap_perfmon+ep
+  # ls -la ~perf/bin/perf
+  -rwxr-xr-x. 1 root perf_users 16968552 Apr  9 13:10 /home/perf/bin/perf
+
+As the 'perf' user in the 'perf_users' group:
+
+  $ perf top -a --stdio
+  Error:
+  Failed to mmap with 1 (Operation not permitted)
+  $
+
+Either add the cap_ipc_lock capability to the perf binary or reduce the
+ring buffer size to some smaller value:
+
+  $ perf top -m10 -a --stdio
+  rounding mmap pages size to 64K (16 pages)
+  Error:
+  Failed to mmap with 1 (Operation not permitted)
+  $ perf top -m4 -a --stdio
+  Error:
+  Failed to mmap with 1 (Operation not permitted)
+  $ perf top -m2 -a --stdio
+   PerfTop: 762 irqs/sec  kernel:49.7%  exact: 100.0% lost: 0/0 drop: 0/0 [4000Hz cycles], (all, 4 CPUs)
+  ------------------------------------------------------------------------------------------------------
+
+     9.83%  perf                [.] __symbols__insert
+     8.58%  perf                [.] rb_next
+     5.91%  [kernel]            [k] module_get_kallsym
+     5.66%  [kernel]            [k] kallsyms_expand_symbol.constprop.0
+     3.98%  libc-2.29.so        [.] __GI_____strtoull_l_internal
+     3.66%  perf                [.] rb_insert_color
+     2.34%  [kernel]            [k] vsnprintf
+     2.30%  [kernel]            [k] string_nocheck
+     2.16%  libc-2.29.so        [.] _IO_getdelim
+     2.15%  [kernel]            [k] number
+     2.13%  [kernel]            [k] format_decode
+     1.58%  libc-2.29.so        [.] _IO_feof
+     1.52%  libc-2.29.so        [.] __strcmp_avx2
+     1.50%  perf                [.] rb_set_parent_color
+     1.47%  libc-2.29.so        [.] __libc_calloc
+     1.24%  [kernel]            [k] do_syscall_64
+     1.17%  [kernel]            [k] __x86_indirect_thunk_rax
+
+  $ perf record -a sleep 1
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.552 MB perf.data (74 samples) ]
+  $ perf evlist
+  cycles
+  $ perf evlist -v
+  cycles: size: 120, { sample_period, sample_freq }: 4000, sample_type: IP|TID|TIME|CPU|PERIOD, read_format: ID, disabled: 1, inherit: 1, mmap: 1, comm: 1, freq: 1, task: 1, precise_ip: 3, sample_id_all: 1, exclude_guest: 1, mmap2: 1, comm_exec: 1, ksymbol: 1, bpf_event: 1
+  $ perf report | head -20
+  # To display the perf.data header info, please use --header/--header-only options.
+  #
+  #
+  # Total Lost Samples: 0
+  #
+  # Samples: 74  of event 'cycles'
+  # Event count (approx.): 15694834
+  #
+  # Overhead  Command          Shared Object               Symbol
+  # ........  ...............  ..........................  ......................................
+  #
+      19.62%  perf             [kernel.vmlinux]            [k] strnlen_user
+      13.88%  swapper          [kernel.vmlinux]            [k] intel_idle
+      13.83%  ksoftirqd/0      [kernel.vmlinux]            [k] pfifo_fast_dequeue
+      13.51%  swapper          [kernel.vmlinux]            [k] kmem_cache_free
+       6.31%  gnome-shell      [kernel.vmlinux]            [k] kmem_cache_free
+       5.66%  kworker/u8:3+ix  [kernel.vmlinux]            [k] delay_tsc
+       4.42%  perf             [kernel.vmlinux]            [k] __set_cpus_allowed_ptr
+       3.45%  kworker/2:1-eve  [kernel.vmlinux]            [k] shmem_truncate_range
+       2.29%  gnome-shell      libgobject-2.0.so.0.6000.7  [.] g_closure_ref
+  $
+
+Signed-off-by: Alexey Budankov <alexey.budankov@linux.intel.com>
+Reviewed-by: James Morris <jamorris@linux.microsoft.com>
+Acked-by: Jiri Olsa <jolsa@redhat.com>
+Acked-by: Namhyung Kim <namhyung@kernel.org>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Igor Lubashev <ilubashe@akamai.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Serge Hallyn <serge@hallyn.com>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: intel-gfx@lists.freedesktop.org
+Cc: linux-doc@vger.kernel.org
+Cc: linux-man@vger.kernel.org
+Cc: linux-security-module@vger.kernel.org
+Cc: selinux@vger.kernel.org
+Link: http://lore.kernel.org/lkml/a66d5648-2b8e-577e-e1f2-1d56c017ab5e@linux.intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

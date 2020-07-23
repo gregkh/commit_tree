@@ -1,0 +1,44 @@
+IB/sa: Resolv use-after-free in ib_nl_make_request()
+
+There is a race condition where ib_nl_make_request() inserts the request
+data into the linked list but the timer in ib_nl_request_timeout() can see
+it and destroy it before ib_nl_send_msg() is done touching it. This could
+happen, for instance, if there is a long delay allocating memory during
+nlmsg_new()
+
+This causes a use-after-free in the send_mad() thread:
+
+  [<ffffffffa02f43cb>] ? ib_pack+0x17b/0x240 [ib_core]
+  [ <ffffffffa032aef1>] ib_sa_path_rec_get+0x181/0x200 [ib_sa]
+  [<ffffffffa0379db0>] rdma_resolve_route+0x3c0/0x8d0 [rdma_cm]
+  [<ffffffffa0374450>] ? cma_bind_port+0xa0/0xa0 [rdma_cm]
+  [<ffffffffa040f850>] ? rds_rdma_cm_event_handler_cmn+0x850/0x850 [rds_rdma]
+  [<ffffffffa040f22c>] rds_rdma_cm_event_handler_cmn+0x22c/0x850 [rds_rdma]
+  [<ffffffffa040f860>] rds_rdma_cm_event_handler+0x10/0x20 [rds_rdma]
+  [<ffffffffa037778e>] addr_handler+0x9e/0x140 [rdma_cm]
+  [<ffffffffa026cdb4>] process_req+0x134/0x190 [ib_addr]
+  [<ffffffff810a02f9>] process_one_work+0x169/0x4a0
+  [<ffffffff810a0b2b>] worker_thread+0x5b/0x560
+  [<ffffffff810a0ad0>] ? flush_delayed_work+0x50/0x50
+  [<ffffffff810a68fb>] kthread+0xcb/0xf0
+  [<ffffffff816ec49a>] ? __schedule+0x24a/0x810
+  [<ffffffff816ec49a>] ? __schedule+0x24a/0x810
+  [<ffffffff810a6830>] ? kthread_create_on_node+0x180/0x180
+  [<ffffffff816f25a7>] ret_from_fork+0x47/0x90
+  [<ffffffff810a6830>] ? kthread_create_on_node+0x180/0x180
+
+The ownership rule is once the request is on the list, ownership transfers
+to the list and the local thread can't touch it any more, just like for
+the normal MAD case in send_mad().
+
+Thus, instead of adding before send and then trying to delete after on
+errors, move the entire thing under the spinlock so that the send and
+update of the lists are atomic to the conurrent threads. Lightly reoganize
+things so spinlock safe memory allocations are done in the final NL send
+path and the rest of the setup work is done before and outside the lock.
+
+Fixes: 3ebd2fd0d011 ("IB/sa: Put netlink request into the request list before sending")
+Link: https://lore.kernel.org/r/1592964789-14533-1-git-send-email-divya.indi@oracle.com
+Signed-off-by: Divya Indi <divya.indi@oracle.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+

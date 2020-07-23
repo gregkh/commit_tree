@@ -1,0 +1,218 @@
+bpf: Add BPF ringbuf and perf buffer benchmarks
+
+Extend bench framework with ability to have benchmark-provided child argument
+parser for custom benchmark-specific parameters. This makes bench generic code
+modular and independent from any specific benchmark.
+
+Also implement a set of benchmarks for new BPF ring buffer and existing perf
+buffer. 4 benchmarks were implemented: 2 variations for each of BPF ringbuf
+and perfbuf:,
+  - rb-libbpf utilizes stock libbpf ring_buffer manager for reading data;
+  - rb-custom implements custom ring buffer setup and reading code, to
+    eliminate overheads inherent in generic libbpf code due to callback
+    functions and the need to update consumer position after each consumed
+    record, instead of batching updates (due to pessimistic assumption that
+    user callback might take long time and thus could unnecessarily hold ring
+    buffer space for too long);
+  - pb-libbpf uses stock libbpf perf_buffer code with all the default
+    settings, though uses higher-performance raw event callback to minimize
+    unnecessary overhead;
+  - pb-custom implements its own custom consumer code to minimize any possible
+    overhead of generic libbpf implementation and indirect function calls.
+
+All of the test support default, no data notification skipped, mode, as well
+as sampled mode (with --rb-sampled flag), which allows to trigger epoll
+notification less frequently and reduce overhead. As will be shown, this mode
+is especially critical for perf buffer, which suffers from high overhead of
+wakeups in kernel.
+
+Otherwise, all benchamrks implement similar way to generate a batch of records
+by using fentry/sys_getpgid BPF program, which pushes a bunch of records in
+a tight loop and records number of successful and dropped samples. Each record
+is a small 8-byte integer, to minimize the effect of memory copying with
+bpf_perf_event_output() and bpf_ringbuf_output().
+
+Benchmarks that have only one producer implement optional back-to-back mode,
+in which record production and consumption is alternating on the same CPU.
+This is the highest-throughput happy case, showing ultimate performance
+achievable with either BPF ringbuf or perfbuf.
+
+All the below scenarios are implemented in a script in
+benchs/run_bench_ringbufs.sh. Tests were performed on 28-core/56-thread
+Intel Xeon CPU E5-2680 v4 @ 2.40GHz CPU.
+
+Single-producer, parallel producer
+==================================
+rb-libbpf            12.054 ± 0.320M/s (drops 0.000 ± 0.000M/s)
+rb-custom            8.158 ± 0.118M/s (drops 0.001 ± 0.003M/s)
+pb-libbpf            0.931 ± 0.007M/s (drops 0.000 ± 0.000M/s)
+pb-custom            0.965 ± 0.003M/s (drops 0.000 ± 0.000M/s)
+
+Single-producer, parallel producer, sampled notification
+========================================================
+rb-libbpf            11.563 ± 0.067M/s (drops 0.000 ± 0.000M/s)
+rb-custom            15.895 ± 0.076M/s (drops 0.000 ± 0.000M/s)
+pb-libbpf            9.889 ± 0.032M/s (drops 0.000 ± 0.000M/s)
+pb-custom            9.866 ± 0.028M/s (drops 0.000 ± 0.000M/s)
+
+Single producer on one CPU, consumer on another one, both running at full
+speed. Curiously, rb-libbpf has higher throughput than objectively faster (due
+to more lightweight consumer code path) rb-custom. It appears that faster
+consumer causes kernel to send notifications more frequently, because consumer
+appears to be caught up more frequently. Performance of perfbuf suffers from
+default "no sampling" policy and huge overhead that causes.
+
+In sampled mode, rb-custom is winning very significantly eliminating too
+frequent in-kernel wakeups, the gain appears to be more than 2x.
+
+Perf buffer achieves even more impressive wins, compared to stock perfbuf
+settings, with 10x improvements in throughput with 1:500 sampling rate. The
+trade-off is that with sampling, application might not get next X events until
+X+1st arrives, which is not always acceptable. With steady influx of events,
+though, this shouldn't be a problem.
+
+Overall, single-producer performance of ring buffers seems to be better no
+matter the sampled/non-sampled modes, but it especially beats ring buffer
+without sampling due to its adaptive notification approach.
+
+Single-producer, back-to-back mode
+==================================
+rb-libbpf            15.507 ± 0.247M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf-sampled    14.692 ± 0.195M/s (drops 0.000 ± 0.000M/s)
+rb-custom            21.449 ± 0.157M/s (drops 0.000 ± 0.000M/s)
+rb-custom-sampled    20.024 ± 0.386M/s (drops 0.000 ± 0.000M/s)
+pb-libbpf            1.601 ± 0.015M/s (drops 0.000 ± 0.000M/s)
+pb-libbpf-sampled    8.545 ± 0.064M/s (drops 0.000 ± 0.000M/s)
+pb-custom            1.607 ± 0.022M/s (drops 0.000 ± 0.000M/s)
+pb-custom-sampled    8.988 ± 0.144M/s (drops 0.000 ± 0.000M/s)
+
+Here we test a back-to-back mode, which is arguably best-case scenario both
+for BPF ringbuf and perfbuf, because there is no contention and for ringbuf
+also no excessive notification, because consumer appears to be behind after
+the first record. For ringbuf, custom consumer code clearly wins with 21.5 vs
+16 million records per second exchanged between producer and consumer. Sampled
+mode actually hurts a bit due to slightly slower producer logic (it needs to
+fetch amount of data available to decide whether to skip or force notification).
+
+Perfbuf with wakeup sampling gets 5.5x throughput increase, compared to
+no-sampling version. There also doesn't seem to be noticeable overhead from
+generic libbpf handling code.
+
+Perfbuf back-to-back, effect of sample rate
+===========================================
+pb-sampled-1         1.035 ± 0.012M/s (drops 0.000 ± 0.000M/s)
+pb-sampled-5         3.476 ± 0.087M/s (drops 0.000 ± 0.000M/s)
+pb-sampled-10        5.094 ± 0.136M/s (drops 0.000 ± 0.000M/s)
+pb-sampled-25        7.118 ± 0.153M/s (drops 0.000 ± 0.000M/s)
+pb-sampled-50        8.169 ± 0.156M/s (drops 0.000 ± 0.000M/s)
+pb-sampled-100       8.887 ± 0.136M/s (drops 0.000 ± 0.000M/s)
+pb-sampled-250       9.180 ± 0.209M/s (drops 0.000 ± 0.000M/s)
+pb-sampled-500       9.353 ± 0.281M/s (drops 0.000 ± 0.000M/s)
+pb-sampled-1000      9.411 ± 0.217M/s (drops 0.000 ± 0.000M/s)
+pb-sampled-2000      9.464 ± 0.167M/s (drops 0.000 ± 0.000M/s)
+pb-sampled-3000      9.575 ± 0.273M/s (drops 0.000 ± 0.000M/s)
+
+This benchmark shows the effect of event sampling for perfbuf. Back-to-back
+mode for highest throughput. Just doing every 5th record notification gives
+3.5x speed up. 250-500 appears to be the point of diminishing return, with
+almost 9x speed up. Most benchmarks use 500 as the default sampling for pb-raw
+and pb-custom.
+
+Ringbuf back-to-back, effect of sample rate
+===========================================
+rb-sampled-1         1.106 ± 0.010M/s (drops 0.000 ± 0.000M/s)
+rb-sampled-5         4.746 ± 0.149M/s (drops 0.000 ± 0.000M/s)
+rb-sampled-10        7.706 ± 0.164M/s (drops 0.000 ± 0.000M/s)
+rb-sampled-25        12.893 ± 0.273M/s (drops 0.000 ± 0.000M/s)
+rb-sampled-50        15.961 ± 0.361M/s (drops 0.000 ± 0.000M/s)
+rb-sampled-100       18.203 ± 0.445M/s (drops 0.000 ± 0.000M/s)
+rb-sampled-250       19.962 ± 0.786M/s (drops 0.000 ± 0.000M/s)
+rb-sampled-500       20.881 ± 0.551M/s (drops 0.000 ± 0.000M/s)
+rb-sampled-1000      21.317 ± 0.532M/s (drops 0.000 ± 0.000M/s)
+rb-sampled-2000      21.331 ± 0.535M/s (drops 0.000 ± 0.000M/s)
+rb-sampled-3000      21.688 ± 0.392M/s (drops 0.000 ± 0.000M/s)
+
+Similar benchmark for ring buffer also shows a great advantage (in terms of
+throughput) of skipping notifications. Skipping every 5th one gives 4x boost.
+Also similar to perfbuf case, 250-500 seems to be the point of diminishing
+returns, giving roughly 20x better results.
+
+Keep in mind, for this test, notifications are controlled manually with
+BPF_RB_NO_WAKEUP and BPF_RB_FORCE_WAKEUP. As can be seen from previous
+benchmarks, adaptive notifications based on consumer's positions provides same
+(or even slightly better due to simpler load generator on BPF side) benefits in
+favorable back-to-back scenario. Over zealous and fast consumer, which is
+almost always caught up, will make thoughput numbers smaller. That's the case
+when manual notification control might prove to be extremely beneficial.
+
+Ringbuf back-to-back, reserve+commit vs output
+==============================================
+reserve              22.819 ± 0.503M/s (drops 0.000 ± 0.000M/s)
+output               18.906 ± 0.433M/s (drops 0.000 ± 0.000M/s)
+
+Ringbuf sampled, reserve+commit vs output
+=========================================
+reserve-sampled      15.350 ± 0.132M/s (drops 0.000 ± 0.000M/s)
+output-sampled       14.195 ± 0.144M/s (drops 0.000 ± 0.000M/s)
+
+BPF ringbuf supports two sets of APIs with various usability and performance
+tradeoffs: bpf_ringbuf_reserve()+bpf_ringbuf_commit() vs bpf_ringbuf_output().
+This benchmark clearly shows superiority of reserve+commit approach, despite
+using a small 8-byte record size.
+
+Single-producer, consumer/producer competing on the same CPU, low batch count
+=============================================================================
+rb-libbpf            3.045 ± 0.020M/s (drops 3.536 ± 0.148M/s)
+rb-custom            3.055 ± 0.022M/s (drops 3.893 ± 0.066M/s)
+pb-libbpf            1.393 ± 0.024M/s (drops 0.000 ± 0.000M/s)
+pb-custom            1.407 ± 0.016M/s (drops 0.000 ± 0.000M/s)
+
+This benchmark shows one of the worst-case scenarios, in which producer and
+consumer do not coordinate *and* fight for the same CPU. No batch count and
+sampling settings were able to eliminate drops for ringbuffer, producer is
+just too fast for consumer to keep up. But ringbuf and perfbuf still able to
+pass through quite a lot of messages, which is more than enough for a lot of
+applications.
+
+Ringbuf, multi-producer contention
+==================================
+rb-libbpf nr_prod 1  10.916 ± 0.399M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 2  4.931 ± 0.030M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 3  4.880 ± 0.006M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 4  3.926 ± 0.004M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 8  4.011 ± 0.004M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 12 3.967 ± 0.016M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 16 2.604 ± 0.030M/s (drops 0.001 ± 0.002M/s)
+rb-libbpf nr_prod 20 2.233 ± 0.003M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 24 2.085 ± 0.015M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 28 2.055 ± 0.004M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 32 1.962 ± 0.004M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 36 2.089 ± 0.005M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 40 2.118 ± 0.006M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 44 2.105 ± 0.004M/s (drops 0.000 ± 0.000M/s)
+rb-libbpf nr_prod 48 2.120 ± 0.058M/s (drops 0.000 ± 0.001M/s)
+rb-libbpf nr_prod 52 2.074 ± 0.024M/s (drops 0.007 ± 0.014M/s)
+
+Ringbuf uses a very short-duration spinlock during reservation phase, to check
+few invariants, increment producer count and set record header. This is the
+biggest point of contention for ringbuf implementation. This benchmark
+evaluates the effect of multiple competing writers on overall throughput of
+a single shared ringbuffer.
+
+Overall throughput drops almost 2x when going from single to two
+highly-contended producers, gradually dropping with additional competing
+producers.  Performance drop stabilizes at around 20 producers and hovers
+around 2mln even with 50+ fighting producers, which is a 5x drop compared to
+non-contended case. Good kernel implementation in kernel helps maintain decent
+performance here.
+
+Note, that in the intended real-world scenarios, it's not expected to get even
+close to such a high levels of contention. But if contention will become
+a problem, there is always an option of sharding few ring buffers across a set
+of CPUs.
+
+Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20200529075424.3139988-5-andriin@fb.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

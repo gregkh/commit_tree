@@ -1,0 +1,57 @@
+nvmet: fail outstanding host posted AEN req
+
+In function nvmet_async_event_process() we only process AENs iff
+there is an open slot on the ctrl->async_event_cmds[] && aen
+event list posted by the target is not empty. This keeps host
+posted AEN outstanding if target generated AEN list is empty.
+We do cleanup the target generated entries from the aen list in
+nvmet_ctrl_free()-> nvmet_async_events_free() but we don't
+process AEN posted by the host. This leads to following problem :-
+
+When processing admin sq at the time of nvmet_sq_destroy() holds
+an extra percpu reference(atomic value = 1), so in the following code
+path after switching to atomic rcu, release function (nvmet_sq_free())
+is not getting called which blocks the sq->free_done in
+nvmet_sq_destroy() :-
+
+nvmet_sq_destroy()
+ percpu_ref_kill_and_confirm()
+ - __percpu_ref_switch_mode()
+ --  __percpu_ref_switch_to_atomic()
+ ---   call_rcu() -> percpu_ref_switch_to_atomic_rcu()
+ ----     /* calls switch callback */
+ - percpu_ref_put()
+ -- percpu_ref_put_many(ref, 1)
+ --- else if (unlikely(atomic_long_sub_and_test(nr, &ref->count)))
+ ----   ref->release(ref); <---- Not called.
+
+This results in indefinite hang:-
+
+  void nvmet_sq_destroy(struct nvmet_sq *sq)
+...
+          if (ctrl && ctrl->sqs && ctrl->sqs[0] == sq) {
+                  nvmet_async_events_process(ctrl, status);
+                  percpu_ref_put(&sq->ref);
+          }
+          percpu_ref_kill_and_confirm(&sq->ref, nvmet_confirm_sq);
+          wait_for_completion(&sq->confirm_done);
+          wait_for_completion(&sq->free_done); <-- Hang here
+
+Which breaks the further disconnect sequence. This problem seems to be
+introduced after commit 64f5e9cdd711b ("nvmet: fix memory leak when
+removing namespaces and controllers concurrently").
+
+This patch processes ctrl->async_event_cmds[] in the admin sq destroy()
+context irrespetive of aen_list. Also we get rid of the controller's
+aen_list processing in the nvmet_sq_destroy() context and just ignore
+ctrl->aen_list.
+
+This results in nvmet_async_events_process() being called from workqueue
+context so we adjust the code accordingly.
+
+Fixes: 64f5e9cdd711 ("nvmet: fix memory leak when removing namespaces and controllers concurrently ")
+Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+
