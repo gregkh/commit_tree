@@ -1,0 +1,38 @@
+RDMA/mlx5: Prevent prefetch from racing with implicit destruction
+
+Prefetch work in mlx5_ib_prefetch_mr_work can be queued and able to run
+concurrently with destruction of the implicit MR. The num_deferred_work
+was intended to serialize this, but there is a race:
+
+       CPU0                                          CPU1
+
+    mlx5_ib_free_implicit_mr()
+      xa_erase(odp_mkeys)
+      synchronize_srcu()
+      __xa_erase(implicit_children)
+                                      mlx5_ib_prefetch_mr_work()
+                                        pagefault_mr()
+                                         pagefault_implicit_mr()
+                                          implicit_get_child_mr()
+                                           xa_cmpxchg()
+                                        atomic_dec_and_test(num_deferred_mr)
+      wait_event(imr->q_deferred_work)
+      ib_umem_odp_release(odp_imr)
+        kfree(odp_imr)
+
+At this point in mlx5_ib_free_implicit_mr() the implicit_children list is
+supposed to be empty forever so that destroy_unused_implicit_child_mr()
+and related are not and will not be running.
+
+Since it is not empty the destroy_unused_implicit_child_mr() flow ends up
+touching deallocated memory as mlx5_ib_free_implicit_mr() already tore down the
+imr parent.
+
+The solution is to flush out the prefetch wq by driving num_deferred_work
+to zero after creation of new prefetch work is blocked.
+
+Fixes: 5256edcb98a1 ("RDMA/mlx5: Rework implicit ODP destroy")
+Link: https://lore.kernel.org/r/20200719065435.130722-1-leon@kernel.org
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+
