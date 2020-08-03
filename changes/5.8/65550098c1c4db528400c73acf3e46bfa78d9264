@@ -1,0 +1,64 @@
+rxrpc: Fix race between recvmsg and sendmsg on immediate call failure
+
+There's a race between rxrpc_sendmsg setting up a call, but then failing to
+send anything on it due to an error, and recvmsg() seeing the call
+completion occur and trying to return the state to the user.
+
+An assertion fails in rxrpc_recvmsg() because the call has already been
+released from the socket and is about to be released again as recvmsg deals
+with it.  (The recvmsg_q queue on the socket holds a ref, so there's no
+problem with use-after-free.)
+
+We also have to be careful not to end up reporting an error twice, in such
+a way that both returns indicate to userspace that the user ID supplied
+with the call is no longer in use - which could cause the client to
+malfunction if it recycles the user ID fast enough.
+
+Fix this by the following means:
+
+ (1) When sendmsg() creates a call after the point that the call has been
+     successfully added to the socket, don't return any errors through
+     sendmsg(), but rather complete the call and let recvmsg() retrieve
+     them.  Make sendmsg() return 0 at this point.  Further calls to
+     sendmsg() for that call will fail with ESHUTDOWN.
+
+     Note that at this point, we haven't send any packets yet, so the
+     server doesn't yet know about the call.
+
+ (2) If sendmsg() returns an error when it was expected to create a new
+     call, it means that the user ID wasn't used.
+
+ (3) Mark the call disconnected before marking it completed to prevent an
+     oops in rxrpc_release_call().
+
+ (4) recvmsg() will then retrieve the error and set MSG_EOR to indicate
+     that the user ID is no longer known by the kernel.
+
+An oops like the following is produced:
+
+	kernel BUG at net/rxrpc/recvmsg.c:605!
+	...
+	RIP: 0010:rxrpc_recvmsg+0x256/0x5ae
+	...
+	Call Trace:
+	 ? __init_waitqueue_head+0x2f/0x2f
+	 ____sys_recvmsg+0x8a/0x148
+	 ? import_iovec+0x69/0x9c
+	 ? copy_msghdr_from_user+0x5c/0x86
+	 ___sys_recvmsg+0x72/0xaa
+	 ? __fget_files+0x22/0x57
+	 ? __fget_light+0x46/0x51
+	 ? fdget+0x9/0x1b
+	 do_recvmmsg+0x15e/0x232
+	 ? _raw_spin_unlock+0xa/0xb
+	 ? vtime_delta+0xf/0x25
+	 __x64_sys_recvmmsg+0x2c/0x2f
+	 do_syscall_64+0x4c/0x78
+	 entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Fixes: 357f5ef64628 ("rxrpc: Call rxrpc_release_call() on error in rxrpc_new_client_call()")
+Reported-by: syzbot+b54969381df354936d96@syzkaller.appspotmail.com
+Signed-off-by: David Howells <dhowells@redhat.com>
+Reviewed-by: Marc Dionne <marc.dionne@auristor.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
