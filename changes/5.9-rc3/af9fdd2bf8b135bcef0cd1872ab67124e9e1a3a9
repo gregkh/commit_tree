@@ -1,0 +1,205 @@
+net: dsa: sja1105: poll for extts events from a timer
+
+The current poll interval is enough to ensure that rising and falling
+edge events are not lost for a 1 PPS signal with 50% duty cycle.
+
+But when we deliver the events to user space, it will try to infer if
+they were corresponding to a rising or to a falling edge (the kernel
+driver doesn't know that either). User space will try to make that
+inference based on the time at which the PPS master had emitted the
+pulse (i.e. if it's a .0 time, it's rising edge, if it's .5 time, it's
+falling edge).
+
+But there is no in-kernel API for retrieving the precise timestamp
+corresponding to a PPS master (aka perout) pulse. So user space has to
+guess even that. It will read the PTP time on the PPS master right after
+we've delivered the extts event, and declare that the PPS master time
+was just the closest integer second, based on 2 thresholds (lower than
+.25, or higher than .75, and ignore anything else).
+
+Except that, if we poll for extts events (and our hardware doesn't
+really help us, by not providing an interrupt), then there is a risk
+that the poll period (and therefore the time at which the event is
+delivered) might confuse user space.
+
+Because we are always scheduling the next extts poll at
+SJA1105_EXTTS_INTERVAL "from now" (that's the only thing that the
+schedule_delayed_work() API gives us), it means that the start time of
+the next delayed workqueue will always be shifted to the right a little
+bit (shifted with the SPI access duration of this workqueue run).
+In turn, because user space sees extts events that are non-periodic
+compared to the PPS master's time, this means that it might start making
+wrong guesses about rising/falling edge.
+
+To understand the effect, here is the output of ts2phc currently. Notice
+the 'src' timestamps of the 'SKIP extts' events, and how they have a
+large wander. They keep increasing until the upper limit for the ignore
+threshold (.75 seconds), after which the application starts ignoring the
+_other_ edge.
+
+ts2phc[26.624]: /dev/ptp3 SKIP extts index 0 at 21.449898912 src 21.657784518
+ts2phc[27.133]: adding tstamp 21.949894240 to clock /dev/ptp3
+ts2phc[27.133]: adding tstamp 22.000000000 to clock /dev/ptp1
+ts2phc[27.133]: /dev/ptp3 offset        640 s2 freq   +5112
+ts2phc[27.636]: /dev/ptp3 SKIP extts index 0 at 22.449889360 src 22.669398022
+ts2phc[28.140]: adding tstamp 22.949884376 to clock /dev/ptp3
+ts2phc[28.140]: adding tstamp 23.000000000 to clock /dev/ptp1
+ts2phc[28.140]: /dev/ptp3 offset         96 s2 freq   +4760
+ts2phc[28.644]: /dev/ptp3 SKIP extts index 0 at 23.449879504 src 23.677420422
+ts2phc[29.153]: adding tstamp 23.949874704 to clock /dev/ptp3
+ts2phc[29.153]: adding tstamp 24.000000000 to clock /dev/ptp1
+ts2phc[29.153]: /dev/ptp3 offset       -264 s2 freq   +4429
+ts2phc[29.656]: /dev/ptp3 SKIP extts index 0 at 24.449870008 src 24.689407238
+ts2phc[30.160]: adding tstamp 24.949865376 to clock /dev/ptp3
+ts2phc[30.160]: adding tstamp 25.000000000 to clock /dev/ptp1
+ts2phc[30.160]: /dev/ptp3 offset       -280 s2 freq   +4334
+ts2phc[30.664]: /dev/ptp3 SKIP extts index 0 at 25.449860760 src 25.697449926
+ts2phc[31.168]: adding tstamp 25.949856176 to clock /dev/ptp3
+ts2phc[31.168]: adding tstamp 26.000000000 to clock /dev/ptp1
+ts2phc[31.168]: /dev/ptp3 offset       -176 s2 freq   +4354
+ts2phc[31.672]: /dev/ptp3 SKIP extts index 0 at 26.449851584 src 26.705433606
+ts2phc[32.180]: adding tstamp 26.949846992 to clock /dev/ptp3
+ts2phc[32.180]: adding tstamp 27.000000000 to clock /dev/ptp1
+ts2phc[32.180]: /dev/ptp3 offset        -80 s2 freq   +4397
+ts2phc[32.684]: /dev/ptp3 SKIP extts index 0 at 27.449842384 src 27.717415110
+ts2phc[33.192]: adding tstamp 27.949837768 to clock /dev/ptp3
+ts2phc[33.192]: adding tstamp 28.000000000 to clock /dev/ptp1
+ts2phc[33.192]: /dev/ptp3 offset          0 s2 freq   +4453
+ts2phc[33.696]: /dev/ptp3 SKIP extts index 0 at 28.449833128 src 28.729412902
+ts2phc[34.200]: adding tstamp 28.949828472 to clock /dev/ptp3
+ts2phc[34.200]: adding tstamp 29.000000000 to clock /dev/ptp1
+ts2phc[34.200]: /dev/ptp3 offset          8 s2 freq   +4461
+ts2phc[34.704]: /dev/ptp3 SKIP extts index 0 at 29.449823816 src 29.737416038
+ts2phc[35.208]: adding tstamp 29.949819152 to clock /dev/ptp3
+ts2phc[35.208]: adding tstamp 30.000000000 to clock /dev/ptp1
+ts2phc[35.208]: /dev/ptp3 offset         -8 s2 freq   +4447
+ts2phc[35.712]: /dev/ptp3 SKIP extts index 0 at 30.449814496 src 30.745554982
+ts2phc[36.216]: adding tstamp 30.949809840 to clock /dev/ptp3
+ts2phc[36.216]: adding tstamp 31.000000000 to clock /dev/ptp1
+ts2phc[36.216]: /dev/ptp3 offset         -8 s2 freq   +4445
+ts2phc[36.468]: /dev/ptp3 SKIP extts index 0 at 31.449805184 src 31.501109446
+ts2phc[36.972]: adding tstamp 31.949800536 to clock /dev/ptp3
+ts2phc[36.972]: adding tstamp 32.000000000 to clock /dev/ptp1
+ts2phc[36.972]: /dev/ptp3 offset         -8 s2 freq   +4442
+ts2phc[37.480]: /dev/ptp3 SKIP extts index 0 at 32.449795896 src 32.513320070
+ts2phc[37.984]: adding tstamp 32.949791248 to clock /dev/ptp3
+ts2phc[37.984]: adding tstamp 33.000000000 to clock /dev/ptp1
+ts2phc[37.984]: /dev/ptp3 offset          0 s2 freq   +4448
+
+Fix that by taking the following measures:
+- Schedule the poll from a timer. Because we are really scheduling the
+  timer periodically, the extts events delivered to user space are
+  periodic too, and don't suffer from the "shift-to-the-right" effect.
+- Increase the poll period to 6 times a second. This imposes a smaller
+  upper bound to the shift that can occur to the delivery time of extts
+  events, and makes user space (ts2phc) to always interpret correctly
+  which events should be skipped and which shouldn't.
+- Move the SPI readout itself to the main PTP kernel thread, instead of
+  the generic workqueue. This is because the timer runs in atomic
+  context, but is also better than before, because if needed, we can
+  chrt & taskset this kernel thread, to ensure it gets enough priority
+  under load.
+
+After this patch, one can notice that the wander is greatly reduced, and
+that the latencies of one extts poll are not propagated to the next. The
+'src' timestamp that is skipped is never larger than .65 seconds (which
+means .15 seconds larger than the time at which the real event occurred
+at, and .10 seconds smaller than the .75 upper threshold for ignoring
+the falling edge):
+
+ts2phc[40.076]: adding tstamp 34.949261296 to clock /dev/ptp3
+ts2phc[40.076]: adding tstamp 35.000000000 to clock /dev/ptp1
+ts2phc[40.076]: /dev/ptp3 offset         48 s2 freq   +4631
+ts2phc[40.568]: /dev/ptp3 SKIP extts index 0 at 35.449256496 src 35.595791078
+ts2phc[41.064]: adding tstamp 35.949251744 to clock /dev/ptp3
+ts2phc[41.064]: adding tstamp 36.000000000 to clock /dev/ptp1
+ts2phc[41.064]: /dev/ptp3 offset       -224 s2 freq   +4374
+ts2phc[41.552]: /dev/ptp3 SKIP extts index 0 at 36.449247088 src 36.579825574
+ts2phc[42.044]: adding tstamp 36.949242456 to clock /dev/ptp3
+ts2phc[42.044]: adding tstamp 37.000000000 to clock /dev/ptp1
+ts2phc[42.044]: /dev/ptp3 offset       -240 s2 freq   +4290
+ts2phc[42.536]: /dev/ptp3 SKIP extts index 0 at 37.449237848 src 37.563828774
+ts2phc[43.028]: adding tstamp 37.949233264 to clock /dev/ptp3
+ts2phc[43.028]: adding tstamp 38.000000000 to clock /dev/ptp1
+ts2phc[43.028]: /dev/ptp3 offset       -144 s2 freq   +4314
+ts2phc[43.520]: /dev/ptp3 SKIP extts index 0 at 38.449228656 src 38.547823238
+ts2phc[44.012]: adding tstamp 38.949224048 to clock /dev/ptp3
+ts2phc[44.012]: adding tstamp 39.000000000 to clock /dev/ptp1
+ts2phc[44.012]: /dev/ptp3 offset        -80 s2 freq   +4335
+ts2phc[44.508]: /dev/ptp3 SKIP extts index 0 at 39.449219432 src 39.535846118
+ts2phc[44.996]: adding tstamp 39.949214816 to clock /dev/ptp3
+ts2phc[44.996]: adding tstamp 40.000000000 to clock /dev/ptp1
+ts2phc[44.996]: /dev/ptp3 offset        -32 s2 freq   +4359
+ts2phc[45.488]: /dev/ptp3 SKIP extts index 0 at 40.449210192 src 40.515824678
+ts2phc[45.980]: adding tstamp 40.949205568 to clock /dev/ptp3
+ts2phc[45.980]: adding tstamp 41.000000000 to clock /dev/ptp1
+ts2phc[45.980]: /dev/ptp3 offset          8 s2 freq   +4390
+ts2phc[46.636]: /dev/ptp3 SKIP extts index 0 at 41.449200928 src 41.664176902
+ts2phc[47.132]: adding tstamp 41.949196288 to clock /dev/ptp3
+ts2phc[47.132]: adding tstamp 42.000000000 to clock /dev/ptp1
+ts2phc[47.132]: /dev/ptp3 offset          0 s2 freq   +4384
+ts2phc[47.620]: /dev/ptp3 SKIP extts index 0 at 42.449191656 src 42.648117190
+ts2phc[48.112]: adding tstamp 42.949187016 to clock /dev/ptp3
+ts2phc[48.112]: adding tstamp 43.000000000 to clock /dev/ptp1
+ts2phc[48.112]: /dev/ptp3 offset          0 s2 freq   +4384
+ts2phc[48.604]: /dev/ptp3 SKIP extts index 0 at 43.449182384 src 43.632112582
+ts2phc[49.100]: adding tstamp 43.949177736 to clock /dev/ptp3
+ts2phc[49.100]: adding tstamp 44.000000000 to clock /dev/ptp1
+ts2phc[49.100]: /dev/ptp3 offset         -8 s2 freq   +4376
+ts2phc[49.588]: /dev/ptp3 SKIP extts index 0 at 44.449173096 src 44.616136774
+ts2phc[50.080]: adding tstamp 44.949168464 to clock /dev/ptp3
+ts2phc[50.080]: adding tstamp 45.000000000 to clock /dev/ptp1
+ts2phc[50.080]: /dev/ptp3 offset          8 s2 freq   +4390
+ts2phc[50.572]: /dev/ptp3 SKIP extts index 0 at 45.449163816 src 45.600134662
+ts2phc[51.064]: adding tstamp 45.949159160 to clock /dev/ptp3
+ts2phc[51.064]: adding tstamp 46.000000000 to clock /dev/ptp1
+ts2phc[51.064]: /dev/ptp3 offset         -8 s2 freq   +4376
+ts2phc[51.556]: /dev/ptp3 SKIP extts index 0 at 46.449154528 src 46.584588550
+ts2phc[52.048]: adding tstamp 46.949149896 to clock /dev/ptp3
+ts2phc[52.048]: adding tstamp 47.000000000 to clock /dev/ptp1
+ts2phc[52.048]: /dev/ptp3 offset          0 s2 freq   +4382
+ts2phc[52.540]: /dev/ptp3 SKIP extts index 0 at 47.449145256 src 47.568132198
+ts2phc[53.032]: adding tstamp 47.949140616 to clock /dev/ptp3
+ts2phc[53.032]: adding tstamp 48.000000000 to clock /dev/ptp1
+ts2phc[53.032]: /dev/ptp3 offset          0 s2 freq   +4382
+ts2phc[53.524]: /dev/ptp3 SKIP extts index 0 at 48.449135968 src 48.552121446
+ts2phc[54.016]: adding tstamp 48.949131320 to clock /dev/ptp3
+ts2phc[54.016]: adding tstamp 49.000000000 to clock /dev/ptp1
+ts2phc[54.016]: /dev/ptp3 offset          0 s2 freq   +4382
+ts2phc[54.512]: /dev/ptp3 SKIP extts index 0 at 49.449126680 src 49.540147014
+ts2phc[55.000]: adding tstamp 49.949122040 to clock /dev/ptp3
+ts2phc[55.000]: adding tstamp 50.000000000 to clock /dev/ptp1
+ts2phc[55.000]: /dev/ptp3 offset          0 s2 freq   +4382
+ts2phc[55.492]: /dev/ptp3 SKIP extts index 0 at 50.449117400 src 50.520119078
+ts2phc[55.988]: adding tstamp 50.949112768 to clock /dev/ptp3
+ts2phc[55.988]: adding tstamp 51.000000000 to clock /dev/ptp1
+ts2phc[55.988]: /dev/ptp3 offset          8 s2 freq   +4390
+ts2phc[56.476]: /dev/ptp3 SKIP extts index 0 at 51.449108120 src 51.504175910
+ts2phc[57.132]: adding tstamp 51.949103480 to clock /dev/ptp3
+ts2phc[57.132]: adding tstamp 52.000000000 to clock /dev/ptp1
+ts2phc[57.132]: /dev/ptp3 offset          0 s2 freq   +4384
+ts2phc[57.624]: /dev/ptp3 SKIP extts index 0 at 52.449098840 src 52.651833574
+ts2phc[58.116]: adding tstamp 52.949094200 to clock /dev/ptp3
+ts2phc[58.116]: adding tstamp 53.000000000 to clock /dev/ptp1
+ts2phc[58.116]: /dev/ptp3 offset          8 s2 freq   +4392
+ts2phc[58.612]: /dev/ptp3 SKIP extts index 0 at 53.449089560 src 53.639826918
+ts2phc[59.100]: adding tstamp 53.949084920 to clock /dev/ptp3
+ts2phc[59.100]: adding tstamp 54.000000000 to clock /dev/ptp1
+ts2phc[59.100]: /dev/ptp3 offset          8 s2 freq   +4394
+ts2phc[59.592]: /dev/ptp3 SKIP extts index 0 at 54.449080272 src 54.619842278
+ts2phc[60.084]: adding tstamp 54.949075624 to clock /dev/ptp3
+ts2phc[60.084]: adding tstamp 55.000000000 to clock /dev/ptp1
+ts2phc[60.084]: /dev/ptp3 offset          8 s2 freq   +4397
+ts2phc[60.576]: /dev/ptp3 SKIP extts index 0 at 55.449070968 src 55.603885542
+ts2phc[61.068]: adding tstamp 55.949066312 to clock /dev/ptp3
+ts2phc[61.068]: adding tstamp 56.000000000 to clock /dev/ptp1
+ts2phc[61.068]: /dev/ptp3 offset          0 s2 freq   +4391
+ts2phc[61.560]: /dev/ptp3 SKIP extts index 0 at 56.449061680 src 56.587885798
+ts2phc[62.052]: adding tstamp 56.949057032 to clock /dev/ptp3
+ts2phc[62.052]: adding tstamp 57.000000000 to clock /dev/ptp1
+ts2phc[62.052]: /dev/ptp3 offset         -8 s2 freq   +4383
+
+Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+Acked-by: Richard Cochran <richardcochran@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

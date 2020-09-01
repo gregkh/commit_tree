@@ -1,0 +1,86 @@
+xfs: Fix false positive lockdep warning with sb_internal & fs_reclaim
+
+Depending on the workloads, the following circular locking dependency
+warning between sb_internal (a percpu rwsem) and fs_reclaim (a pseudo
+lock) may show up:
+
+======================================================
+WARNING: possible circular locking dependency detected
+5.0.0-rc1+ #60 Tainted: G        W
+------------------------------------------------------
+fsfreeze/4346 is trying to acquire lock:
+0000000026f1d784 (fs_reclaim){+.+.}, at:
+fs_reclaim_acquire.part.19+0x5/0x30
+
+but task is already holding lock:
+0000000072bfc54b (sb_internal){++++}, at: percpu_down_write+0xb4/0x650
+
+which lock already depends on the new lock.
+  :
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(sb_internal);
+                               lock(fs_reclaim);
+                               lock(sb_internal);
+  lock(fs_reclaim);
+
+ *** DEADLOCK ***
+
+4 locks held by fsfreeze/4346:
+ #0: 00000000b478ef56 (sb_writers#8){++++}, at: percpu_down_write+0xb4/0x650
+ #1: 000000001ec487a9 (&type->s_umount_key#28){++++}, at: freeze_super+0xda/0x290
+ #2: 000000003edbd5a0 (sb_pagefaults){++++}, at: percpu_down_write+0xb4/0x650
+ #3: 0000000072bfc54b (sb_internal){++++}, at: percpu_down_write+0xb4/0x650
+
+stack backtrace:
+Call Trace:
+ dump_stack+0xe0/0x19a
+ print_circular_bug.isra.10.cold.34+0x2f4/0x435
+ check_prev_add.constprop.19+0xca1/0x15f0
+ validate_chain.isra.14+0x11af/0x3b50
+ __lock_acquire+0x728/0x1200
+ lock_acquire+0x269/0x5a0
+ fs_reclaim_acquire.part.19+0x29/0x30
+ fs_reclaim_acquire+0x19/0x20
+ kmem_cache_alloc+0x3e/0x3f0
+ kmem_zone_alloc+0x79/0x150
+ xfs_trans_alloc+0xfa/0x9d0
+ xfs_sync_sb+0x86/0x170
+ xfs_log_sbcount+0x10f/0x140
+ xfs_quiesce_attr+0x134/0x270
+ xfs_fs_freeze+0x4a/0x70
+ freeze_super+0x1af/0x290
+ do_vfs_ioctl+0xedc/0x16c0
+ ksys_ioctl+0x41/0x80
+ __x64_sys_ioctl+0x73/0xa9
+ do_syscall_64+0x18f/0xd23
+ entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+This is a false positive as all the dirty pages are flushed out before
+the filesystem can be frozen.
+
+One way to avoid this splat is to add GFP_NOFS to the affected allocation
+calls by using the memalloc_nofs_save()/memalloc_nofs_restore() pair.
+This shouldn't matter unless the system is really running out of memory.
+In that particular case, the filesystem freeze operation may fail while
+it was succeeding previously.
+
+Without this patch, the command sequence below will show that the lock
+dependency chain sb_internal -> fs_reclaim exists.
+
+ # fsfreeze -f /home
+ # fsfreeze --unfreeze /home
+ # grep -i fs_reclaim -C 3 /proc/lockdep_chains | grep -C 5 sb_internal
+
+After applying the patch, such sb_internal -> fs_reclaim lock dependency
+chain can no longer be found. Because of that, the locking dependency
+warning will not be shown.
+
+Suggested-by: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Waiman Long <longman@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+

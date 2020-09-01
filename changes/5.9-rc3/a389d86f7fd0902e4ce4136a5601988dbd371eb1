@@ -1,0 +1,189 @@
+ring-buffer: Have nested events still record running time stamp
+
+Up until now, if an event is interrupted while it is recorded by an
+interrupt, and that interrupt records events, the time of those events will
+all be the same. This is because events only record the delta of the time
+since the previous event (or beginning of a page), and to handle updating
+the time keeping for that of nested events is extremely racy. After years of
+thinking about this and several failed attempts, I finally have a solution
+to solve this puzzle.
+
+The problem is that you need to atomically calculate the delta and then
+update the time stamp you made the delta from, as well as then record it
+into the buffer, all this while at any time an interrupt can come in and
+do the same thing. This is easy to solve with heavy weight atomics, but that
+would be detrimental to the performance of the ring buffer. The current
+state of affairs sacrificed the time deltas for nested events for
+performance.
+
+The reason for previous failed attempts at solving this puzzle was because I
+was trying to completely avoid slow atomic operations like cmpxchg. I final
+came to the conclusion to always avoid cmpxchg is not possible, which is why
+those previous attempts always failed. But it is possible to pick one path
+(the most common case) and avoid cmpxchg in that path, which is the "fast
+path". The most common case is that an event will not be interrupted and
+have other events added into it. An event can detect if it has
+interrupted another event, and for these cases we can make it the slow
+path and use the heavy operations like cmpxchg.
+
+One more player was added to the game that made this possible, and that is
+the "absolute timestamp" (by Tom Zanussi) that allows us to inject a full 59
+bit time stamp. (Of course this breaks if a machine is running for more than
+18 years without a reboot!).
+
+There's barrier() placements around for being paranoid, even when they
+are not needed because of other atomic functions near by. But those
+should not hurt, as if they are not needed, they basically become a nop.
+
+Note, this also makes the race window much smaller, which means there
+are less slow paths to slow down the performance.
+
+The basic idea is that there's two main paths taken.
+
+ 1) Not being interrupted between time stamps and reserving buffer space.
+    In this case, the time stamps taken are true to the location in the
+    buffer.
+
+ 2) Was interrupted by another path between taking time stamps and reserving
+    buffer space.
+
+The objective is to know what the delta is from the last reserved location
+in the buffer.
+
+As it is possible to detect if an event is interrupting another event before
+reserving data, space is added to the length to be reserved to inject a full
+time stamp along with the event being reserved.
+
+When an event is not interrupted, the write stamp is always the time of the
+last event written to the buffer.
+
+In path 1, there's two sub paths we care about:
+
+ a) The event did not interrupt another event.
+ b) The event interrupted another event.
+
+In case a, as the write stamp was read and known to be correct, the delta
+between the current time stamp and the write stamp is the delta between the
+current event and the previously recorded event.
+
+In case b, extra space was reserved to just put the full time stamp into the
+buffer. Which is done, as stated, in this path the time stamp taken is known
+to match the location in the buffer.
+
+In path 2, there's also two sub paths we care about:
+
+ a) The event was not interrupted by another event since it reserved space
+    on the buffer and re-reading the write stamp.
+ b) The event was interrupted by another event.
+
+In case a, the write stamp is that of the last event that interrupted this
+event between taking the time stamps and reserving. As no event came in
+after re-reading the write stamp, that event is known to be the time of the
+event directly before this event and the delta can be the new time stamp and
+the write stamp.
+
+In case b, one or more events came in between reserving the event and
+re-reading he write stamp. Since this event's buffer reservation is between
+other events at this path, there's no way to know what the delta is. But
+because an event interrupted this event after it started, its fine to just
+give a zero delta, and take the same time stamp as the events that happened
+within the event being recorded.
+
+Here's the implementation of the design of this solution:
+
+ All this is per cpu, and only needs to worry about nested events (not
+ parallel events).
+
+The players:
+
+ write_tail: The index in the buffer where new events can be written to.
+     It is incremented via local_add() to reserve space for a new event.
+
+ before_stamp: A time stamp set by all events before reserving space.
+
+ write_stamp: A time stamp updated by events after it has successfully
+     reserved space.
+
+	/* Save the current position of write */
+ [A]	w = local_read(write_tail);
+	barrier();
+	/* Read both before and write stamps before touching anything */
+	before = local_read(before_stamp);
+	after = local_read(write_stamp);
+	barrier();
+
+	/*
+	 * If before and after are the same, then this event is not
+	 * interrupting a time update. If it is, then reserve space for adding
+	 * a full time stamp (this can turn into a time extend which is
+	 * just an extended time delta but fill up the extra space).
+	 */
+	if (after != before)
+		abs = true;
+
+	ts = clock();
+
+	/* Now update the before_stamp (everyone does this!) */
+ [B]	local_set(before_stamp, ts);
+
+	/* Now reserve space on the buffer */
+ [C]	write = local_add_return(len, write_tail);
+
+	/* Set tail to be were this event's data is */
+	tail = write - len;
+
+ 	if (w == tail) {
+
+		/* Nothing interrupted this between A and C */
+ [D]		local_set(write_stamp, ts);
+		barrier();
+ [E]		save_before = local_read(before_stamp);
+
+ 		if (!abs) {
+			/* This did not interrupt a time update */
+			delta = ts - after;
+		} else {
+			delta = ts; /* The full time stamp will be in use */
+		}
+		if (ts != save_before) {
+			/* slow path - Was interrupted between C and E */
+			/* The update to write_stamp could have overwritten the update to
+			 * it by the interrupting event, but before and after should be
+			 * the same for all completed top events */
+			after = local_read(write_stamp);
+			if (save_before > after)
+				local_cmpxchg(write_stamp, after, save_before);
+		}
+	} else {
+		/* slow path - Interrupted between A and C */
+
+		after = local_read(write_stamp);
+		temp_ts = clock();
+		barrier();
+ [F]		if (write == local_read(write_tail) && after < temp_ts) {
+			/* This was not interrupted since C and F
+			 * The last write_stamp is still valid for the previous event
+			 * in the buffer. */
+			delta = temp_ts - after;
+			/* OK to keep this new time stamp */
+			ts = temp_ts;
+		} else {
+			/* Interrupted between C and F
+			 * Well, there's no use to try to know what the time stamp
+			 * is for the previous event. Just set delta to zero and
+			 * be the same time as that event that interrupted us before
+			 * the reservation of the buffer. */
+
+			delta = 0;
+		}
+		/* No need to use full timestamps here */
+		abs = 0;
+	}
+
+Link: https://lkml.kernel.org/r/20200625094454.732790f7@oasis.local.home
+Link: https://lore.kernel.org/r/20200627010041.517736087@goodmis.org
+Link: http://lkml.kernel.org/r/20200629025258.957440797@goodmis.org
+
+Reviewed-by: Masami Hiramatsu <mhiramat@kernel.org>
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+

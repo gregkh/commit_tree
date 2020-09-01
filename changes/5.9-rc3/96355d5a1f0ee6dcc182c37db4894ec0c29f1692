@@ -1,0 +1,56 @@
+xfs: Don't allow logging of XFS_ISTALE inodes
+
+In tracking down a problem in this patchset, I discovered we are
+reclaiming dirty stale inodes. This wasn't discovered until inodes
+were always attached to the cluster buffer and then the rcu callback
+that freed inodes was assert failing because the inode still had an
+active pointer to the cluster buffer after it had been reclaimed.
+
+Debugging the issue indicated that this was a pre-existing issue
+resulting from the way the inodes are handled in xfs_inactive_ifree.
+When we free a cluster buffer from xfs_ifree_cluster, all the inodes
+in cache are marked XFS_ISTALE. Those that are clean have nothing
+else done to them and so eventually get cleaned up by background
+reclaim. i.e. it is assumed we'll never dirty/relog an inode marked
+XFS_ISTALE.
+
+On journal commit dirty stale inodes as are handled by both
+buffer and inode log items to run though xfs_istale_done() and
+removed from the AIL (buffer log item commit) or the log item will
+simply unpin it because the buffer log item will clean it. What happens
+to any specific inode is entirely dependent on which log item wins
+the commit race, but the result is the same - stale inodes are
+clean, not attached to the cluster buffer, and not in the AIL. Hence
+inode reclaim can just free these inodes without further care.
+
+However, if the stale inode is relogged, it gets dirtied again and
+relogged into the CIL. Most of the time this isn't an issue, because
+relogging simply changes the inode's location in the current
+checkpoint. Problems arise, however, when the CIL checkpoints
+between two transactions in the xfs_inactive_ifree() deferops
+processing. This results in the XFS_ISTALE inode being redirtied
+and inserted into the CIL without any of the other stale cluster
+buffer infrastructure being in place.
+
+Hence on journal commit, it simply gets unpinned, so it remains
+dirty in memory. Everything in inode writeback avoids XFS_ISTALE
+inodes so it can't be written back, and it is not tracked in the AIL
+so there's not even a trigger to attempt to clean the inode. Hence
+the inode just sits dirty in memory until inode reclaim comes along,
+sees that it is XFS_ISTALE, and goes to reclaim it. This reclaiming
+of a dirty inode caused use after free, list corruptions and other
+nasty issues later in this patchset.
+
+Hence this patch addresses a violation of the "never log XFS_ISTALE
+inodes" caused by the deferops processing rolling a transaction
+and relogging a stale inode in xfs_inactive_free. It also adds a
+bunch of asserts to catch this problem in debug kernels so that
+we don't reintroduce this problem in future.
+
+Reproducer for this issue was generic/558 on a v4 filesystem.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+

@@ -1,0 +1,60 @@
+spi: spi-geni-qcom: Mo' betta locking
+
+If you added a bit of a delay (like a trace_printk) into the ISR for
+the spi-geni-qcom driver, you would suddenly start seeing some errors
+spit out.  The problem was that, though the ISR itself held a lock,
+other parts of the driver didn't always grab the lock.
+
+One example race was this:
+  CPU0                                         CPU1
+  ----                                         ----
+  spi_geni_set_cs()
+   mas->cur_mcmd = CMD_CS;
+   geni_se_setup_m_cmd(...)
+   wait_for_completion_timeout(&xfer_done);
+                                              <INTERRUPT>
+                                               geni_spi_isr()
+                                                complete(&xfer_done);
+   <wakeup>
+   pm_runtime_put(mas->dev);
+  ... // back to SPI core
+  spi_geni_transfer_one()
+   setup_fifo_xfer()
+    mas->cur_mcmd = CMD_XFER;
+                                                mas->cur_cmd = CMD_NONE; // bad!
+                                                return IRQ_HANDLED;
+
+Let's fix this.  Before we start messing with hardware, we'll grab the
+lock to make sure that the IRQ handler from some previous command has
+really finished.  We don't need to hold the lock unless we're in a
+state where more interrupts can come in, but we at least need to make
+sure the previous IRQ is done.  This lock is used exclusively to
+prevent the IRQ handler and non-IRQ from stomping on each other.  The
+SPI core handles all other mutual exclusion.
+
+As part of this, we change the way that the IRQ handler detects
+spurious interrupts.  Previously we checked for our state variable
+being set to IRQ_NONE, but that was done outside the spinlock.  We
+could move it into the spinlock, but instead let's just change it to
+look for the lack of any IRQ status bits being set.  This can be done
+outside the lock--the hardware certainly isn't grabbing or looking at
+the spinlock when it updates its status register.
+
+It's possible that this will fix real (but very rare) errors seen in
+the field that look like:
+  irq ...: nobody cared (try booting with the "irqpoll" option)
+
+NOTE: an alternate strategy considered here was to always make the
+complete() / spi_finalize_current_transfer() the very last thing in
+our IRQ handler.  With such a change you could consider that we could
+be "lockless".  In that case, though, we'd have to be very careful w/
+memory barriers so we made sure we didn't have any bugs with weakly
+ordered memory.  Using spinlocks makes the driver much easier to
+understand.
+
+Fixes: 561de45f72bd ("spi: spi-geni-qcom: Add SPI driver support for GENI based QUP")
+Signed-off-by: Douglas Anderson <dianders@chromium.org>
+Reviewed-by: Stephen Boyd <swboyd@chromium.org>
+Link: https://lore.kernel.org/r/20200618080459.v4.2.I752ebdcfd5e8bf0de06d66e767b8974932b3620e@changeid
+Signed-off-by: Mark Brown <broonie@kernel.org>
+

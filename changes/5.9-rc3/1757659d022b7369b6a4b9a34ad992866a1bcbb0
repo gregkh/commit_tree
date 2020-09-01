@@ -1,0 +1,59 @@
+ACPI: OSL: Implement deferred unmapping of ACPI memory
+
+The ACPI OS layer in Linux uses RCU to protect the walkers of the
+list of ACPI memory mappings from seeing an inconsistent state
+while it is being updated.  Among other situations, that list can
+be walked in (NMI and non-NMI) interrupt context, so using a
+sleeping lock to protect it is not an option.
+
+However, performance issues related to the RCU usage in there
+appear, as described by Dan Williams:
+
+"Recently a performance problem was reported for a process invoking
+a non-trival ASL program. The method call in this case ends up
+repetitively triggering a call path like:
+
+    acpi_ex_store
+    acpi_ex_store_object_to_node
+    acpi_ex_write_data_to_field
+    acpi_ex_insert_into_field
+    acpi_ex_write_with_update_rule
+    acpi_ex_field_datum_io
+    acpi_ex_access_region
+    acpi_ev_address_space_dispatch
+    acpi_ex_system_memory_space_handler
+    acpi_os_map_cleanup.part.14
+    _synchronize_rcu_expedited.constprop.89
+    schedule
+
+The end result of frequent synchronize_rcu_expedited() invocation is
+tiny sub-millisecond spurts of execution where the scheduler freely
+migrates this apparently sleepy task. The overhead of frequent
+scheduler invocation multiplies the execution time by a factor
+of 2-3X."
+
+The source of this is that acpi_ex_system_memory_space_handler()
+unmaps the memory mapping currently cached by it at the access time
+if that mapping doesn't cover the memory area being accessed.
+Consequently, if there is a memory opregion with two fields
+separated from each other by an unused chunk of address space that
+is large enough for not being covered by a single mapping, and they
+happen to be used in an alternating pattern, the unmapping will
+occur on every acpi_ex_system_memory_space_handler() invocation for
+that memory opregion and that will lead to significant overhead.
+
+Moreover, acpi_ex_system_memory_space_handler() carries out the
+memory unmapping with the namespace and interpreter mutexes held
+which may lead to additional latency, because all of the tasks
+wanting to acquire on of these mutexes need to wait for the
+memory unmapping operation to complete.
+
+To address that, rework acpi_os_unmap_memory() so that it does not
+release the memory mapping covering the given address range right
+away and instead make it queue up the mapping at hand for removal
+via queue_rcu_work().
+
+Reported-by: Dan Williams <dan.j.williams@intel.com>
+Tested-by: Xiang Li <xiang.z.li@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+

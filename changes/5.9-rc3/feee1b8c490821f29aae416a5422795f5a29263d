@@ -1,0 +1,68 @@
+gcc-plugins/stackleak: Use asm instrumentation to avoid useless register saving
+
+The kernel code instrumentation in stackleak gcc plugin works in two stages.
+At first, stack tracking is added to GIMPLE representation of every function
+(except some special cases). And later, when stack frame size info is
+available, stack tracking is removed from the RTL representation of the
+functions with small stack frame. There is an unwanted side-effect for these
+functions: some of them do useless work with caller-saved registers.
+
+As an example of such case, proc_sys_write without() instrumentation:
+    55                      push   %rbp
+    41 b8 01 00 00 00       mov    $0x1,%r8d
+    48 89 e5                mov    %rsp,%rbp
+    e8 11 ff ff ff          callq  ffffffff81284610 <proc_sys_call_handler>
+    5d                      pop    %rbp
+    c3                      retq
+    0f 1f 44 00 00          nopl   0x0(%rax,%rax,1)
+    66 2e 0f 1f 84 00 00    nopw   %cs:0x0(%rax,%rax,1)
+    00 00 00
+
+proc_sys_write() with instrumentation:
+    55                      push   %rbp
+    48 89 e5                mov    %rsp,%rbp
+    41 56                   push   %r14
+    41 55                   push   %r13
+    41 54                   push   %r12
+    53                      push   %rbx
+    49 89 f4                mov    %rsi,%r12
+    48 89 fb                mov    %rdi,%rbx
+    49 89 d5                mov    %rdx,%r13
+    49 89 ce                mov    %rcx,%r14
+    4c 89 f1                mov    %r14,%rcx
+    4c 89 ea                mov    %r13,%rdx
+    4c 89 e6                mov    %r12,%rsi
+    48 89 df                mov    %rbx,%rdi
+    41 b8 01 00 00 00       mov    $0x1,%r8d
+    e8 f2 fe ff ff          callq  ffffffff81298e80 <proc_sys_call_handler>
+    5b                      pop    %rbx
+    41 5c                   pop    %r12
+    41 5d                   pop    %r13
+    41 5e                   pop    %r14
+    5d                      pop    %rbp
+    c3                      retq
+    66 0f 1f 84 00 00 00    nopw   0x0(%rax,%rax,1)
+    00 00
+
+Let's improve the instrumentation to avoid this:
+
+1. Make stackleak_track_stack() save all register that it works with.
+Use no_caller_saved_registers attribute for that function. This attribute
+is available for x86_64 and i386 starting from gcc-7.
+
+2. Insert calling stackleak_track_stack() in asm:
+  asm volatile("call stackleak_track_stack" :: "r" (current_stack_pointer))
+Here we use ASM_CALL_CONSTRAINT trick from arch/x86/include/asm/asm.h.
+The input constraint is taken into account during gcc shrink-wrapping
+optimization. It is needed to be sure that stackleak_track_stack() call is
+inserted after the prologue of the containing function, when the stack
+frame is prepared.
+
+This work is a deep reengineering of the idea described on grsecurity blog
+  https://grsecurity.net/resolving_an_unfortunate_stackleak_interaction
+
+Signed-off-by: Alexander Popov <alex.popov@linux.com>
+Acked-by: Miguel Ojeda <miguel.ojeda.sandonis@gmail.com>
+Link: https://lore.kernel.org/r/20200624123330.83226-5-alex.popov@linux.com
+Signed-off-by: Kees Cook <keescook@chromium.org>
+

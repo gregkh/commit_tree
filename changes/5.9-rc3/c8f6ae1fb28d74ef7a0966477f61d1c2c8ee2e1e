@@ -1,0 +1,170 @@
+perf inject jit: Remove //anon mmap events
+
+**perf-<pid>.map and jit-<pid>.dump designs:
+
+When a JIT generates code to be executed, it must allocate memory and
+mark it executable using an mmap call.
+
+*** perf-<pid>.map design
+
+The perf-<pid>.map assumes that any sample recorded in an anonymous
+memory page is JIT code. It then tries to resolve the symbol name by
+looking at the process' perf-<pid>.map.
+
+*** jit-<pid>.dump design
+
+The jit-<pid>.dump mechanism takes a different approach. It requires a
+JIT to write a `<path>/jit-<pid>.dump` file. This file must also be
+mmapped so that perf inject -jit can find the file. The JIT must also
+add JIT_CODE_LOAD records for any functions it generates. The records
+are timestamped using a clock which can be correlated to the perf record
+clock.
+
+After perf record,  the `perf inject -jit` pass parses the recording
+looking for a `<path>/jit-<pid>.dump` file. When it finds the file, it
+parses it and for each JIT_CODE_LOAD record:
+* creates an elf file `<path>/jitted-<pid>-<code_index>.so
+* injects a new mmap record mapping the new elf file into the process.
+
+*** Coexistence design
+
+The kernel and perf support both of these mechanisms. We need to make
+sure perf works on an app supporting either or both of these mechanisms.
+Both designs rely on mmap records to determine how to resolve an ip
+address.
+
+The mmap records of both techniques by definition overlap. When the JIT
+compiles a method, it must:
+
+* allocate memory (mmap)
+* add execution privilege (mprotect or mmap. either will
+generate an mmap event form the kernel to perf)
+* compile code into memory
+* add a function record to perf-<pid>.map and/or jit-<pid>.dump
+
+Because the jit-<pid>.dump mechanism supports greater capabilities, perf
+prefers the symbols from jit-<pid>.dump. It implements this based on
+timestamp ordering of events. There is an implicit ASSUMPTION that the
+JIT_CODE_LOAD record timestamp will be after the // anon mmap event that
+was generated during memory allocation or adding the execution privilege setting.
+
+*** Problems with the ASSUMPTION
+
+The ASSUMPTION made in the Coexistence design section above is violated
+in the following scenario.
+
+*** Scenario
+
+While a JIT is jitting code it will eventually need to commit more
+pages and change these pages to executable permissions. Typically the
+JIT will want these collocated to minimize branch displacements.
+
+The kernel will coalesce these anonymous mapping with identical
+permissions before sending an MMAP event for the new pages. The address
+range of the new mmap will not be just the most recently mmap pages.
+It will include the entire coalesced mmap region.
+
+See mm/mmap.c
+
+unsigned long mmap_region(struct file *file, unsigned long addr,
+                unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
+                struct list_head *uf)
+{
+...
+        /*
+         * Can we just expand an old mapping?
+         */
+...
+        perf_event_mmap(vma);
+...
+}
+
+*** Symptoms
+
+The coalesced // anon mmap event will be timestamped after the
+JIT_CODE_LOAD records. This means it will be used as the most recent
+mapping for that entire address range. For remaining events it will look
+at the inferior perf-<pid>.map for symbols.
+
+If both mechanisms are supported, the symbol will appear twice with
+different module names. This causes weird behavior in reporting.
+
+If only jit-<pid>.dump is supported, the symbol will no longer be resolved.
+
+** Implemented solution
+
+This patch solves the issue by removing // anon mmap events for any
+process which has a valid jit-<pid>.dump file.
+
+It tracks on a per process basis to handle the case where some running
+apps support jit-<pid>.dump, but some only support perf-<pid>.map.
+
+It adds new assumptions:
+* // anon mmap events are only required for perf-<pid>.map support.
+* An app that uses jit-<pid>.dump, no longer needs
+perf-<pid>.map support. It assumes that any perf-<pid>.map info is
+inferior.
+
+*** Details
+
+Use thread->priv to store whether a jitdump file has been processed
+
+During "perf inject --jit", discard "//anon*" mmap events for any pid which
+has sucessfully processed a jitdump file.
+
+** Testing:
+
+// jitdump case
+
+  perf record <app with jitdump>
+  perf inject --jit --input perf.data --output perfjit.data
+
+// verify mmap "//anon" events present initially
+
+  perf script --input perf.data --show-mmap-events | grep '//anon'
+
+// verify mmap "//anon" events removed
+
+  perf script --input perfjit.data --show-mmap-events | grep '//anon'
+
+// no jitdump case
+
+  perf record <app without jitdump>
+  perf inject --jit --input perf.data --output perfjit.data
+
+// verify mmap "//anon" events present initially
+
+  perf script --input perf.data --show-mmap-events | grep '//anon'
+
+// verify mmap "//anon" events not removed
+
+  perf script --input perfjit.data --show-mmap-events | grep '//anon'
+
+** Repro:
+
+This issue was discovered while testing the initial CoreCLR jitdump
+implementation. https://github.com/dotnet/coreclr/pull/26897.
+
+** Alternate solutions considered
+
+These were also briefly considered:
+
+* Change kernel to not coalesce mmap regions.
+
+* Change kernel reporting of coalesced mmap regions to perf. Only
+include newly mapped memory.
+
+* Only strip parts of // anon mmap events overlapping existing
+jitted-<pid>-<code_index>.so mmap events.
+
+Signed-off-by: Steve MacLean <Steve.MacLean@Microsoft.com>
+Acked-by: Ian Rogers <irogers@google.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Link: http://lore.kernel.org/lkml/1590544271-125795-1-git-send-email-steve.maclean@linux.microsoft.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

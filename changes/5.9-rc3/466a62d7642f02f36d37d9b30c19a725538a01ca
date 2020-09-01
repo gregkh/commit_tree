@@ -1,0 +1,128 @@
+mfd: core: Make a best effort attempt to match devices with the correct of_nodes
+
+Currently, when a child platform device (sometimes referred to as a
+sub-device) is registered via the Multi-Functional Device (MFD) API,
+the framework attempts to match the newly registered platform device
+with its associated Device Tree (OF) node.  Until now, the device has
+been allocated the first node found with an identical OF compatible
+string.  Unfortunately, if there are, say for example '3' devices
+which are to be handled by the same driver and therefore have the same
+compatible string, each of them will be allocated a pointer to the
+*first* node.
+
+An example Device Tree entry might look like this:
+
+  mfd_of_test {
+          compatible = "mfd,of-test-parent";
+          #address-cells = <0x02>;
+          #size-cells = <0x02>;
+
+          child@aaaaaaaaaaaaaaaa {
+                  compatible = "mfd,of-test-child";
+                  reg = <0xaaaaaaaa 0xaaaaaaaa 0 0x11>,
+                        <0xbbbbbbbb 0xbbbbbbbb 0 0x22>;
+          };
+
+          child@cccccccc {
+                  compatible = "mfd,of-test-child";
+                  reg = <0x00000000 0xcccccccc 0 0x33>;
+          };
+
+          child@dddddddd00000000 {
+                  compatible = "mfd,of-test-child";
+                  reg = <0xdddddddd 0x00000000 0 0x44>;
+          };
+  };
+
+When used with example sub-device registration like this:
+
+  static const struct mfd_cell mfd_of_test_cell[] = {
+        OF_MFD_CELL("mfd-of-test-child", NULL, NULL, 0, 0, "mfd,of-test-child"),
+        OF_MFD_CELL("mfd-of-test-child", NULL, NULL, 0, 1, "mfd,of-test-child"),
+        OF_MFD_CELL("mfd-of-test-child", NULL, NULL, 0, 2, "mfd,of-test-child")
+  };
+
+... the current implementation will result in all devices being allocated
+the first OF node found containing a matching compatible string:
+
+  [0.712511] mfd-of-test-child mfd-of-test-child.0: Probing platform device: 0
+  [0.712710] mfd-of-test-child mfd-of-test-child.0: Using OF node: child@aaaaaaaaaaaaaaaa
+  [0.713033] mfd-of-test-child mfd-of-test-child.1: Probing platform device: 1
+  [0.713381] mfd-of-test-child mfd-of-test-child.1: Using OF node: child@aaaaaaaaaaaaaaaa
+  [0.713691] mfd-of-test-child mfd-of-test-child.2: Probing platform device: 2
+  [0.713889] mfd-of-test-child mfd-of-test-child.2: Using OF node: child@aaaaaaaaaaaaaaaa
+
+After this patch each device will be allocated a unique OF node:
+
+  [0.712511] mfd-of-test-child mfd-of-test-child.0: Probing platform device: 0
+  [0.712710] mfd-of-test-child mfd-of-test-child.0: Using OF node: child@aaaaaaaaaaaaaaaa
+  [0.713033] mfd-of-test-child mfd-of-test-child.1: Probing platform device: 1
+  [0.713381] mfd-of-test-child mfd-of-test-child.1: Using OF node: child@cccccccc
+  [0.713691] mfd-of-test-child mfd-of-test-child.2: Probing platform device: 2
+  [0.713889] mfd-of-test-child mfd-of-test-child.2: Using OF node: child@dddddddd00000000
+
+Which is fine if all OF nodes are identical.  However if we wish to
+apply an attribute to particular device, we really need to ensure the
+correct OF node will be associated with the device containing the
+correct address.  We accomplish this by matching the device's address
+expressed in DT with one provided during sub-device registration.
+Like this:
+
+  static const struct mfd_cell mfd_of_test_cell[] = {
+        OF_MFD_CELL_REG("mfd-of-test-child", NULL, NULL, 0, 1, "mfd,of-test-child", 0xdddddddd00000000),
+        OF_MFD_CELL_REG("mfd-of-test-child", NULL, NULL, 0, 2, "mfd,of-test-child", 0xaaaaaaaaaaaaaaaa),
+        OF_MFD_CELL_REG("mfd-of-test-child", NULL, NULL, 0, 3, "mfd,of-test-child", 0x00000000cccccccc)
+  };
+
+This will ensure a specific device (designated here using the
+platform_ids; 1, 2 and 3) is matched with a particular OF node:
+
+  [0.712511] mfd-of-test-child mfd-of-test-child.0: Probing platform device: 0
+  [0.712710] mfd-of-test-child mfd-of-test-child.0: Using OF node: child@dddddddd00000000
+  [0.713033] mfd-of-test-child mfd-of-test-child.1: Probing platform device: 1
+  [0.713381] mfd-of-test-child mfd-of-test-child.1: Using OF node: child@aaaaaaaaaaaaaaaa
+  [0.713691] mfd-of-test-child mfd-of-test-child.2: Probing platform device: 2
+  [0.713889] mfd-of-test-child mfd-of-test-child.2: Using OF node: child@cccccccc
+
+This implementation is still not infallible, hence the mention of
+"best effort" in the commit subject.  Since we have not *insisted* on
+the existence of 'reg' properties (in some scenarios they just do not
+make sense) and no device currently uses the new 'of_reg' attribute,
+we have to make an on-the-fly judgement call whether to associate the
+OF node anyway.  Which we do in cases where parent drivers haven't
+specified a particular OF node to match to.  So there is a *slight*
+possibility of the following result (note: the implementation here is
+convoluted, but it shows you one means by which this process can
+still break):
+
+  /*
+   * First entry will match to the first OF node with matching compatible
+   * Second will fail, since the first took its OF node and is no longer available
+   * Third will succeed
+   */
+  static const struct mfd_cell mfd_of_test_cell[] = {
+        OF_MFD_CELL("mfd-of-test-child", NULL, NULL, 0, 1, "mfd,of-test-child"),
+	OF_MFD_CELL_REG("mfd-of-test-child", NULL, NULL, 0, 2, "mfd,of-test-child", 0xaaaaaaaaaaaaaaaa),
+        OF_MFD_CELL_REG("mfd-of-test-child", NULL, NULL, 0, 3, "mfd,of-test-child", 0x00000000cccccccc)
+  };
+
+The result:
+
+  [0.753869] mfd-of-test-parent mfd_of_test: Registering 3 devices
+  [0.756597] mfd-of-test-child: Failed to locate of_node [id: 2]
+  [0.759999] mfd-of-test-child mfd-of-test-child.1: Probing platform device: 1
+  [0.760314] mfd-of-test-child mfd-of-test-child.1: Using OF node: child@aaaaaaaaaaaaaaaa
+  [0.760908] mfd-of-test-child mfd-of-test-child.2: Probing platform device: 2
+  [0.761183] mfd-of-test-child mfd-of-test-child.2: No OF node associated with this device
+  [0.761621] mfd-of-test-child mfd-of-test-child.3: Probing platform device: 3
+  [0.761899] mfd-of-test-child mfd-of-test-child.3: Using OF node: child@cccccccc
+
+We could code around this with some pre-parsing semantics, but the
+added complexity required to cover each and every corner-case is not
+justified.  Merely patching the current failing (via this patch) is
+already working with some pretty small corner-cases.  Other issues
+should be patched in the parent drivers which can be achieved simply
+by implementing OF_MFD_CELL_REG().
+
+Signed-off-by: Lee Jones <lee.jones@linaro.org>
+

@@ -1,0 +1,45 @@
+RDMA/ipoib: Fix ABBA deadlock with ipoib_reap_ah()
+
+ipoib_mcast_carrier_on_task() insanely open codes a rtnl_lock() such that
+the only time flush_workqueue() can be called is if it also clears
+IPOIB_FLAG_OPER_UP.
+
+Thus the flush inside ipoib_flush_ah() will deadlock if it gets unlucky
+enough, and lockdep doesn't help us to find it early:
+
+          CPU0               CPU1          CPU2
+   __ipoib_ib_dev_flush()
+      down_read(vlan_rwsem)
+
+                         ipoib_vlan_add()
+                           rtnl_trylock()
+                           down_write(vlan_rwsem)
+
+				      ipoib_mcast_carrier_on_task()
+					 while (!rtnl_trylock())
+					      msleep(20);
+
+      ipoib_flush_ah()
+	flush_workqueue(priv->wq)
+
+Clean up the ah_reaper related functions and lifecycle to make sense:
+
+ - Start/Stop of the reaper should only be done in open/stop NDOs, not in
+   any other places
+
+ - cancel and flush of the reaper should only happen in the stop NDO.
+   cancel is only functional when combined with IPOIB_STOP_REAPER.
+
+ - Non-stop places were flushing the AH's just need to flush out dead AH's
+   synchronously and ignore the background task completely. It is fully
+   locked and harmless to leave running.
+
+Which ultimately fixes the ABBA deadlock by removing the unnecessary
+flush_workqueue() from the problematic place under the vlan_rwsem.
+
+Fixes: efc82eeeae4e ("IB/ipoib: No longer use flush as a parameter")
+Link: https://lore.kernel.org/r/20200625174219.290842-1-kamalheib1@gmail.com
+Reported-by: Kamal Heib <kheib@redhat.com>
+Tested-by: Kamal Heib <kheib@redhat.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+

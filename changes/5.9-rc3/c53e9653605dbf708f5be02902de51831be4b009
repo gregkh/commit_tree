@@ -1,0 +1,63 @@
+btrfs: qgroup: try to flush qgroup space when we get -EDQUOT
+
+[PROBLEM]
+There are known problem related to how btrfs handles qgroup reserved
+space.  One of the most obvious case is the the test case btrfs/153,
+which do fallocate, then write into the preallocated range.
+
+  btrfs/153 1s ... - output mismatch (see xfstests-dev/results//btrfs/153.out.bad)
+      --- tests/btrfs/153.out     2019-10-22 15:18:14.068965341 +0800
+      +++ xfstests-dev/results//btrfs/153.out.bad      2020-07-01 20:24:40.730000089 +0800
+      @@ -1,2 +1,5 @@
+       QA output created by 153
+      +pwrite: Disk quota exceeded
+      +/mnt/scratch/testfile2: Disk quota exceeded
+      +/mnt/scratch/testfile2: Disk quota exceeded
+       Silence is golden
+      ...
+      (Run 'diff -u xfstests-dev/tests/btrfs/153.out xfstests-dev/results//btrfs/153.out.bad'  to see the entire diff)
+
+[CAUSE]
+Since commit c6887cd11149 ("Btrfs: don't do nocow check unless we have to"),
+we always reserve space no matter if it's COW or not.
+
+Such behavior change is mostly for performance, and reverting it is not
+a good idea anyway.
+
+For preallcoated extent, we reserve qgroup data space for it already,
+and since we also reserve data space for qgroup at buffered write time,
+it needs twice the space for us to write into preallocated space.
+
+This leads to the -EDQUOT in buffered write routine.
+
+And we can't follow the same solution, unlike data/meta space check,
+qgroup reserved space is shared between data/metadata.
+The EDQUOT can happen at the metadata reservation, so doing NODATACOW
+check after qgroup reservation failure is not a solution.
+
+[FIX]
+To solve the problem, we don't return -EDQUOT directly, but every time
+we got a -EDQUOT, we try to flush qgroup space:
+
+- Flush all inodes of the root
+  NODATACOW writes will free the qgroup reserved at run_dealloc_range().
+  However we don't have the infrastructure to only flush NODATACOW
+  inodes, here we flush all inodes anyway.
+
+- Wait for ordered extents
+  This would convert the preallocated metadata space into per-trans
+  metadata, which can be freed in later transaction commit.
+
+- Commit transaction
+  This will free all per-trans metadata space.
+
+Also we don't want to trigger flush multiple times, so here we introduce
+a per-root wait list and a new root status, to ensure only one thread
+starts the flushing.
+
+Fixes: c6887cd11149 ("Btrfs: don't do nocow check unless we have to")
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

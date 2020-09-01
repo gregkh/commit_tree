@@ -1,0 +1,110 @@
+net: ena: avoid unnecessary rearming of interrupt vector when busy-polling
+
+For an overview of the race created by this patch goto synchronization
+label.
+
+In napi busy-poll mode, the kernel invokes the napi handler of the
+device repeatedly to poll the NIC's receive queues. This process
+repeats until a timeout, specific for each connection, is up.
+By polling packets in busy-poll mode the user may gain lower latency
+and higher throughput (since the kernel no longer waits for interrupts
+to poll the queues) in expense of CPU usage.
+
+Upon completing a napi routine, the driver checks whether
+the routine was called by an interrupt handler. If so, the driver
+re-enables interrupts for the device. This is needed since an
+interrupt routine invocation disables future invocations until
+explicitly re-enabled.
+
+The driver avoids re-enabling the interrupts if they were not disabled
+in the first place (e.g. if driver in busy mode).
+Originally, the driver checked whether interrupt re-enabling is needed
+by reading the 'ena_napi->unmask_interrupt' variable. This atomic
+variable was set upon interrupt and cleared after re-enabling it.
+
+In the 4.10 Linux version, the 'napi_complete_done' call was changed
+so that it returns 'false' when device should not re-enable
+interrupts, and 'true' otherwise. The change includes reading the
+"NAPIF_STATE_IN_BUSY_POLL" flag to check if the napi call is in
+busy-poll mode, and if so, return 'false'.
+The driver was changed to re-enable interrupts according to this
+routine's return value.
+The Linux community rejected the use of the
+'ena_napi->unmaunmask_interrupt' variable to determine whether
+unmasking is needed, and urged to use napi_napi_complete_done()
+return value solely.
+See https://lore.kernel.org/patchwork/patch/741149/ for more details
+
+As explained, a busy-poll session exists for a specified timeout
+value, after which it exits the busy-poll mode and re-enters it later.
+This leads to many invocations of the napi handler where
+napi_complete_done() false indicates that interrupts should be
+re-enabled.
+This creates a bug in which the interrupts are re-enabled
+unnecessarily.
+To reproduce this bug:
+    1) echo 50 | sudo tee /proc/sys/net/core/busy_poll
+    2) echo 50 | sudo tee /proc/sys/net/core/busy_read
+    3) Add counters that check whether
+    'ena_unmask_interrupt(tx_ring, rx_ring);'
+    is called without disabling the interrupts in the first
+    place (i.e. with calling the interrupt routine
+    ena_intr_msix_io())
+
+Steps 1+2 enable busy-poll as the default mode for new connections.
+
+The busy poll routine rearms the interrupts after every session by
+design, and so we need to add an extra check that the interrupts were
+masked in the first place.
+
+synchronization:
+This patch introduces a race between the interrupt handler
+ena_intr_msix_io() and the napi routine ena_io_poll().
+Some macros and instruction were added to prevent this race from leaving
+the interrupts masked. The following specifies the different race
+scenarios in this patch:
+
+1) interrupt handler and napi routine run sequentially
+    i) interrupt handler is called, sets 'interrupts_masked' flag and
+	successfully schedules the napi handler via softirq.
+
+    In this scenario the napi routine might not see the flag change
+    for several reasons:
+	a) The flag is stored in a register by the compiler. For this
+	case the WRITE_ONCE macro which prevents this.
+	b) The compiler might reorder the instruction. For this the
+	smp_wmb() instruction was used which implies a compiler memory
+	barrier.
+	c) On archs with weak consistency model (like ARM64) the napi
+	routine might be scheduled and start running before the flag
+	STORE instruction is committed to cache/memory. To ensure this
+	doesn't happen, the smp_wmb() instruction was added. It ensures
+	that the flag set instruction is committed before scheduling
+	napi.
+
+    ii) compiler reorders the flag's value check in the 'if' with
+    the flag set in the napi routine.
+
+    This scenario is prevented by smp_rmb() call after the flag check.
+
+2) interrupt handler and napi routine run in parallel (can happen when
+busy poll routine invokes the napi handler)
+
+    i) interrupt handler sets the flag in one core, while the napi
+    routine reads it in another core.
+
+    This scenario also is divided into two cases:
+	a) napi_complete_done() doesn't finish running, in which case
+	napi_sched() would just set NAPIF_STATE_MISSED and the napi
+	routine would reschedule itself without changing the flag's value.
+
+	b) napi_complete_done() finishes running. In this case the
+	napi routine might override the flag's value.
+	This doesn't present any rise since it later unmasks the
+	interrupt vector.
+
+Signed-off-by: Shay Agroskin <shayagr@amazon.com>
+Signed-off-by: Arthur Kiyanovski <akiyano@amazon.com>
+Cc: Eric Dumazet <eric.dumazet@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
