@@ -1,0 +1,189 @@
+btrfs: allocate scrub workqueues outside of locks
+
+I got the following lockdep splat while testing:
+
+  ======================================================
+  WARNING: possible circular locking dependency detected
+  5.8.0-rc7-00172-g021118712e59 #932 Not tainted
+  ------------------------------------------------------
+  btrfs/229626 is trying to acquire lock:
+  ffffffff828513f0 (cpu_hotplug_lock){++++}-{0:0}, at: alloc_workqueue+0x378/0x450
+
+  but task is already holding lock:
+  ffff889dd3889518 (&fs_info->scrub_lock){+.+.}-{3:3}, at: btrfs_scrub_dev+0x11c/0x630
+
+  which lock already depends on the new lock.
+
+  the existing dependency chain (in reverse order) is:
+
+  -> #7 (&fs_info->scrub_lock){+.+.}-{3:3}:
+	 __mutex_lock+0x9f/0x930
+	 btrfs_scrub_dev+0x11c/0x630
+	 btrfs_dev_replace_by_ioctl.cold.21+0x10a/0x1d4
+	 btrfs_ioctl+0x2799/0x30a0
+	 ksys_ioctl+0x83/0xc0
+	 __x64_sys_ioctl+0x16/0x20
+	 do_syscall_64+0x50/0x90
+	 entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+  -> #6 (&fs_devs->device_list_mutex){+.+.}-{3:3}:
+	 __mutex_lock+0x9f/0x930
+	 btrfs_run_dev_stats+0x49/0x480
+	 commit_cowonly_roots+0xb5/0x2a0
+	 btrfs_commit_transaction+0x516/0xa60
+	 sync_filesystem+0x6b/0x90
+	 generic_shutdown_super+0x22/0x100
+	 kill_anon_super+0xe/0x30
+	 btrfs_kill_super+0x12/0x20
+	 deactivate_locked_super+0x29/0x60
+	 cleanup_mnt+0xb8/0x140
+	 task_work_run+0x6d/0xb0
+	 __prepare_exit_to_usermode+0x1cc/0x1e0
+	 do_syscall_64+0x5c/0x90
+	 entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+  -> #5 (&fs_info->tree_log_mutex){+.+.}-{3:3}:
+	 __mutex_lock+0x9f/0x930
+	 btrfs_commit_transaction+0x4bb/0xa60
+	 sync_filesystem+0x6b/0x90
+	 generic_shutdown_super+0x22/0x100
+	 kill_anon_super+0xe/0x30
+	 btrfs_kill_super+0x12/0x20
+	 deactivate_locked_super+0x29/0x60
+	 cleanup_mnt+0xb8/0x140
+	 task_work_run+0x6d/0xb0
+	 __prepare_exit_to_usermode+0x1cc/0x1e0
+	 do_syscall_64+0x5c/0x90
+	 entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+  -> #4 (&fs_info->reloc_mutex){+.+.}-{3:3}:
+	 __mutex_lock+0x9f/0x930
+	 btrfs_record_root_in_trans+0x43/0x70
+	 start_transaction+0xd1/0x5d0
+	 btrfs_dirty_inode+0x42/0xd0
+	 touch_atime+0xa1/0xd0
+	 btrfs_file_mmap+0x3f/0x60
+	 mmap_region+0x3a4/0x640
+	 do_mmap+0x376/0x580
+	 vm_mmap_pgoff+0xd5/0x120
+	 ksys_mmap_pgoff+0x193/0x230
+	 do_syscall_64+0x50/0x90
+	 entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+  -> #3 (&mm->mmap_lock#2){++++}-{3:3}:
+	 __might_fault+0x68/0x90
+	 _copy_to_user+0x1e/0x80
+	 perf_read+0x141/0x2c0
+	 vfs_read+0xad/0x1b0
+	 ksys_read+0x5f/0xe0
+	 do_syscall_64+0x50/0x90
+	 entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+  -> #2 (&cpuctx_mutex){+.+.}-{3:3}:
+	 __mutex_lock+0x9f/0x930
+	 perf_event_init_cpu+0x88/0x150
+	 perf_event_init+0x1db/0x20b
+	 start_kernel+0x3ae/0x53c
+	 secondary_startup_64+0xa4/0xb0
+
+  -> #1 (pmus_lock){+.+.}-{3:3}:
+	 __mutex_lock+0x9f/0x930
+	 perf_event_init_cpu+0x4f/0x150
+	 cpuhp_invoke_callback+0xb1/0x900
+	 _cpu_up.constprop.26+0x9f/0x130
+	 cpu_up+0x7b/0xc0
+	 bringup_nonboot_cpus+0x4f/0x60
+	 smp_init+0x26/0x71
+	 kernel_init_freeable+0x110/0x258
+	 kernel_init+0xa/0x103
+	 ret_from_fork+0x1f/0x30
+
+  -> #0 (cpu_hotplug_lock){++++}-{0:0}:
+	 __lock_acquire+0x1272/0x2310
+	 lock_acquire+0x9e/0x360
+	 cpus_read_lock+0x39/0xb0
+	 alloc_workqueue+0x378/0x450
+	 __btrfs_alloc_workqueue+0x15d/0x200
+	 btrfs_alloc_workqueue+0x51/0x160
+	 scrub_workers_get+0x5a/0x170
+	 btrfs_scrub_dev+0x18c/0x630
+	 btrfs_dev_replace_by_ioctl.cold.21+0x10a/0x1d4
+	 btrfs_ioctl+0x2799/0x30a0
+	 ksys_ioctl+0x83/0xc0
+	 __x64_sys_ioctl+0x16/0x20
+	 do_syscall_64+0x50/0x90
+	 entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+  other info that might help us debug this:
+
+  Chain exists of:
+    cpu_hotplug_lock --> &fs_devs->device_list_mutex --> &fs_info->scrub_lock
+
+   Possible unsafe locking scenario:
+
+	 CPU0                    CPU1
+	 ----                    ----
+    lock(&fs_info->scrub_lock);
+				 lock(&fs_devs->device_list_mutex);
+				 lock(&fs_info->scrub_lock);
+    lock(cpu_hotplug_lock);
+
+   *** DEADLOCK ***
+
+  2 locks held by btrfs/229626:
+   #0: ffff88bfe8bb86e0 (&fs_devs->device_list_mutex){+.+.}-{3:3}, at: btrfs_scrub_dev+0xbd/0x630
+   #1: ffff889dd3889518 (&fs_info->scrub_lock){+.+.}-{3:3}, at: btrfs_scrub_dev+0x11c/0x630
+
+  stack backtrace:
+  CPU: 15 PID: 229626 Comm: btrfs Kdump: loaded Not tainted 5.8.0-rc7-00172-g021118712e59 #932
+  Hardware name: Quanta Tioga Pass Single Side 01-0030993006/Tioga Pass Single Side, BIOS F08_3A18 12/20/2018
+  Call Trace:
+   dump_stack+0x78/0xa0
+   check_noncircular+0x165/0x180
+   __lock_acquire+0x1272/0x2310
+   lock_acquire+0x9e/0x360
+   ? alloc_workqueue+0x378/0x450
+   cpus_read_lock+0x39/0xb0
+   ? alloc_workqueue+0x378/0x450
+   alloc_workqueue+0x378/0x450
+   ? rcu_read_lock_sched_held+0x52/0x80
+   __btrfs_alloc_workqueue+0x15d/0x200
+   btrfs_alloc_workqueue+0x51/0x160
+   scrub_workers_get+0x5a/0x170
+   btrfs_scrub_dev+0x18c/0x630
+   ? start_transaction+0xd1/0x5d0
+   btrfs_dev_replace_by_ioctl.cold.21+0x10a/0x1d4
+   btrfs_ioctl+0x2799/0x30a0
+   ? do_sigaction+0x102/0x250
+   ? lockdep_hardirqs_on_prepare+0xca/0x160
+   ? _raw_spin_unlock_irq+0x24/0x30
+   ? trace_hardirqs_on+0x1c/0xe0
+   ? _raw_spin_unlock_irq+0x24/0x30
+   ? do_sigaction+0x102/0x250
+   ? ksys_ioctl+0x83/0xc0
+   ksys_ioctl+0x83/0xc0
+   __x64_sys_ioctl+0x16/0x20
+   do_syscall_64+0x50/0x90
+   entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+This happens because we're allocating the scrub workqueues under the
+scrub and device list mutex, which brings in a whole host of other
+dependencies.
+
+Because the work queue allocation is done with GFP_KERNEL, it can
+trigger reclaim, which can lead to a transaction commit, which in turns
+needs the device_list_mutex, it can lead to a deadlock. A different
+problem for which this fix is a solution.
+
+Fix this by moving the actual allocation outside of the
+scrub lock, and then only take the lock once we're ready to actually
+assign them to the fs_info.  We'll now have to cleanup the workqueues in
+a few more places, so I've added a helper to do the refcount dance to
+safely free the workqueues.
+
+CC: stable@vger.kernel.org # 5.4+
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+
