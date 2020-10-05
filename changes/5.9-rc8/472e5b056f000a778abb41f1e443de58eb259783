@@ -1,0 +1,55 @@
+pipe: remove pipe_wait() and fix wakeup race with splice
+
+The pipe splice code still used the old model of waiting for pipe IO by
+using a non-specific "pipe_wait()" that waited for any pipe event to
+happen, which depended on all pipe IO being entirely serialized by the
+pipe lock.  So by checking the state you were waiting for, and then
+adding yourself to the wait queue before dropping the lock, you were
+guaranteed to see all the wakeups.
+
+Strictly speaking, the actual wakeups were not done under the lock, but
+the pipe_wait() model still worked, because since the waiter held the
+lock when checking whether it should sleep, it would always see the
+current state, and the wakeup was always done after updating the state.
+
+However, commit 0ddad21d3e99 ("pipe: use exclusive waits when reading or
+writing") split the single wait-queue into two, and in the process also
+made the "wait for event" code wait for _two_ wait queues, and that then
+showed a race with the wakers that were not serialized by the pipe lock.
+
+It's only splice that used that "pipe_wait()" model, so the problem
+wasn't obvious, but Josef Bacik reports:
+
+ "I hit a hang with fstest btrfs/187, which does a btrfs send into
+  /dev/null. This works by creating a pipe, the write side is given to
+  the kernel to write into, and the read side is handed to a thread that
+  splices into a file, in this case /dev/null.
+
+  The box that was hung had the write side stuck here [pipe_write] and
+  the read side stuck here [splice_from_pipe_next -> pipe_wait].
+
+  [ more details about pipe_wait() scenario ]
+
+  The problem is we're doing the prepare_to_wait, which sets our state
+  each time, however we can be woken up either with reads or writes. In
+  the case above we race with the WRITER waking us up, and re-set our
+  state to INTERRUPTIBLE, and thus never break out of schedule"
+
+Josef had a patch that avoided the issue in pipe_wait() by just making
+it set the state only once, but the deeper problem is that pipe_wait()
+depends on a level of synchonization by the pipe mutex that it really
+shouldn't.  And the whole "wait for any pipe state change" model really
+isn't very good to begin with.
+
+So rather than trying to work around things in pipe_wait(), remove that
+legacy model of "wait for arbitrary pipe event" entirely, and actually
+create functions that wait for the pipe actually being readable or
+writable, and can do so without depending on the pipe lock serializing
+everything.
+
+Fixes: 0ddad21d3e99 ("pipe: use exclusive waits when reading or writing")
+Link: https://lore.kernel.org/linux-fsdevel/bfa88b5ad6f069b2b679316b9e495a970130416c.1601567868.git.josef@toxicpanda.com/
+Reported-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-and-tested-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

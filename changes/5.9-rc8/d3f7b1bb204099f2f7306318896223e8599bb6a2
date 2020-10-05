@@ -1,0 +1,98 @@
+mm/gup: fix gup_fast with dynamic page table folding
+
+Currently to make sure that every page table entry is read just once
+gup_fast walks perform READ_ONCE and pass pXd value down to the next
+gup_pXd_range function by value e.g.:
+
+  static int gup_pud_range(p4d_t p4d, unsigned long addr, unsigned long end,
+                           unsigned int flags, struct page **pages, int *nr)
+  ...
+          pudp = pud_offset(&p4d, addr);
+
+This function passes a reference on that local value copy to pXd_offset,
+and might get the very same pointer in return.  This happens when the
+level is folded (on most arches), and that pointer should not be
+iterated.
+
+On s390 due to the fact that each task might have different 5,4 or
+3-level address translation and hence different levels folded the logic
+is more complex and non-iteratable pointer to a local copy leads to
+severe problems.
+
+Here is an example of what happens with gup_fast on s390, for a task
+with 3-level paging, crossing a 2 GB pud boundary:
+
+  // addr = 0x1007ffff000, end = 0x10080001000
+  static int gup_pud_range(p4d_t p4d, unsigned long addr, unsigned long end,
+                           unsigned int flags, struct page **pages, int *nr)
+  {
+        unsigned long next;
+        pud_t *pudp;
+
+        // pud_offset returns &p4d itself (a pointer to a value on stack)
+        pudp = pud_offset(&p4d, addr);
+        do {
+                // on second iteratation reading "random" stack value
+                pud_t pud = READ_ONCE(*pudp);
+
+                // next = 0x10080000000, due to PUD_SIZE/MASK != PGDIR_SIZE/MASK on s390
+                next = pud_addr_end(addr, end);
+                ...
+        } while (pudp++, addr = next, addr != end); // pudp++ iterating over stack
+
+        return 1;
+  }
+
+This happens since s390 moved to common gup code with commit
+d1874a0c2805 ("s390/mm: make the pxd_offset functions more robust") and
+commit 1a42010cdc26 ("s390/mm: convert to the generic
+get_user_pages_fast code").
+
+s390 tried to mimic static level folding by changing pXd_offset
+primitives to always calculate top level page table offset in pgd_offset
+and just return the value passed when pXd_offset has to act as folded.
+
+What is crucial for gup_fast and what has been overlooked is that
+PxD_SIZE/MASK and thus pXd_addr_end should also change correspondingly.
+And the latter is not possible with dynamic folding.
+
+To fix the issue in addition to pXd values pass original pXdp pointers
+down to gup_pXd_range functions.  And introduce pXd_offset_lockless
+helpers, which take an additional pXd entry value parameter.  This has
+already been discussed in
+
+  https://lkml.kernel.org/r/20190418100218.0a4afd51@mschwideX1
+
+Fixes: 1a42010cdc26 ("s390/mm: convert to the generic get_user_pages_fast code")
+Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reviewed-by: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Reviewed-by: Alexander Gordeev <agordeev@linux.ibm.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Reviewed-by: Mike Rapoport <rppt@linux.ibm.com>
+Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Russell King <linux@armlinux.org.uk>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: Paul Mackerras <paulus@samba.org>
+Cc: Jeff Dike <jdike@addtoit.com>
+Cc: Richard Weinberger <richard@nod.at>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+Cc: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Cc: <stable@vger.kernel.org>	[5.2+]
+Link: https://lkml.kernel.org/r/patch.git-943f1e5dcff2.your-ad-here.call-01599856292-ext-8676@work.hours
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

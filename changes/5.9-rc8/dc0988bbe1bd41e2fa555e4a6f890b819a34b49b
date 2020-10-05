@@ -1,0 +1,76 @@
+bpf: Do not use bucket_lock for hashmap iterator
+
+Currently, for hashmap, the bpf iterator will grab a bucket lock, a
+spinlock, before traversing the elements in the bucket. This can ensure
+all bpf visted elements are valid. But this mechanism may cause
+deadlock if update/deletion happens to the same bucket of the
+visited map in the program. For example, if we added bpf_map_update_elem()
+call to the same visited element in selftests bpf_iter_bpf_hash_map.c,
+we will have the following deadlock:
+
+  ============================================
+  WARNING: possible recursive locking detected
+  5.9.0-rc1+ #841 Not tainted
+  --------------------------------------------
+  test_progs/1750 is trying to acquire lock:
+  ffff9a5bb73c5e70 (&htab->buckets[i].raw_lock){....}-{2:2}, at: htab_map_update_elem+0x1cf/0x410
+
+  but task is already holding lock:
+  ffff9a5bb73c5e20 (&htab->buckets[i].raw_lock){....}-{2:2}, at: bpf_hash_map_seq_find_next+0x94/0x120
+
+  other info that might help us debug this:
+   Possible unsafe locking scenario:
+
+         CPU0
+         ----
+    lock(&htab->buckets[i].raw_lock);
+    lock(&htab->buckets[i].raw_lock);
+
+   *** DEADLOCK ***
+   ...
+  Call Trace:
+   dump_stack+0x78/0xa0
+   __lock_acquire.cold.74+0x209/0x2e3
+   lock_acquire+0xba/0x380
+   ? htab_map_update_elem+0x1cf/0x410
+   ? __lock_acquire+0x639/0x20c0
+   _raw_spin_lock_irqsave+0x3b/0x80
+   ? htab_map_update_elem+0x1cf/0x410
+   htab_map_update_elem+0x1cf/0x410
+   ? lock_acquire+0xba/0x380
+   bpf_prog_ad6dab10433b135d_dump_bpf_hash_map+0x88/0xa9c
+   ? find_held_lock+0x34/0xa0
+   bpf_iter_run_prog+0x81/0x16e
+   __bpf_hash_map_seq_show+0x145/0x180
+   bpf_seq_read+0xff/0x3d0
+   vfs_read+0xad/0x1c0
+   ksys_read+0x5f/0xe0
+   do_syscall_64+0x33/0x40
+   entry_SYSCALL_64_after_hwframe+0x44/0xa9
+  ...
+
+The bucket_lock first grabbed in seq_ops->next() called by bpf_seq_read(),
+and then grabbed again in htab_map_update_elem() in the bpf program, causing
+deadlocks.
+
+Actually, we do not need bucket_lock here, we can just use rcu_read_lock()
+similar to netlink iterator where the rcu_read_{lock,unlock} likes below:
+ seq_ops->start():
+     rcu_read_lock();
+ seq_ops->next():
+     rcu_read_unlock();
+     /* next element */
+     rcu_read_lock();
+ seq_ops->stop();
+     rcu_read_unlock();
+
+Compared to old bucket_lock mechanism, if concurrent updata/delete happens,
+we may visit stale elements, miss some elements, or repeat some elements.
+I think this is a reasonable compromise. For users wanting to avoid
+stale, missing/repeated accesses, bpf_map batch access syscall interface
+can be used.
+
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200902235340.2001375-1-yhs@fb.com
+
