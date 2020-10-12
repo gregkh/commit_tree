@@ -1,0 +1,171 @@
+net: core: add nested_level variable in net_device
+
+This patch is to add a new variable 'nested_level' into the net_device
+structure.
+This variable will be used as a parameter of spin_lock_nested() of
+dev->addr_list_lock.
+
+netif_addr_lock() can be called recursively so spin_lock_nested() is
+used instead of spin_lock() and dev->lower_level is used as a parameter
+of spin_lock_nested().
+But, dev->lower_level value can be updated while it is being used.
+So, lockdep would warn a possible deadlock scenario.
+
+When a stacked interface is deleted, netif_{uc | mc}_sync() is
+called recursively.
+So, spin_lock_nested() is called recursively too.
+At this moment, the dev->lower_level variable is used as a parameter of it.
+dev->lower_level value is updated when interfaces are being unlinked/linked
+immediately.
+Thus, After unlinking, dev->lower_level shouldn't be a parameter of
+spin_lock_nested().
+
+    A (macvlan)
+    |
+    B (vlan)
+    |
+    C (bridge)
+    |
+    D (macvlan)
+    |
+    E (vlan)
+    |
+    F (bridge)
+
+    A->lower_level : 6
+    B->lower_level : 5
+    C->lower_level : 4
+    D->lower_level : 3
+    E->lower_level : 2
+    F->lower_level : 1
+
+When an interface 'A' is removed, it releases resources.
+At this moment, netif_addr_lock() would be called.
+Then, netdev_upper_dev_unlink() is called recursively.
+Then dev->lower_level is updated.
+There is no problem.
+
+But, when the bridge module is removed, 'C' and 'F' interfaces
+are removed at once.
+If 'F' is removed first, a lower_level value is like below.
+    A->lower_level : 5
+    B->lower_level : 4
+    C->lower_level : 3
+    D->lower_level : 2
+    E->lower_level : 1
+    F->lower_level : 1
+
+Then, 'C' is removed. at this moment, netif_addr_lock() is called
+recursively.
+The ordering is like this.
+C(3)->D(2)->E(1)->F(1)
+At this moment, the lower_level value of 'E' and 'F' are the same.
+So, lockdep warns a possible deadlock scenario.
+
+In order to avoid this problem, a new variable 'nested_level' is added.
+This value is the same as dev->lower_level - 1.
+But this value is updated in rtnl_unlock().
+So, this variable can be used as a parameter of spin_lock_nested() safely
+in the rtnl context.
+
+Test commands:
+   ip link add br0 type bridge vlan_filtering 1
+   ip link add vlan1 link br0 type vlan id 10
+   ip link add macvlan2 link vlan1 type macvlan
+   ip link add br3 type bridge vlan_filtering 1
+   ip link set macvlan2 master br3
+   ip link add vlan4 link br3 type vlan id 10
+   ip link add macvlan5 link vlan4 type macvlan
+   ip link add br6 type bridge vlan_filtering 1
+   ip link set macvlan5 master br6
+   ip link add vlan7 link br6 type vlan id 10
+   ip link add macvlan8 link vlan7 type macvlan
+
+   ip link set br0 up
+   ip link set vlan1 up
+   ip link set macvlan2 up
+   ip link set br3 up
+   ip link set vlan4 up
+   ip link set macvlan5 up
+   ip link set br6 up
+   ip link set vlan7 up
+   ip link set macvlan8 up
+   modprobe -rv bridge
+
+Splat looks like:
+[   36.057436][  T744] WARNING: possible recursive locking detected
+[   36.058848][  T744] 5.9.0-rc6+ #728 Not tainted
+[   36.059959][  T744] --------------------------------------------
+[   36.061391][  T744] ip/744 is trying to acquire lock:
+[   36.062590][  T744] ffff8c4767509280 (&vlan_netdev_addr_lock_key){+...}-{2:2}, at: dev_set_rx_mode+0x19/0x30
+[   36.064922][  T744]
+[   36.064922][  T744] but task is already holding lock:
+[   36.066626][  T744] ffff8c4767769280 (&vlan_netdev_addr_lock_key){+...}-{2:2}, at: dev_uc_add+0x1e/0x60
+[   36.068851][  T744]
+[   36.068851][  T744] other info that might help us debug this:
+[   36.070731][  T744]  Possible unsafe locking scenario:
+[   36.070731][  T744]
+[   36.072497][  T744]        CPU0
+[   36.073238][  T744]        ----
+[   36.074007][  T744]   lock(&vlan_netdev_addr_lock_key);
+[   36.075290][  T744]   lock(&vlan_netdev_addr_lock_key);
+[   36.076590][  T744]
+[   36.076590][  T744]  *** DEADLOCK ***
+[   36.076590][  T744]
+[   36.078515][  T744]  May be due to missing lock nesting notation
+[   36.078515][  T744]
+[   36.080491][  T744] 3 locks held by ip/744:
+[   36.081471][  T744]  #0: ffffffff98571df0 (rtnl_mutex){+.+.}-{3:3}, at: rtnetlink_rcv_msg+0x236/0x490
+[   36.083614][  T744]  #1: ffff8c4767769280 (&vlan_netdev_addr_lock_key){+...}-{2:2}, at: dev_uc_add+0x1e/0x60
+[   36.085942][  T744]  #2: ffff8c476c8da280 (&bridge_netdev_addr_lock_key/4){+...}-{2:2}, at: dev_uc_sync+0x39/0x80
+[   36.088400][  T744]
+[   36.088400][  T744] stack backtrace:
+[   36.089772][  T744] CPU: 6 PID: 744 Comm: ip Not tainted 5.9.0-rc6+ #728
+[   36.091364][  T744] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1ubuntu1 04/01/2014
+[   36.093630][  T744] Call Trace:
+[   36.094416][  T744]  dump_stack+0x77/0x9b
+[   36.095385][  T744]  __lock_acquire+0xbc3/0x1f40
+[   36.096522][  T744]  lock_acquire+0xb4/0x3b0
+[   36.097540][  T744]  ? dev_set_rx_mode+0x19/0x30
+[   36.098657][  T744]  ? rtmsg_ifinfo+0x1f/0x30
+[   36.099711][  T744]  ? __dev_notify_flags+0xa5/0xf0
+[   36.100874][  T744]  ? rtnl_is_locked+0x11/0x20
+[   36.101967][  T744]  ? __dev_set_promiscuity+0x7b/0x1a0
+[   36.103230][  T744]  _raw_spin_lock_bh+0x38/0x70
+[   36.104348][  T744]  ? dev_set_rx_mode+0x19/0x30
+[   36.105461][  T744]  dev_set_rx_mode+0x19/0x30
+[   36.106532][  T744]  dev_set_promiscuity+0x36/0x50
+[   36.107692][  T744]  __dev_set_promiscuity+0x123/0x1a0
+[   36.108929][  T744]  dev_set_promiscuity+0x1e/0x50
+[   36.110093][  T744]  br_port_set_promisc+0x1f/0x40 [bridge]
+[   36.111415][  T744]  br_manage_promisc+0x8b/0xe0 [bridge]
+[   36.112728][  T744]  __dev_set_promiscuity+0x123/0x1a0
+[   36.113967][  T744]  ? __hw_addr_sync_one+0x23/0x50
+[   36.115135][  T744]  __dev_set_rx_mode+0x68/0x90
+[   36.116249][  T744]  dev_uc_sync+0x70/0x80
+[   36.117244][  T744]  dev_uc_add+0x50/0x60
+[   36.118223][  T744]  macvlan_open+0x18e/0x1f0 [macvlan]
+[   36.119470][  T744]  __dev_open+0xd6/0x170
+[   36.120470][  T744]  __dev_change_flags+0x181/0x1d0
+[   36.121644][  T744]  dev_change_flags+0x23/0x60
+[   36.122741][  T744]  do_setlink+0x30a/0x11e0
+[   36.123778][  T744]  ? __lock_acquire+0x92c/0x1f40
+[   36.124929][  T744]  ? __nla_validate_parse.part.6+0x45/0x8e0
+[   36.126309][  T744]  ? __lock_acquire+0x92c/0x1f40
+[   36.127457][  T744]  __rtnl_newlink+0x546/0x8e0
+[   36.128560][  T744]  ? lock_acquire+0xb4/0x3b0
+[   36.129623][  T744]  ? deactivate_slab.isra.85+0x6a1/0x850
+[   36.130946][  T744]  ? __lock_acquire+0x92c/0x1f40
+[   36.132102][  T744]  ? lock_acquire+0xb4/0x3b0
+[   36.133176][  T744]  ? is_bpf_text_address+0x5/0xe0
+[   36.134364][  T744]  ? rtnl_newlink+0x2e/0x70
+[   36.135445][  T744]  ? rcu_read_lock_sched_held+0x32/0x60
+[   36.136771][  T744]  ? kmem_cache_alloc_trace+0x2d8/0x380
+[   36.138070][  T744]  ? rtnl_newlink+0x2e/0x70
+[   36.139164][  T744]  rtnl_newlink+0x47/0x70
+[ ... ]
+
+Fixes: 845e0ebb4408 ("net: change addr_list_lock back to static key")
+Signed-off-by: Taehee Yoo <ap420073@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

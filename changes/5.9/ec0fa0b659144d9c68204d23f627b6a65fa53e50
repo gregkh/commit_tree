@@ -1,0 +1,96 @@
+afs: Fix deadlock between writeback and truncate
+
+The afs filesystem has a lock[*] that it uses to serialise I/O operations
+going to the server (vnode->io_lock), as the server will only perform one
+modification operation at a time on any given file or directory.  This
+prevents the the filesystem from filling up all the call slots to a server
+with calls that aren't going to be executed in parallel anyway, thereby
+allowing operations on other files to obtain slots.
+
+  [*] Note that is probably redundant for directories at least since
+      i_rwsem is used to serialise directory modifications and
+      lookup/reading vs modification.  The server does allow parallel
+      non-modification ops, however.
+
+When a file truncation op completes, we truncate the in-memory copy of the
+file to match - but we do it whilst still holding the io_lock, the idea
+being to prevent races with other operations.
+
+However, if writeback starts in a worker thread simultaneously with
+truncation (whilst notify_change() is called with i_rwsem locked, writeback
+pays it no heed), it may manage to set PG_writeback bits on the pages that
+will get truncated before afs_setattr_success() manages to call
+truncate_pagecache().  Truncate will then wait for those pages - whilst
+still inside io_lock:
+
+    # cat /proc/8837/stack
+    [<0>] wait_on_page_bit_common+0x184/0x1e7
+    [<0>] truncate_inode_pages_range+0x37f/0x3eb
+    [<0>] truncate_pagecache+0x3c/0x53
+    [<0>] afs_setattr_success+0x4d/0x6e
+    [<0>] afs_wait_for_operation+0xd8/0x169
+    [<0>] afs_do_sync_operation+0x16/0x1f
+    [<0>] afs_setattr+0x1fb/0x25d
+    [<0>] notify_change+0x2cf/0x3c4
+    [<0>] do_truncate+0x7f/0xb2
+    [<0>] do_sys_ftruncate+0xd1/0x104
+    [<0>] do_syscall_64+0x2d/0x3a
+    [<0>] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+The writeback operation, however, stalls indefinitely because it needs to
+get the io_lock to proceed:
+
+    # cat /proc/5940/stack
+    [<0>] afs_get_io_locks+0x58/0x1ae
+    [<0>] afs_begin_vnode_operation+0xc7/0xd1
+    [<0>] afs_store_data+0x1b2/0x2a3
+    [<0>] afs_write_back_from_locked_page+0x418/0x57c
+    [<0>] afs_writepages_region+0x196/0x224
+    [<0>] afs_writepages+0x74/0x156
+    [<0>] do_writepages+0x2d/0x56
+    [<0>] __writeback_single_inode+0x84/0x207
+    [<0>] writeback_sb_inodes+0x238/0x3cf
+    [<0>] __writeback_inodes_wb+0x68/0x9f
+    [<0>] wb_writeback+0x145/0x26c
+    [<0>] wb_do_writeback+0x16a/0x194
+    [<0>] wb_workfn+0x74/0x177
+    [<0>] process_one_work+0x174/0x264
+    [<0>] worker_thread+0x117/0x1b9
+    [<0>] kthread+0xec/0xf1
+    [<0>] ret_from_fork+0x1f/0x30
+
+and thus deadlock has occurred.
+
+Note that whilst afs_setattr() calls filemap_write_and_wait(), the fact
+that the caller is holding i_rwsem doesn't preclude more pages being
+dirtied through an mmap'd region.
+
+Fix this by:
+
+ (1) Use the vnode validate_lock to mediate access between afs_setattr()
+     and afs_writepages():
+
+     (a) Exclusively lock validate_lock in afs_setattr() around the whole
+     	 RPC operation.
+
+     (b) If WB_SYNC_ALL isn't set on entry to afs_writepages(), trying to
+     	 shared-lock validate_lock and returning immediately if we couldn't
+     	 get it.
+
+     (c) If WB_SYNC_ALL is set, wait for the lock.
+
+     The validate_lock is also used to validate a file and to zap its cache
+     if the file was altered by a third party, so it's probably a good fit
+     for this.
+
+ (2) Move the truncation outside of the io_lock in setattr, using the same
+     hook as is used for local directory editing.
+
+     This requires the old i_size to be retained in the operation record as
+     we commit the revised status to the inode members inside the io_lock
+     still, but we still need to know if we reduced the file size.
+
+Fixes: d2ddc776a458 ("afs: Overhaul volume and server record caching and fileserver rotation")
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
