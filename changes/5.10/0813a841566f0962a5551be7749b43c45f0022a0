@@ -1,0 +1,159 @@
+bpf: tcp: Allow bpf prog to write and parse TCP header option
+
+[ Note: The TCP changes here is mainly to implement the bpf
+  pieces into the bpf_skops_*() functions introduced
+  in the earlier patches. ]
+
+The earlier effort in BPF-TCP-CC allows the TCP Congestion Control
+algorithm to be written in BPF.  It opens up opportunities to allow
+a faster turnaround time in testing/releasing new congestion control
+ideas to production environment.
+
+The same flexibility can be extended to writing TCP header option.
+It is not uncommon that people want to test new TCP header option
+to improve the TCP performance.  Another use case is for data-center
+that has a more controlled environment and has more flexibility in
+putting header options for internal only use.
+
+For example, we want to test the idea in putting maximum delay
+ACK in TCP header option which is similar to a draft RFC proposal [1].
+
+This patch introduces the necessary BPF API and use them in the
+TCP stack to allow BPF_PROG_TYPE_SOCK_OPS program to parse
+and write TCP header options.  It currently supports most of
+the TCP packet except RST.
+
+Supported TCP header option:
+───────────────────────────
+This patch allows the bpf-prog to write any option kind.
+Different bpf-progs can write its own option by calling the new helper
+bpf_store_hdr_opt().  The helper will ensure there is no duplicated
+option in the header.
+
+By allowing bpf-prog to write any option kind, this gives a lot of
+flexibility to the bpf-prog.  Different bpf-prog can write its
+own option kind.  It could also allow the bpf-prog to support a
+recently standardized option on an older kernel.
+
+Sockops Callback Flags:
+──────────────────────
+The bpf program will only be called to parse/write tcp header option
+if the following newly added callback flags are enabled
+in tp->bpf_sock_ops_cb_flags:
+BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG
+BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG
+BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG
+
+A few words on the PARSE CB flags.  When the above PARSE CB flags are
+turned on, the bpf-prog will be called on packets received
+at a sk that has at least reached the ESTABLISHED state.
+The parsing of the SYN-SYNACK-ACK will be discussed in the
+"3 Way HandShake" section.
+
+The default is off for all of the above new CB flags, i.e. the bpf prog
+will not be called to parse or write bpf hdr option.  There are
+details comment on these new cb flags in the UAPI bpf.h.
+
+sock_ops->skb_data and bpf_load_hdr_opt()
+─────────────────────────────────────────
+sock_ops->skb_data and sock_ops->skb_data_end covers the whole
+TCP header and its options.  They are read only.
+
+The new bpf_load_hdr_opt() helps to read a particular option "kind"
+from the skb_data.
+
+Please refer to the comment in UAPI bpf.h.  It has details
+on what skb_data contains under different sock_ops->op.
+
+3 Way HandShake
+───────────────
+The bpf-prog can learn if it is sending SYN or SYNACK by reading the
+sock_ops->skb_tcp_flags.
+
+* Passive side
+
+When writing SYNACK (i.e. sock_ops->op == BPF_SOCK_OPS_WRITE_HDR_OPT_CB),
+the received SYN skb will be available to the bpf prog.  The bpf prog can
+use the SYN skb (which may carry the header option sent from the remote bpf
+prog) to decide what bpf header option should be written to the outgoing
+SYNACK skb.  The SYN packet can be obtained by getsockopt(TCP_BPF_SYN*).
+More on this later.  Also, the bpf prog can learn if it is in syncookie
+mode (by checking sock_ops->args[0] == BPF_WRITE_HDR_TCP_SYNACK_COOKIE).
+
+The bpf prog can store the received SYN pkt by using the existing
+bpf_setsockopt(TCP_SAVE_SYN).  The example in a later patch does it.
+[ Note that the fullsock here is a listen sk, bpf_sk_storage
+  is not very useful here since the listen sk will be shared
+  by many concurrent connection requests.
+
+  Extending bpf_sk_storage support to request_sock will add weight
+  to the minisock and it is not necessary better than storing the
+  whole ~100 bytes SYN pkt. ]
+
+When the connection is established, the bpf prog will be called
+in the existing PASSIVE_ESTABLISHED_CB callback.  At that time,
+the bpf prog can get the header option from the saved syn and
+then apply the needed operation to the newly established socket.
+The later patch will use the max delay ack specified in the SYN
+header and set the RTO of this newly established connection
+as an example.
+
+The received ACK (that concludes the 3WHS) will also be available to
+the bpf prog during PASSIVE_ESTABLISHED_CB through the sock_ops->skb_data.
+It could be useful in syncookie scenario.  More on this later.
+
+There is an existing getsockopt "TCP_SAVED_SYN" to return the whole
+saved syn pkt which includes the IP[46] header and the TCP header.
+A few "TCP_BPF_SYN*" getsockopt has been added to allow specifying where to
+start getting from, e.g. starting from TCP header, or from IP[46] header.
+
+The new getsockopt(TCP_BPF_SYN*) will also know where it can get
+the SYN's packet from:
+  - (a) the just received syn (available when the bpf prog is writing SYNACK)
+        and it is the only way to get SYN during syncookie mode.
+  or
+  - (b) the saved syn (available in PASSIVE_ESTABLISHED_CB and also other
+        existing CB).
+
+The bpf prog does not need to know where the SYN pkt is coming from.
+The getsockopt(TCP_BPF_SYN*) will hide this details.
+
+Similarly, a flags "BPF_LOAD_HDR_OPT_TCP_SYN" is also added to
+bpf_load_hdr_opt() to read a particular header option from the SYN packet.
+
+* Fastopen
+
+Fastopen should work the same as the regular non fastopen case.
+This is a test in a later patch.
+
+* Syncookie
+
+For syncookie, the later example patch asks the active
+side's bpf prog to resend the header options in ACK.  The server
+can use bpf_load_hdr_opt() to look at the options in this
+received ACK during PASSIVE_ESTABLISHED_CB.
+
+* Active side
+
+The bpf prog will get a chance to write the bpf header option
+in the SYN packet during WRITE_HDR_OPT_CB.  The received SYNACK
+pkt will also be available to the bpf prog during the existing
+ACTIVE_ESTABLISHED_CB callback through the sock_ops->skb_data
+and bpf_load_hdr_opt().
+
+* Turn off header CB flags after 3WHS
+
+If the bpf prog does not need to write/parse header options
+beyond the 3WHS, the bpf prog can clear the bpf_sock_ops_cb_flags
+to avoid being called for header options.
+Or the bpf-prog can select to leave the UNKNOWN_HDR_OPT_CB_FLAG on
+so that the kernel will only call it when there is option that
+the kernel cannot handle.
+
+[1]: draft-wang-tcpm-low-latency-opt-00
+     https://tools.ietf.org/html/draft-wang-tcpm-low-latency-opt-00
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200820190104.2885895-1-kafai@fb.com
+

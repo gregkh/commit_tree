@@ -1,0 +1,79 @@
+btrfs: fix missing delalloc new bit for new delalloc ranges
+
+When doing a buffered write, through one of the write family syscalls, we
+look for ranges which currently don't have allocated extents and set the
+'delalloc new' bit on them, so that we can report a correct number of used
+blocks to the stat(2) syscall until delalloc is flushed and ordered extents
+complete.
+
+However there are a few other places where we can do a buffered write
+against a range that is mapped to a hole (no extent allocated) and where
+we do not set the 'new delalloc' bit. Those places are:
+
+- Doing a memory mapped write against a hole;
+
+- Cloning an inline extent into a hole starting at file offset 0;
+
+- Calling btrfs_cont_expand() when the i_size of the file is not aligned
+  to the sector size and is located in a hole. For example when cloning
+  to a destination offset beyond EOF.
+
+So after such cases, until the corresponding delalloc range is flushed and
+the respective ordered extents complete, we can report an incorrect number
+of blocks used through the stat(2) syscall.
+
+In some cases we can end up reporting 0 used blocks to stat(2), which is a
+particular bad value to report as it may mislead tools to think a file is
+completely sparse when its i_size is not zero, making them skip reading
+any data, an undesired consequence for tools such as archivers and other
+backup tools, as reported a long time ago in the following thread (and
+other past threads):
+
+  https://lists.gnu.org/archive/html/bug-tar/2016-07/msg00001.html
+
+Example reproducer:
+
+  $ cat reproducer.sh
+  #!/bin/bash
+
+  MNT=/mnt/sdi
+  DEV=/dev/sdi
+
+  mkfs.btrfs -f $DEV > /dev/null
+  # mkfs.xfs -f $DEV > /dev/null
+  # mkfs.ext4 -F $DEV > /dev/null
+  # mkfs.f2fs -f $DEV > /dev/null
+  mount $DEV $MNT
+
+  xfs_io -f -c "truncate 64K"   \
+      -c "mmap -w 0 64K"        \
+      -c "mwrite -S 0xab 0 64K" \
+      -c "munmap"               \
+      $MNT/foo
+
+  blocks_used=$(stat -c %b $MNT/foo)
+  echo "blocks used: $blocks_used"
+
+  if [ $blocks_used -eq 0 ]; then
+      echo "ERROR: blocks used is 0"
+  fi
+
+  umount $DEV
+
+  $ ./reproducer.sh
+  blocks used: 0
+  ERROR: blocks used is 0
+
+So move the logic that decides to set the 'delalloc bit' bit into the
+function btrfs_set_extent_delalloc(), since that is what we use for all
+those missing cases as well as for the cases that currently work well.
+
+This change is also preparatory work for an upcoming patch that fixes
+other problems related to tracking and reporting the number of bytes used
+by an inode.
+
+CC: stable@vger.kernel.org # 4.19+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

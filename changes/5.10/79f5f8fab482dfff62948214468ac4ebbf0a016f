@@ -1,0 +1,89 @@
+mm,hwpoison: rework soft offline for in-use pages
+
+This patch changes the way we set and handle in-use poisoned pages.  Until
+now, poisoned pages were released to the buddy allocator, trusting that
+the checks that take place at allocation time would act as a safe net and
+would skip that page.
+
+This has proved to be wrong, as we got some pfn walkers out there, like
+compaction, that all they care is the page to be in a buddy freelist.
+
+Although this might not be the only user, having poisoned pages in the
+buddy allocator seems a bad idea as we should only have free pages that
+are ready and meant to be used as such.
+
+Before explaining the taken approach, let us break down the kind of pages
+we can soft offline.
+
+- Anonymous THP (after the split, they end up being 4K pages)
+- Hugetlb
+- Order-0 pages (that can be either migrated or invalited)
+
+* Normal pages (order-0 and anon-THP)
+
+  - If they are clean and unmapped page cache pages, we invalidate
+    then by means of invalidate_inode_page().
+  - If they are mapped/dirty, we do the isolate-and-migrate dance.
+
+Either way, do not call put_page directly from those paths.  Instead, we
+keep the page and send it to page_handle_poison to perform the right
+handling.
+
+page_handle_poison sets the HWPoison flag and does the last put_page.
+
+Down the chain, we placed a check for HWPoison page in
+free_pages_prepare, that just skips any poisoned page, so those pages
+do not end up in any pcplist/freelist.
+
+After that, we set the refcount on the page to 1 and we increment
+the poisoned pages counter.
+
+If we see that the check in free_pages_prepare creates trouble, we can
+always do what we do for free pages:
+
+  - wait until the page hits buddy's freelists
+  - take it off, and flag it
+
+The downside of the above approach is that we could race with an
+allocation, so by the time we  want to take the page off the buddy, the
+page has been already allocated so we cannot soft offline it.
+But the user could always retry it.
+
+* Hugetlb pages
+
+  - We isolate-and-migrate them
+
+After the migration has been successful, we call dissolve_free_huge_page,
+and we set HWPoison on the page if we succeed.
+Hugetlb has a slightly different handling though.
+
+While for non-hugetlb pages we cared about closing the race with an
+allocation, doing so for hugetlb pages requires quite some additional
+and intrusive code (we would need to hook in free_huge_page and some other
+places).
+So I decided to not make the code overly complicated and just fail
+normally if the page we allocated in the meantime.
+
+We can always build on top of this.
+
+As a bonus, because of the way we handle now in-use pages, we no longer
+need the put-as-isolation-migratetype dance, that was guarding for poisoned
+pages to end up in pcplists.
+
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Cc: Aristeu Rozanski <aris@ruivo.org>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dmitry Yakunin <zeil@yandex-team.ru>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Oscar Salvador <osalvador@suse.com>
+Cc: Qian Cai <cai@lca.pw>
+Cc: Tony Luck <tony.luck@intel.com>
+Link: https://lkml.kernel.org/r/20200922135650.1634-10-osalvador@suse.de
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

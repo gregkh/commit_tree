@@ -1,0 +1,66 @@
+virtiofs: serialize truncate/punch_hole and dax fault path
+
+Currently in fuse we don't seem have any lock which can serialize fault
+path with truncate/punch_hole path. With dax support I need one for
+following reasons.
+
+1. Dax requirement
+
+  DAX fault code relies on inode size being stable for the duration of
+  fault and want to serialize with truncate/punch_hole and they explicitly
+  mention it.
+
+  static vm_fault_t dax_iomap_pmd_fault(struct vm_fault *vmf, pfn_t *pfnp,
+                               const struct iomap_ops *ops)
+        /*
+         * Check whether offset isn't beyond end of file now. Caller is
+         * supposed to hold locks serializing us with truncate / punch hole so
+         * this is a reliable test.
+         */
+        max_pgoff = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+
+2. Make sure there are no users of pages being truncated/punch_hole
+
+  get_user_pages() might take references to page and then do some DMA
+  to said pages. Filesystem might truncate those pages without knowing
+  that a DMA is in progress or some I/O is in progress. So use
+  dax_layout_busy_page() to make sure there are no such references
+  and I/O is not in progress on said pages before moving ahead with
+  truncation.
+
+3. Limitation of kvm page fault error reporting
+
+  If we are truncating file on host first and then removing mappings in
+  guest lateter (truncate page cache etc), then this could lead to a
+  problem with KVM. Say a mapping is in place in guest and truncation
+  happens on host. Now if guest accesses that mapping, then host will
+  take a fault and kvm will either exit to qemu or spin infinitely.
+
+  IOW, before we do truncation on host, we need to make sure that guest
+  inode does not have any mapping in that region or whole file.
+
+4. virtiofs memory range reclaim
+
+ Soon I will introduce the notion of being able to reclaim dax memory
+ ranges from a fuse dax inode. There also I need to make sure that
+ no I/O or fault is going on in the reclaimed range and nobody is using
+ it so that range can be reclaimed without issues.
+
+Currently if we take inode lock, that serializes read/write. But it does
+not do anything for faults. So I add another semaphore fuse_inode->i_mmap_sem
+for this purpose.  It can be used to serialize with faults.
+
+As of now, I am adding taking this semaphore only in dax fault path and
+not regular fault path because existing code does not have one. May
+be existing code can benefit from it as well to take care of some
+races, but that we can fix later if need be. For now, I am just focussing
+only on DAX path which is new path.
+
+Also added logic to take fuse_inode->i_mmap_sem in
+truncate/punch_hole/open(O_TRUNC) path to make sure file truncation and
+fuse dax fault are mutually exlusive and avoid all the above problems.
+
+Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+

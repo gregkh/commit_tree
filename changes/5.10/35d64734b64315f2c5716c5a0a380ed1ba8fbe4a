@@ -1,0 +1,124 @@
+powerpc/eeh: Clean up PE addressing
+
+When support for EEH on PowerNV was added a lot of pseries specific code
+was made "generic" and some of the quirks of pseries EEH came along for the
+ride. One of the stranger quirks is eeh_pe containing two types of PE
+address: pe->addr and pe->config_addr. There reason for this appears to be
+historical baggage rather than any real requirements.
+
+On pseries EEH PEs are manipulated using RTAS calls. Each EEH RTAS call
+takes a "PE configuration address" as an input which is used to identify
+which EEH PE is being manipulated by the call. When initialising the EEH
+state for a device the first thing we need to do is determine the
+configuration address for the PE which contains the device so we can enable
+EEH on that PE. This process is outlined in PAPR which is the modern
+(i.e post-2003) FW specification for pseries. However, EEH support was
+first described in the pSeries RISC Platform Architecture (RPA) and
+although they are mostly compatible EEH is one of the areas where they are
+not.
+
+The major difference is that RPA doesn't actually have the concept of a PE.
+On RPA systems the EEH RTAS calls are done on a per-device basis using the
+same config_addr that would be passed to the RTAS functions to access PCI
+config space (e.g. ibm,read-pci-config). The config_addr is not identical
+since the function and config register offsets of the config_addr must be
+set to zero. EEH operations being done on a per-device basis doesn't make a
+whole lot of sense when you consider how EEH was implemented on legacy PCI
+systems.
+
+For legacy PCI(-X) systems EEH was implemented using special PCI-PCI
+bridges which contained logic to detect errors and freeze the secondary
+bus when one occurred. This means that the EEH enabled state is shared
+among all devices behind that EEH bridge. As a result there's no way to
+implement the per-device control required for the semantics specified by
+RPA. It can be made to work if we assume that a separate EEH bridge exists
+for each EEH capable PCI slot and there are no bridges behind those slots.
+However, RPA also specifies the ibm,configure-bridge RTAS call for
+re-initalising bridges behind EEH capable slots after they are reset due
+to an EEH event so that is probably not a valid assumption. This
+incoherence was fixed in later PAPR, which succeeded RPA. Unfortunately,
+since Linux EEH support seems to have been implemented based on the RPA
+spec some of the legacy assumptions were carried over (probably for POWER4
+compatibility).
+
+The fix made in PAPR was the introduction of the "PE" concept and
+redefining the EEH RTAS calls (set-eeh-option, reset-slot, etc) to operate
+on a per-PE basis so all devices behind an EEH bride would share the same
+EEH state. The "config_addr" argument to the EEH RTAS calls became the
+"PE_config_addr" and the OS was required to use the
+ibm,get-config-addr-info RTAS call to find the correct PE address for the
+device. When support for the new interfaces was added to Linux it was
+implemented using something like:
+
+At probe time:
+
+	pdn->eeh_config_addr = rtas_config_addr(pdn);
+	pdn->eeh_pe_config_addr = rtas_get_config_addr_info(pdn);
+
+When performing an RTAS call:
+
+	config_addr = pdn->eeh_config_addr;
+	if (pdn->eeh_pe_config_addr)
+		config_addr = pdn->eeh_pe_config_addr;
+
+	rtas_call(..., config_addr, ...);
+
+In other words, if the ibm,get-config-addr-info RTAS call is implemented
+and returned a valid result we'd use that as the argument to the EEH
+RTAS calls. If not, Linux would fall back to using the device's
+config_addr. Over time these addresses have moved around going from pci_dn
+to eeh_dev and finally into eeh_pe. Today the users look like this:
+
+	config_addr = pe->config_addr;
+	if (pe->addr)
+		config_addr = pe->addr;
+
+	rtas_call(..., config_addr, ...);
+
+However, considering the EEH core always operates on a per-PE basis and
+even on pseries the only per-device operation is the initial call to
+ibm,set-eeh-option I'm not sure if any of this actually works on an RPA
+system today. It doesn't make much sense to have the fallback address in
+a generic structure either since the bulk of the code which reference it
+is in pseries anyway.
+
+The EEH core makes a token effort to support looking up a PE using the
+config_addr by having two arguments to eeh_pe_get(). However, a survey of
+all the callers to eeh_pe_get() shows that all bar one have the config_addr
+argument hard-coded to zero.The only caller that doesn't is in
+eeh_pe_tree_insert() which has:
+
+	if (!eeh_has_flag(EEH_VALID_PE_ZERO) && !edev->pe_config_addr)
+		return -EINVAL;
+
+	pe = eeh_pe_get(hose, edev->pe_config_addr, edev->bdfn);
+
+The third argument (config_addr) is only used if the second (pe->addr)
+argument is invalid. The preceding check ensures that the call to
+eeh_pe_get() will never happen if edev->pe_config_addr is invalid so there
+is no situation where eeh_pe_get() will search for a PE based on the 3rd
+argument. The check also means that we'll never insert a PE into the tree
+where pe_config_addr is zero since EEH_VALID_PE_ZERO is never set on
+pseries. All the users of the fallback address on pseries never actually
+use the fallback and all the only caller that supplies something for the
+config_addr argument to eeh_pe_get() never use it either. It's all dead
+code.
+
+This patch removes the fallback address from eeh_pe since nothing uses it.
+Specificly, we do this by:
+
+1) Removing pe->config_addr
+2) Removing the EEH_VALID_PE_ZERO flag
+3) Removing the fallback address argument to eeh_pe_get().
+4) Removing all the checks for pe->addr being zero in the pseries EEH code.
+
+This leaves us with PE's only being identified by what's in their pe->addr
+field and the EEH core relying on the platform to ensure that eeh_dev's are
+only inserted into the EEH tree if they're actually inside a PE.
+
+No functional changes, I hope.
+
+Signed-off-by: Oliver O'Halloran <oohall@gmail.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200918093050.37344-9-oohall@gmail.com
+

@@ -1,0 +1,80 @@
+spi: Take the SPI IO-mutex in the spi_setup() method
+
+I've discovered that due to the recent commit 49d7d695ca4b ("spi: dw:
+Explicitly de-assert CS on SPI transfer completion") a concurrent usage of
+the spidev devices with different chip-selects causes the "SPI transfer
+timed out" error. The root cause of the problem has turned to be in a race
+condition of the SPI-transfer execution procedure and the spi_setup()
+method being called at the same time. In particular in calling the
+spi_set_cs(false) while there is an SPI-transfer being executed. In my
+case due to the commit cited above all CSs get to be switched off by
+calling the spi_setup() for /dev/spidev0.1 while there is an concurrent
+SPI-transfer execution performed on /dev/spidev0.0. Of course a situation
+of the spi_setup() being called while there is an SPI-transfer being
+executed for two different SPI peripheral devices of the same controller
+may happen not only for the spidev driver, but for instance for MMC SPI +
+some another device, or spi_setup() being called from an SPI-peripheral
+probe method while some other device has already been probed and is being
+used by a corresponding driver...
+
+Of course I could have provided a fix affecting the DW APB SSI driver
+only, for instance, by creating a mutual exclusive access to the set_cs
+callback and setting/clearing only the bit responsible for the
+corresponding chip-select. But after a short research I've discovered that
+the problem most likely affects a lot of the other drivers:
+- drivers/spi/spi-sun4i.c - RMW the chip-select register;
+- drivers/spi/spi-rockchip.c - RMW the chip-select register;
+- drivers/spi/spi-qup.c - RMW a generic force-CS flag in a CSR.
+- drivers/spi/spi-sifive.c - set a generic CS-mode flag in a CSR.
+- drivers/spi/spi-bcm63xx-hsspi.c - uses an internal mutex to serialize
+  the bus config changes, but still isn't protected from the race
+  condition described above;
+- drivers/spi/spi-geni-qcom.c - RMW a chip-select internal flag and set the
+  CS state in HW;
+- drivers/spi/spi-orion.c - RMW a chip-select register;
+- drivers/spi/spi-cadence.c - RMW a chip-select register;
+- drivers/spi/spi-armada-3700.c - RMW a chip-select register;
+- drivers/spi/spi-lantiq-ssc.c - overwrites the chip-select register;
+- drivers/spi/spi-sun6i.c - RMW a chip-select register;
+- drivers/spi/spi-synquacer.c - RMW a chip-select register;
+- drivers/spi/spi-altera.c - directly sets the chip-select state;
+- drivers/spi/spi-omap2-mcspi.c - RMW an internally cached CS state and
+  writes it to HW;
+- drivers/spi/spi-mt65xx.c - RMW some CSR;
+- drivers/spi/spi-jcore.c - directly sets the chip-selects state;
+- drivers/spi/spi-mt7621.c - RMW a chip-select register;
+
+I could have missed some drivers, but a scale of the problem is obvious.
+As you can see most of the drivers perform an unprotected
+Read-modify-write chip-select register modification in the set_cs callback.
+Seeing the spi_setup() function is calling the spi_set_cs() and it can be
+executed concurrently with SPI-transfers exec procedure, which also calls
+spi_set_cs() in the SPI core spi_transfer_one_message() method, the race
+condition of the register modification turns to be obvious.
+
+To sum up the problem denoted above affects each driver for a controller
+having more than one chip-select lane and which:
+1) performs the RMW to some CS-related register with no serialization;
+2) directly disables any CS on spi_set_cs(dev, false).
+* the later is the case of the DW APB SSI driver.
+
+The controllers which equipped with a single CS theoretically can also
+experience the problem, but in practice will not since normally the
+spi_setup() isn't called concurrently with the SPI-transfers executed on
+the same SPI peripheral device.
+
+In order to generically fix the denoted bug I'd suggest to serialize an
+access to the controller IO by taking the IO mutex in the spi_setup()
+callback. The mutex is held while there is an SPI communication going on
+on the SPI-bus of the corresponding SPI-controller. So calling the
+spi_setup() method and disabling/updating the CS state within it would be
+safe while there is no any SPI-transfers being executed. Also note I
+suppose it would be safer to protect the spi_controller->setup() callback
+invocation too, seeing some of the SPI-controller drivers update a HW
+state in there.
+
+Fixes: 49d7d695ca4b ("spi: dw: Explicitly de-assert CS on SPI transfer completion")
+Signed-off-by: Serge Semin <Sergey.Semin@baikalelectronics.ru>
+Link: https://lore.kernel.org/r/20201117094517.5654-1-Sergey.Semin@baikalelectronics.ru
+Signed-off-by: Mark Brown <broonie@kernel.org>
+

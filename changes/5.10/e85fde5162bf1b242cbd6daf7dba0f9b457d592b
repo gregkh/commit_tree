@@ -1,0 +1,64 @@
+btrfs: qgroup: fix qgroup meta rsv leak for subvolume operations
+
+[BUG]
+When quota is enabled for TEST_DEV, generic/013 sometimes fails like this:
+
+  generic/013 14s ... _check_dmesg: something found in dmesg (see xfstests-dev/results//generic/013.dmesg)
+
+And with the following metadata leak:
+
+  BTRFS warning (device dm-3): qgroup 0/1370 has unreleased space, type 2 rsv 49152
+  ------------[ cut here ]------------
+  WARNING: CPU: 2 PID: 47912 at fs/btrfs/disk-io.c:4078 close_ctree+0x1dc/0x323 [btrfs]
+  Call Trace:
+   btrfs_put_super+0x15/0x17 [btrfs]
+   generic_shutdown_super+0x72/0x110
+   kill_anon_super+0x18/0x30
+   btrfs_kill_super+0x17/0x30 [btrfs]
+   deactivate_locked_super+0x3b/0xa0
+   deactivate_super+0x40/0x50
+   cleanup_mnt+0x135/0x190
+   __cleanup_mnt+0x12/0x20
+   task_work_run+0x64/0xb0
+   __prepare_exit_to_usermode+0x1bc/0x1c0
+   __syscall_return_slowpath+0x47/0x230
+   do_syscall_64+0x64/0xb0
+   entry_SYSCALL_64_after_hwframe+0x44/0xa9
+  ---[ end trace a6cfd45ba80e4e06 ]---
+  BTRFS error (device dm-3): qgroup reserved space leaked
+  BTRFS info (device dm-3): disk space caching is enabled
+  BTRFS info (device dm-3): has skinny extents
+
+[CAUSE]
+The qgroup preallocated meta rsv operations of that offending root are:
+
+  btrfs_delayed_inode_reserve_metadata: rsv_meta_prealloc root=1370 num_bytes=131072
+  btrfs_delayed_inode_reserve_metadata: rsv_meta_prealloc root=1370 num_bytes=131072
+  btrfs_subvolume_reserve_metadata: rsv_meta_prealloc root=1370 num_bytes=49152
+  btrfs_delayed_inode_release_metadata: convert_meta_prealloc root=1370 num_bytes=-131072
+  btrfs_delayed_inode_release_metadata: convert_meta_prealloc root=1370 num_bytes=-131072
+
+It's pretty obvious that, we reserve qgroup meta rsv in
+btrfs_subvolume_reserve_metadata(), but doesn't have corresponding
+release/convert calls in btrfs_subvolume_release_metadata().
+
+This leads to the leakage.
+
+[FIX]
+To fix this bug, we should follow what we're doing in
+btrfs_delalloc_reserve_metadata(), where we reserve qgroup space, and
+add it to block_rsv->qgroup_rsv_reserved.
+
+And free the qgroup reserved metadata space when releasing the
+block_rsv.
+
+To do this, we need to change the btrfs_subvolume_release_metadata() to
+accept btrfs_root, and record the qgroup_to_release number, and call
+btrfs_qgroup_convert_reserved_meta() for it.
+
+Fixes: 733e03a0b26a ("btrfs: qgroup: Split meta rsv type into meta_prealloc and meta_pertrans")
+CC: stable@vger.kernel.org # 4.19+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

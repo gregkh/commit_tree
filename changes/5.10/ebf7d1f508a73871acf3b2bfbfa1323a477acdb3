@@ -1,0 +1,150 @@
+bpf, x64: rework pro/epilogue and tailcall handling in JIT
+
+This commit serves two things:
+1) it optimizes BPF prologue/epilogue generation
+2) it makes possible to have tailcalls within BPF subprogram
+
+Both points are related to each other since without 1), 2) could not be
+achieved.
+
+In [1], Alexei says:
+"The prologue will look like:
+nop5
+xor eax,eax  // two new bytes if bpf_tail_call() is used in this
+             // function
+push rbp
+mov rbp, rsp
+sub rsp, rounded_stack_depth
+push rax // zero init tail_call counter
+variable number of push rbx,r13,r14,r15
+
+Then bpf_tail_call will pop variable number rbx,..
+and final 'pop rax'
+Then 'add rsp, size_of_current_stack_frame'
+jmp to next function and skip over 'nop5; xor eax,eax; push rpb; mov
+rbp, rsp'
+
+This way new function will set its own stack size and will init tail
+call
+counter with whatever value the parent had.
+
+If next function doesn't use bpf_tail_call it won't have 'xor eax,eax'.
+Instead it would need to have 'nop2' in there."
+
+Implement that suggestion.
+
+Since the layout of stack is changed, tail call counter handling can not
+rely anymore on popping it to rbx just like it have been handled for
+constant prologue case and later overwrite of rbx with actual value of
+rbx pushed to stack. Therefore, let's use one of the register (%rcx) that
+is considered to be volatile/caller-saved and pop the value of tail call
+counter in there in the epilogue.
+
+Drop the BUILD_BUG_ON in emit_prologue and in
+emit_bpf_tail_call_indirect where instruction layout is not constant
+anymore.
+
+Introduce new poke target, 'tailcall_bypass' to poke descriptor that is
+dedicated for skipping the register pops and stack unwind that are
+generated right before the actual jump to target program.
+For case when the target program is not present, BPF program will skip
+the pop instructions and nop5 dedicated for jmpq $target. An example of
+such state when only R6 of callee saved registers is used by program:
+
+ffffffffc0513aa1:       e9 0e 00 00 00          jmpq   0xffffffffc0513ab4
+ffffffffc0513aa6:       5b                      pop    %rbx
+ffffffffc0513aa7:       58                      pop    %rax
+ffffffffc0513aa8:       48 81 c4 00 00 00 00    add    $0x0,%rsp
+ffffffffc0513aaf:       0f 1f 44 00 00          nopl   0x0(%rax,%rax,1)
+ffffffffc0513ab4:       48 89 df                mov    %rbx,%rdi
+
+When target program is inserted, the jump that was there to skip
+pops/nop5 will become the nop5, so CPU will go over pops and do the
+actual tailcall.
+
+One might ask why there simply can not be pushes after the nop5?
+In the following example snippet:
+
+ffffffffc037030c:       48 89 fb                mov    %rdi,%rbx
+(...)
+ffffffffc0370332:       5b                      pop    %rbx
+ffffffffc0370333:       58                      pop    %rax
+ffffffffc0370334:       48 81 c4 00 00 00 00    add    $0x0,%rsp
+ffffffffc037033b:       0f 1f 44 00 00          nopl   0x0(%rax,%rax,1)
+ffffffffc0370340:       48 81 ec 00 00 00 00    sub    $0x0,%rsp
+ffffffffc0370347:       50                      push   %rax
+ffffffffc0370348:       53                      push   %rbx
+ffffffffc0370349:       48 89 df                mov    %rbx,%rdi
+ffffffffc037034c:       e8 f7 21 00 00          callq  0xffffffffc0372548
+
+There is the bpf2bpf call (at ffffffffc037034c) right after the tailcall
+and jump target is not present. ctx is in %rbx register and BPF
+subprogram that we will call into on ffffffffc037034c is relying on it,
+e.g. it will pick ctx from there. Such code layout is therefore broken
+as we would overwrite the content of %rbx with the value that was pushed
+on the prologue. That is the reason for the 'bypass' approach.
+
+Special care needs to be taken during the install/update/remove of
+tailcall target. In case when target program is not present, the CPU
+must not execute the pop instructions that precede the tailcall.
+
+To address that, the following states can be defined:
+A nop, unwind, nop
+B nop, unwind, tail
+C skip, unwind, nop
+D skip, unwind, tail
+
+A is forbidden (lead to incorrectness). The state transitions between
+tailcall install/update/remove will work as follows:
+
+First install tail call f: C->D->B(f)
+ * poke the tailcall, after that get rid of the skip
+Update tail call f to f': B(f)->B(f')
+ * poke the tailcall (poke->tailcall_target) and do NOT touch the
+   poke->tailcall_bypass
+Remove tail call: B(f')->C(f')
+ * poke->tailcall_bypass is poked back to jump, then we wait the RCU
+   grace period so that other programs will finish its execution and
+   after that we are safe to remove the poke->tailcall_target
+Install new tail call (f''): C(f')->D(f'')->B(f'').
+ * same as first step
+
+This way CPU can never be exposed to "unwind, tail" state.
+
+Last but not least, when tailcalls get mixed with bpf2bpf calls, it
+would be possible to encounter the endless loop due to clearing the
+tailcall counter if for example we would use the tailcall3-like from BPF
+selftests program that would be subprogram-based, meaning the tailcall
+would be present within the BPF subprogram.
+
+This test, broken down to particular steps, would do:
+entry -> set tailcall counter to 0, bump it by 1, tailcall to func0
+func0 -> call subprog_tail
+(we are NOT skipping the first 11 bytes of prologue and this subprogram
+has a tailcall, therefore we clear the counter...)
+subprog -> do the same thing as entry
+
+and then loop forever.
+
+To address this, the idea is to go through the call chain of bpf2bpf progs
+and look for a tailcall presence throughout whole chain. If we saw a single
+tail call then each node in this call chain needs to be marked as a subprog
+that can reach the tailcall. We would later feed the JIT with this info
+and:
+- set eax to 0 only when tailcall is reachable and this is the entry prog
+- if tailcall is reachable but there's no tailcall in insns of currently
+  JITed prog then push rax anyway, so that it will be possible to
+  propagate further down the call chain
+- finally if tailcall is reachable, then we need to precede the 'call'
+  insn with mov rax, [rbp - (stack_depth + 8)]
+
+Tail call related cases from test_verifier kselftest are also working
+fine. Sample BPF programs that utilize tail calls (sockex3, tracex5)
+work properly as well.
+
+[1]: https://lore.kernel.org/bpf/20200517043227.2gpq22ifoq37ogst@ast-mbp.dhcp.thefacebook.com/
+
+Suggested-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+

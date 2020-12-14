@@ -1,0 +1,285 @@
+btrfs: make fast fsyncs wait only for writeback
+
+Currently regardless of a full or a fast fsync we always wait for ordered
+extents to complete, and then start logging the inode after that. However
+for fast fsyncs we can just wait for the writeback to complete, we don't
+need to wait for the ordered extents to complete since we use the list of
+modified extents maps to figure out which extents we must log and we can
+get their checksums directly from the ordered extents that are still in
+flight, otherwise look them up from the checksums tree.
+
+Until commit b5e6c3e170b770 ("btrfs: always wait on ordered extents at
+fsync time"), for fast fsyncs, we used to start logging without even
+waiting for the writeback to complete first, we would wait for it to
+complete after logging, while holding a transaction open, which lead to
+performance issues when using cgroups and probably for other cases too,
+as wait for IO while holding a transaction handle should be avoided as
+much as possible. After that, for fast fsyncs, we started to wait for
+ordered extents to complete before starting to log, which adds some
+latency to fsyncs and we even got at least one report about a performance
+drop which bisected to that particular change:
+
+https://lore.kernel.org/linux-btrfs/20181109215148.GF23260@techsingularity.net/
+
+This change makes fast fsyncs only wait for writeback to finish before
+starting to log the inode, instead of waiting for both the writeback to
+finish and for the ordered extents to complete. This brings back part of
+the logic we had that extracts checksums from in flight ordered extents,
+which are not yet in the checksums tree, and making sure transaction
+commits wait for the completion of ordered extents previously logged
+(by far most of the time they have already completed by the time a
+transaction commit starts, resulting in no wait at all), to avoid any
+data loss if an ordered extent completes after the transaction used to
+log an inode is committed, followed by a power failure.
+
+When there are no other tasks accessing the checksums and the subvolume
+btrees, the ordered extent completion is pretty fast, typically taking
+100 to 200 microseconds only in my observations. However when there are
+other tasks accessing these btrees, ordered extent completion can take a
+lot more time due to lock contention on nodes and leaves of these btrees.
+I've seen cases over 2 milliseconds, which starts to be significant. In
+particular when we do have concurrent fsyncs against different files there
+is a lot of contention on the checksums btree, since we have many tasks
+writing the checksums into the btree and other tasks that already started
+the logging phase are doing lookups for checksums in the btree.
+
+This change also turns all ranged fsyncs into full ranged fsyncs, which
+is something we already did when not using the NO_HOLES features or when
+doing a full fsync. This is to guarantee we never miss checksums due to
+writeback having been triggered only for a part of an extent, and we end
+up logging the full extent but only checksums for the written range, which
+results in missing checksums after log replay. Allowing ranged fsyncs to
+operate again only in the original range, when using the NO_HOLES feature
+and doing a fast fsync is doable but requires some non trivial changes to
+the writeback path, which can always be worked on later if needed, but I
+don't think they are a very common use case.
+
+Several tests were performed using fio for different numbers of concurrent
+jobs, each writing and fsyncing its own file, for both sequential and
+random file writes. The tests were run on bare metal, no virtualization,
+on a box with 12 cores (Intel i7-8700), 64Gb of RAM and a NVMe device,
+with a kernel configuration that is the default of typical distributions
+(debian in this case), without debug options enabled (kasan, kmemleak,
+slub debug, debug of page allocations, lock debugging, etc).
+
+The following script that calls fio was used:
+
+  $ cat test-fsync.sh
+  #!/bin/bash
+
+  DEV=/dev/nvme0n1
+  MNT=/mnt/btrfs
+  MOUNT_OPTIONS="-o ssd -o space_cache=v2"
+  MKFS_OPTIONS="-d single -m single"
+
+  if [ $# -ne 5 ]; then
+    echo "Use $0 NUM_JOBS FILE_SIZE FSYNC_FREQ BLOCK_SIZE [write|randwrite]"
+    exit 1
+  fi
+
+  NUM_JOBS=$1
+  FILE_SIZE=$2
+  FSYNC_FREQ=$3
+  BLOCK_SIZE=$4
+  WRITE_MODE=$5
+
+  if [ "$WRITE_MODE" != "write" ] && [ "$WRITE_MODE" != "randwrite" ]; then
+    echo "Invalid WRITE_MODE, must be 'write' or 'randwrite'"
+    exit 1
+  fi
+
+  cat <<EOF > /tmp/fio-job.ini
+  [writers]
+  rw=$WRITE_MODE
+  fsync=$FSYNC_FREQ
+  fallocate=none
+  group_reporting=1
+  direct=0
+  bs=$BLOCK_SIZE
+  ioengine=sync
+  size=$FILE_SIZE
+  directory=$MNT
+  numjobs=$NUM_JOBS
+  EOF
+
+  echo "performance" | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+  echo
+  echo "Using config:"
+  echo
+  cat /tmp/fio-job.ini
+  echo
+
+  umount $MNT &> /dev/null
+  mkfs.btrfs -f $MKFS_OPTIONS $DEV
+  mount $MOUNT_OPTIONS $DEV $MNT
+  fio /tmp/fio-job.ini
+  umount $MNT
+
+The results were the following:
+
+*************************
+*** sequential writes ***
+*************************
+
+==== 1 job, 8GiB file, fsync frequency 1, block size 64KiB ====
+
+Before patch:
+
+WRITE: bw=36.6MiB/s (38.4MB/s), 36.6MiB/s-36.6MiB/s (38.4MB/s-38.4MB/s), io=8192MiB (8590MB), run=223689-223689msec
+
+After patch:
+
+WRITE: bw=40.2MiB/s (42.1MB/s), 40.2MiB/s-40.2MiB/s (42.1MB/s-42.1MB/s), io=8192MiB (8590MB), run=203980-203980msec
+(+9.8%, -8.8% runtime)
+
+==== 2 jobs, 4GiB files, fsync frequency 1, block size 64KiB ====
+
+Before patch:
+
+WRITE: bw=35.8MiB/s (37.5MB/s), 35.8MiB/s-35.8MiB/s (37.5MB/s-37.5MB/s), io=8192MiB (8590MB), run=228950-228950msec
+
+After patch:
+
+WRITE: bw=43.5MiB/s (45.6MB/s), 43.5MiB/s-43.5MiB/s (45.6MB/s-45.6MB/s), io=8192MiB (8590MB), run=188272-188272msec
+(+21.5% throughput, -17.8% runtime)
+
+==== 4 jobs, 2GiB files, fsync frequency 1, block size 64KiB ====
+
+Before patch:
+
+WRITE: bw=50.1MiB/s (52.6MB/s), 50.1MiB/s-50.1MiB/s (52.6MB/s-52.6MB/s), io=8192MiB (8590MB), run=163446-163446msec
+
+After patch:
+
+WRITE: bw=64.5MiB/s (67.6MB/s), 64.5MiB/s-64.5MiB/s (67.6MB/s-67.6MB/s), io=8192MiB (8590MB), run=126987-126987msec
+(+28.7% throughput, -22.3% runtime)
+
+==== 8 jobs, 1GiB files, fsync frequency 1, block size 64KiB ====
+
+Before patch:
+
+WRITE: bw=64.0MiB/s (68.1MB/s), 64.0MiB/s-64.0MiB/s (68.1MB/s-68.1MB/s), io=8192MiB (8590MB), run=126075-126075msec
+
+After patch:
+
+WRITE: bw=86.8MiB/s (91.0MB/s), 86.8MiB/s-86.8MiB/s (91.0MB/s-91.0MB/s), io=8192MiB (8590MB), run=94358-94358msec
+(+35.6% throughput, -25.2% runtime)
+
+==== 16 jobs, 512MiB files, fsync frequency 1, block size 64KiB ====
+
+Before patch:
+
+WRITE: bw=79.8MiB/s (83.6MB/s), 79.8MiB/s-79.8MiB/s (83.6MB/s-83.6MB/s), io=8192MiB (8590MB), run=102694-102694msec
+
+After patch:
+
+WRITE: bw=107MiB/s (112MB/s), 107MiB/s-107MiB/s (112MB/s-112MB/s), io=8192MiB (8590MB), run=76446-76446msec
+(+34.1% throughput, -25.6% runtime)
+
+==== 32 jobs, 512MiB files, fsync frequency 1, block size 64KiB ====
+
+Before patch:
+
+WRITE: bw=93.2MiB/s (97.7MB/s), 93.2MiB/s-93.2MiB/s (97.7MB/s-97.7MB/s), io=16.0GiB (17.2GB), run=175836-175836msec
+
+After patch:
+
+WRITE: bw=111MiB/s (117MB/s), 111MiB/s-111MiB/s (117MB/s-117MB/s), io=16.0GiB (17.2GB), run=147001-147001msec
+(+19.1% throughput, -16.4% runtime)
+
+==== 64 jobs, 512MiB files, fsync frequency 1, block size 64KiB ====
+
+Before patch:
+
+WRITE: bw=108MiB/s (114MB/s), 108MiB/s-108MiB/s (114MB/s-114MB/s), io=32.0GiB (34.4GB), run=302656-302656msec
+
+After patch:
+
+WRITE: bw=133MiB/s (140MB/s), 133MiB/s-133MiB/s (140MB/s-140MB/s), io=32.0GiB (34.4GB), run=246003-246003msec
+(+23.1% throughput, -18.7% runtime)
+
+************************
+***   random writes  ***
+************************
+
+==== 1 job, 8GiB file, fsync frequency 16, block size 4KiB ====
+
+Before patch:
+
+WRITE: bw=11.5MiB/s (12.0MB/s), 11.5MiB/s-11.5MiB/s (12.0MB/s-12.0MB/s), io=8192MiB (8590MB), run=714281-714281msec
+
+After patch:
+
+WRITE: bw=11.6MiB/s (12.2MB/s), 11.6MiB/s-11.6MiB/s (12.2MB/s-12.2MB/s), io=8192MiB (8590MB), run=705959-705959msec
+(+0.9% throughput, -1.7% runtime)
+
+==== 2 jobs, 4GiB files, fsync frequency 16, block size 4KiB ====
+
+Before patch:
+
+WRITE: bw=12.8MiB/s (13.5MB/s), 12.8MiB/s-12.8MiB/s (13.5MB/s-13.5MB/s), io=8192MiB (8590MB), run=638101-638101msec
+
+After patch:
+
+WRITE: bw=13.1MiB/s (13.7MB/s), 13.1MiB/s-13.1MiB/s (13.7MB/s-13.7MB/s), io=8192MiB (8590MB), run=625374-625374msec
+(+2.3% throughput, -2.0% runtime)
+
+==== 4 jobs, 2GiB files, fsync frequency 16, block size 4KiB ====
+
+Before patch:
+
+WRITE: bw=15.4MiB/s (16.2MB/s), 15.4MiB/s-15.4MiB/s (16.2MB/s-16.2MB/s), io=8192MiB (8590MB), run=531146-531146msec
+
+After patch:
+
+WRITE: bw=17.8MiB/s (18.7MB/s), 17.8MiB/s-17.8MiB/s (18.7MB/s-18.7MB/s), io=8192MiB (8590MB), run=460431-460431msec
+(+15.6% throughput, -13.3% runtime)
+
+==== 8 jobs, 1GiB files, fsync frequency 16, block size 4KiB ====
+
+Before patch:
+
+WRITE: bw=19.9MiB/s (20.8MB/s), 19.9MiB/s-19.9MiB/s (20.8MB/s-20.8MB/s), io=8192MiB (8590MB), run=412664-412664msec
+
+After patch:
+
+WRITE: bw=22.2MiB/s (23.3MB/s), 22.2MiB/s-22.2MiB/s (23.3MB/s-23.3MB/s), io=8192MiB (8590MB), run=368589-368589msec
+(+11.6% throughput, -10.7% runtime)
+
+==== 16 jobs, 512MiB files, fsync frequency 16, block size 4KiB ====
+
+Before patch:
+
+WRITE: bw=29.3MiB/s (30.7MB/s), 29.3MiB/s-29.3MiB/s (30.7MB/s-30.7MB/s), io=8192MiB (8590MB), run=279924-279924msec
+
+After patch:
+
+WRITE: bw=30.4MiB/s (31.9MB/s), 30.4MiB/s-30.4MiB/s (31.9MB/s-31.9MB/s), io=8192MiB (8590MB), run=269258-269258msec
+(+3.8% throughput, -3.8% runtime)
+
+==== 32 jobs, 512MiB files, fsync frequency 16, block size 4KiB ====
+
+Before patch:
+
+WRITE: bw=36.9MiB/s (38.7MB/s), 36.9MiB/s-36.9MiB/s (38.7MB/s-38.7MB/s), io=16.0GiB (17.2GB), run=443581-443581msec
+
+After patch:
+
+WRITE: bw=41.6MiB/s (43.6MB/s), 41.6MiB/s-41.6MiB/s (43.6MB/s-43.6MB/s), io=16.0GiB (17.2GB), run=394114-394114msec
+(+12.7% throughput, -11.2% runtime)
+
+==== 64 jobs, 512MiB files, fsync frequency 16, block size 4KiB ====
+
+Before patch:
+
+WRITE: bw=45.9MiB/s (48.1MB/s), 45.9MiB/s-45.9MiB/s (48.1MB/s-48.1MB/s), io=32.0GiB (34.4GB), run=714614-714614msec
+
+After patch:
+
+WRITE: bw=48.8MiB/s (51.1MB/s), 48.8MiB/s-48.8MiB/s (51.1MB/s-51.1MB/s), io=32.0GiB (34.4GB), run=672087-672087msec
+(+6.3% throughput, -6.0% runtime)
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

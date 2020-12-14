@@ -1,0 +1,107 @@
+io-wq: fix use-after-free in io_wq_worker_running
+
+The smart syzbot has found a reproducer for the following issue:
+
+ ==================================================================
+ BUG: KASAN: use-after-free in instrument_atomic_write include/linux/instrumented.h:71 [inline]
+ BUG: KASAN: use-after-free in atomic_inc include/asm-generic/atomic-instrumented.h:240 [inline]
+ BUG: KASAN: use-after-free in io_wqe_inc_running fs/io-wq.c:301 [inline]
+ BUG: KASAN: use-after-free in io_wq_worker_running+0xde/0x110 fs/io-wq.c:613
+ Write of size 4 at addr ffff8882183db08c by task io_wqe_worker-0/7771
+
+ CPU: 0 PID: 7771 Comm: io_wqe_worker-0 Not tainted 5.9.0-rc4-syzkaller #0
+ Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+ Call Trace:
+  __dump_stack lib/dump_stack.c:77 [inline]
+  dump_stack+0x198/0x1fd lib/dump_stack.c:118
+  print_address_description.constprop.0.cold+0xae/0x497 mm/kasan/report.c:383
+  __kasan_report mm/kasan/report.c:513 [inline]
+  kasan_report.cold+0x1f/0x37 mm/kasan/report.c:530
+  check_memory_region_inline mm/kasan/generic.c:186 [inline]
+  check_memory_region+0x13d/0x180 mm/kasan/generic.c:192
+  instrument_atomic_write include/linux/instrumented.h:71 [inline]
+  atomic_inc include/asm-generic/atomic-instrumented.h:240 [inline]
+  io_wqe_inc_running fs/io-wq.c:301 [inline]
+  io_wq_worker_running+0xde/0x110 fs/io-wq.c:613
+  schedule_timeout+0x148/0x250 kernel/time/timer.c:1879
+  io_wqe_worker+0x517/0x10e0 fs/io-wq.c:580
+  kthread+0x3b5/0x4a0 kernel/kthread.c:292
+  ret_from_fork+0x1f/0x30 arch/x86/entry/entry_64.S:294
+
+ Allocated by task 7768:
+  kasan_save_stack+0x1b/0x40 mm/kasan/common.c:48
+  kasan_set_track mm/kasan/common.c:56 [inline]
+  __kasan_kmalloc.constprop.0+0xbf/0xd0 mm/kasan/common.c:461
+  kmem_cache_alloc_node_trace+0x17b/0x3f0 mm/slab.c:3594
+  kmalloc_node include/linux/slab.h:572 [inline]
+  kzalloc_node include/linux/slab.h:677 [inline]
+  io_wq_create+0x57b/0xa10 fs/io-wq.c:1064
+  io_init_wq_offload fs/io_uring.c:7432 [inline]
+  io_sq_offload_start fs/io_uring.c:7504 [inline]
+  io_uring_create fs/io_uring.c:8625 [inline]
+  io_uring_setup+0x1836/0x28e0 fs/io_uring.c:8694
+  do_syscall_64+0x2d/0x70 arch/x86/entry/common.c:46
+  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+ Freed by task 21:
+  kasan_save_stack+0x1b/0x40 mm/kasan/common.c:48
+  kasan_set_track+0x1c/0x30 mm/kasan/common.c:56
+  kasan_set_free_info+0x1b/0x30 mm/kasan/generic.c:355
+  __kasan_slab_free+0xd8/0x120 mm/kasan/common.c:422
+  __cache_free mm/slab.c:3418 [inline]
+  kfree+0x10e/0x2b0 mm/slab.c:3756
+  __io_wq_destroy fs/io-wq.c:1138 [inline]
+  io_wq_destroy+0x2af/0x460 fs/io-wq.c:1146
+  io_finish_async fs/io_uring.c:6836 [inline]
+  io_ring_ctx_free fs/io_uring.c:7870 [inline]
+  io_ring_exit_work+0x1e4/0x6d0 fs/io_uring.c:7954
+  process_one_work+0x94c/0x1670 kernel/workqueue.c:2269
+  worker_thread+0x64c/0x1120 kernel/workqueue.c:2415
+  kthread+0x3b5/0x4a0 kernel/kthread.c:292
+  ret_from_fork+0x1f/0x30 arch/x86/entry/entry_64.S:294
+
+ The buggy address belongs to the object at ffff8882183db000
+  which belongs to the cache kmalloc-1k of size 1024
+ The buggy address is located 140 bytes inside of
+  1024-byte region [ffff8882183db000, ffff8882183db400)
+ The buggy address belongs to the page:
+ page:000000009bada22b refcount:1 mapcount:0 mapping:0000000000000000 index:0x0 pfn:0x2183db
+ flags: 0x57ffe0000000200(slab)
+ raw: 057ffe0000000200 ffffea0008604c48 ffffea00086a8648 ffff8880aa040700
+ raw: 0000000000000000 ffff8882183db000 0000000100000002 0000000000000000
+ page dumped because: kasan: bad access detected
+
+ Memory state around the buggy address:
+  ffff8882183daf80: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  ffff8882183db000: fa fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+ >ffff8882183db080: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+                       ^
+  ffff8882183db100: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+  ffff8882183db180: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+ ==================================================================
+
+which is down to the comment below,
+
+	/* all workers gone, wq exit can proceed */
+	if (!nr_workers && refcount_dec_and_test(&wqe->wq->refs))
+		complete(&wqe->wq->done);
+
+because there might be multiple cases of wqe in a wq and we would wait
+for every worker in every wqe to go home before releasing wq's resources
+on destroying.
+
+To that end, rework wq's refcount by making it independent of the tracking
+of workers because after all they are two different things, and keeping
+it balanced when workers come and go. Note the manager kthread, like
+other workers, now holds a grab to wq during its lifetime.
+
+Finally to help destroy wq, check IO_WQ_BIT_EXIT upon creating worker
+and do nothing for exiting wq.
+
+Cc: stable@vger.kernel.org # v5.5+
+Reported-by: syzbot+45fa0a195b941764e0f0@syzkaller.appspotmail.com
+Reported-by: syzbot+9af99580130003da82b1@syzkaller.appspotmail.com
+Cc: Pavel Begunkov <asml.silence@gmail.com>
+Signed-off-by: Hillf Danton <hdanton@sina.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

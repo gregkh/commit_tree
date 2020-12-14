@@ -1,0 +1,63 @@
+hugetlbfs: fix anon huge page migration race
+
+Qian Cai reported the following BUG in [1]
+
+  LTP: starting move_pages12
+  BUG: unable to handle page fault for address: ffffffffffffffe0
+  ...
+  RIP: 0010:anon_vma_interval_tree_iter_first+0xa2/0x170 avc_start_pgoff at mm/interval_tree.c:63
+  Call Trace:
+    rmap_walk_anon+0x141/0xa30 rmap_walk_anon at mm/rmap.c:1864
+    try_to_unmap+0x209/0x2d0 try_to_unmap at mm/rmap.c:1763
+    migrate_pages+0x1005/0x1fb0
+    move_pages_and_store_status.isra.47+0xd7/0x1a0
+    __x64_sys_move_pages+0xa5c/0x1100
+    do_syscall_64+0x5f/0x310
+    entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Hugh Dickins diagnosed this as a migration bug caused by code introduced
+to use i_mmap_rwsem for pmd sharing synchronization.  Specifically, the
+routine unmap_and_move_huge_page() is always passing the TTU_RMAP_LOCKED
+flag to try_to_unmap() while holding i_mmap_rwsem.  This is wrong for
+anon pages as the anon_vma_lock should be held in this case.  Further
+analysis suggested that i_mmap_rwsem was not required to he held at all
+when calling try_to_unmap for anon pages as an anon page could never be
+part of a shared pmd mapping.
+
+Discussion also revealed that the hack in hugetlb_page_mapping_lock_write
+to drop page lock and acquire i_mmap_rwsem is wrong.  There is no way to
+keep mapping valid while dropping page lock.
+
+This patch does the following:
+
+ - Do not take i_mmap_rwsem and set TTU_RMAP_LOCKED for anon pages when
+   calling try_to_unmap.
+
+ - Remove the hacky code in hugetlb_page_mapping_lock_write. The routine
+   will now simply do a 'trylock' while still holding the page lock. If
+   the trylock fails, it will return NULL. This could impact the
+   callers:
+
+    - migration calling code will receive -EAGAIN and retry up to the
+      hard coded limit (10).
+
+    - memory error code will treat the page as BUSY. This will force
+      killing (SIGKILL) instead of SIGBUS any mapping tasks.
+
+   Do note that this change in behavior only happens when there is a
+   race. None of the standard kernel testing suites actually hit this
+   race, but it is possible.
+
+[1] https://lore.kernel.org/lkml/20200708012044.GC992@lca.pw/
+[2] https://lore.kernel.org/linux-mm/alpine.LSU.2.11.2010071833100.2214@eggly.anvils/
+
+Fixes: c0d0381ade79 ("hugetlbfs: use i_mmap_rwsem for more pmd sharing synchronization")
+Reported-by: Qian Cai <cai@lca.pw>
+Suggested-by: Hugh Dickins <hughd@google.com>
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: <stable@vger.kernel.org>
+Link: https://lkml.kernel.org/r/20201105195058.78401-1-mike.kravetz@oracle.com
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

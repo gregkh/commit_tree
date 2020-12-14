@@ -1,0 +1,69 @@
+afs: Fix cell refcounting by splitting the usage counter
+
+Management of the lifetime of afs_cell struct has some problems due to the
+usage counter being used to determine whether objects of that type are in
+use in addition to whether anyone might be interested in the structure.
+
+This is made trickier by cell objects being cached for a period of time in
+case they're quickly reused as they hold the result of a setup process that
+may be slow (DNS lookups, AFS RPC ops).
+
+Problems include the cached root volume from alias resolution pinning its
+parent cell record, rmmod occasionally hanging and occasionally producing
+assertion failures.
+
+Fix this by splitting the count of active users from the struct reference
+count.  Things then work as follows:
+
+ (1) The cell cache keeps +1 on the cell's activity count and this has to
+     be dropped before the cell can be removed.  afs_manage_cell() tries to
+     exchange the 1 to a 0 with the cells_lock write-locked, and if
+     successful, the record is removed from the net->cells.
+
+ (2) One struct ref is 'owned' by the activity count.  That is put when the
+     active count is reduced to 0 (final_destruction label).
+
+ (3) A ref can be held on a cell whilst it is queued for management on a
+     work queue without confusing the active count.  afs_queue_cell() is
+     added to wrap this.
+
+ (4) The queue's ref is dropped at the end of the management.  This is
+     split out into a separate function, afs_manage_cell_work().
+
+ (5) The root volume record is put after a cell is removed (at the
+     final_destruction label) rather then in the RCU destruction routine.
+
+ (6) Volumes hold struct refs, but aren't active users.
+
+ (7) Both counts are displayed in /proc/net/afs/cells.
+
+There are some management function changes:
+
+ (*) afs_put_cell() now just decrements the refcount and triggers the RCU
+     destruction if it becomes 0.  It no longer sets a timer to have the
+     manager do this.
+
+ (*) afs_use_cell() and afs_unuse_cell() are added to increase and decrease
+     the active count.  afs_unuse_cell() sets the management timer.
+
+ (*) afs_queue_cell() is added to queue a cell with approprate refs.
+
+There are also some other fixes:
+
+ (*) Don't let /proc/net/afs/cells access a cell's vllist if it's NULL.
+
+ (*) Make sure that candidate cells in lookups are properly destroyed
+     rather than being simply kfree'd.  This ensures the bits it points to
+     are destroyed also.
+
+ (*) afs_dec_cells_outstanding() is now called in cell destruction rather
+     than at "final_destruction".  This ensures that cell->net is still
+     valid to the end of the destructor.
+
+ (*) As a consequence of the previous two changes, move the increment of
+     net->cells_outstanding that was at the point of insertion into the
+     tree to the allocation routine to correctly balance things.
+
+Fixes: 989782dcdc91 ("afs: Overhaul cell database management")
+Signed-off-by: David Howells <dhowells@redhat.com>
+

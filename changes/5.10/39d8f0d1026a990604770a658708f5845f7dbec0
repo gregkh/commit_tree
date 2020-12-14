@@ -1,0 +1,88 @@
+bpf: Use raw_spin_trylock() for pcpu_freelist_push/pop in NMI
+
+Recent improvements in LOCKDEP highlighted a potential A-A deadlock with
+pcpu_freelist in NMI:
+
+./tools/testing/selftests/bpf/test_progs -t stacktrace_build_id_nmi
+
+[   18.984807] ================================
+[   18.984807] WARNING: inconsistent lock state
+[   18.984808] 5.9.0-rc6-01771-g1466de1330e1 #2967 Not tainted
+[   18.984809] --------------------------------
+[   18.984809] inconsistent {INITIAL USE} -> {IN-NMI} usage.
+[   18.984810] test_progs/1990 [HC2[2]:SC0[0]:HE0:SE1] takes:
+[   18.984810] ffffe8ffffc219c0 (&head->lock){....}-{2:2}, at: __pcpu_freelist_pop+0xe3/0x180
+[   18.984813] {INITIAL USE} state was registered at:
+[   18.984814]   lock_acquire+0x175/0x7c0
+[   18.984814]   _raw_spin_lock+0x2c/0x40
+[   18.984815]   __pcpu_freelist_pop+0xe3/0x180
+[   18.984815]   pcpu_freelist_pop+0x31/0x40
+[   18.984816]   htab_map_alloc+0xbbf/0xf40
+[   18.984816]   __do_sys_bpf+0x5aa/0x3ed0
+[   18.984817]   do_syscall_64+0x2d/0x40
+[   18.984818]   entry_SYSCALL_64_after_hwframe+0x44/0xa9
+[   18.984818] irq event stamp: 12
+[...]
+[   18.984822] other info that might help us debug this:
+[   18.984823]  Possible unsafe locking scenario:
+[   18.984823]
+[   18.984824]        CPU0
+[   18.984824]        ----
+[   18.984824]   lock(&head->lock);
+[   18.984826]   <Interrupt>
+[   18.984826]     lock(&head->lock);
+[   18.984827]
+[   18.984828]  *** DEADLOCK ***
+[   18.984828]
+[   18.984829] 2 locks held by test_progs/1990:
+[...]
+[   18.984838]  <NMI>
+[   18.984838]  dump_stack+0x9a/0xd0
+[   18.984839]  lock_acquire+0x5c9/0x7c0
+[   18.984839]  ? lock_release+0x6f0/0x6f0
+[   18.984840]  ? __pcpu_freelist_pop+0xe3/0x180
+[   18.984840]  _raw_spin_lock+0x2c/0x40
+[   18.984841]  ? __pcpu_freelist_pop+0xe3/0x180
+[   18.984841]  __pcpu_freelist_pop+0xe3/0x180
+[   18.984842]  pcpu_freelist_pop+0x17/0x40
+[   18.984842]  ? lock_release+0x6f0/0x6f0
+[   18.984843]  __bpf_get_stackid+0x534/0xaf0
+[   18.984843]  bpf_prog_1fd9e30e1438d3c5_oncpu+0x73/0x350
+[   18.984844]  bpf_overflow_handler+0x12f/0x3f0
+
+This is because pcpu_freelist_head.lock is accessed in both NMI and
+non-NMI context. Fix this issue by using raw_spin_trylock() in NMI.
+
+Since NMI interrupts non-NMI context, when NMI context tries to lock the
+raw_spinlock, non-NMI context of the same CPU may already have locked a
+lock and is blocked from unlocking the lock. For a system with N CPUs,
+there could be N NMIs at the same time, and they may block N non-NMI
+raw_spinlocks. This is tricky for pcpu_freelist_push(), where unlike
+_pop(), failing _push() means leaking memory. This issue is more likely to
+trigger in non-SMP system.
+
+Fix this issue with an extra list, pcpu_freelist.extralist. The extralist
+is primarily used to take _push() when raw_spin_trylock() failed on all
+the per CPU lists. It should be empty most of the time. The following
+table summarizes the behavior of pcpu_freelist in NMI and non-NMI:
+
+non-NMI pop(): 	use _lock(); check per CPU lists first;
+                if all per CPU lists are empty, check extralist;
+                if extralist is empty, return NULL.
+
+non-NMI push(): use _lock(); only push to per CPU lists.
+
+NMI pop():    use _trylock(); check per CPU lists first;
+              if all per CPU lists are locked or empty, check extralist;
+              if extralist is locked or empty, return NULL.
+
+NMI push():   use _trylock(); check per CPU lists first;
+              if all per CPU lists are locked; try push to extralist;
+              if extralist is also locked, keep trying on per CPU lists.
+
+Reported-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20201005165838.3735218-1-songliubraving@fb.com
+

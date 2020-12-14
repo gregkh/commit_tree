@@ -1,0 +1,53 @@
+sched: Fix data-race in wakeup
+
+Mel reported that on some ARM64 platforms loadavg goes bananas and
+Will tracked it down to the following race:
+
+  CPU0					CPU1
+
+  schedule()
+    prev->sched_contributes_to_load = X;
+    deactivate_task(prev);
+
+					try_to_wake_up()
+					  if (p->on_rq &&) // false
+					  if (smp_load_acquire(&p->on_cpu) && // true
+					      ttwu_queue_wakelist())
+					        p->sched_remote_wakeup = Y;
+
+    smp_store_release(prev->on_cpu, 0);
+
+where both p->sched_contributes_to_load and p->sched_remote_wakeup are
+in the same word, and thus the stores X and Y race (and can clobber
+one another's data).
+
+Whereas prior to commit c6e7bd7afaeb ("sched/core: Optimize ttwu()
+spinning on p->on_cpu") the p->on_cpu handoff serialized access to
+p->sched_remote_wakeup (just as it still does with
+p->sched_contributes_to_load) that commit broke that by calling
+ttwu_queue_wakelist() with p->on_cpu != 0.
+
+However, due to
+
+  p->XXX = X			ttwu()
+  schedule()			  if (p->on_rq && ...) // false
+    smp_mb__after_spinlock()	  if (smp_load_acquire(&p->on_cpu) &&
+    deactivate_task()		      ttwu_queue_wakelist())
+      p->on_rq = 0;		        p->sched_remote_wakeup = Y;
+
+We can be sure any 'current' store is complete and 'current' is
+guaranteed asleep. Therefore we can move p->sched_remote_wakeup into
+the current flags word.
+
+Note: while the observed failure was loadavg accounting gone wrong due
+to ttwu() cobbering p->sched_contributes_to_load, the reverse problem
+is also possible where schedule() clobbers p->sched_remote_wakeup,
+this could result in enqueue_entity() wrecking ->vruntime and causing
+scheduling artifacts.
+
+Fixes: c6e7bd7afaeb ("sched/core: Optimize ttwu() spinning on p->on_cpu")
+Reported-by: Mel Gorman <mgorman@techsingularity.net>
+Debugged-by: Will Deacon <will@kernel.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20201117083016.GK3121392@hirez.programming.kicks-ass.net
+

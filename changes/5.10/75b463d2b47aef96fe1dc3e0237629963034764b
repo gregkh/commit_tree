@@ -1,0 +1,101 @@
+btrfs: do not commit logs and transactions during link and rename operations
+
+Since commit d4682ba03ef618 ("Btrfs: sync log after logging new name") we
+started to commit logs, and fallback to transaction commits when we failed
+to log the new names or commit the logs, after link and rename operations
+when the target inodes (or their parents) were previously logged in the
+current transaction. This was to avoid losing directories despite an
+explicit fsync on them when they are ancestors of some inode that got a
+new named logged, due to a link or rename operation. However that adds the
+cost of starting IO and waiting for it to complete, which can cause higher
+latencies for applications.
+
+Instead of doing that, just make sure that when we log a new name for an
+inode we don't mark any of its ancestors as logged, so that if any one
+does an fsync against any of them, without doing any other change on them,
+the fsync commits the log. This way we only pay the cost of a log commit
+(or a transaction commit if something goes wrong or a new block group was
+created) if the application explicitly asks to fsync any of the parent
+directories.
+
+Using dbench, which mixes several filesystems operations including renames,
+revealed some significant latency gains. The following script that uses
+dbench was used to test this:
+
+  #!/bin/bash
+
+  DEV=/dev/nvme0n1
+  MNT=/mnt/btrfs
+  MOUNT_OPTIONS="-o ssd -o space_cache=v2"
+  MKFS_OPTIONS="-m single -d single"
+  THREADS=16
+
+  echo "performance" | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+  mkfs.btrfs -f $MKFS_OPTIONS $DEV
+  mount $MOUNT_OPTIONS $DEV $MNT
+
+  dbench -t 300 -D $MNT $THREADS
+
+  umount $MNT
+
+The test was run on bare metal, no virtualization, on a box with 12 cores
+(Intel i7-8700), 64Gb of RAM and using a NVMe device, with a kernel
+configuration that is the default of typical distributions (debian in this
+case), without debug options enabled (kasan, kmemleak, slub debug, debug
+of page allocations, lock debugging, etc).
+
+Results before this patch:
+
+ Operation      Count    AvgLat    MaxLat
+ ----------------------------------------
+ NTCreateX    10750455     0.011   155.088
+ Close         7896674     0.001     0.243
+ Rename         455222     2.158  1101.947
+ Unlink        2171189     0.067   121.638
+ Deltree           256     2.425     7.816
+ Mkdir             128     0.002     0.003
+ Qpathinfo     9744323     0.006    21.370
+ Qfileinfo     1707092     0.001     0.146
+ Qfsinfo       1786756     0.001    11.228
+ Sfileinfo      875612     0.003    21.263
+ Find          3767281     0.025     9.617
+ WriteX        5356924     0.011   211.390
+ ReadX        16852694     0.003     9.442
+ LockX           35008     0.002     0.119
+ UnlockX         35008     0.001     0.138
+ Flush          753458     4.252  1102.249
+
+Throughput 1128.35 MB/sec  16 clients  16 procs  max_latency=1102.255 ms
+
+Results after this patch:
+
+16 clients, after
+
+ Operation      Count    AvgLat    MaxLat
+ ----------------------------------------
+ NTCreateX    11471098     0.012   448.281
+ Close         8426396     0.001     0.925
+ Rename         485746     0.123   267.183
+ Unlink        2316477     0.080    63.433
+ Deltree           288     2.830    11.144
+ Mkdir             144     0.003     0.010
+ Qpathinfo    10397420     0.006    10.288
+ Qfileinfo     1822039     0.001     0.169
+ Qfsinfo       1906497     0.002    14.039
+ Sfileinfo      934433     0.004     2.438
+ Find          4019879     0.026    10.200
+ WriteX        5718932     0.011   200.985
+ ReadX        17981671     0.003    10.036
+ LockX           37352     0.002     0.076
+ UnlockX         37352     0.001     0.109
+ Flush          804018     5.015   778.033
+
+Throughput 1201.98 MB/sec  16 clients  16 procs  max_latency=778.036 ms
+(+6.5% throughput, -29.4% max latency, -75.8% rename latency)
+
+Test case generic/498 from fstests tests the scenario that the previously
+mentioned commit fixed.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

@@ -1,0 +1,60 @@
+PCI: hv: Fix hibernation in case interrupts are not re-created
+
+pci_restore_msi_state() directly writes the MSI/MSI-X related registers
+via MMIO. On a physical machine, this works perfectly; for a Linux VM
+running on a hypervisor, which typically enables IOMMU interrupt remapping,
+the hypervisor usually should trap and emulate the MMIO accesses in order
+to re-create the necessary interrupt remapping table entries in the IOMMU,
+otherwise the interrupts can not work in the VM after hibernation.
+
+Hyper-V is different from other hypervisors in that it does not trap and
+emulate the MMIO accesses, and instead it uses a para-virtualized method,
+which requires the VM to call hv_compose_msi_msg() to notify the hypervisor
+of the info that would be passed to the hypervisor in the case of the
+trap-and-emulate method. This is not an issue to a lot of PCI device
+drivers, which destroy and re-create the interrupts across hibernation, so
+hv_compose_msi_msg() is called automatically. However, some PCI device
+drivers (e.g. the in-tree GPU driver nouveau and the out-of-tree Nvidia
+proprietary GPU driver) do not destroy and re-create MSI/MSI-X interrupts
+across hibernation, so hv_pci_resume() has to call hv_compose_msi_msg(),
+otherwise the PCI device drivers can no longer receive interrupts after
+the VM resumes from hibernation.
+
+Hyper-V is also different in that chip->irq_unmask() may fail in a
+Linux VM running on Hyper-V (on a physical machine, chip->irq_unmask()
+can not fail because unmasking an MSI/MSI-X register just means an MMIO
+write): during hibernation, when a CPU is offlined, the kernel tries
+to move the interrupt to the remaining CPUs that haven't been offlined
+yet. In this case, hv_irq_unmask() -> hv_do_hypercall() always fails
+because the vmbus channel has been closed: here the early "return" in
+hv_irq_unmask() means the pci_msi_unmask_irq() is not called, i.e. the
+desc->masked remains "true", so later after hibernation, the MSI interrupt
+always remains masked, which is incorrect. Refer to cpu_disable_common()
+-> fixup_irqs() -> irq_migrate_all_off_this_cpu() -> migrate_one_irq():
+
+static bool migrate_one_irq(struct irq_desc *desc)
+{
+...
+        if (maskchip && chip->irq_mask)
+                chip->irq_mask(d);
+...
+        err = irq_do_set_affinity(d, affinity, false);
+...
+        if (maskchip && chip->irq_unmask)
+                chip->irq_unmask(d);
+
+Fix the issue by calling pci_msi_unmask_irq() unconditionally in
+hv_irq_unmask(). Also suppress the error message for hibernation because
+the hypercall failure during hibernation does not matter (at this time
+all the devices have been frozen). Note: the correct affinity info is
+still updated into the irqdata data structure in migrate_one_irq() ->
+irq_do_set_affinity() -> hv_set_affinity(), so later when the VM
+resumes, hv_pci_restore_msi_state() is able to correctly restore
+the interrupt with the correct affinity.
+
+Link: https://lore.kernel.org/r/20201002085158.9168-1-decui@microsoft.com
+Fixes: ac82fc832708 ("PCI: hv: Add hibernation support")
+Signed-off-by: Dexuan Cui <decui@microsoft.com>
+Signed-off-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+Reviewed-by: Jake Oshins <jakeo@microsoft.com>
+

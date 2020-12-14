@@ -1,0 +1,61 @@
+xfs: don't allow NOWAIT DIO across extent boundaries
+
+Jens has reported a situation where partial direct IOs can be issued
+and completed yet still return -EAGAIN. We don't want this to report
+a short IO as we want XFS to complete user DIO entirely or not at
+all.
+
+This partial IO situation can occur on a write IO that is split
+across an allocated extent and a hole, and the second mapping is
+returning EAGAIN because allocation would be required.
+
+The trivial reproducer:
+
+$ sudo xfs_io -fdt -c "pwrite 0 4k" -c "pwrite -V 1 -b 8k -N 0 8k" /mnt/scr/foo
+wrote 4096/4096 bytes at offset 0
+4 KiB, 1 ops; 0.0001 sec (27.509 MiB/sec and 7042.2535 ops/sec)
+pwrite: Resource temporarily unavailable
+$
+
+The pwritev2(0, 8kB, RWF_NOWAIT) call returns EAGAIN having done
+the first 4kB write:
+
+ xfs_file_direct_write: dev 259:1 ino 0x83 size 0x1000 offset 0x0 count 0x2000
+ iomap_apply:          dev 259:1 ino 0x83 pos 0 length 8192 flags WRITE|DIRECT|NOWAIT (0x31) ops xfs_direct_write_iomap_ops caller iomap_dio_rw actor iomap_dio_actor
+ xfs_ilock_nowait:     dev 259:1 ino 0x83 flags ILOCK_SHARED caller xfs_ilock_for_iomap
+ xfs_iunlock:          dev 259:1 ino 0x83 flags ILOCK_SHARED caller xfs_direct_write_iomap_begin
+ xfs_iomap_found:      dev 259:1 ino 0x83 size 0x1000 offset 0x0 count 8192 fork data startoff 0x0 startblock 24 blockcount 0x1
+ iomap_apply_dstmap:   dev 259:1 ino 0x83 bdev 259:1 addr 102400 offset 0 length 4096 type MAPPED flags DIRTY
+
+Here the first iomap loop has mapped the first 4kB of the file and
+issued the IO, and we enter the second iomap_apply loop:
+
+ iomap_apply: dev 259:1 ino 0x83 pos 4096 length 4096 flags WRITE|DIRECT|NOWAIT (0x31) ops xfs_direct_write_iomap_ops caller iomap_dio_rw actor iomap_dio_actor
+ xfs_ilock_nowait:     dev 259:1 ino 0x83 flags ILOCK_SHARED caller xfs_ilock_for_iomap
+ xfs_iunlock:          dev 259:1 ino 0x83 flags ILOCK_SHARED caller xfs_direct_write_iomap_begin
+
+And we exit with -EAGAIN out because we hit the allocate case trying
+to make the second 4kB block.
+
+Then IO completes on the first 4kB and the original IO context
+completes and unlocks the inode, returning -EAGAIN to userspace:
+
+ xfs_end_io_direct_write: dev 259:1 ino 0x83 isize 0x1000 disize 0x1000 offset 0x0 count 4096
+ xfs_iunlock:          dev 259:1 ino 0x83 flags IOLOCK_SHARED caller xfs_file_dio_aio_write
+
+There are other vectors to the same problem when we re-enter the
+mapping code if we have to make multiple mappinfs under NOWAIT
+conditions. e.g. failing trylocks, COW extents being found,
+allocation being required, and so on.
+
+Avoid all these potential problems by only allowing IOMAP_NOWAIT IO
+to go ahead if the mapping we retrieve for the IO spans an entire
+allocated extent. This avoids the possibility of subsequent mappings
+to complete the IO from triggering NOWAIT semantics by any means as
+NOWAIT IO will now only enter the mapping code once per NOWAIT IO.
+
+Reported-and-tested-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
