@@ -1,0 +1,94 @@
+btrfs: send: fix wrong file path when there is an inode with a pending rmdir
+
+When doing an incremental send, if we have a new inode that happens to
+have the same number that an old directory inode had in the base snapshot
+and that old directory has a pending rmdir operation, we end up computing
+a wrong path for the new inode, causing the receiver to fail.
+
+Example reproducer:
+
+  $ cat test-send-rmdir.sh
+  #!/bin/bash
+
+  DEV=/dev/sdi
+  MNT=/mnt/sdi
+
+  mkfs.btrfs -f $DEV >/dev/null
+  mount $DEV $MNT
+
+  mkdir $MNT/dir
+  touch $MNT/dir/file1
+  touch $MNT/dir/file2
+  touch $MNT/dir/file3
+
+  # Filesystem looks like:
+  #
+  # .                                     (ino 256)
+  # |----- dir/                           (ino 257)
+  #         |----- file1                  (ino 258)
+  #         |----- file2                  (ino 259)
+  #         |----- file3                  (ino 260)
+  #
+
+  btrfs subvolume snapshot -r $MNT $MNT/snap1
+  btrfs send -f /tmp/snap1.send $MNT/snap1
+
+  # Now remove our directory and all its files.
+  rm -fr $MNT/dir
+
+  # Unmount the filesystem and mount it again. This is to ensure that
+  # the next inode that is created ends up with the same inode number
+  # that our directory "dir" had, 257, which is the first free "objectid"
+  # available after mounting again the filesystem.
+  umount $MNT
+  mount $DEV $MNT
+
+  # Now create a new file (it could be a directory as well).
+  touch $MNT/newfile
+
+  # Filesystem now looks like:
+  #
+  # .                                     (ino 256)
+  # |----- newfile                        (ino 257)
+  #
+
+  btrfs subvolume snapshot -r $MNT $MNT/snap2
+  btrfs send -f /tmp/snap2.send -p $MNT/snap1 $MNT/snap2
+
+  # Now unmount the filesystem, create a new one, mount it and try to apply
+  # both send streams to recreate both snapshots.
+  umount $DEV
+
+  mkfs.btrfs -f $DEV >/dev/null
+
+  mount $DEV $MNT
+
+  btrfs receive -f /tmp/snap1.send $MNT
+  btrfs receive -f /tmp/snap2.send $MNT
+
+  umount $MNT
+
+When running the test, the receive operation for the incremental stream
+fails:
+
+  $ ./test-send-rmdir.sh
+  Create a readonly snapshot of '/mnt/sdi' in '/mnt/sdi/snap1'
+  At subvol /mnt/sdi/snap1
+  Create a readonly snapshot of '/mnt/sdi' in '/mnt/sdi/snap2'
+  At subvol /mnt/sdi/snap2
+  At subvol snap1
+  At snapshot snap2
+  ERROR: chown o257-9-0 failed: No such file or directory
+
+So fix this by tracking directories that have a pending rmdir by inode
+number and generation number, instead of only inode number.
+
+A test case for fstests follows soon.
+
+Reported-by: Massimo B. <massimo.b@gmx.net>
+Tested-by: Massimo B. <massimo.b@gmx.net>
+Link: https://lore.kernel.org/linux-btrfs/6ae34776e85912960a253a8327068a892998e685.camel@gmx.net/
+CC: stable@vger.kernel.org # 4.19+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

@@ -1,0 +1,65 @@
+btrfs: update last_byte_to_unpin in switch_commit_roots
+
+While writing an explanation for the need of the commit_root_sem for
+btrfs_prepare_extent_commit, I realized we have a slight hole that could
+result in leaked space if we have to do the old style caching.  Consider
+the following scenario
+
+ commit root
+ +----+----+----+----+----+----+----+
+ |\\\\|    |\\\\|\\\\|    |\\\\|\\\\|
+ +----+----+----+----+----+----+----+
+ 0    1    2    3    4    5    6    7
+
+ new commit root
+ +----+----+----+----+----+----+----+
+ |    |    |    |\\\\|    |    |\\\\|
+ +----+----+----+----+----+----+----+
+ 0    1    2    3    4    5    6    7
+
+Prior to this patch, we run btrfs_prepare_extent_commit, which updates
+the last_byte_to_unpin, and then we subsequently run
+switch_commit_roots.  In this example lets assume that
+caching_ctl->progress == 1 at btrfs_prepare_extent_commit() time, which
+means that cache->last_byte_to_unpin == 1.  Then we go and do the
+switch_commit_roots(), but in the meantime the caching thread has made
+some more progress, because we drop the commit_root_sem and re-acquired
+it.  Now caching_ctl->progress == 3.  We swap out the commit root and
+carry on to unpin.
+
+The race can happen like:
+
+  1) The caching thread was running using the old commit root when it
+     found the extent for [2, 3);
+
+  2) Then it released the commit_root_sem because it was in the last
+     item of a leaf and the semaphore was contended, and set ->progress
+     to 3 (value of 'last'), as the last extent item in the current leaf
+     was for the extent for range [2, 3);
+
+  3) Next time it gets the commit_root_sem, will start using the new
+     commit root and search for a key with offset 3, so it never finds
+     the hole for [2, 3).
+
+  So the caching thread never saw [2, 3) as free space in any of the
+  commit roots, and by the time finish_extent_commit() was called for
+  the range [0, 3), ->last_byte_to_unpin was 1, so it only returned the
+  subrange [0, 1) to the free space cache, skipping [2, 3).
+
+In the unpin code we have last_byte_to_unpin == 1, so we unpin [0,1),
+but do not unpin [2,3).  However because caching_ctl->progress == 3 we
+do not see the newly freed section of [2,3), and thus do not add it to
+our free space cache.  This results in us missing a chunk of free space
+in memory (on disk too, unless we have a power failure before writing
+the free space cache to disk).
+
+Fix this by making sure the ->last_byte_to_unpin is set at the same time
+that we swap the commit roots, this ensures that we will always be
+consistent.
+
+CC: stable@vger.kernel.org # 5.8+
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+[ update changelog with Filipe's review comments ]
+Signed-off-by: David Sterba <dsterba@suse.com>
+

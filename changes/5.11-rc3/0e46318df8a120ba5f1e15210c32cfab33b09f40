@@ -1,0 +1,114 @@
+btrfs: unlock to current level in btrfs_next_old_leaf
+
+Filipe reported the following lockdep splat
+
+  ======================================================
+  WARNING: possible circular locking dependency detected
+  5.10.0-rc2-btrfs-next-71 #1 Not tainted
+  ------------------------------------------------------
+  find/324157 is trying to acquire lock:
+  ffff8ebc48d293a0 (btrfs-tree-01#2/3){++++}-{3:3}, at: __btrfs_tree_read_lock+0x32/0x1a0 [btrfs]
+
+  but task is already holding lock:
+  ffff8eb9932c5088 (btrfs-tree-00){++++}-{3:3}, at: __btrfs_tree_read_lock+0x32/0x1a0 [btrfs]
+
+  which lock already depends on the new lock.
+
+  the existing dependency chain (in reverse order) is:
+
+  -> #1 (btrfs-tree-00){++++}-{3:3}:
+	 lock_acquire+0xd8/0x490
+	 down_write_nested+0x44/0x120
+	 __btrfs_tree_lock+0x27/0x120 [btrfs]
+	 btrfs_search_slot+0x2a3/0xc50 [btrfs]
+	 btrfs_insert_empty_items+0x58/0xa0 [btrfs]
+	 insert_with_overflow+0x44/0x110 [btrfs]
+	 btrfs_insert_xattr_item+0xb8/0x1d0 [btrfs]
+	 btrfs_setxattr+0xd6/0x4c0 [btrfs]
+	 btrfs_setxattr_trans+0x68/0x100 [btrfs]
+	 __vfs_setxattr+0x66/0x80
+	 __vfs_setxattr_noperm+0x70/0x200
+	 vfs_setxattr+0x6b/0x120
+	 setxattr+0x125/0x240
+	 path_setxattr+0xba/0xd0
+	 __x64_sys_setxattr+0x27/0x30
+	 do_syscall_64+0x33/0x80
+	 entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+  -> #0 (btrfs-tree-01#2/3){++++}-{3:3}:
+	 check_prev_add+0x91/0xc60
+	 __lock_acquire+0x1689/0x3130
+	 lock_acquire+0xd8/0x490
+	 down_read_nested+0x45/0x220
+	 __btrfs_tree_read_lock+0x32/0x1a0 [btrfs]
+	 btrfs_next_old_leaf+0x27d/0x580 [btrfs]
+	 btrfs_real_readdir+0x1e3/0x4b0 [btrfs]
+	 iterate_dir+0x170/0x1c0
+	 __x64_sys_getdents64+0x83/0x140
+	 do_syscall_64+0x33/0x80
+	 entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+  other info that might help us debug this:
+
+   Possible unsafe locking scenario:
+
+	 CPU0                    CPU1
+	 ----                    ----
+    lock(btrfs-tree-00);
+				 lock(btrfs-tree-01#2/3);
+				 lock(btrfs-tree-00);
+    lock(btrfs-tree-01#2/3);
+
+   *** DEADLOCK ***
+
+  5 locks held by find/324157:
+   #0: ffff8ebc502c6e00 (&f->f_pos_lock){+.+.}-{3:3}, at: __fdget_pos+0x4d/0x60
+   #1: ffff8eb97f689980 (&type->i_mutex_dir_key#10){++++}-{3:3}, at: iterate_dir+0x52/0x1c0
+   #2: ffff8ebaec00ca58 (btrfs-tree-02#2){++++}-{3:3}, at: __btrfs_tree_read_lock+0x32/0x1a0 [btrfs]
+   #3: ffff8eb98f986f78 (btrfs-tree-01#2){++++}-{3:3}, at: __btrfs_tree_read_lock+0x32/0x1a0 [btrfs]
+   #4: ffff8eb9932c5088 (btrfs-tree-00){++++}-{3:3}, at: __btrfs_tree_read_lock+0x32/0x1a0 [btrfs]
+
+  stack backtrace:
+  CPU: 2 PID: 324157 Comm: find Not tainted 5.10.0-rc2-btrfs-next-71 #1
+  Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.13.0-0-gf21b5a4aeb02-prebuilt.qemu.org 04/01/2014
+  Call Trace:
+   dump_stack+0x8d/0xb5
+   check_noncircular+0xff/0x110
+   ? mark_lock.part.0+0x468/0xe90
+   check_prev_add+0x91/0xc60
+   __lock_acquire+0x1689/0x3130
+   ? kvm_clock_read+0x14/0x30
+   ? kvm_sched_clock_read+0x5/0x10
+   lock_acquire+0xd8/0x490
+   ? __btrfs_tree_read_lock+0x32/0x1a0 [btrfs]
+   down_read_nested+0x45/0x220
+   ? __btrfs_tree_read_lock+0x32/0x1a0 [btrfs]
+   __btrfs_tree_read_lock+0x32/0x1a0 [btrfs]
+   btrfs_next_old_leaf+0x27d/0x580 [btrfs]
+   btrfs_real_readdir+0x1e3/0x4b0 [btrfs]
+   iterate_dir+0x170/0x1c0
+   __x64_sys_getdents64+0x83/0x140
+   ? filldir+0x1d0/0x1d0
+   do_syscall_64+0x33/0x80
+   entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+This happens because btrfs_next_old_leaf searches down to our current
+key, and then walks up the path until we can move to the next slot, and
+then reads back down the path so we get the next leaf.
+
+However it doesn't unlock any lower levels until it replaces them with
+the new extent buffer.  This is technically fine, but of course causes
+lockdep to complain, because we could be holding locks on lower levels
+while locking upper levels.
+
+Fix this by dropping all nodes below the level that we use as our new
+starting point before we start reading back down the path.  This also
+allows us to drop the nested/recursive locking magic, because we're no
+longer locking two nodes at the same level anymore.
+
+Reported-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

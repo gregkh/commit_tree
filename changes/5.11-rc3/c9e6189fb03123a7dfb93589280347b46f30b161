@@ -1,0 +1,76 @@
+ntp: Make the RTC synchronization more reliable
+
+Miroslav reported that the periodic RTC synchronization in the NTP code
+fails more often than not to hit the specified update window.
+
+The reason is that the code uses delayed_work to schedule the update which
+needs to be in thread context as the underlying RTC might be connected via
+a slow bus, e.g. I2C. In the update function it verifies whether the
+current time is correct vs. the requirements of the underlying RTC.
+
+But delayed_work is using the timer wheel for scheduling which is
+inaccurate by design. Depending on the distance to the expiry the wheel
+gets less granular to allow batching and to avoid the cascading of the
+original timer wheel. See 500462a9de65 ("timers: Switch to a non-cascading
+wheel") and the code for further details.
+
+The code already deals with this by splitting the 660 seconds period into a
+long 659 seconds timer and then retrying with a smaller delta.
+
+But looking at the actual granularities of the timer wheel (which depend on
+the HZ configuration) the 659 seconds timer ends up in an outer wheel level
+and is affected by a worst case granularity of:
+
+HZ          Granularity
+1000        32s
+ 250        16s
+ 100        40s
+
+So the initial timer can be already off by max 12.5% which is not a big
+issue as the period of the sync is defined as ~11 minutes.
+
+The fine grained second attempt schedules to the desired update point with
+a timer expiring less than a second from now. Depending on the actual delta
+and the HZ setting even the second attempt can end up in outer wheel levels
+which have a large enough granularity to make the correctness check fail.
+
+As this is a fundamental property of the timer wheel there is no way to
+make this more accurate short of iterating in one jiffies steps towards the
+update point.
+
+Switch it to an hrtimer instead which schedules the actual update work. The
+hrtimer will expire precisely (max 1 jiffie delay when high resolution
+timers are not available). The actual scheduling delay of the work is the
+same as before.
+
+The update is triggered from do_adjtimex() which is a bit racy but not much
+more racy than it was before:
+
+     if (ntp_synced())
+     	queue_delayed_work(system_power_efficient_wq, &sync_work, 0);
+
+which is racy when the work is currently executed and has not managed to
+reschedule itself.
+
+This becomes now:
+
+     if (ntp_synced() && !hrtimer_is_queued(&sync_hrtimer))
+     	queue_work(system_power_efficient_wq, &sync_work, 0);
+
+which is racy when the hrtimer has expired and the work is currently
+executed and has not yet managed to rearm the hrtimer.
+
+Not a big problem as it just schedules work for nothing.
+
+The new implementation has a safe guard in place to catch the case where
+the hrtimer is queued on entry to the work function and avoids an extra
+update attempt of the RTC that way.
+
+Reported-by: Miroslav Lichvar <mlichvar@redhat.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Miroslav Lichvar <mlichvar@redhat.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Acked-by: Alexandre Belloni <alexandre.belloni@bootlin.com>
+Link: https://lore.kernel.org/r/20201206220542.062910520@linutronix.de
+
+

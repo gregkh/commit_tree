@@ -1,0 +1,66 @@
+fuse: support SB_NOSEC flag to improve write performance
+
+Virtiofs can be slow with small writes if xattr are enabled and we are
+doing cached writes (No direct I/O).  Ganesh Mahalingam noticed this.
+
+Some debugging showed that file_remove_privs() is called in cached write
+path on every write.  And everytime it calls security_inode_need_killpriv()
+which results in call to __vfs_getxattr(XATTR_NAME_CAPS).  And this goes to
+file server to fetch xattr.  This extra round trip for every write slows
+down writes tremendously.
+
+Normally to avoid paying this penalty on every write, vfs has the notion of
+caching this information in inode (S_NOSEC).  So vfs sets S_NOSEC, if
+filesystem opted for it using super block flag SB_NOSEC.  And S_NOSEC is
+cleared when setuid/setgid bit is set or when security xattr is set on
+inode so that next time a write happens, we check inode again for clearing
+setuid/setgid bits as well clear any security.capability xattr.
+
+This seems to work well for local file systems but for remote file systems
+it is possible that VFS does not have full picture and a different client
+sets setuid/setgid bit or security.capability xattr on file and that means
+VFS information about S_NOSEC on another client will be stale.  So for
+remote filesystems SB_NOSEC was disabled by default.
+
+Commit 9e1f1de02c22 ("more conservative S_NOSEC handling") mentioned that
+these filesystems can still make use of SB_NOSEC as long as they clear
+S_NOSEC when they are refreshing inode attriutes from server.
+
+So this patch tries to enable SB_NOSEC on fuse (regular fuse as well as
+virtiofs).  And clear SB_NOSEC when we are refreshing inode attributes.
+
+This is enabled only if server supports FUSE_HANDLE_KILLPRIV_V2.  This says
+that server will clear setuid/setgid/security.capability on
+chown/truncate/write as apporpriate.
+
+This should provide tighter coherency because now suid/sgid/
+security.capability will be cleared even if fuse client cache has not seen
+these attrs.
+
+Basic idea is that fuse client will trigger suid/sgid/security.capability
+clearing based on its attr cache.  But even if cache has gone stale, it is
+fine because FUSE_HANDLE_KILLPRIV_V2 will make sure WRITE clear
+suid/sgid/security.capability.
+
+We make this change only if server supports FUSE_HANDLE_KILLPRIV_V2.  This
+should make sure that existing filesystems which might be relying on
+seucurity.capability always being queried from server are not impacted.
+
+This tighter coherency relies on WRITE showing up on server (and not being
+cached in guest).  So writeback_cache mode will not provide that tight
+coherency and it is not recommended to use two together.  Having said that
+it might work reasonably well for lot of use cases.
+
+This change improves random write performance very significantly.  Running
+virtiofsd with cache=auto and following fio command:
+
+fio --ioengine=libaio --direct=1  --name=test --filename=/mnt/virtiofs/random_read_write.fio --bs=4k --iodepth=64 --size=4G --readwrite=randwrite
+
+Bandwidth increases from around 50MB/s to around 250MB/s as a result of
+applying this patch.  So improvement is very significant.
+
+Link: https://github.com/kata-containers/runtime/issues/2815
+Reported-by: "Mahalingam, Ganesh" <ganesh.mahalingam@intel.com>
+Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+

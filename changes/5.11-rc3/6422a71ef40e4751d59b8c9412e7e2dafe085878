@@ -1,0 +1,72 @@
+f2fs: fix race of pending_pages in decompression
+
+I found out f2fs_free_dic() is invoked in a wrong timing, but
+f2fs_verify_bio() still needed the dic info and it triggered the
+below kernel panic. It has been caused by the race condition of
+pending_pages value between decompression and verity logic, when
+the same compression cluster had been split in different bios.
+By split bios, f2fs_verify_bio() ended up with decreasing
+pending_pages value before it is reset to nr_cpages by
+f2fs_decompress_pages() and caused the kernel panic.
+
+[ 4416.564763] Unable to handle kernel NULL pointer dereference
+               at virtual address 0000000000000000
+...
+[ 4416.896016] Workqueue: fsverity_read_queue f2fs_verity_work
+[ 4416.908515] pc : fsverity_verify_page+0x20/0x78
+[ 4416.913721] lr : f2fs_verify_bio+0x11c/0x29c
+[ 4416.913722] sp : ffffffc019533cd0
+[ 4416.913723] x29: ffffffc019533cd0 x28: 0000000000000402
+[ 4416.913724] x27: 0000000000000001 x26: 0000000000000100
+[ 4416.913726] x25: 0000000000000001 x24: 0000000000000004
+[ 4416.913727] x23: 0000000000001000 x22: 0000000000000000
+[ 4416.913728] x21: 0000000000000000 x20: ffffffff2076f9c0
+[ 4416.913729] x19: ffffffff2076f9c0 x18: ffffff8a32380c30
+[ 4416.913731] x17: ffffffc01f966d97 x16: 0000000000000298
+[ 4416.913732] x15: 0000000000000000 x14: 0000000000000000
+[ 4416.913733] x13: f074faec89ffffff x12: 0000000000000000
+[ 4416.913734] x11: 0000000000001000 x10: 0000000000001000
+[ 4416.929176] x9 : ffffffff20d1f5c7 x8 : 0000000000000000
+[ 4416.929178] x7 : 626d7464ff286b6b x6 : ffffffc019533ade
+[ 4416.929179] x5 : 000000008049000e x4 : ffffffff2793e9e0
+[ 4416.929180] x3 : 000000008049000e x2 : ffffff89ecfa74d0
+[ 4416.929181] x1 : 0000000000000c40 x0 : ffffffff2076f9c0
+[ 4416.929184] Call trace:
+[ 4416.929187]  fsverity_verify_page+0x20/0x78
+[ 4416.929189]  f2fs_verify_bio+0x11c/0x29c
+[ 4416.929192]  f2fs_verity_work+0x58/0x84
+[ 4417.050667]  process_one_work+0x270/0x47c
+[ 4417.055354]  worker_thread+0x27c/0x4d8
+[ 4417.059784]  kthread+0x13c/0x320
+[ 4417.063693]  ret_from_fork+0x10/0x18
+
+Chao pointed this can happen by the below race condition.
+
+Thread A        f2fs_post_read_wq          fsverity_wq
+- f2fs_read_multi_pages()
+  - f2fs_alloc_dic
+   - dic->pending_pages = 2
+   - submit_bio()
+   - submit_bio()
+               - f2fs_post_read_work() handle first bio
+                - f2fs_decompress_work()
+                 - __read_end_io()
+                  - f2fs_decompress_pages()
+                   - dic->pending_pages--
+                - enqueue f2fs_verity_work()
+                                           - f2fs_verity_work() handle first bio
+                                            - f2fs_verify_bio()
+                                             - dic->pending_pages--
+               - f2fs_post_read_work() handle second bio
+                - f2fs_decompress_work()
+                - enqueue f2fs_verity_work()
+                                            - f2fs_verify_pages()
+                                            - f2fs_free_dic()
+
+                                          - f2fs_verity_work() handle second bio
+                                           - f2fs_verfy_bio()
+                                                 - use-after-free on dic
+
+Signed-off-by: Daeho Jeong <daehojeong@google.com>
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+

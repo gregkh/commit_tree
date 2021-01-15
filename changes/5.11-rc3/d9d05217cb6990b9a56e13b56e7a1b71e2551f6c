@@ -1,0 +1,36 @@
+io_uring: stop SQPOLL submit on creator's death
+
+When the creator of SQPOLL io_uring dies (i.e. sqo_task), we don't want
+its internals like ->files and ->mm to be poked by the SQPOLL task, it
+have never been nice and recently got racy. That can happen when the
+owner undergoes destruction and SQPOLL tasks tries to submit new
+requests in parallel, and so calls io_sq_thread_acquire*().
+
+That patch halts SQPOLL submissions when sqo_task dies by introducing
+sqo_dead flag. Once set, the SQPOLL task must not do any submission,
+which is synchronised by uring_lock as well as the new flag.
+
+The tricky part is to make sure that disabling always happens, that
+means either the ring is discovered by creator's do_exit() -> cancel,
+or if the final close() happens before it's done by the creator. The
+last is guaranteed by the fact that for SQPOLL the creator task and only
+it holds exactly one file note, so either it pins up to do_exit() or
+removed by the creator on the final put in flush. (see comments in
+uring_flush() around file->f_count == 2).
+
+One more place that can trigger io_sq_thread_acquire_*() is
+__io_req_task_submit(). Shoot off requests on sqo_dead there, even
+though actually we don't need to. That's because cancellation of
+sqo_task should wait for the request before going any further.
+
+note 1: io_disable_sqo_submit() does io_ring_set_wakeup_flag() so the
+caller would enter the ring to get an error, but it still doesn't
+guarantee that the flag won't be cleared.
+
+note 2: if final __userspace__ close happens not from the creator
+task, the file note will pin the ring until the task dies.
+
+Fixed: b1b6b5a30dce8 ("kernel/io_uring: cancel io_uring before task works")
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

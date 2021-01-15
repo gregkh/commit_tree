@@ -1,0 +1,58 @@
+cpuset: fix race between hotplug work and later CPU offline
+
+One of our machines keeled over trying to rebuild the scheduler domains.
+Mainline produces the same splat:
+
+  BUG: unable to handle page fault for address: 0000607f820054db
+  CPU: 2 PID: 149 Comm: kworker/1:1 Not tainted 5.10.0-rc1-master+ #6
+  Workqueue: events cpuset_hotplug_workfn
+  RIP: build_sched_domains
+  Call Trace:
+   partition_sched_domains_locked
+   rebuild_sched_domains_locked
+   cpuset_hotplug_workfn
+
+It happens with cgroup2 and exclusive cpusets only.  This reproducer
+triggers it on an 8-cpu vm and works most effectively with no
+preexisting child cgroups:
+
+  cd $UNIFIED_ROOT
+  mkdir cg1
+  echo 4-7 > cg1/cpuset.cpus
+  echo root > cg1/cpuset.cpus.partition
+
+  # with smt/control reading 'on',
+  echo off > /sys/devices/system/cpu/smt/control
+
+RIP maps to
+
+  sd->shared = *per_cpu_ptr(sdd->sds, sd_id);
+
+from sd_init().  sd_id is calculated earlier in the same function:
+
+  cpumask_and(sched_domain_span(sd), cpu_map, tl->mask(cpu));
+  sd_id = cpumask_first(sched_domain_span(sd));
+
+tl->mask(cpu), which reads cpu_sibling_map on x86, returns an empty mask
+and so cpumask_first() returns >= nr_cpu_ids, which leads to the bogus
+value from per_cpu_ptr() above.
+
+The problem is a race between cpuset_hotplug_workfn() and a later
+offline of CPU N.  cpuset_hotplug_workfn() updates the effective masks
+when N is still online, the offline clears N from cpu_sibling_map, and
+then the worker uses the stale effective masks that still have N to
+generate the scheduling domains, leading the worker to read
+N's empty cpu_sibling_map in sd_init().
+
+rebuild_sched_domains_locked() prevented the race during the cgroup2
+cpuset series up until the Fixes commit changed its check.  Make the
+check more robust so that it can detect an offline CPU in any exclusive
+cpuset's effective mask, not just the top one.
+
+Fixes: 0ccea8feb980 ("cpuset: Make generate_sched_domains() work with partition")
+Signed-off-by: Daniel Jordan <daniel.m.jordan@oracle.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Tejun Heo <tj@kernel.org>
+Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/20201112171711.639541-1-daniel.m.jordan@oracle.com
+

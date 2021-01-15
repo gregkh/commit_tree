@@ -1,0 +1,70 @@
+scsi: NCR5380: Remove context check
+
+NCR5380_poll_politely2() uses in_interrupt() and irqs_disabled() to check
+if it is safe to sleep.
+
+Such usage in drivers is phased out and Linus clearly requested that code
+which changes behaviour depending on context should either be separated, or
+the context be explicitly conveyed in an argument passed by the caller.
+
+Below is a context analysis of NCR5380_poll_politely2() uppermost callers:
+
+  - NCR5380_maybe_reset_bus(), task, invoked during device probe.
+    -> NCR5380_poll_politely()
+    -> do_abort()
+
+  - NCR5380_select(), task, but can only sleep in the "release, then
+    re-acquire" regions of the spinlock held by its caller.
+    Sleeping invocations (lock released):
+    -> NCR5380_poll_politely2()
+
+    Atomic invocations (lock acquired):
+    -> NCR5380_reselect()
+       -> NCR5380_poll_politely()
+       -> do_abort()
+       -> NCR5380_transfer_pio()
+
+  - NCR5380_intr(), interrupt handler
+    -> NCR5380_dma_complete()
+       -> NCR5380_transfer_pio()
+	  -> NCR5380_poll_politely()
+    -> NCR5380_reselect() (see above)
+
+  - NCR5380_information_transfer(), task, but can only sleep in the
+    "release, then re-acquire" regions of the caller-held spinlock.
+    Sleeping invocations (lock released):
+      - NCR5380_transfer_pio() -> NCR5380_poll_politely()
+      - NCR5380_poll_politely()
+
+    Atomic invocations (lock acquired):
+      - NCR5380_transfer_dma()
+	-> NCR5380_dma_recv_setup()
+           => generic_NCR5380_precv() -> NCR5380_poll_politely()
+	   => macscsi_pread() -> NCR5380_poll_politely()
+
+	-> NCR5380_dma_send_setup()
+ 	   => generic_NCR5380_psend -> NCR5380_poll_politely2()
+	   => macscsi_pwrite() -> NCR5380_poll_politely()
+
+	-> NCR5380_poll_politely2()
+        -> NCR5380_dma_complete()
+           -> NCR5380_transfer_pio()
+	      -> NCR5380_poll_politely()
+      - NCR5380_transfer_pio() -> NCR5380_poll_politely
+
+  - NCR5380_reselect(), atomic, always called with hostdata spinlock
+    held.
+
+Since NCR5380_poll_politely2() already takes a "wait" argument in jiffies,
+use it to determine if the function can sleep. Modify atomic callers, which
+passed an unused wait value in terms of HZ, to pass zero.
+
+Link: https://lore.kernel.org/r/20201206075157.19067-1-a.darwish@linutronix.de
+Cc: Michael Schmitz <schmitzmic@gmail.com>
+Cc: <linux-m68k@lists.linux-m68k.org>
+Suggested-by: Finn Thain <fthain@telegraphics.com.au>
+Co-developed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Acked-by: Finn Thain <fthain@telegraphics.com.au>
+Signed-off-by: Ahmed S. Darwish <a.darwish@linutronix.de>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+

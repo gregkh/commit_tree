@@ -1,0 +1,125 @@
+scsi: mpt3sas: Update hba_port objects after host reset
+
+During host reset there is a chance that the Port number allocated by the
+firmware for the attached devices may change. Also, it may be possible that
+some HBA phy's can go down/come up after reset. As a result, the driver
+can't just trust the HBA Port table that it has populated before host reset
+as valid. Instead it has to update the HBA Port table in such a way that it
+shouldn't disturb the drives which are still accessible even after host
+reset.
+
+Use the following algorithm to update the HBA Port table during host reset:
+
+I. After host reset operation and before marking the devices as
+   responding/non-responding, create a temporary Port table called "New
+   Port table" by parsing each of the HBA phy's Phy data info read from SAS
+   IOUnit Page0:
+
+   a. Check whether Phy's negotiated link rate is greater than 1.5Gbps, if
+      not go to next Phy;
+
+   b. Get the SAS Address of the attached device;
+
+   c. Create a new entry in the "New Port table" with SAS Address field
+      filled with attached device's SAS Address, port number with Phy's
+      Port number (read from SAS IOUnit Page0) and enable bit in the 'Phy
+      mask' field corresponding to current Phy number.  New entry is
+      created only if the driver can't find an entry in the "New Port
+      table" which matches with attached device 'SAS Address' & 'Port
+      Number'. If it finds an entry with matches with attached device 'SAS
+      Address' & 'Port Number' then the driver takes that matched entry and
+      will enable current Phy number bit in the 'Phy mask' field;
+
+   d. After parsing all the HBA phy's info, the driver will have complete
+      Port table info in "New Port table".
+
+II. Mark all the existing sas_device & sas_expander device structures as
+    'dirty'.
+
+III. Mark each entry of the HBA Port lists as 'dirty'.
+
+IV. Take each entry from 'New Port table' one by one and check whether the
+    entry has any corresponding matched entry (which is marked as 'dirty')
+    in the HBA Port table or not.  While looking for a corresponding
+    matched entry, look for matched entry in the sequence from top row to
+    bottom row listed in the following table. If you find any matched entry
+    (according to any of the rules tabulated below) then perform the action
+    mentioned in the 'Action' column in that matched rule.
+
+    ===========================================================================
+    |Search  |SAS     | Phy Mask | Port    | Possibilities| Action            |
+    |every   |Address |    or    | Number  |              | required          |
+    |entry   |matched?| subset of| matched?|              |                   |
+    |in below|        | phy mask |         |              |                   |
+    |sequence|        | matched? |         |              |                   |
+    ===========================================================================
+    |  1     |matched | matched  | matched | nothing      |* unmark HBA port  |
+    |        |        |          |         | changed      |table entry as     |
+    |        |        |          |         |              |dirty              |
+    ---------------------------------------------------------------------------
+    |  2     |matched | matched  | not     | port number  |* Update port      |
+    |        |        |          | matched | is changed   |number in the      |
+    |        |        |          |         |              |matched port table |
+    |        |        |          |         |              |entry              |
+    |        |        |          |         |              |* unmask HBA port  |
+    |        |        |          |         |              |table entry as     |
+    |        |        |          |         |              |dirty              |
+    ---------------------------------------------------------------------------
+    |  3.a   |matched | subset of| matched |some phys     |* Add these new    |
+    |        |        | phy mask | (or)    |might have    |phys to current    |
+    |        |        | matched  | not     |enabled which |port in STL        |
+    |        |        |          | matched |are previously|* Update phy mask  |
+    |        |        |          | (but    |disabled      |field in HBA's port|
+    |        |        |          | first   |              |table's matched    |
+    |        |        |          | look for|              |entry,             |
+    |        |        |          | matched |              |* Update port      |
+    |        |        |          | one)    |              |number in the      |
+    |	     |	      |		 | 	   |		  |matched port       |
+    |        |        |          |         |              |table entry (if    |
+    |        |        |          |         |              |port number is     |
+    |        |        |          |         |              |changed),          |
+    |        |        |          |         |              |* Unmask HBA port  |
+    |        |        |          |         |              |table entry as     |
+    |        |        |          |         |              |dirty              |
+    ---------------------------------------------------------------------------
+    |  3.b   |matched | subset of| matched |some phys     |*Remove these phys |
+    |        |        | phy mask | (or)    |might have    |from current port  |
+    |        |        | matched  | not     |disabled which|in STL             |
+    |        |        |          | matched |are previously|* Update phy mask  |
+    |        |        |          | (but    |enabled       |field in HBA's port|
+    |        |        |          | first   |              |tables's matched   |
+    |        |        |          | look for|              |entry,             |
+    |        |        |          | matched |              |*Update port number|
+    |        |        |          | one)    |              |in the matched port|
+    |        |        |          |         |              |table entry (if    |
+    |        |        |          |         |              |port number is     |
+    |        |        |          |         |              |changed),          |
+    |        |        |          |         |              |* Unmask HBA port  |
+    |        |        |          |         |              |table entry as     |
+    |        |        |          |         |              |dirty              |
+    ---------------------------------------------------------------------------
+    |  4     |matched | not      | matched |A cable       |*Remove old phys & |
+    |        |        | matched  | (or)    |attached to an|new phys to current|
+    |        |        |          | not     |expander is   |port in STL        |
+    |        |        |          | matched |changed to    |* Update phy mask  |
+    |        |        |          |         |another HBA   |field in HBA's port|
+    |        |        |          |         |port during   |tables's matched   |
+    |        |        |          |         |reset         |entry,             |
+    |        |        |          |         |              |*Update port number|
+    |        |        |          |         |              |in the matched port|
+    |        |        |          |         |              |table entry (if    |
+    |        |        |          |         |              |port number is     |
+    |        |        |          |         |              |changed),          |
+    |        |        |          |         |              |* Unmask HBA port  |
+    |        |        |          |         |              |table entry as     |
+    |        |        |          |         |              |dirty              |
+    ---------------------------------------------------------------------------
+
+V. Delete the hba_port objects which are still marked as dirty.
+
+Link: https://lore.kernel.org/r/20201027130847.9962-9-sreekanth.reddy@broadcom.com
+Reported-by: kernel test robot <lkp@intel.com>
+Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+Signed-off-by: Sreekanth Reddy <sreekanth.reddy@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+

@@ -1,0 +1,87 @@
+mm/vmalloc: rework the drain logic
+
+A current "lazy drain" model suffers from at least two issues.
+
+First one is related to the unsorted list of vmap areas, thus in order to
+identify the [min:max] range of areas to be drained, it requires a full
+list scan.  What is a time consuming if the list is too long.
+
+Second one and as a next step is about merging all fragments with a free
+space.  What is also a time consuming because it has to iterate over
+entire list which holds outstanding lazy areas.
+
+See below the "preemptirqsoff" tracer that illustrates a high latency.  It
+is ~24676us.  Our workloads like audio and video are effected by such long
+latency:
+
+<snip>
+  tracer: preemptirqsoff
+
+  preemptirqsoff latency trace v1.1.5 on 4.9.186-perf+
+  --------------------------------------------------------------------
+  latency: 24676 us, #4/4, CPU#1 | (M:preempt VP:0, KP:0, SP:0 HP:0 P:8)
+     -----------------
+     | task: crtc_commit:112-261 (uid:0 nice:0 policy:1 rt_prio:16)
+     -----------------
+   => started at: __purge_vmap_area_lazy
+   => ended at:   __purge_vmap_area_lazy
+
+                   _------=> CPU#
+                  / _-----=> irqs-off
+                 | / _----=> need-resched
+                 || / _---=> hardirq/softirq
+                 ||| / _--=> preempt-depth
+                 |||| /     delay
+   cmd     pid   ||||| time  |   caller
+      \   /      |||||  \    |   /
+crtc_com-261     1...1    1us*: _raw_spin_lock <-__purge_vmap_area_lazy
+[...]
+crtc_com-261     1...1 24675us : _raw_spin_unlock <-__purge_vmap_area_lazy
+crtc_com-261     1...1 24677us : trace_preempt_on <-__purge_vmap_area_lazy
+crtc_com-261     1...1 24683us : <stack trace>
+ => free_vmap_area_noflush
+ => remove_vm_area
+ => __vunmap
+ => vfree
+ => drm_property_free_blob
+ => drm_mode_object_unreference
+ => drm_property_unreference_blob
+ => __drm_atomic_helper_crtc_destroy_state
+ => sde_crtc_destroy_state
+ => drm_atomic_state_default_clear
+ => drm_atomic_state_clear
+ => drm_atomic_state_free
+ => complete_commit
+ => _msm_drm_commit_work_cb
+ => kthread_worker_fn
+ => kthread
+ => ret_from_fork
+<snip>
+
+To address those two issues we can redesign a purging of the outstanding
+lazy areas.  Instead of queuing vmap areas to the list, we replace it by
+the separate rb-tree.  In hat case an area is located in the tree/list in
+ascending order.  It will give us below advantages:
+
+a) Outstanding vmap areas are merged creating bigger coalesced blocks,
+   thus it becomes less fragmented.
+
+b) It is possible to calculate a flush range [min:max] without scanning
+   all elements.  It is O(1) access time or complexity;
+
+c) The final merge of areas with the rb-tree that represents a free
+   space is faster because of (a).  As a result the lock contention is
+   also reduced.
+
+Link: https://lkml.kernel.org/r/20201116220033.1837-2-urezki@gmail.com
+Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Oleksiy Avramchenko <oleksiy.avramchenko@sonymobile.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: huang ying <huang.ying.caritas@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

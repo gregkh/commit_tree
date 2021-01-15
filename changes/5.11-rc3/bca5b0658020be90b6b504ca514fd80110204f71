@@ -1,0 +1,146 @@
+md/cluster: fix deadlock when node is doing resync job
+
+md-cluster uses MD_CLUSTER_SEND_LOCK to make node can exclusively send msg.
+During sending msg, node can concurrently receive msg from another node.
+When node does resync job, grab token_lockres:EX may trigger a deadlock:
+```
+nodeA                       nodeB
+--------------------     --------------------
+a.
+send METADATA_UPDATED
+held token_lockres:EX
+                         b.
+                         md_do_sync
+                          resync_info_update
+                            send RESYNCING
+                             + set MD_CLUSTER_SEND_LOCK
+                             + wait for holding token_lockres:EX
+
+                         c.
+                         mdadm /dev/md0 --remove /dev/sdg
+                          + held reconfig_mutex
+                          + send REMOVE
+                             + wait_event(MD_CLUSTER_SEND_LOCK)
+
+                         d.
+                         recv_daemon //METADATA_UPDATED from A
+                          process_metadata_update
+                           + (mddev_trylock(mddev) ||
+                              MD_CLUSTER_HOLDING_MUTEX_FOR_RECVD)
+                             //this time, both return false forever
+```
+Explaination:
+a. A send METADATA_UPDATED
+   This will block another node to send msg
+
+b. B does sync jobs, which will send RESYNCING at intervals.
+   This will be block for holding token_lockres:EX lock.
+
+c. B do "mdadm --remove", which will send REMOVE.
+   This will be blocked by step <b>: MD_CLUSTER_SEND_LOCK is 1.
+
+d. B recv METADATA_UPDATED msg, which send from A in step <a>.
+   This will be blocked by step <c>: holding mddev lock, it makes
+   wait_event can't hold mddev lock. (btw,
+   MD_CLUSTER_HOLDING_MUTEX_FOR_RECVD keep ZERO in this scenario.)
+
+There is a similar deadlock in commit 0ba959774e93
+("md-cluster: use sync way to handle METADATA_UPDATED msg")
+In that commit, step c is "update sb". This patch step c is
+"mdadm --remove".
+
+For fixing this issue, we can refer the solution of function:
+metadata_update_start. Which does the same grab lock_token action.
+lock_comm can use the same steps to avoid deadlock. By moving
+MD_CLUSTER_HOLDING_MUTEX_FOR_RECVD from lock_token to lock_comm.
+It enlarge a little bit window of MD_CLUSTER_HOLDING_MUTEX_FOR_RECVD,
+but it is safe & can break deadlock.
+
+Repro steps (I only triggered 3 times with hundreds tests):
+
+two nodes share 3 iSCSI luns: sdg/sdh/sdi. Each lun size is 1GB.
+```
+ssh root@node2 "mdadm -S --scan"
+mdadm -S --scan
+for i in {g,h,i};do dd if=/dev/zero of=/dev/sd$i oflag=direct bs=1M \
+count=20; done
+
+mdadm -C /dev/md0 -b clustered -e 1.2 -n 2 -l mirror /dev/sdg /dev/sdh \
+ --bitmap-chunk=1M
+ssh root@node2 "mdadm -A /dev/md0 /dev/sdg /dev/sdh"
+
+sleep 5
+
+mkfs.xfs /dev/md0
+mdadm --manage --add /dev/md0 /dev/sdi
+mdadm --wait /dev/md0
+mdadm --grow --raid-devices=3 /dev/md0
+
+mdadm /dev/md0 --fail /dev/sdg
+mdadm /dev/md0 --remove /dev/sdg
+mdadm --grow --raid-devices=2 /dev/md0
+```
+
+test script will hung when executing "mdadm --remove".
+
+```
+ # dump stacks by "echo t > /proc/sysrq-trigger"
+md0_cluster_rec D    0  5329      2 0x80004000
+Call Trace:
+ __schedule+0x1f6/0x560
+ ? _cond_resched+0x2d/0x40
+ ? schedule+0x4a/0xb0
+ ? process_metadata_update.isra.0+0xdb/0x140 [md_cluster]
+ ? wait_woken+0x80/0x80
+ ? process_recvd_msg+0x113/0x1d0 [md_cluster]
+ ? recv_daemon+0x9e/0x120 [md_cluster]
+ ? md_thread+0x94/0x160 [md_mod]
+ ? wait_woken+0x80/0x80
+ ? md_congested+0x30/0x30 [md_mod]
+ ? kthread+0x115/0x140
+ ? __kthread_bind_mask+0x60/0x60
+ ? ret_from_fork+0x1f/0x40
+
+mdadm           D    0  5423      1 0x00004004
+Call Trace:
+ __schedule+0x1f6/0x560
+ ? __schedule+0x1fe/0x560
+ ? schedule+0x4a/0xb0
+ ? lock_comm.isra.0+0x7b/0xb0 [md_cluster]
+ ? wait_woken+0x80/0x80
+ ? remove_disk+0x4f/0x90 [md_cluster]
+ ? hot_remove_disk+0xb1/0x1b0 [md_mod]
+ ? md_ioctl+0x50c/0xba0 [md_mod]
+ ? wait_woken+0x80/0x80
+ ? blkdev_ioctl+0xa2/0x2a0
+ ? block_ioctl+0x39/0x40
+ ? ksys_ioctl+0x82/0xc0
+ ? __x64_sys_ioctl+0x16/0x20
+ ? do_syscall_64+0x5f/0x150
+ ? entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+md0_resync      D    0  5425      2 0x80004000
+Call Trace:
+ __schedule+0x1f6/0x560
+ ? schedule+0x4a/0xb0
+ ? dlm_lock_sync+0xa1/0xd0 [md_cluster]
+ ? wait_woken+0x80/0x80
+ ? lock_token+0x2d/0x90 [md_cluster]
+ ? resync_info_update+0x95/0x100 [md_cluster]
+ ? raid1_sync_request+0x7d3/0xa40 [raid1]
+ ? md_do_sync.cold+0x737/0xc8f [md_mod]
+ ? md_thread+0x94/0x160 [md_mod]
+ ? md_congested+0x30/0x30 [md_mod]
+ ? kthread+0x115/0x140
+ ? __kthread_bind_mask+0x60/0x60
+ ? ret_from_fork+0x1f/0x40
+```
+
+At last, thanks for Xiao's solution.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Zhao Heming <heming.zhao@suse.com>
+Suggested-by: Xiao Ni <xni@redhat.com>
+Reviewed-by: Xiao Ni <xni@redhat.com>
+Signed-off-by: Song Liu <songliubraving@fb.com>
+

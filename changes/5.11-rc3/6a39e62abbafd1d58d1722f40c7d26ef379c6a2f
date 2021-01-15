@@ -1,0 +1,140 @@
+lib: string.h: detect intra-object overflow in fortified string functions
+
+Patch series "Fortify strscpy()", v7.
+
+This patch implements a fortified version of strscpy() enabled by setting
+CONFIG_FORTIFY_SOURCE=y.  The new version ensures the following before
+calling vanilla strscpy():
+
+1. There is no read overflow because either size is smaller than src
+   length or we shrink size to src length by calling fortified strnlen().
+
+2. There is no write overflow because we either failed during
+   compilation or at runtime by checking that size is smaller than dest
+   size.  Note that, if src and dst size cannot be got, the patch defaults
+   to call vanilla strscpy().
+
+The patches adds the following:
+
+1. Implement the fortified version of strscpy().
+
+2. Add a new LKDTM test to ensures the fortified version still returns
+   the same value as the vanilla one while panic'ing when there is a write
+   overflow.
+
+3. Correct some typos in LKDTM related file.
+
+I based my modifications on top of two patches from Daniel Axtens which
+modify calls to __builtin_object_size, in fortified string functions, to
+ensure the true size of char * are returned and not the surrounding
+structure size.
+
+About performance, I measured the slow down of fortified strscpy(), using
+the vanilla one as baseline.  The hardware I used is an Intel i3 2130 CPU
+clocked at 3.4 GHz.  I ran "Linux 5.10.0-rc4+ SMP PREEMPT" inside qemu
+3.10 with 4 CPU cores.  The following code, called through LKDTM, was used
+as a benchmark:
+
+#define TIMES 10000
+	char *src;
+	char dst[7];
+	int i;
+	ktime_t begin;
+
+	src = kstrdup("foobar", GFP_KERNEL);
+
+	if (src == NULL)
+		return;
+
+	begin = ktime_get();
+	for (i = 0; i < TIMES; i++)
+		strscpy(dst, src, strlen(src));
+	pr_info("%d fortified strscpy() tooks %lld", TIMES, ktime_get() - begin);
+
+	begin = ktime_get();
+	for (i = 0; i < TIMES; i++)
+		__real_strscpy(dst, src, strlen(src));
+	pr_info("%d vanilla strscpy() tooks %lld", TIMES, ktime_get() - begin);
+
+	kfree(src);
+
+I called the above code 30 times to compute stats for each version (in ns,
+round to int):
+
+| version   | mean    | std    | median  | 95th    |
+| --------- | ------- | ------ | ------- | ------- |
+| fortified | 245_069 | 54_657 | 216_230 | 331_122 |
+| vanilla   | 172_501 | 70_281 | 143_539 | 219_553 |
+
+On average, fortified strscpy() is approximately 1.42 times slower than
+vanilla strscpy().  For the 95th percentile, the fortified version is
+about 1.50 times slower.
+
+So, clearly the stats are not in favor of fortified strscpy().  But, the
+fortified version loops the string twice (one in strnlen() and another in
+vanilla strscpy()) while the vanilla one only loops once.  This can
+explain why fortified strscpy() is slower than the vanilla one.
+
+This patch (of 5):
+
+When the fortify feature was first introduced in commit 6974f0c4555e
+("include/linux/string.h: add the option of fortified string.h
+functions"), Daniel Micay observed:
+
+  * It should be possible to optionally use __builtin_object_size(x, 1) for
+    some functions (C strings) to detect intra-object overflows (like
+    glibc's _FORTIFY_SOURCE=2), but for now this takes the conservative
+    approach to avoid likely compatibility issues.
+
+This is a case that often cannot be caught by KASAN. Consider:
+
+struct foo {
+    char a[10];
+    char b[10];
+}
+
+void test() {
+    char *msg;
+    struct foo foo;
+
+    msg = kmalloc(16, GFP_KERNEL);
+    strcpy(msg, "Hello world!!");
+    // this copy overwrites foo.b
+    strcpy(foo.a, msg);
+}
+
+The questionable copy overflows foo.a and writes to foo.b as well.  It
+cannot be detected by KASAN.  Currently it is also not detected by
+fortify, because strcpy considers __builtin_object_size(x, 0), which
+considers the size of the surrounding object (here, struct foo).  However,
+if we switch the string functions over to use __builtin_object_size(x, 1),
+the compiler will measure the size of the closest surrounding subobject
+(here, foo.a), rather than the size of the surrounding object as a whole.
+See https://gcc.gnu.org/onlinedocs/gcc/Object-Size-Checking.html for more
+info.
+
+Only do this for string functions: we cannot use it on things like memcpy,
+memmove, memcmp and memchr_inv due to code like this which purposefully
+operates on multiple structure members: (arch/x86/kernel/traps.c)
+
+	/*
+	 * regs->sp points to the failing IRET frame on the
+	 * ESPFIX64 stack.  Copy it to the entry stack.  This fills
+	 * in gpregs->ss through gpregs->ip.
+	 *
+	 */
+	memmove(&gpregs->ip, (void *)regs->sp, 5*8);
+
+This change passes an allyesconfig on powerpc and x86, and an x86 kernel
+built with it survives running with syz-stress from syzkaller, so it seems
+safe so far.
+
+Link: https://lkml.kernel.org/r/20201122162451.27551-1-laniel_francis@privacyrequired.com
+Link: https://lkml.kernel.org/r/20201122162451.27551-2-laniel_francis@privacyrequired.com
+Signed-off-by: Daniel Axtens <dja@axtens.net>
+Signed-off-by: Francis Laniel <laniel_francis@privacyrequired.com>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+Cc: Daniel Micay <danielmicay@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

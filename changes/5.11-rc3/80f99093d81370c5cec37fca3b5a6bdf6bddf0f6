@@ -1,0 +1,85 @@
+block/rnbd-clt: Fix sg table use after free
+
+Since dynamically allocate sglist is used for rnbd_iu, we can't free sg
+table after send_usr_msg since the callback function (cqe.done) could
+still access the sglist.
+
+Otherwise KASAN reports UAF issue:
+
+[ 4856.600257] BUG: KASAN: use-after-free in dma_direct_unmap_sg+0x53/0x290
+[ 4856.600772] Read of size 4 at addr ffff888206af3a98 by task swapper/1/0
+
+[ 4856.601729] CPU: 1 PID: 0 Comm: swapper/1 Kdump: loaded Tainted: G        W         5.10.0-pserver #5.10.0-1+feature+linux+next+20201214.1025+0910d71
+[ 4856.601748] Hardware name: Supermicro Super Server/X11DDW-L, BIOS 3.3 02/21/2020
+[ 4856.601766] Call Trace:
+[ 4856.601785]  <IRQ>
+[ 4856.601822]  dump_stack+0x99/0xcb
+[ 4856.601856]  ? dma_direct_unmap_sg+0x53/0x290
+[ 4856.601888]  print_address_description.constprop.7+0x1e/0x230
+[ 4856.601913]  ? freeze_kernel_threads+0x73/0x73
+[ 4856.601965]  ? mark_held_locks+0x29/0xa0
+[ 4856.602019]  ? dma_direct_unmap_sg+0x53/0x290
+[ 4856.602039]  ? dma_direct_unmap_sg+0x53/0x290
+[ 4856.602079]  kasan_report.cold.9+0x37/0x7c
+[ 4856.602188]  ? mlx5_ib_post_recv+0x430/0x520 [mlx5_ib]
+[ 4856.602209]  ? dma_direct_unmap_sg+0x53/0x290
+[ 4856.602256]  dma_direct_unmap_sg+0x53/0x290
+[ 4856.602366]  complete_rdma_req+0x188/0x4b0 [rtrs_client]
+[ 4856.602451]  ? rtrs_clt_close+0x80/0x80 [rtrs_client]
+[ 4856.602535]  ? mlx5_ib_poll_cq+0x48b/0x16e0 [mlx5_ib]
+[ 4856.602589]  ? radix_tree_insert+0x3a0/0x3a0
+[ 4856.602610]  ? do_raw_spin_lock+0x119/0x1d0
+[ 4856.602647]  ? rwlock_bug.part.1+0x60/0x60
+[ 4856.602740]  rtrs_clt_rdma_done+0x3f7/0x670 [rtrs_client]
+[ 4856.602804]  ? rtrs_clt_rdma_cm_handler+0xda0/0xda0 [rtrs_client]
+[ 4856.602857]  ? check_flags.part.31+0x6c/0x1f0
+[ 4856.602927]  ? rcu_read_lock_sched_held+0xaf/0xe0
+[ 4856.602963]  ? rcu_read_lock_bh_held+0xc0/0xc0
+[ 4856.603137]  __ib_process_cq+0x10a/0x350 [ib_core]
+[ 4856.603309]  ib_poll_handler+0x41/0x1c0 [ib_core]
+[ 4856.603358]  irq_poll_softirq+0xe6/0x280
+[ 4856.603392]  ? lockdep_hardirqs_on_prepare+0x111/0x210
+[ 4856.603446]  __do_softirq+0x10d/0x646
+[ 4856.603540]  asm_call_irq_on_stack+0x12/0x20
+[ 4856.603563]  </IRQ>
+
+[ 4856.605096] Allocated by task 8914:
+[ 4856.605510]  kasan_save_stack+0x19/0x40
+[ 4856.605532]  __kasan_kmalloc.constprop.7+0xc1/0xd0
+[ 4856.605552]  __kmalloc+0x155/0x320
+[ 4856.605574]  __sg_alloc_table+0x155/0x1c0
+[ 4856.605594]  sg_alloc_table+0x1f/0x50
+[ 4856.605620]  send_msg_sess_info+0x119/0x2e0 [rnbd_client]
+[ 4856.605646]  remap_devs+0x71/0x210 [rnbd_client]
+[ 4856.605676]  init_sess+0xad8/0xe10 [rtrs_client]
+[ 4856.605706]  rtrs_clt_reconnect_work+0xd6/0x170 [rtrs_client]
+[ 4856.605728]  process_one_work+0x521/0xa90
+[ 4856.605748]  worker_thread+0x65/0x5b0
+[ 4856.605769]  kthread+0x1f2/0x210
+[ 4856.605789]  ret_from_fork+0x22/0x30
+
+[ 4856.606159] Freed by task 8914:
+[ 4856.606559]  kasan_save_stack+0x19/0x40
+[ 4856.606580]  kasan_set_track+0x1c/0x30
+[ 4856.606601]  kasan_set_free_info+0x1b/0x30
+[ 4856.606622]  __kasan_slab_free+0x108/0x150
+[ 4856.606642]  slab_free_freelist_hook+0x64/0x190
+[ 4856.606661]  kfree+0xe2/0x650
+[ 4856.606681]  __sg_free_table+0xa4/0x100
+[ 4856.606707]  send_msg_sess_info+0x1d6/0x2e0 [rnbd_client]
+[ 4856.606733]  remap_devs+0x71/0x210 [rnbd_client]
+[ 4856.606763]  init_sess+0xad8/0xe10 [rtrs_client]
+[ 4856.606792]  rtrs_clt_reconnect_work+0xd6/0x170 [rtrs_client]
+[ 4856.606813]  process_one_work+0x521/0xa90
+[ 4856.606833]  worker_thread+0x65/0x5b0
+[ 4856.606853]  kthread+0x1f2/0x210
+[ 4856.606872]  ret_from_fork+0x22/0x30
+
+The solution is to free iu's sgtable after the iu is not used anymore.
+And also move sg_alloc_table into rnbd_get_iu accordingly.
+
+Fixes: 5a1328d0c3a7 ("block/rnbd-clt: Dynamically allocate sglist for rnbd_iu")
+Signed-off-by: Guoqing Jiang <guoqing.jiang@cloud.ionos.com>
+Signed-off-by: Jack Wang <jinpu.wang@cloud.ionos.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

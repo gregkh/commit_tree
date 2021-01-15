@@ -1,0 +1,67 @@
+mm/gup: prevent gup_fast from racing with COW during fork
+
+Since commit 70e806e4e645 ("mm: Do early cow for pinned pages during
+fork() for ptes") pages under a FOLL_PIN will not be write protected
+during COW for fork.  This means that pages returned from
+pin_user_pages(FOLL_WRITE) should not become write protected while the pin
+is active.
+
+However, there is a small race where get_user_pages_fast(FOLL_PIN) can
+establish a FOLL_PIN at the same time copy_present_page() is write
+protecting it:
+
+        CPU 0                             CPU 1
+   get_user_pages_fast()
+    internal_get_user_pages_fast()
+                                       copy_page_range()
+                                         pte_alloc_map_lock()
+                                           copy_present_page()
+                                             atomic_read(has_pinned) == 0
+					     page_maybe_dma_pinned() == false
+     atomic_set(has_pinned, 1);
+     gup_pgd_range()
+      gup_pte_range()
+       pte_t pte = gup_get_pte(ptep)
+       pte_access_permitted(pte)
+       try_grab_compound_head()
+                                             pte = pte_wrprotect(pte)
+	                                     set_pte_at();
+                                         pte_unmap_unlock()
+      // GUP now returns with a write protected page
+
+The first attempt to resolve this by using the write protect caused
+problems (and was missing a barrrier), see commit f3c64eda3e50 ("mm: avoid
+early COW write protect games during fork()")
+
+Instead wrap copy_p4d_range() with the write side of a seqcount and check
+the read side around gup_pgd_range().  If there is a collision then
+get_user_pages_fast() fails and falls back to slow GUP.
+
+Slow GUP is safe against this race because copy_page_range() is only
+called while holding the exclusive side of the mmap_lock on the src
+mm_struct.
+
+[akpm@linux-foundation.org: coding style fixes]
+  Link: https://lore.kernel.org/r/CAHk-=wi=iCnYCARbPGjkVJu9eyYeZ13N64tZYLdOB8CP5Q_PLw@mail.gmail.com
+
+Link: https://lkml.kernel.org/r/2-v4-908497cf359a+4782-gup_fork_jgg@nvidia.com
+Fixes: f3c64eda3e50 ("mm: avoid early COW write protect games during fork()")
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Peter Xu <peterx@redhat.com>
+Acked-by: "Ahmed S. Darwish" <a.darwish@linutronix.de>	[seqcount_t parts]
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Kirill Shutemov <kirill@shutemov.name>
+Cc: Kirill Tkhai <ktkhai@virtuozzo.com>
+Cc: Leon Romanovsky <leonro@nvidia.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,66 @@
+btrfs: switch extent buffer tree lock to rw_semaphore
+
+Historically we've implemented our own locking because we wanted to be
+able to selectively spin or sleep based on what we were doing in the
+tree.  For instance, if all of our nodes were in cache then there's
+rarely a reason to need to sleep waiting for node locks, as they'll
+likely become available soon.  At the time this code was written the
+rw_semaphore didn't do adaptive spinning, and thus was orders of
+magnitude slower than our home grown locking.
+
+However now the opposite is the case.  There are a few problems with how
+we implement blocking locks, namely that we use a normal waitqueue and
+simply wake everybody up in reverse sleep order.  This leads to some
+suboptimal performance behavior, and a lot of context switches in highly
+contended cases.  The rw_semaphores actually do this properly, and also
+have adaptive spinning that works relatively well.
+
+The locking code is also a bit of a bear to understand, and we lose the
+benefit of lockdep for the most part because the blocking states of the
+lock are simply ad-hoc and not mapped into lockdep.
+
+So rework the locking code to drop all of this custom locking stuff, and
+simply use a rw_semaphore for everything.  This makes the locking much
+simpler for everything, as we can now drop a lot of cruft and blocking
+transitions.  The performance numbers vary depending on the workload,
+because generally speaking there doesn't tend to be a lot of contention
+on the btree.  However, on my test system which is an 80 core single
+socket system with 256GiB of RAM and a 2TiB NVMe drive I get the
+following results (with all debug options off):
+
+  dbench 200 baseline
+  Throughput 216.056 MB/sec  200 clients  200 procs  max_latency=1471.197 ms
+
+  dbench 200 with patch
+  Throughput 737.188 MB/sec  200 clients  200 procs  max_latency=714.346 ms
+
+Previously we also used fs_mark to test this sort of contention, and
+those results are far less impressive, mostly because there's not enough
+tasks to really stress the locking
+
+  fs_mark -d /d[0-15] -S 0 -L 20 -n 100000 -s 0 -t 16
+
+  baseline
+    Average Files/sec:     160166.7
+    p50 Files/sec:         165832
+    p90 Files/sec:         123886
+    p99 Files/sec:         123495
+
+    real    3m26.527s
+    user    2m19.223s
+    sys     48m21.856s
+
+  patched
+    Average Files/sec:     164135.7
+    p50 Files/sec:         171095
+    p90 Files/sec:         122889
+    p99 Files/sec:         113819
+
+    real    3m29.660s
+    user    2m19.990s
+    sys     44m12.259s
+
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

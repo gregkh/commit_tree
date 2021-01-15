@@ -1,0 +1,120 @@
+rcu: Fix single-CPU check in rcu_blocking_is_gp()
+
+Currently, for CONFIG_PREEMPTION=n kernels, rcu_blocking_is_gp() uses
+num_online_cpus() to determine whether there is only one CPU online.  When
+there is only a single CPU online, the simple fact that synchronize_rcu()
+could be legally called implies that a full grace period has elapsed.
+Therefore, in the single-CPU case, synchronize_rcu() simply returns
+immediately.  Unfortunately, num_online_cpus() is unreliable while a
+CPU-hotplug operation is transitioning to or from single-CPU operation
+because:
+
+1.	num_online_cpus() uses atomic_read(&__num_online_cpus) to
+	locklessly sample the number of online CPUs.  The hotplug locks
+	are not held, which means that an incoming CPU can concurrently
+	update this count.  This in turn means that an RCU read-side
+	critical section on the incoming CPU might observe updates
+	prior to the grace period, but also that this critical section
+	might extend beyond the end of the optimized synchronize_rcu().
+	This breaks RCU's fundamental guarantee.
+
+2.	In addition, num_online_cpus() does no ordering, thus providing
+	another way that RCU's fundamental guarantee can be broken by
+	the current code.
+
+3.	The most probable failure mode happens on outgoing CPUs.
+	The outgoing CPU updates the count of online CPUs in the
+	CPUHP_TEARDOWN_CPU stop-machine handler, which is fine in
+	and of itself due to preemption being disabled at the call
+	to num_online_cpus().  Unfortunately, after that stop-machine
+	handler returns, the CPU takes one last trip through the
+	scheduler (which has RCU readers) and, after the resulting
+	context switch, one final dive into the idle loop.  During this
+	time, RCU needs to keep track of two CPUs, but num_online_cpus()
+	will say that there is only one, which in turn means that the
+	surviving CPU will incorrectly ignore the outgoing CPU's RCU
+	read-side critical sections.
+
+This problem is illustrated by the following litmus test in which P0()
+corresponds to synchronize_rcu() and P1() corresponds to the incoming CPU.
+The herd7 tool confirms that the "exists" clause can be satisfied,
+thus demonstrating that this breakage can happen according to the Linux
+kernel memory model.
+
+   {
+     int x = 0;
+     atomic_t numonline = ATOMIC_INIT(1);
+   }
+
+   P0(int *x, atomic_t *numonline)
+   {
+     int r0;
+     WRITE_ONCE(*x, 1);
+     r0 = atomic_read(numonline);
+     if (r0 == 1) {
+       smp_mb();
+     } else {
+       synchronize_rcu();
+     }
+     WRITE_ONCE(*x, 2);
+   }
+
+   P1(int *x, atomic_t *numonline)
+   {
+     int r0; int r1;
+
+     atomic_inc(numonline);
+     smp_mb();
+     rcu_read_lock();
+     r0 = READ_ONCE(*x);
+     smp_rmb();
+     r1 = READ_ONCE(*x);
+     rcu_read_unlock();
+   }
+
+   locations [x;numonline;]
+
+   exists (1:r0=0 /\ 1:r1=2)
+
+It is important to note that these problems arise only when the system
+is transitioning to or from single-CPU operation.
+
+One solution would be to hold the CPU-hotplug locks while sampling
+num_online_cpus(), which was in fact the intent of the (redundant)
+preempt_disable() and preempt_enable() surrounding this call to
+num_online_cpus().  Actually blocking CPU hotplug would not only result
+in excessive overhead, but would also unnecessarily impede CPU-hotplug
+operations.
+
+This commit therefore follows long-standing RCU tradition by maintaining
+a separate RCU-specific set of CPU-hotplug books.
+
+This separate set of books is implemented by a new ->n_online_cpus field
+in the rcu_state structure that maintains RCU's count of the online CPUs.
+This count is incremented early in the CPU-online process, so that
+the critical transition away from single-CPU operation will occur when
+there is only a single CPU.  Similarly for the critical transition to
+single-CPU operation, the counter is decremented late in the CPU-offline
+process, again while there is only a single CPU.  Because there is only
+ever a single CPU when the ->n_online_cpus field undergoes the critical
+1->2 and 2->1 transitions, full memory ordering and mutual exclusion is
+provided implicitly and, better yet, for free.
+
+In the case where the CPU is coming online, nothing will happen until
+the current CPU helps it come online.  Therefore, the new CPU will see
+all accesses prior to the optimized grace period, which means that RCU
+does not need to further delay this new CPU.  In the case where the CPU
+is going offline, the outgoing CPU is totally out of the picture before
+the optimized grace period starts, which means that this outgoing CPU
+cannot see any of the accesses following that grace period.  Again,
+RCU needs no further interaction with the outgoing CPU.
+
+This does mean that synchronize_rcu() will unnecessarily do a few grace
+periods the hard way just before the second CPU comes online and just
+after the second-to-last CPU goes offline, but it is not worth optimizing
+this uncommon case.
+
+Reviewed-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+Signed-off-by: Neeraj Upadhyay <neeraju@codeaurora.org>
+Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+

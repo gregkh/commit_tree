@@ -1,0 +1,48 @@
+epoll: take epitem list out of struct file
+
+Move the head of epitem list out of struct file; for epoll ones it's
+moved into struct eventpoll (->refs there), for non-epoll - into
+the new object (struct epitem_head).  In place of ->f_ep_links we
+leave a pointer to the list head (->f_ep).
+
+->f_ep is protected by ->f_lock and it's zeroed as soon as the list
+of epitems becomes empty (that can happen only in ep_remove() by
+now).
+
+The list of files for reverse path check is *not* going through
+struct file now - it's a single-linked list going through epitem_head
+instances.  It's terminated by ERR_PTR(-1) (== EP_UNACTIVE_POINTER),
+so the elements of list can be distinguished by head->next != NULL.
+
+epitem_head instances are allocated at ep_insert() time (by
+attach_epitem()) and freed either by ep_remove() (if it empties
+the set of epitems *and* epitem_head does not belong to the
+reverse path check list) or by clear_tfile_check_list() when
+the list is emptied (if the set of epitems is empty by that
+point).  Allocations are done from a separate slab - minimal kmalloc()
+size is too large on some architectures.
+
+As the result, we trim struct file _and_ get rid of the games with
+temporary file references.
+
+Locking and barriers are interesting (aren't they always); see unlist_file()
+and ep_remove() for details.  The non-obvious part is that ep_remove() needs
+to decide if it will be the one to free the damn thing *before* actually
+storing NULL to head->epitems.first - that's what smp_load_acquire is for
+in there.  unlist_file() lockless path is safe, since we hit it only if
+we observe NULL in head->epitems.first and whoever had done that store is
+guaranteed to have observed non-NULL in head->next.  IOW, their last access
+had been the store of NULL into ->epitems.first and we can safely free
+the sucker.  OTOH, we are under rcu_read_lock() and both epitem and
+epitem->file have their freeing RCU-delayed.  So if we see non-NULL
+->epitems.first, we can grab ->f_lock (all epitems in there share the
+same struct file) and safely recheck the emptiness of ->epitems; again,
+->next is still non-NULL, so ep_remove() couldn't have freed head yet.
+->f_lock serializes us wrt ep_remove(); the rest is trivial.
+
+Note that once head->epitems becomes NULL, nothing can get inserted into
+it - the only remaining reference to head after that point is from the
+reverse path check list.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
