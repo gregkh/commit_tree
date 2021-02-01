@@ -1,0 +1,78 @@
+btrfs: fix log replay failure due to race with space cache rebuild
+
+After a sudden power failure we may end up with a space cache on disk that
+is not valid and needs to be rebuilt from scratch.
+
+If that happens, during log replay when we attempt to pin an extent buffer
+from a log tree, at btrfs_pin_extent_for_log_replay(), we do not wait for
+the space cache to be rebuilt through the call to:
+
+    btrfs_cache_block_group(cache, 1);
+
+That is because that only waits for the task (work queue job) that loads
+the space cache to change the cache state from BTRFS_CACHE_FAST to any
+other value. That is ok when the space cache on disk exists and is valid,
+but when the cache is not valid and needs to be rebuilt, it ends up
+returning as soon as the cache state changes to BTRFS_CACHE_STARTED (done
+at caching_thread()).
+
+So this means that we can end up trying to unpin a range which is not yet
+marked as free in the block group. This results in the call to
+btrfs_remove_free_space() to return -EINVAL to
+btrfs_pin_extent_for_log_replay(), which in turn makes the log replay fail
+as well as mounting the filesystem. More specifically the -EINVAL comes
+from free_space_cache.c:remove_from_bitmap(), because the requested range
+is not marked as free space (ones in the bitmap), we have the following
+condition triggered:
+
+static noinline int remove_from_bitmap(struct btrfs_free_space_ctl *ctl,
+(...)
+       if (ret < 0 || search_start != *offset)
+            return -EINVAL;
+(...)
+
+It's the "search_start != *offset" that results in the condition being
+evaluated to true.
+
+When this happens we got the following in dmesg/syslog:
+
+[72383.415114] BTRFS: device fsid 32b95b69-0ea9-496a-9f02-3f5a56dc9322 devid 1 transid 1432 /dev/sdb scanned by mount (3816007)
+[72383.417837] BTRFS info (device sdb): disk space caching is enabled
+[72383.418536] BTRFS info (device sdb): has skinny extents
+[72383.423846] BTRFS info (device sdb): start tree-log replay
+[72383.426416] BTRFS warning (device sdb): block group 30408704 has wrong amount of free space
+[72383.427686] BTRFS warning (device sdb): failed to load free space cache for block group 30408704, rebuilding it now
+[72383.454291] BTRFS: error (device sdb) in btrfs_recover_log_trees:6203: errno=-22 unknown (Failed to pin buffers while recovering log root tree.)
+[72383.456725] BTRFS: error (device sdb) in btrfs_replay_log:2253: errno=-22 unknown (Failed to recover log tree)
+[72383.460241] BTRFS error (device sdb): open_ctree failed
+
+We also mark the range for the extent buffer in the excluded extents io
+tree. That is fine when the space cache is valid on disk and we can load
+it, in which case it causes no problems.
+
+However, for the case where we need to rebuild the space cache, because it
+is either invalid or it is missing, having the extent buffer range marked
+in the excluded extents io tree leads to a -EINVAL failure from the call
+to btrfs_remove_free_space(), resulting in the log replay and mount to
+fail. This is because by having the range marked in the excluded extents
+io tree, the caching thread ends up never adding the range of the extent
+buffer as free space in the block group since the calls to
+add_new_free_space(), called from load_extent_tree_free(), filter out any
+ranges that are marked as excluded extents.
+
+So fix this by making sure that during log replay we wait for the caching
+task to finish completely when we need to rebuild a space cache, and also
+drop the need to mark the extent buffer range in the excluded extents io
+tree, as well as clearing ranges from that tree at
+btrfs_finish_extent_commit().
+
+This started to happen with some frequency on large filesystems having
+block groups with a lot of fragmentation since the recent commit
+e747853cae3ae3 ("btrfs: load free space cache asynchronously"), but in
+fact the issue has been there for years, it was just much less likely
+to happen.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+
