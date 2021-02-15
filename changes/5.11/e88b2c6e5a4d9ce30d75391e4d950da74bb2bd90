@@ -1,0 +1,71 @@
+bpf: Fix 32 bit src register truncation on div/mod
+
+While reviewing a different fix, John and I noticed an oddity in one of the
+BPF program dumps that stood out, for example:
+
+  # bpftool p d x i 13
+   0: (b7) r0 = 808464450
+   1: (b4) w4 = 808464432
+   2: (bc) w0 = w0
+   3: (15) if r0 == 0x0 goto pc+1
+   4: (9c) w4 %= w0
+  [...]
+
+In line 2 we noticed that the mov32 would 32 bit truncate the original src
+register for the div/mod operation. While for the two operations the dst
+register is typically marked unknown e.g. from adjust_scalar_min_max_vals()
+the src register is not, and thus verifier keeps tracking original bounds,
+simplified:
+
+  0: R1=ctx(id=0,off=0,imm=0) R10=fp0
+  0: (b7) r0 = -1
+  1: R0_w=invP-1 R1=ctx(id=0,off=0,imm=0) R10=fp0
+  1: (b7) r1 = -1
+  2: R0_w=invP-1 R1_w=invP-1 R10=fp0
+  2: (3c) w0 /= w1
+  3: R0_w=invP(id=0,umax_value=4294967295,var_off=(0x0; 0xffffffff)) R1_w=invP-1 R10=fp0
+  3: (77) r1 >>= 32
+  4: R0_w=invP(id=0,umax_value=4294967295,var_off=(0x0; 0xffffffff)) R1_w=invP4294967295 R10=fp0
+  4: (bf) r0 = r1
+  5: R0_w=invP4294967295 R1_w=invP4294967295 R10=fp0
+  5: (95) exit
+  processed 6 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0
+
+Runtime result of r0 at exit is 0 instead of expected -1. Remove the
+verifier mov32 src rewrite in div/mod and replace it with a jmp32 test
+instead. After the fix, we result in the following code generation when
+having dividend r1 and divisor r6:
+
+  div, 64 bit:                             div, 32 bit:
+
+   0: (b7) r6 = 8                           0: (b7) r6 = 8
+   1: (b7) r1 = 8                           1: (b7) r1 = 8
+   2: (55) if r6 != 0x0 goto pc+2           2: (56) if w6 != 0x0 goto pc+2
+   3: (ac) w1 ^= w1                         3: (ac) w1 ^= w1
+   4: (05) goto pc+1                        4: (05) goto pc+1
+   5: (3f) r1 /= r6                         5: (3c) w1 /= w6
+   6: (b7) r0 = 0                           6: (b7) r0 = 0
+   7: (95) exit                             7: (95) exit
+
+  mod, 64 bit:                             mod, 32 bit:
+
+   0: (b7) r6 = 8                           0: (b7) r6 = 8
+   1: (b7) r1 = 8                           1: (b7) r1 = 8
+   2: (15) if r6 == 0x0 goto pc+1           2: (16) if w6 == 0x0 goto pc+1
+   3: (9f) r1 %= r6                         3: (9c) w1 %= w6
+   4: (b7) r0 = 0                           4: (b7) r0 = 0
+   5: (95) exit                             5: (95) exit
+
+x86 in particular can throw a 'divide error' exception for div
+instruction not only for divisor being zero, but also for the case
+when the quotient is too large for the designated register. For the
+edx:eax and rdx:rax dividend pair it is not an issue in x86 BPF JIT
+since we always zero edx (rdx). Hence really the only protection
+needed is against divisor being zero.
+
+Fixes: 68fda450a7df ("bpf: fix 32-bit divide by zero")
+Co-developed-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+
