@@ -1,0 +1,67 @@
+mm, slab, slub: stop taking memory hotplug lock
+
+Since commit 03afc0e25f7f ("slab: get_online_mems for
+kmem_cache_{create,destroy,shrink}") we are taking memory hotplug lock for
+SLAB and SLUB when creating, destroying or shrinking a cache.  It is quite
+a heavy lock and it's best to avoid it if possible, as we had several
+issues with lockdep complaining about ordering in the past, see e.g.
+e4f8e513c3d3 ("mm/slub: fix a deadlock in show_slab_objects()").
+
+The problem scenario in 03afc0e25f7f (solved by the memory hotplug lock)
+can be summarized as follows: while there's slab_mutex synchronizing new
+kmem cache creation and SLUB's MEM_GOING_ONLINE callback
+slab_mem_going_online_callback(), we may miss creation of kmem_cache_node
+for the hotplugged node in the new kmem cache, because the hotplug
+callback doesn't yet see the new cache, and cache creation in
+init_kmem_cache_nodes() only inits kmem_cache_node for nodes in the
+N_NORMAL_MEMORY nodemask, which however may not yet include the new node,
+as that happens only later after the MEM_GOING_ONLINE callback.
+
+Instead of using get/put_online_mems(), the problem can be solved by SLUB
+maintaining its own nodemask of nodes for which it has allocated the
+per-node kmem_cache_node structures.  This nodemask would generally mirror
+the N_NORMAL_MEMORY nodemask, but would be updated only in under SLUB's
+control in its memory hotplug callbacks under the slab_mutex.  This patch
+adds such nodemask and its handling.
+
+Commit 03afc0e25f7f mentiones "issues like [the one above]", but there
+don't appear to be further issues.  All the paths (shared for SLAB and
+SLUB) taking the memory hotplug locks are also taking the slab_mutex,
+except kmem_cache_shrink() where 03afc0e25f7f replaced slab_mutex with
+get/put_online_mems().
+
+We however cannot simply restore slab_mutex in kmem_cache_shrink(), as
+SLUB can enters the function from a write to sysfs 'shrink' file, thus
+holding kernfs lock, and in kmem_cache_create() the kernfs lock is nested
+within slab_mutex.  But on closer inspection we don't actually need to
+protect kmem_cache_shrink() from hotplug callbacks: While SLUB's
+__kmem_cache_shrink() does for_each_kmem_cache_node(), missing a new node
+added in parallel hotplug is not fatal, and parallel hotremove does not
+free kmem_cache_node's anymore after the previous patch, so use-after free
+cannot happen.  The per-node shrinking itself is protected by
+n->list_lock.  Same is true for SLAB, and SLOB is no-op.
+
+SLAB also doesn't need the memory hotplug locking, which it only gained by
+03afc0e25f7f through the shared paths in slab_common.c.  Its memory
+hotplug callbacks are also protected by slab_mutex against races with
+these paths.  The problem of SLUB relying on N_NORMAL_MEMORY doesn't apply
+to SLAB, as its setup_kmem_cache_nodes relies on N_ONLINE, and the new
+node is already set there during the MEM_GOING_ONLINE callback, so no
+special care is needed for SLAB.
+
+As such, this patch removes all get/put_online_mems() usage by the slab
+subsystem.
+
+Link: https://lkml.kernel.org/r/20210113131634.3671-3-vbabka@suse.cz
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Qian Cai <cai@redhat.com>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

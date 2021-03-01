@@ -1,0 +1,66 @@
+btrfs: only let one thread pre-flush delayed refs in commit
+
+I've been running a stress test that runs 20 workers in their own
+subvolume, which are running an fsstress instance with 4 threads per
+worker, which is 80 total fsstress threads.  In addition to this I'm
+running balance in the background as well as creating and deleting
+snapshots.  This test takes around 12 hours to run normally, going
+slower and slower as the test goes on.
+
+The reason for this is because fsstress is running fsync sometimes, and
+because we're messing with block groups we often fall through to
+btrfs_commit_transaction, so will often have 20-30 threads all calling
+btrfs_commit_transaction at the same time.
+
+These all get stuck contending on the extent tree while they try to run
+delayed refs during the initial part of the commit.
+
+This is suboptimal, really because the extent tree is a single point of
+failure we only want one thread acting on that tree at once to reduce
+lock contention.
+
+Fix this by making the flushing mechanism a bit operation, to make it
+easy to use test_and_set_bit() in order to make sure only one task does
+this initial flush.
+
+Once we're into the transaction commit we only have one thread doing
+delayed ref running, it's just this initial pre-flush that is
+problematic.  With this patch my stress test takes around 90 minutes to
+run, instead of 12 hours.
+
+The memory barrier is not necessary for the flushing bit as it's
+ordered, unlike plain int. The transaction state accessed in
+btrfs_should_end_transaction could be affected by that too as it's not
+always used under transaction lock. Upon Nikolay's analysis in [1]
+it's not necessary:
+
+  In should_end_transaction it's read without holding any locks. (U)
+
+  It's modified in btrfs_cleanup_transaction without holding the
+  fs_info->trans_lock (U), but the STATE_ERROR flag is going to be set.
+
+  set in cleanup_transaction under fs_info->trans_lock (L)
+  set in btrfs_commit_trans to COMMIT_START under fs_info->trans_lock.(L)
+  set in btrfs_commit_trans to COMMIT_DOING under fs_info->trans_lock.(L)
+  set in btrfs_commit_trans to COMMIT_UNBLOCK under
+  fs_info->trans_lock.(L)
+
+  set in btrfs_commit_trans to COMMIT_COMPLETED without locks but at this
+  point the transaction is finished and fs_info->running_trans is NULL (U
+  but irrelevant).
+
+  So by the looks of it we can have a concurrent READ race with a WRITE,
+  due to reads not taking a lock. In this case what we want to ensure is
+  we either see new or old state. I consulted with Will Deacon and he said
+  that in such a case we'd want to annotate the accesses to ->state with
+  (READ|WRITE)_ONCE so as to avoid a theoretical tear, in this case I
+  don't think this could happen but I imagine at some point KCSAN would
+  flag such an access as racy (which it is).
+
+[1] https://lore.kernel.org/linux-btrfs/e1fd5cc1-0f28-f670-69f4-e9958b4964e6@suse.com
+
+Reviewed-by: Nikolay Borisov <nborisov@suse.com>
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+[ add comments regarding memory barrier ]
+Signed-off-by: David Sterba <dsterba@suse.com>
+

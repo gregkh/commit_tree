@@ -1,0 +1,56 @@
+btrfs: support subpage for extent buffer page release
+
+In btrfs_release_extent_buffer_pages(), we need to add extra handling
+for subpage.
+
+Introduce a helper, detach_extent_buffer_page(), to do different
+handling for regular and subpage cases.
+
+For subpage case, handle detaching page private.
+
+For unmapped (dummy or cloned) ebs, we can detach the page private
+immediately as the page can only be attached to one unmapped eb.
+
+For mapped ebs, we have to ensure there are no eb in the page range
+before we delete it, as page->private is shared between all ebs in the
+same page.
+
+But there is a subpage specific race, where we can race with extent
+buffer allocation, and clear the page private while new eb is still
+being utilized, like this:
+
+  Extent buffer A is the new extent buffer which will be allocated,
+  while extent buffer B is the last existing extent buffer of the page.
+
+  		T1 (eb A) 	 |		T2 (eb B)
+  -------------------------------+------------------------------
+  alloc_extent_buffer()		 | btrfs_release_extent_buffer_pages()
+  |- p = find_or_create_page()   | |
+  |- attach_extent_buffer_page() | |
+  |				 | |- detach_extent_buffer_page()
+  |				 |    |- if (!page_range_has_eb())
+  |				 |    |  No new eb in the page range yet
+  |				 |    |  As new eb A hasn't yet been
+  |				 |    |  inserted into radix tree.
+  |				 |    |- btrfs_detach_subpage()
+  |				 |       |- detach_page_private();
+  |- radix_tree_insert()	 |
+
+  Then we have a metadata eb whose page has no private bit.
+
+To avoid such race, we introduce a subpage metadata-specific member,
+btrfs_subpage::eb_refs.
+
+In alloc_extent_buffer() we increase eb_refs in the critical section of
+private_lock.  Then page_range_has_eb() will return true for
+detach_extent_buffer_page(), and will not detach page private.
+
+The section is marked by:
+
+- btrfs_page_inc_eb_refs()
+- btrfs_page_dec_eb_refs()
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

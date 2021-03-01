@@ -1,0 +1,72 @@
+net_sched: fix RTNL deadlock again caused by request_module()
+
+tcf_action_init_1() loads tc action modules automatically with
+request_module() after parsing the tc action names, and it drops RTNL
+lock and re-holds it before and after request_module(). This causes a
+lot of troubles, as discovered by syzbot, because we can be in the
+middle of batch initializations when we create an array of tc actions.
+
+One of the problem is deadlock:
+
+CPU 0					CPU 1
+rtnl_lock();
+for (...) {
+  tcf_action_init_1();
+    -> rtnl_unlock();
+    -> request_module();
+				rtnl_lock();
+				for (...) {
+				  tcf_action_init_1();
+				    -> tcf_idr_check_alloc();
+				   // Insert one action into idr,
+				   // but it is not committed until
+				   // tcf_idr_insert_many(), then drop
+				   // the RTNL lock in the _next_
+				   // iteration
+				   -> rtnl_unlock();
+    -> rtnl_lock();
+    -> a_o->init();
+      -> tcf_idr_check_alloc();
+      // Now waiting for the same index
+      // to be committed
+				    -> request_module();
+				    -> rtnl_lock()
+				    // Now waiting for RTNL lock
+				}
+				rtnl_unlock();
+}
+rtnl_unlock();
+
+This is not easy to solve, we can move the request_module() before
+this loop and pre-load all the modules we need for this netlink
+message and then do the rest initializations. So the loop breaks down
+to two now:
+
+        for (i = 1; i <= TCA_ACT_MAX_PRIO && tb[i]; i++) {
+                struct tc_action_ops *a_o;
+
+                a_o = tc_action_load_ops(name, tb[i]...);
+                ops[i - 1] = a_o;
+        }
+
+        for (i = 1; i <= TCA_ACT_MAX_PRIO && tb[i]; i++) {
+                act = tcf_action_init_1(ops[i - 1]...);
+        }
+
+Although this looks serious, it only has been reported by syzbot, so it
+seems hard to trigger this by humans. And given the size of this patch,
+I'd suggest to make it to net-next and not to backport to stable.
+
+This patch has been tested by syzbot and tested with tdc.py by me.
+
+Fixes: 0fedc63fadf0 ("net_sched: commit action insertions together")
+Reported-and-tested-by: syzbot+82752bc5331601cf4899@syzkaller.appspotmail.com
+Reported-and-tested-by: syzbot+b3b63b6bff456bd95294@syzkaller.appspotmail.com
+Reported-by: syzbot+ba67b12b1ca729912834@syzkaller.appspotmail.com
+Cc: Jiri Pirko <jiri@resnulli.us>
+Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+Tested-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Link: https://lore.kernel.org/r/20210117005657.14810-1-xiyou.wangcong@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+

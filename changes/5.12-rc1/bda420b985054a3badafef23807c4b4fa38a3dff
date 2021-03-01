@@ -1,0 +1,109 @@
+numa balancing: migrate on fault among multiple bound nodes
+
+Now, NUMA balancing can only optimize the page placement among the NUMA
+nodes if the default memory policy is used.  Because the memory policy
+specified explicitly should take precedence.  But this seems too strict in
+some situations.  For example, on a system with 4 NUMA nodes, if the
+memory of an application is bound to the node 0 and 1, NUMA balancing can
+potentially migrate the pages between the node 0 and 1 to reduce
+cross-node accessing without breaking the explicit memory binding policy.
+
+So in this patch, we add MPOL_F_NUMA_BALANCING mode flag to
+set_mempolicy() when mode is MPOL_BIND.  With the flag specified, NUMA
+balancing will be enabled within the thread to optimize the page placement
+within the constrains of the specified memory binding policy.  With the
+newly added flag, the NUMA balancing control mechanism becomes,
+
+ - sysctl knob numa_balancing can enable/disable the NUMA balancing
+   globally.
+
+ - even if sysctl numa_balancing is enabled, the NUMA balancing will be
+   disabled for the memory areas or applications with the explicit
+   memory policy by default.
+
+ - MPOL_F_NUMA_BALANCING can be used to enable the NUMA balancing for
+   the applications when specifying the explicit memory policy
+   (MPOL_BIND).
+
+Various page placement optimization based on the NUMA balancing can be
+done with these flags.  As the first step, in this patch, if the memory of
+the application is bound to multiple nodes (MPOL_BIND), and in the hint
+page fault handler the accessing node are in the policy nodemask, the page
+will be tried to be migrated to the accessing node to reduce the
+cross-node accessing.
+
+If the newly added MPOL_F_NUMA_BALANCING flag is specified by an
+application on an old kernel version without its support, set_mempolicy()
+will return -1 and errno will be set to EINVAL.  The application can use
+this behavior to run on both old and new kernel versions.
+
+And if the MPOL_F_NUMA_BALANCING flag is specified for the mode other than
+MPOL_BIND, set_mempolicy() will return -1 and errno will be set to EINVAL
+as before.  Because we don't support optimization based on the NUMA
+balancing for these modes.
+
+In the previous version of the patch, we tried to reuse MPOL_MF_LAZY for
+mbind().  But that flag is tied to MPOL_MF_MOVE.*, so it seems not a good
+API/ABI for the purpose of the patch.
+
+And because it's not clear whether it's necessary to enable NUMA balancing
+for a specific memory area inside an application, so we only add the flag
+at the thread level (set_mempolicy()) instead of the memory area level
+(mbind()).  We can do that when it become necessary.
+
+To test the patch, we run a test case as follows on a 4-node machine with
+192 GB memory (48 GB per node).
+
+1. Change pmbench memory accessing benchmark to call set_mempolicy()
+   to bind its memory to node 1 and 3 and enable NUMA balancing.  Some
+   related code snippets are as follows,
+
+     #include <numaif.h>
+     #include <numa.h>
+
+	struct bitmask *bmp;
+	int ret;
+
+	bmp = numa_parse_nodestring("1,3");
+	ret = set_mempolicy(MPOL_BIND | MPOL_F_NUMA_BALANCING,
+			    bmp->maskp, bmp->size + 1);
+	/* If MPOL_F_NUMA_BALANCING isn't supported, fall back to MPOL_BIND */
+	if (ret < 0 && errno == EINVAL)
+		ret = set_mempolicy(MPOL_BIND, bmp->maskp, bmp->size + 1);
+	if (ret < 0) {
+		perror("Failed to call set_mempolicy");
+		exit(-1);
+	}
+
+2. Run a memory eater on node 3 to use 40 GB memory before running pmbench.
+
+3. Run pmbench with 64 processes, the working-set size of each process
+   is 640 MB, so the total working-set size is 64 * 640 MB = 40 GB.  The
+   CPU and the memory (as in step 1.) of all pmbench processes is bound
+   to node 1 and 3. So, after CPU usage is balanced, some pmbench
+   processes run on the CPUs of the node 3 will access the memory of
+   the node 1.
+
+4. After the pmbench processes run for 100 seconds, kill the memory
+   eater.  Now it's possible for some pmbench processes to migrate
+   their pages from node 1 to node 3 to reduce cross-node accessing.
+
+Test results show that, with the patch, the pages can be migrated from
+node 1 to node 3 after killing the memory eater, and the pmbench score
+can increase about 17.5%.
+
+Link: https://lkml.kernel.org/r/20210120061235.148637-2-ying.huang@intel.com
+Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+Acked-by: Mel Gorman <mgorman@suse.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: David Rientjes <rientjes@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

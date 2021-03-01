@@ -1,0 +1,59 @@
+drivers:tty:pty: Fix a race causing data loss on close
+
+Remove the tty_vhangup() from the pty code and just release the
+redirect.  The tty_vhangup() results in data loss and data out of order
+issues.
+
+If you write to a pty master an immediately close the pty master, the
+receiver might get a chunk of data dropped, but then receive some later
+data.  That's obviously something rather unexpected for a user.  It
+certainly confused my test program.
+
+It turns out that tty_vhangup() on the slave pty gets called from
+pty_close(), and that causes the data on the slave side to be flushed,
+but due to races more data can be copied into the slave side's buffer
+after that.  Consider the following sequence:
+
+thread1          thread2         thread3
+-------          -------         -------
+ |                |-write data into buffer,
+ |                | n_tty buffer is filled
+ |                | along with other buffers
+ |                |-pty_close(master)
+ |                |--tty_vhangup(slave)
+ |                |---tty_ldisc_hangup()
+ |                |----n_tty_flush_buffer()
+ |                |-----reset_buffer_flags()
+ |-n_tty_read()   |
+ |--up_read(&tty->termios_rwsem);
+ |                |------down_read(&tty->termios_rwsem)
+ |                |------clear n_tty buffer contents
+ |                |------up_read(&tty->termios_rwsem)
+ |--tty_buffer_flush_work()       |
+ |--schedules work calling        |
+ |  flush_to_ldisc()              |
+ |                                |-flush_to_ldisc()
+ |                                |--receive_buf()
+ |                                |---tty_port_default_receive_buf()
+ |                                |----tty_ldisc_receive_buf()
+ |                                |-----n_tty_receive_buf2()
+ |                                |------n_tty_receive_buf_common()
+ |                                |-------down_read(&tty->termios_rwsem)
+ |                                |-------__receive_buf()
+ |                                |       copies data into n_tty buffer
+ |                                |-------up_read(&tty->termios_rwsem)
+ |--down_read(&tty->termios_rwsem)
+ |--copy buffer data to user
+
+>From this sequence, you can see that thread2 writes to the buffer then
+only clears the part of the buffer in n_tty.  The n_tty receive buffer
+code then copies more data into the n_tty buffer.
+
+But part of the vhangup, releasing the redirect, is still required to
+avoid issues with consoles running on pty slaves.  So do that.
+As far as I can tell, that is all that should be required.
+
+Signed-off-by: Corey Minyard <cminyard@mvista.com>
+Link: https://lore.kernel.org/r/20201124004902.1398477-3-minyard@acm.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

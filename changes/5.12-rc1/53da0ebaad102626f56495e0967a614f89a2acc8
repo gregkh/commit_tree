@@ -1,0 +1,121 @@
+net: dsa: allow changing the tag protocol via the "tagging" device attribute
+
+Currently DSA exposes the following sysfs:
+$ cat /sys/class/net/eno2/dsa/tagging
+ocelot
+
+which is a read-only device attribute, introduced in the kernel as
+commit 98cdb4807123 ("net: dsa: Expose tagging protocol to user-space"),
+and used by libpcap since its commit 993db3800d7d ("Add support for DSA
+link-layer types").
+
+It would be nice if we could extend this device attribute by making it
+writable:
+$ echo ocelot-8021q > /sys/class/net/eno2/dsa/tagging
+
+This is useful with DSA switches that can make use of more than one
+tagging protocol. It may be useful in dsa_loop in the future too, to
+perform offline testing of various taggers, or for changing between dsa
+and edsa on Marvell switches, if that is desirable.
+
+In terms of implementation, drivers can support this feature by
+implementing .change_tag_protocol, which should always leave the switch
+in a consistent state: either with the new protocol if things went well,
+or with the old one if something failed. Teardown of the old protocol,
+if necessary, must be handled by the driver.
+
+Some things remain as before:
+- The .get_tag_protocol is currently only called at probe time, to load
+  the initial tagging protocol driver. Nonetheless, new drivers should
+  report the tagging protocol in current use now.
+- The driver should manage by itself the initial setup of tagging
+  protocol, no later than the .setup() method, as well as destroying
+  resources used by the last tagger in use, no earlier than the
+  .teardown() method.
+
+For multi-switch DSA trees, error handling is a bit more complicated,
+since e.g. the 5th out of 7 switches may fail to change the tag
+protocol. When that happens, a revert to the original tag protocol is
+attempted, but that may fail too, leaving the tree in an inconsistent
+state despite each individual switch implementing .change_tag_protocol
+transactionally. Since the intersection between drivers that implement
+.change_tag_protocol and drivers that support D in DSA is currently the
+empty set, the possibility for this error to happen is ignored for now.
+
+Testing:
+
+$ insmod mscc_felix.ko
+[   79.549784] mscc_felix 0000:00:00.5: Adding to iommu group 14
+[   79.565712] mscc_felix 0000:00:00.5: Failed to register DSA switch: -517
+$ insmod tag_ocelot.ko
+$ rmmod mscc_felix.ko
+$ insmod mscc_felix.ko
+[   97.261724] libphy: VSC9959 internal MDIO bus: probed
+[   97.267363] mscc_felix 0000:00:00.5: Found PCS at internal MDIO address 0
+[   97.274998] mscc_felix 0000:00:00.5: Found PCS at internal MDIO address 1
+[   97.282561] mscc_felix 0000:00:00.5: Found PCS at internal MDIO address 2
+[   97.289700] mscc_felix 0000:00:00.5: Found PCS at internal MDIO address 3
+[   97.599163] mscc_felix 0000:00:00.5 swp0 (uninitialized): PHY [0000:00:00.3:10] driver [Microsemi GE VSC8514 SyncE] (irq=POLL)
+[   97.862034] mscc_felix 0000:00:00.5 swp1 (uninitialized): PHY [0000:00:00.3:11] driver [Microsemi GE VSC8514 SyncE] (irq=POLL)
+[   97.950731] mscc_felix 0000:00:00.5 swp0: configuring for inband/qsgmii link mode
+[   97.964278] 8021q: adding VLAN 0 to HW filter on device swp0
+[   98.146161] mscc_felix 0000:00:00.5 swp2 (uninitialized): PHY [0000:00:00.3:12] driver [Microsemi GE VSC8514 SyncE] (irq=POLL)
+[   98.238649] mscc_felix 0000:00:00.5 swp1: configuring for inband/qsgmii link mode
+[   98.251845] 8021q: adding VLAN 0 to HW filter on device swp1
+[   98.433916] mscc_felix 0000:00:00.5 swp3 (uninitialized): PHY [0000:00:00.3:13] driver [Microsemi GE VSC8514 SyncE] (irq=POLL)
+[   98.485542] mscc_felix 0000:00:00.5: configuring for fixed/internal link mode
+[   98.503584] mscc_felix 0000:00:00.5: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[   98.527948] device eno2 entered promiscuous mode
+[   98.544755] DSA: tree 0 setup
+
+$ ping 10.0.0.1
+PING 10.0.0.1 (10.0.0.1): 56 data bytes
+64 bytes from 10.0.0.1: seq=0 ttl=64 time=2.337 ms
+64 bytes from 10.0.0.1: seq=1 ttl=64 time=0.754 ms
+^C
+ -  10.0.0.1 ping statistics  -
+2 packets transmitted, 2 packets received, 0% packet loss
+round-trip min/avg/max = 0.754/1.545/2.337 ms
+
+$ cat /sys/class/net/eno2/dsa/tagging
+ocelot
+$ cat ./test_ocelot_8021q.sh
+        #!/bin/bash
+
+        ip link set swp0 down
+        ip link set swp1 down
+        ip link set swp2 down
+        ip link set swp3 down
+        ip link set swp5 down
+        ip link set eno2 down
+        echo ocelot-8021q > /sys/class/net/eno2/dsa/tagging
+        ip link set eno2 up
+        ip link set swp0 up
+        ip link set swp1 up
+        ip link set swp2 up
+        ip link set swp3 up
+        ip link set swp5 up
+$ ./test_ocelot_8021q.sh
+./test_ocelot_8021q.sh: line 9: echo: write error: Protocol not available
+$ rmmod tag_ocelot.ko
+rmmod: can't unload module 'tag_ocelot': Resource temporarily unavailable
+$ insmod tag_ocelot_8021q.ko
+$ ./test_ocelot_8021q.sh
+$ cat /sys/class/net/eno2/dsa/tagging
+ocelot-8021q
+$ rmmod tag_ocelot.ko
+$ rmmod tag_ocelot_8021q.ko
+rmmod: can't unload module 'tag_ocelot_8021q': Resource temporarily unavailable
+$ ping 10.0.0.1
+PING 10.0.0.1 (10.0.0.1): 56 data bytes
+64 bytes from 10.0.0.1: seq=0 ttl=64 time=0.953 ms
+64 bytes from 10.0.0.1: seq=1 ttl=64 time=0.787 ms
+64 bytes from 10.0.0.1: seq=2 ttl=64 time=0.771 ms
+$ rmmod mscc_felix.ko
+[  645.544426] mscc_felix 0000:00:00.5: Link is Down
+[  645.838608] DSA: tree 0 torn down
+$ rmmod tag_ocelot_8021q.ko
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+

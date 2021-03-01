@@ -1,0 +1,78 @@
+binfmt_elf: partially sanitize PRSTATUS_SIZE and SET_PR_FPVALID
+
+On 64bit architectures that support 32bit processes there are
+two possible layouts for NT_PRSTATUS note in ELF coredumps.
+For one thing, several fields are 64bit for native processes
+and 32bit for compat ones (pr_sigpend, etc.).  For another,
+the register dump is obviously different - the size and number
+of registers are not going to be the same for 32bit and 64bit
+variants of processor.
+
+Usually that's handled by having two structures - elf_prstatus
+for native layout and compat_elf_prstatus for 32bit one.
+32bit processes are handled by fs/compat_binfmt_elf.c, which
+defines a macro called 'elf_prstatus' that expands to compat_elf_prstatus.
+Then it includes fs/binfmt_elf.c, which makes all references to
+struct elf_prstatus to be textually replaced with struct
+compat_elf_prstatus.  Ugly and somewhat brittle, but it works.
+
+However, amd64 is worse - there are _three_ possible layouts.
+One for native 64bit processes, another for i386 (32bit) processes
+and yet another for x32 (32bit address space with full 64bit
+registers).
+
+Both i386 and x32 processes are handled by fs/compat_binfmt_elf.c,
+with usual compat_binfmt_elf.c trickery.  However, the layouts
+for i386 and x32 are not identical - they have the common beginning,
+but the register dump part (pr_reg) is bigger on x32.  Worse, pr_reg
+is not the last field - it's followed by int pr_fpvalid, so that
+field ends up at different offsets for i386 and x32 layouts.
+
+Fortunately, there's not much code that cares about any of that -
+it's all encapsulated in fill_thread_core_info().  Since x32
+variant is bigger, we define compat_elf_prstatus to match that
+layout.  That way i386 processes have enough space to fit
+their layout into.
+
+Moreover, since these layouts are identical prior to pr_reg,
+we don't need to distinguish x32 and i386 cases when we are
+setting the fields prior to pr_reg.
+
+Filling pr_reg itself is done by calling ->get() method of
+appropriate regset, and that method knows what layout (and size)
+to use.
+
+We do need to distinguish x32 and i386 cases only for two
+things: setting ->pr_fpvalid (offset differs for x32 and
+i386) and choosing the right size for our note.
+
+The way it's done is Not Nice, for the lack of more accurate
+printable description.  There are two macros (PRSTATUS_SIZE and
+SET_PR_FPVALID), that default essentially to sizeof(struct elf_prstatus)
+and (S)->pr_fpvalid = 1.  On x86 asm/compat.h provides its own
+variants.
+
+Unfortunately, quite a few things go wrong there:
+	* PRSTATUS_SIZE doesn't use the normal test for process
+being an x32 one; it compares the size reported by regset with
+the size of pr_reg.
+	* it hardcodes the sizes of x32 and i386 variants (296 and 144
+resp.), so if some change in includes leads to asm/compat.h pulled
+in by fs/binfmt_elf.c we are in trouble - it will end up using
+the size of x32 variant for 64bit processes.
+	* it's in the wrong place; asm/compat.h couldn't define
+the structure for i386 layout, since it lacks quite a few types
+needed for it.  Hardcoded sizes are largely due to that.
+
+The proper fix would be to have an explicitly defined i386 variant
+of structure and have PRSTATUS_SIZE/SET_PR_FPVALID check for
+TIF_X32 to choose the variant that should be used.  Unfortunately,
+that requires some manipulations of headers; we'll do that later
+in the series, but for now let's go with the minimal variant -
+rename PRSTATUS_SIZE in asm/compat.h to COMPAT_PRSTATUS_SIZE,
+have fs/compat_binfmt_elf.c define PRSTATUS_SIZE to COMPAT_PRSTATUS_SIZE
+and use the normal TIF_X32 check in that macro.  The size of i386 variant
+is kept hardcoded for now.  Similar story for SET_PR_FPVALID.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+

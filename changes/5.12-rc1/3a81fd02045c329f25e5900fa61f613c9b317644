@@ -1,0 +1,46 @@
+io_uring: enable LOOKUP_CACHED path resolution for filename lookups
+
+Instead of being pessimistic and assume that path lookup will block, use
+LOOKUP_CACHED to attempt just a cached lookup. This ensures that the
+fast path is always done inline, and we only punt to async context if
+IO is needed to satisfy the lookup.
+
+For forced nonblock open attempts, mark the file O_NONBLOCK over the
+actual ->open() call as well. We can safely clear this again before
+doing fd_install(), so it'll never be user visible that we fiddled with
+it.
+
+This greatly improves the performance of file open where the dentry is
+already cached:
+
+ached		5.10-git	5.10-git+LOOKUP_CACHED	Speedup
+---------------------------------------------------------------
+33%		1,014,975	900,474			1.1x
+89%		 545,466	292,937			1.9x
+100%		 435,636	151,475			2.9x
+
+The more cache hot we are, the faster the inline LOOKUP_CACHED
+optimization helps. This is unsurprising and expected, as a thread
+offload becomes a more dominant part of the total overhead. If we look
+at io_uring tracing, doing an IORING_OP_OPENAT on a file that isn't in
+the dentry cache will yield:
+
+275.550481: io_uring_create: ring 00000000ddda6278, fd 3 sq size 8, cq size 16, flags 0
+275.550491: io_uring_submit_sqe: ring 00000000ddda6278, op 18, data 0x0, non block 1, sq_thread 0
+275.550498: io_uring_queue_async_work: ring 00000000ddda6278, request 00000000c0267d17, flags 69760, normal queue, work 000000003d683991
+275.550502: io_uring_cqring_wait: ring 00000000ddda6278, min_events 1
+275.550556: io_uring_complete: ring 00000000ddda6278, user_data 0x0, result 4
+
+which shows a failed nonblock lookup, then punt to worker, and then we
+complete with fd == 4. This takes 65 usec in total. Re-running the same
+test case again:
+
+281.253956: io_uring_create: ring 0000000008207252, fd 3 sq size 8, cq size 16, flags 0
+281.253967: io_uring_submit_sqe: ring 0000000008207252, op 18, data 0x0, non block 1, sq_thread 0
+281.253973: io_uring_complete: ring 0000000008207252, user_data 0x0, result 4
+
+shows the same request completing inline, also returning fd == 4. This
+takes 6 usec.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

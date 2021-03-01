@@ -1,0 +1,132 @@
+rcu: Check and report missed fqs timer wakeup on RCU stall
+
+For a new grace period request, the RCU GP kthread transitions through
+following states:
+
+a. [RCU_GP_WAIT_GPS] -> [RCU_GP_DONE_GPS]
+
+The RCU_GP_WAIT_GPS state is where the GP kthread waits for a request
+for a new GP.  Once it receives a request (for example, when a new RCU
+callback is queued), the GP kthread transitions to RCU_GP_DONE_GPS.
+
+b. [RCU_GP_DONE_GPS] -> [RCU_GP_ONOFF]
+
+Grace period initialization starts in rcu_gp_init(), which records the
+start of new GP in rcu_state.gp_seq and transitions to RCU_GP_ONOFF.
+
+c. [RCU_GP_ONOFF] -> [RCU_GP_INIT]
+
+The purpose of the RCU_GP_ONOFF state is to apply the online/offline
+information that was buffered for any CPUs that recently came online or
+went offline.  This state is maintained in per-leaf rcu_node bitmasks,
+with the buffered state in ->qsmaskinitnext and the state for the upcoming
+GP in ->qsmaskinit.  At the end of this RCU_GP_ONOFF state, each bit in
+->qsmaskinit will correspond to a CPU that must pass through a quiescent
+state before the upcoming grace period is allowed to complete.
+
+However, a leaf rcu_node structure with an all-zeroes ->qsmaskinit
+cannot necessarily be ignored.  In preemptible RCU, there might well be
+tasks still in RCU read-side critical sections that were first preempted
+while running on one of the CPUs managed by this structure.  Such tasks
+will be queued on this structure's ->blkd_tasks list.  Only after this
+list fully drains can this leaf rcu_node structure be ignored, and even
+then only if none of its CPUs have come back online in the meantime.
+Once that happens, the ->qsmaskinit masks further up the tree will be
+updated to exclude this leaf rcu_node structure.
+
+Once the ->qsmaskinitnext and ->qsmaskinit fields have been updated
+as needed, the GP kthread transitions to RCU_GP_INIT.
+
+d. [RCU_GP_INIT] -> [RCU_GP_WAIT_FQS]
+
+The purpose of the RCU_GP_INIT state is to copy each ->qsmaskinit to
+the ->qsmask field within each rcu_node structure.  This copying is done
+breadth-first from the root to the leaves.  Why not just copy directly
+from ->qsmaskinitnext to ->qsmask?  Because the ->qsmaskinitnext masks
+can change in the meantime as additional CPUs come online or go offline.
+Such changes would result in inconsistencies in the ->qsmask fields up and
+down the tree, which could in turn result in too-short grace periods or
+grace-period hangs.  These issues are avoided by snapshotting the leaf
+rcu_node structures' ->qsmaskinitnext fields into their ->qsmaskinit
+counterparts, generating a consistent set of ->qsmaskinit fields
+throughout the tree, and only then copying these consistent ->qsmaskinit
+fields to their ->qsmask counterparts.
+
+Once this initialization step is complete, the GP kthread transitions
+to RCU_GP_WAIT_FQS, where it waits to do a force-quiescent-state scan
+on the one hand or for the end of the grace period on the other.
+
+e. [RCU_GP_WAIT_FQS] -> [RCU_GP_DOING_FQS]
+
+The RCU_GP_WAIT_FQS state waits for one of three things:  (1) An
+explicit request to do a force-quiescent-state scan, (2) The end of
+the grace period, or (3) A short interval of time, after which it
+will do a force-quiescent-state (FQS) scan.  The explicit request can
+come from rcutorture or from any CPU that has too many RCU callbacks
+queued (see the qhimark kernel parameter and the RCU_GP_FLAG_OVLD
+flag).  The aforementioned "short period of time" is specified by the
+jiffies_till_first_fqs boot parameter for a given grace period's first
+FQS scan and by the jiffies_till_next_fqs for later FQS scans.
+
+Either way, once the wait is over, the GP kthread transitions to
+RCU_GP_DOING_FQS.
+
+f. [RCU_GP_DOING_FQS] -> [RCU_GP_CLEANUP]
+
+The RCU_GP_DOING_FQS state performs an FQS scan.  Each such scan carries
+out two functions for any CPU whose bit is still set in its leaf rcu_node
+structure's ->qsmask field, that is, for any CPU that has not yet reported
+a quiescent state for the current grace period:
+
+  i.  Report quiescent states on behalf of CPUs that have been observed
+      to be idle (from an RCU perspective) since the beginning of the
+      grace period.
+
+  ii. If the current grace period is too old, take various actions to
+      encourage holdout CPUs to pass through quiescent states, including
+      enlisting the aid of any calls to cond_resched() and might_sleep(),
+      and even including IPIing the holdout CPUs.
+
+These checks are skipped for any leaf rcu_node structure with a all-zero
+->qsmask field, however such structures are subject to RCU priority
+boosting if there are tasks on a given structure blocking the current
+grace period.  The end of the grace period is detected when the root
+rcu_node structure's ->qsmask is zero and when there are no longer any
+preempted tasks blocking the current grace period.  (No, this last check
+is not redundant.  To see this, consider an rcu_node tree having exactly
+one structure that serves as both root and leaf.)
+
+Once the end of the grace period is detected, the GP kthread transitions
+to RCU_GP_CLEANUP.
+
+g. [RCU_GP_CLEANUP] -> [RCU_GP_CLEANED]
+
+The RCU_GP_CLEANUP state marks the end of grace period by updating the
+rcu_state structure's ->gp_seq field and also all rcu_node structures'
+->gp_seq field.  As before, the rcu_node tree is traversed in breadth
+first order.  Once this update is complete, the GP kthread transitions
+to the RCU_GP_CLEANED state.
+
+i. [RCU_GP_CLEANED] -> [RCU_GP_INIT]
+
+Once in the RCU_GP_CLEANED state, the GP kthread immediately transitions
+into the RCU_GP_INIT state.
+
+j. The role of timers.
+
+If there is at least one idle CPU, and if timers are not firing, the
+transition from RCU_GP_DOING_FQS to RCU_GP_CLEANUP will never happen.
+Timers can fail to fire for a number of reasons, including issues in
+timer configuration, issues in the timer framework, and failure to handle
+softirqs (for example, when there is a storm of interrupts).  Whatever the
+reason, if the timers fail to fire, the GP kthread will never be awakened,
+resulting in RCU CPU stall warnings and eventually in OOM.
+
+However, an RCU CPU stall warning has a large number of potential causes,
+as documented in Documentation/RCU/stallwarn.rst.  This commit therefore
+adds analysis to the RCU CPU stall-warning code to emit an additional
+message if the cause of the stall is likely to be timer failure.
+
+Signed-off-by: Neeraj Upadhyay <neeraju@codeaurora.org>
+Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+

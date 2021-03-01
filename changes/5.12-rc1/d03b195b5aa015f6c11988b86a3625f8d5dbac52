@@ -1,0 +1,63 @@
+sch_htb: Hierarchical QoS hardware offload
+
+HTB doesn't scale well because of contention on a single lock, and it
+also consumes CPU. This patch adds support for offloading HTB to
+hardware that supports hierarchical rate limiting.
+
+In the offload mode, HTB passes control commands to the driver using
+ndo_setup_tc. The driver has to replicate the whole hierarchy of classes
+and their settings (rate, ceil) in the NIC. Every modification of the
+HTB tree caused by the admin results in ndo_setup_tc being called.
+
+After this setup, the HTB algorithm is done completely in the NIC. An SQ
+(send queue) is created for every leaf class and attached to the
+hierarchy, so that the NIC can calculate and obey aggregated rate
+limits, too. In the future, it can be changed, so that multiple SQs will
+back a single leaf class.
+
+ndo_select_queue is responsible for selecting the right queue that
+serves the traffic class of each packet.
+
+The data path works as follows: a packet is classified by clsact, the
+driver selects a hardware queue according to its class, and the packet
+is enqueued into this queue's qdisc.
+
+This solution addresses two main problems of scaling HTB:
+
+1. Contention by flow classification. Currently the filters are attached
+to the HTB instance as follows:
+
+    # tc filter add dev eth0 parent 1:0 protocol ip flower dst_port 80
+    classid 1:10
+
+It's possible to move classification to clsact egress hook, which is
+thread-safe and lock-free:
+
+    # tc filter add dev eth0 egress protocol ip flower dst_port 80
+    action skbedit priority 1:10
+
+This way classification still happens in software, but the lock
+contention is eliminated, and it happens before selecting the TX queue,
+allowing the driver to translate the class to the corresponding hardware
+queue in ndo_select_queue.
+
+Note that this is already compatible with non-offloaded HTB and doesn't
+require changes to the kernel nor iproute2.
+
+2. Contention by handling packets. HTB is not multi-queue, it attaches
+to a whole net device, and handling of all packets takes the same lock.
+When HTB is offloaded, it registers itself as a multi-queue qdisc,
+similarly to mq: HTB is attached to the netdev, and each queue has its
+own qdisc.
+
+Some features of HTB may be not supported by some particular hardware,
+for example, the maximum number of classes may be limited, the
+granularity of rate and ceil parameters may be different, etc. - so, the
+offload is not enabled by default, a new parameter is used to enable it:
+
+    # tc qdisc replace dev eth0 root handle 1: htb offload
+
+Signed-off-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+

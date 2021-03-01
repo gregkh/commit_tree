@@ -1,0 +1,154 @@
+selftests/bpf: Add verifier tests for x64 jit jump padding
+
+There are 3 tests added into verifier's jit tests to trigger x64
+jit jump padding.
+
+The first test can be represented as the following assembly code:
+
+      1: bpf_call bpf_get_prandom_u32
+      2: if r0 == 1 goto pc+128
+      3: if r0 == 2 goto pc+128
+         ...
+    129: if r0 == 128 goto pc+128
+    130: goto pc+128
+    131: goto pc+127
+         ...
+    256: goto pc+2
+    257: goto pc+1
+    258: r0 = 1
+    259: ret
+
+We first store a random number to r0 and add the corresponding
+conditional jumps (2~129) to make verifier believe that those jump
+instructions from 130 to 257 are reachable. When the program is sent to
+x64 jit, it starts to optimize out the NOP jumps backwards from 257.
+Since there are 128 such jumps, the program easily reaches 15 passes and
+triggers jump padding.
+
+Here is the x64 jit code of the first test:
+
+      0:    0f 1f 44 00 00          nop    DWORD PTR [rax+rax*1+0x0]
+      5:    66 90                   xchg   ax,ax
+      7:    55                      push   rbp
+      8:    48 89 e5                mov    rbp,rsp
+      b:    e8 4c 90 75 e3          call   0xffffffffe375905c
+     10:    48 83 f8 01             cmp    rax,0x1
+     14:    0f 84 fe 04 00 00       je     0x518
+     1a:    48 83 f8 02             cmp    rax,0x2
+     1e:    0f 84 f9 04 00 00       je     0x51d
+      ...
+     f6:    48 83 f8 18             cmp    rax,0x18
+     fa:    0f 84 8b 04 00 00       je     0x58b
+    100:    48 83 f8 19             cmp    rax,0x19
+    104:    0f 84 86 04 00 00       je     0x590
+    10a:    48 83 f8 1a             cmp    rax,0x1a
+    10e:    0f 84 81 04 00 00       je     0x595
+      ...
+    500:    0f 84 83 01 00 00       je     0x689
+    506:    48 81 f8 80 00 00 00    cmp    rax,0x80
+    50d:    0f 84 76 01 00 00       je     0x689
+    513:    e9 71 01 00 00          jmp    0x689
+    518:    e9 6c 01 00 00          jmp    0x689
+      ...
+    5fe:    e9 86 00 00 00          jmp    0x689
+    603:    e9 81 00 00 00          jmp    0x689
+    608:    0f 1f 00                nop    DWORD PTR [rax]
+    60b:    eb 7c                   jmp    0x689
+    60d:    eb 7a                   jmp    0x689
+      ...
+    683:    eb 04                   jmp    0x689
+    685:    eb 02                   jmp    0x689
+    687:    66 90                   xchg   ax,ax
+    689:    b8 01 00 00 00          mov    eax,0x1
+    68e:    c9                      leave
+    68f:    c3                      ret
+
+As expected, a 3 bytes NOPs is inserted at 608 due to the transition
+from imm32 jmp to imm8 jmp. A 2 bytes NOPs is also inserted at 687 to
+replace a NOP jump.
+
+The second test case is tricky. Here is the assembly code:
+
+       1: bpf_call bpf_get_prandom_u32
+       2: if r0 == 1 goto pc+2048
+       3: if r0 == 2 goto pc+2048
+       ...
+    2049: if r0 == 2048 goto pc+2048
+    2050: goto pc+2048
+    2051: goto pc+16
+    2052: goto pc+15
+       ...
+    2064: goto pc+3
+    2065: goto pc+2
+    2066: goto pc+1
+       ...
+       [repeat "goto pc+16".."goto pc+1" 127 times]
+       ...
+    4099: r0 = 2
+    4100: ret
+
+There are 4 major parts of the program.
+1) 1~2049: Those are instructions to make 2050~4098 reachable. Some of
+           them also could generate the padding for jmp_cond.
+2) 2050: This is the target instruction for the imm32 nop jmp padding.
+3) 2051~4098: The repeated "goto 1~16" instructions are designed to be
+              consumed by the nop jmp optimization. In the end, those
+              instrucitons become 128 continuous 0 offset jmp and are
+              optimized out in 1 pass, and this make insn 2050 an imm32
+              nop jmp in the next pass, so that we can trigger the
+              5 bytes padding.
+4) 4099~4100: Those are the instructions to end the program.
+
+The x64 jit code is like this:
+
+       0:       0f 1f 44 00 00          nop    DWORD PTR [rax+rax*1+0x0]
+       5:       66 90                   xchg   ax,ax
+       7:       55                      push   rbp
+       8:       48 89 e5                mov    rbp,rsp
+       b:       e8 bc 7b d5 d3          call   0xffffffffd3d57bcc
+      10:       48 83 f8 01             cmp    rax,0x1
+      14:       0f 84 7e 66 00 00       je     0x6698
+      1a:       48 83 f8 02             cmp    rax,0x2
+      1e:       0f 84 74 66 00 00       je     0x6698
+      24:       48 83 f8 03             cmp    rax,0x3
+      28:       0f 84 6a 66 00 00       je     0x6698
+      2e:       48 83 f8 04             cmp    rax,0x4
+      32:       0f 84 60 66 00 00       je     0x6698
+      38:       48 83 f8 05             cmp    rax,0x5
+      3c:       0f 84 56 66 00 00       je     0x6698
+      42:       48 83 f8 06             cmp    rax,0x6
+      46:       0f 84 4c 66 00 00       je     0x6698
+      ...
+    666c:       48 81 f8 fe 07 00 00    cmp    rax,0x7fe
+    6673:       0f 1f 40 00             nop    DWORD PTR [rax+0x0]
+    6677:       74 1f                   je     0x6698
+    6679:       48 81 f8 ff 07 00 00    cmp    rax,0x7ff
+    6680:       0f 1f 40 00             nop    DWORD PTR [rax+0x0]
+    6684:       74 12                   je     0x6698
+    6686:       48 81 f8 00 08 00 00    cmp    rax,0x800
+    668d:       0f 1f 40 00             nop    DWORD PTR [rax+0x0]
+    6691:       74 05                   je     0x6698
+    6693:       0f 1f 44 00 00          nop    DWORD PTR [rax+rax*1+0x0]
+    6698:       b8 02 00 00 00          mov    eax,0x2
+    669d:       c9                      leave
+    669e:       c3                      ret
+
+Since insn 2051~4098 are optimized out right before the padding pass,
+there are several conditional jumps from the first part are replaced with
+imm8 jmp_cond, and this triggers the 4 bytes padding, for example at
+6673, 6680, and 668d. On the other hand, Insn 2050 is replaced with the
+5 bytes nops at 6693.
+
+The third test is to invoke the first and second tests as subprogs to test
+bpf2bpf. Per the system log, there was one more jit happened with only
+one pass and the same jit code was produced.
+
+v4:
+  - Add the second test case which triggers jmp_cond padding and imm32 nop
+    jmp padding.
+  - Add the new test case as another subprog
+
+Signed-off-by: Gary Lin <glin@suse.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210119102501.511-4-glin@suse.com
+

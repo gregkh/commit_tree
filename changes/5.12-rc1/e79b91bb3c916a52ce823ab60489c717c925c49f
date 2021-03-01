@@ -1,0 +1,109 @@
+KVM: SVM: use vmsave/vmload for saving/restoring additional host state
+
+Using a guest workload which simply issues 'hlt' in a tight loop to
+generate VMEXITs, it was observed (on a recent EPYC processor) that a
+significant amount of the VMEXIT overhead measured on the host was the
+result of MSR reads/writes in svm_vcpu_load/svm_vcpu_put according to
+perf:
+
+  67.49%--kvm_arch_vcpu_ioctl_run
+          |
+          |--23.13%--vcpu_put
+          |          kvm_arch_vcpu_put
+          |          |
+          |          |--21.31%--native_write_msr
+          |          |
+          |           --1.27%--svm_set_cr4
+          |
+          |--16.11%--vcpu_load
+          |          |
+          |           --15.58%--kvm_arch_vcpu_load
+          |                     |
+          |                     |--13.97%--svm_set_cr4
+          |                     |          |
+          |                     |          |--12.64%--native_read_msr
+
+Most of these MSRs relate to 'syscall'/'sysenter' and segment bases, and
+can be saved/restored using 'vmsave'/'vmload' instructions rather than
+explicit MSR reads/writes. In doing so there is a significant reduction
+in the svm_vcpu_load/svm_vcpu_put overhead measured for the above
+workload:
+
+  50.92%--kvm_arch_vcpu_ioctl_run
+          |
+          |--19.28%--disable_nmi_singlestep
+          |
+          |--13.68%--vcpu_load
+          |          kvm_arch_vcpu_load
+          |          |
+          |          |--9.19%--svm_set_cr4
+          |          |          |
+          |          |           --6.44%--native_read_msr
+          |          |
+          |           --3.55%--native_write_msr
+          |
+          |--6.05%--kvm_inject_nmi
+          |--2.80%--kvm_sev_es_mmio_read
+          |--2.19%--vcpu_put
+          |          |
+          |           --1.25%--kvm_arch_vcpu_put
+          |                     native_write_msr
+
+Quantifying this further, if we look at the raw cycle counts for a
+normal iteration of the above workload (according to 'rdtscp'),
+kvm_arch_vcpu_ioctl_run() takes ~4600 cycles from start to finish with
+the current behavior. Using 'vmsave'/'vmload', this is reduced to
+~2800 cycles, a savings of 39%.
+
+While this approach doesn't seem to manifest in any noticeable
+improvement for more realistic workloads like UnixBench, netperf, and
+kernel builds, likely due to their exit paths generally involving IO
+with comparatively high latencies, it does improve overall overhead
+of KVM_RUN significantly, which may still be noticeable for certain
+situations. It also simplifies some aspects of the code.
+
+With this change, explicit save/restore is no longer needed for the
+following host MSRs, since they are documented[1] as being part of the
+VMCB State Save Area:
+
+  MSR_STAR, MSR_LSTAR, MSR_CSTAR,
+  MSR_SYSCALL_MASK, MSR_KERNEL_GS_BASE,
+  MSR_IA32_SYSENTER_CS,
+  MSR_IA32_SYSENTER_ESP,
+  MSR_IA32_SYSENTER_EIP,
+  MSR_FS_BASE, MSR_GS_BASE
+
+and only the following MSR needs individual handling in
+svm_vcpu_put/svm_vcpu_load:
+
+  MSR_TSC_AUX
+
+We could drop the host_save_user_msrs array/loop and instead handle
+MSR read/write of MSR_TSC_AUX directly, but we leave that for now as
+a potential follow-up.
+
+Since 'vmsave'/'vmload' also handles the LDTR and FS/GS segment
+registers (and associated hidden state)[2], some of the code
+previously used to handle this is no longer needed, so we drop it
+as well.
+
+The first public release of the SVM spec[3] also documents the same
+handling for the host state in question, so we make these changes
+unconditionally.
+
+Also worth noting is that we 'vmsave' to the same page that is
+subsequently used by 'vmrun' to record some host additional state. This
+is okay, since, in accordance with the spec[2], the additional state
+written to the page by 'vmrun' does not overwrite any fields written by
+'vmsave'. This has also been confirmed through testing (for the above
+CPU, at least).
+
+[1] AMD64 Architecture Programmer's Manual, Rev 3.33, Volume 2, Appendix B, Table B-2
+[2] AMD64 Architecture Programmer's Manual, Rev 3.31, Volume 3, Chapter 4, VMSAVE/VMLOAD
+[3] Secure Virtual Machine Architecture Reference Manual, Rev 3.01
+
+Suggested-by: Tom Lendacky <thomas.lendacky@amd.com>
+Signed-off-by: Michael Roth <michael.roth@amd.com>
+Message-Id: <20210202190126.2185715-2-michael.roth@amd.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+

@@ -1,0 +1,127 @@
+btrfs: keep track of the root owner for relocation reads
+
+While testing the error paths in relocation, I hit the following lockdep
+splat:
+
+  ======================================================
+  WARNING: possible circular locking dependency detected
+  5.10.0-rc3+ #206 Not tainted
+  ------------------------------------------------------
+  btrfs-balance/1571 is trying to acquire lock:
+  ffff8cdbcc8f77d0 (&head_ref->mutex){+.+.}-{3:3}, at: btrfs_lookup_extent_info+0x156/0x3b0
+
+  but task is already holding lock:
+  ffff8cdbc54adbf8 (btrfs-tree-00){++++}-{3:3}, at: __btrfs_tree_lock+0x27/0x100
+
+  which lock already depends on the new lock.
+
+  the existing dependency chain (in reverse order) is:
+
+  -> #2 (btrfs-tree-00){++++}-{3:3}:
+	 down_write_nested+0x43/0x80
+	 __btrfs_tree_lock+0x27/0x100
+	 btrfs_search_slot+0x248/0x890
+	 relocate_tree_blocks+0x490/0x650
+	 relocate_block_group+0x1ba/0x5d0
+	 kretprobe_trampoline+0x0/0x50
+
+  -> #1 (btrfs-csum-01){++++}-{3:3}:
+	 down_read_nested+0x43/0x130
+	 __btrfs_tree_read_lock+0x27/0x100
+	 btrfs_read_lock_root_node+0x31/0x40
+	 btrfs_search_slot+0x5ab/0x890
+	 btrfs_del_csums+0x10b/0x3c0
+	 __btrfs_free_extent+0x49d/0x8e0
+	 __btrfs_run_delayed_refs+0x283/0x11f0
+	 btrfs_run_delayed_refs+0x86/0x220
+	 btrfs_start_dirty_block_groups+0x2ba/0x520
+	 kretprobe_trampoline+0x0/0x50
+
+  -> #0 (&head_ref->mutex){+.+.}-{3:3}:
+	 __lock_acquire+0x1167/0x2150
+	 lock_acquire+0x116/0x3e0
+	 __mutex_lock+0x7e/0x7b0
+	 btrfs_lookup_extent_info+0x156/0x3b0
+	 walk_down_proc+0x1c3/0x280
+	 walk_down_tree+0x64/0xe0
+	 btrfs_drop_subtree+0x182/0x260
+	 do_relocation+0x52e/0x660
+	 relocate_tree_blocks+0x2ae/0x650
+	 relocate_block_group+0x1ba/0x5d0
+	 kretprobe_trampoline+0x0/0x50
+
+  other info that might help us debug this:
+
+  Chain exists of:
+    &head_ref->mutex --> btrfs-csum-01 --> btrfs-tree-00
+
+   Possible unsafe locking scenario:
+
+	 CPU0                    CPU1
+	 ----                    ----
+    lock(btrfs-tree-00);
+				 lock(btrfs-csum-01);
+				 lock(btrfs-tree-00);
+    lock(&head_ref->mutex);
+
+   *** DEADLOCK ***
+
+  5 locks held by btrfs-balance/1571:
+   #0: ffff8cdb89749ff8 (&fs_info->delete_unused_bgs_mutex){+.+.}-{3:3}, at: btrfs_balance+0x563/0xf40
+   #1: ffff8cdb89748838 (&fs_info->cleaner_mutex){+.+.}-{3:3}, at: btrfs_relocate_block_group+0x156/0x300
+   #2: ffff8cdbc2c16650 (sb_internal#2){.+.+}-{0:0}, at: start_transaction+0x413/0x5c0
+   #3: ffff8cdbc135f538 (btrfs-treloc-01){+.+.}-{3:3}, at: __btrfs_tree_lock+0x27/0x100
+   #4: ffff8cdbc54adbf8 (btrfs-tree-00){++++}-{3:3}, at: __btrfs_tree_lock+0x27/0x100
+
+  stack backtrace:
+  CPU: 1 PID: 1571 Comm: btrfs-balance Not tainted 5.10.0-rc3+ #206
+  Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 1.13.0-2.fc32 04/01/2014
+  Call Trace:
+   dump_stack+0x8b/0xb0
+   check_noncircular+0xcf/0xf0
+   ? trace_call_bpf+0x139/0x260
+   __lock_acquire+0x1167/0x2150
+   lock_acquire+0x116/0x3e0
+   ? btrfs_lookup_extent_info+0x156/0x3b0
+   __mutex_lock+0x7e/0x7b0
+   ? btrfs_lookup_extent_info+0x156/0x3b0
+   ? btrfs_lookup_extent_info+0x156/0x3b0
+   ? release_extent_buffer+0x124/0x170
+   ? _raw_spin_unlock+0x1f/0x30
+   ? release_extent_buffer+0x124/0x170
+   btrfs_lookup_extent_info+0x156/0x3b0
+   walk_down_proc+0x1c3/0x280
+   walk_down_tree+0x64/0xe0
+   btrfs_drop_subtree+0x182/0x260
+   do_relocation+0x52e/0x660
+   relocate_tree_blocks+0x2ae/0x650
+   ? add_tree_block+0x149/0x1b0
+   relocate_block_group+0x1ba/0x5d0
+   elfcorehdr_read+0x40/0x40
+   ? elfcorehdr_read+0x40/0x40
+   ? btrfs_balance+0x796/0xf40
+   ? __kthread_parkme+0x66/0x90
+   ? btrfs_balance+0xf40/0xf40
+   ? balance_kthread+0x37/0x50
+   ? kthread+0x137/0x150
+   ? __kthread_bind_mask+0x60/0x60
+   ? ret_from_fork+0x1f/0x30
+
+As you can see this is bogus, we never take another tree's lock under
+the csum lock.  This happens because sometimes we have to read tree
+blocks from disk without knowing which root they belong to during
+relocation.  We defaulted to an owner of 0, which translates to an fs
+tree.  This is fine as all fs trees have the same class, but obviously
+isn't fine if the block belongs to a COW only tree.
+
+Thankfully COW only trees only have their owners root as a reference to
+them, and since we already look up the extent information during
+relocation, go ahead and check and see if this block might belong to a
+COW only tree, and if so save the owner in the tree_block struct.  This
+allows us to read_tree_block with the proper owner, which gets rid of
+this lockdep splat.
+
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

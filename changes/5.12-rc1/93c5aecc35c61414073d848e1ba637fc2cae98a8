@@ -1,0 +1,104 @@
+bpf,x64: Pad NOPs to make images converge more easily
+
+The x64 bpf jit expects bpf images converge within the given passes, but
+it could fail to do so with some corner cases. For example:
+
+      l0:     ja 40
+      l1:     ja 40
+
+        [... repeated ja 40 ]
+
+      l39:    ja 40
+      l40:    ret #0
+
+This bpf program contains 40 "ja 40" instructions which are effectively
+NOPs and designed to be replaced with valid code dynamically. Ideally,
+bpf jit should optimize those "ja 40" instructions out when translating
+the bpf instructions into x64 machine code. However, do_jit() can only
+remove one "ja 40" for offset==0 on each pass, so it requires at least
+40 runs to eliminate those JMPs and exceeds the current limit of
+passes(20). In the end, the program got rejected when BPF_JIT_ALWAYS_ON
+is set even though it's legit as a classic socket filter.
+
+To make bpf images more likely converge within 20 passes, this commit
+pads some instructions with NOPs in the last 5 passes:
+
+1. conditional jumps
+  A possible size variance comes from the adoption of imm8 JMP. If the
+  offset is imm8, we calculate the size difference of this BPF instruction
+  between the previous and the current pass and fill the gap with NOPs.
+  To avoid the recalculation of jump offset, those NOPs are inserted before
+  the JMP code, so we have to subtract the 2 bytes of imm8 JMP when
+  calculating the NOP number.
+
+2. BPF_JA
+  There are two conditions for BPF_JA.
+  a.) nop jumps
+    If this instruction is not optimized out in the previous pass,
+    instead of removing it, we insert the equivalent size of NOPs.
+  b.) label jumps
+    Similar to condition jumps, we prepend NOPs right before the JMP
+    code.
+
+To make the code concise, emit_nops() is modified to use the signed len and
+return the number of inserted NOPs.
+
+For bpf-to-bpf, we always enable padding for the extra pass since there
+is only one extra run and the jump padding doesn't affected the images
+that converge without padding.
+
+After applying this patch, the corner case was loaded with the following
+jit code:
+
+    flen=45 proglen=77 pass=17 image=ffffffffc03367d4 from=jump pid=10097
+    JIT code: 00000000: 0f 1f 44 00 00 55 48 89 e5 53 41 55 31 c0 45 31
+    JIT code: 00000010: ed 48 89 fb eb 30 eb 2e eb 2c eb 2a eb 28 eb 26
+    JIT code: 00000020: eb 24 eb 22 eb 20 eb 1e eb 1c eb 1a eb 18 eb 16
+    JIT code: 00000030: eb 14 eb 12 eb 10 eb 0e eb 0c eb 0a eb 08 eb 06
+    JIT code: 00000040: eb 04 eb 02 66 90 31 c0 41 5d 5b c9 c3
+
+     0: 0f 1f 44 00 00          nop    DWORD PTR [rax+rax*1+0x0]
+     5: 55                      push   rbp
+     6: 48 89 e5                mov    rbp,rsp
+     9: 53                      push   rbx
+     a: 41 55                   push   r13
+     c: 31 c0                   xor    eax,eax
+     e: 45 31 ed                xor    r13d,r13d
+    11: 48 89 fb                mov    rbx,rdi
+    14: eb 30                   jmp    0x46
+    16: eb 2e                   jmp    0x46
+        ...
+    3e: eb 06                   jmp    0x46
+    40: eb 04                   jmp    0x46
+    42: eb 02                   jmp    0x46
+    44: 66 90                   xchg   ax,ax
+    46: 31 c0                   xor    eax,eax
+    48: 41 5d                   pop    r13
+    4a: 5b                      pop    rbx
+    4b: c9                      leave
+    4c: c3                      ret
+
+At the 16th pass, 15 jumps were already optimized out, and one jump was
+replaced with NOPs at 44 and the image converged at the 17th pass.
+
+v4:
+  - Add the detailed comments about the possible padding bytes
+
+v3:
+  - Copy the instructions of prologue separately or the size calculation
+    of the first BPF instruction would include the prologue.
+  - Replace WARN_ONCE() with pr_err() and EFAULT
+  - Use MAX_PASSES in the for loop condition check
+  - Remove the "padded" flag from x64_jit_data. For the extra pass of
+    subprogs, padding is always enabled since it won't hurt the images
+    that converge without padding.
+
+v2:
+  - Simplify the sample code in the description and provide the jit code
+  - Check the expected padding bytes with WARN_ONCE
+  - Move the 'padded' flag to 'struct x64_jit_data'
+
+Signed-off-by: Gary Lin <glin@suse.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210119102501.511-2-glin@suse.com
+

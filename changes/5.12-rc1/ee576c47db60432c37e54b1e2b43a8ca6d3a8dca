@@ -1,0 +1,75 @@
+net: icmp: pass zeroed opts from icmp{,v6}_ndo_send before sending
+
+The icmp{,v6}_send functions make all sorts of use of skb->cb, casting
+it with IPCB or IP6CB, assuming the skb to have come directly from the
+inet layer. But when the packet comes from the ndo layer, especially
+when forwarded, there's no telling what might be in skb->cb at that
+point. As a result, the icmp sending code risks reading bogus memory
+contents, which can result in nasty stack overflows such as this one
+reported by a user:
+
+    panic+0x108/0x2ea
+    __stack_chk_fail+0x14/0x20
+    __icmp_send+0x5bd/0x5c0
+    icmp_ndo_send+0x148/0x160
+
+In icmp_send, skb->cb is cast with IPCB and an ip_options struct is read
+from it. The optlen parameter there is of particular note, as it can
+induce writes beyond bounds. There are quite a few ways that can happen
+in __ip_options_echo. For example:
+
+    // sptr/skb are attacker-controlled skb bytes
+    sptr = skb_network_header(skb);
+    // dptr/dopt points to stack memory allocated by __icmp_send
+    dptr = dopt->__data;
+    // sopt is the corrupt skb->cb in question
+    if (sopt->rr) {
+        optlen  = sptr[sopt->rr+1]; // corrupt skb->cb + skb->data
+        soffset = sptr[sopt->rr+2]; // corrupt skb->cb + skb->data
+	// this now writes potentially attacker-controlled data, over
+	// flowing the stack:
+        memcpy(dptr, sptr+sopt->rr, optlen);
+    }
+
+In the icmpv6_send case, the story is similar, but not as dire, as only
+IP6CB(skb)->iif and IP6CB(skb)->dsthao are used. The dsthao case is
+worse than the iif case, but it is passed to ipv6_find_tlv, which does
+a bit of bounds checking on the value.
+
+This is easy to simulate by doing a `memset(skb->cb, 0x41,
+sizeof(skb->cb));` before calling icmp{,v6}_ndo_send, and it's only by
+good fortune and the rarity of icmp sending from that context that we've
+avoided reports like this until now. For example, in KASAN:
+
+    BUG: KASAN: stack-out-of-bounds in __ip_options_echo+0xa0e/0x12b0
+    Write of size 38 at addr ffff888006f1f80e by task ping/89
+    CPU: 2 PID: 89 Comm: ping Not tainted 5.10.0-rc7-debug+ #5
+    Call Trace:
+     dump_stack+0x9a/0xcc
+     print_address_description.constprop.0+0x1a/0x160
+     __kasan_report.cold+0x20/0x38
+     kasan_report+0x32/0x40
+     check_memory_region+0x145/0x1a0
+     memcpy+0x39/0x60
+     __ip_options_echo+0xa0e/0x12b0
+     __icmp_send+0x744/0x1700
+
+Actually, out of the 4 drivers that do this, only gtp zeroed the cb for
+the v4 case, while the rest did not. So this commit actually removes the
+gtp-specific zeroing, while putting the code where it belongs in the
+shared infrastructure of icmp{,v6}_ndo_send.
+
+This commit fixes the issue by passing an empty IPCB or IP6CB along to
+the functions that actually do the work. For the icmp_send, this was
+already trivial, thanks to __icmp_send providing the plumbing function.
+For icmpv6_send, this required a tiny bit of refactoring to make it
+behave like the v4 case, after which it was straight forward.
+
+Fixes: a2b78e9b2cac ("sunvnet: generate ICMP PTMUD messages for smaller port MTUs")
+Reported-by: SinYu <liuxyon@gmail.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://lore.kernel.org/netdev/CAF=yD-LOF116aHub6RMe8vB8ZpnrrnoTdqhobEx+bvoA8AsP0w@mail.gmail.com/T/
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+Link: https://lore.kernel.org/r/20210223131858.72082-1-Jason@zx2c4.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+

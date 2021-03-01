@@ -1,0 +1,160 @@
+scsi: libiscsi: Fix iscsi_task use after free()
+
+The following bug was reported and debugged by wubo40@huawei.com:
+
+When testing kernel 4.18 version, NULL pointer dereference problem occurs
+in iscsi_eh_cmd_timed_out() function.
+
+I think this bug in the upstream is still exists.
+
+The analysis reasons are as follows:
+
+1) For some reason, I/O command did not complete within the timeout
+   period. The block layer timer works, call scsi_times_out() to handle I/O
+   timeout logic.  At the same time the command just completes.
+
+2) scsi_times_out() call iscsi_eh_cmd_timed_out() to process timeout logic.
+   Although there is an NULL judgment for the task, the task has not been
+   released yet now.
+
+3) iscsi_complete_task() calls __iscsi_put_task(). The task reference count
+   reaches zero, the conditions for free task is met, then
+   iscsi_free_task() frees the task, and sets sc->SCp.ptr = NULL. After
+   iscsi_eh_cmd_timed_out() passes the task judgment check, there can still
+   be NULL dereference scenarios.
+
+   CPU0                                                CPU3
+
+    |- scsi_times_out()                                 |-
+iscsi_complete_task()
+    |                                                   |
+    |- iscsi_eh_cmd_timed_out()                         |-
+__iscsi_put_task()
+    |                                                   |
+    |- task=sc->SCp.ptr, task is not NUL, check passed  |-
+iscsi_free_task(task)
+    |                                                   |
+    |                                                   |-> sc->SCp.ptr
+= NULL
+    |                                                   |
+    |- task is NULL now, NULL pointer dereference       |
+    |                                                   |
+   \|/                                                 \|/
+
+Calltrace:
+[380751.840862] BUG: unable to handle kernel NULL pointer dereference at
+0000000000000138
+[380751.843709] PGD 0 P4D 0
+[380751.844770] Oops: 0000 [#1] SMP PTI
+[380751.846283] CPU: 0 PID: 403 Comm: kworker/0:1H Kdump: loaded
+Tainted: G
+[380751.851467] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996)
+[380751.856521] Workqueue: kblockd blk_mq_timeout_work
+[380751.858527] RIP: 0010:iscsi_eh_cmd_timed_out+0x15e/0x2e0 [libiscsi]
+[380751.861129] Code: 83 ea 01 48 8d 74 d0 08 48 8b 10 48 8b 4a 50 48 85
+c9 74 2c 48 39 d5 74
+[380751.868811] RSP: 0018:ffffc1e280a5fd58 EFLAGS: 00010246
+[380751.870978] RAX: ffff9fd1e84e15e0 RBX: ffff9fd1e84e6dd0 RCX:
+0000000116acc580
+[380751.873791] RDX: ffff9fd1f97a9400 RSI: ffff9fd1e84e1800 RDI:
+ffff9fd1e4d6d420
+[380751.876059] RBP: ffff9fd1e4d49000 R08: 0000000116acc580 R09:
+0000000116acc580
+[380751.878284] R10: 0000000000000000 R11: 0000000000000000 R12:
+ffff9fd1e6e931e8
+[380751.880500] R13: ffff9fd1e84e6ee0 R14: 0000000000000010 R15:
+0000000000000003
+[380751.882687] FS:  0000000000000000(0000) GS:ffff9fd1fac00000(0000)
+knlGS:0000000000000000
+[380751.885236] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[380751.887059] CR2: 0000000000000138 CR3: 000000011860a001 CR4:
+00000000003606f0
+[380751.889308] DR0: 0000000000000000 DR1: 0000000000000000 DR2:
+0000000000000000
+[380751.891523] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7:
+0000000000000400
+[380751.893738] Call Trace:
+[380751.894639]  scsi_times_out+0x60/0x1c0
+[380751.895861]  blk_mq_check_expired+0x144/0x200
+[380751.897302]  ? __switch_to_asm+0x35/0x70
+[380751.898551]  blk_mq_queue_tag_busy_iter+0x195/0x2e0
+[380751.900091]  ? __blk_mq_requeue_request+0x100/0x100
+[380751.901611]  ? __switch_to_asm+0x41/0x70
+[380751.902853]  ? __blk_mq_requeue_request+0x100/0x100
+[380751.904398]  blk_mq_timeout_work+0x54/0x130
+[380751.905740]  process_one_work+0x195/0x390
+[380751.907228]  worker_thread+0x30/0x390
+[380751.908713]  ? process_one_work+0x390/0x390
+[380751.910350]  kthread+0x10d/0x130
+[380751.911470]  ? kthread_flush_work_fn+0x10/0x10
+[380751.913007]  ret_from_fork+0x35/0x40
+
+crash> dis -l iscsi_eh_cmd_timed_out+0x15e
+xxxxx/drivers/scsi/libiscsi.c: 2062
+
+1970 enum blk_eh_timer_return iscsi_eh_cmd_timed_out(struct scsi_cmnd
+*sc)
+{
+...
+1984         spin_lock_bh(&session->frwd_lock);
+1985         task = (struct iscsi_task *)sc->SCp.ptr;
+1986         if (!task) {
+1987                 /*
+1988                  * Raced with completion. Blk layer has taken
+ownership
+1989                  * so let timeout code complete it now.
+1990                  */
+1991                 rc = BLK_EH_DONE;
+1992                 goto done;
+1993         }
+
+...
+
+2052         for (i = 0; i < conn->session->cmds_max; i++) {
+2053                 running_task = conn->session->cmds[i];
+2054                 if (!running_task->sc || running_task == task ||
+2055                      running_task->state != ISCSI_TASK_RUNNING)
+2056                         continue;
+2057
+2058                 /*
+2059                  * Only check if cmds started before this one have
+made
+2060                  * progress, or this could never fail
+2061                  */
+2062                 if (time_after(running_task->sc->jiffies_at_alloc,
+2063                                task->sc->jiffies_at_alloc))    <---
+2064                         continue;
+2065
+...
+}
+
+carsh> struct scsi_cmnd ffff9fd1e6e931e8
+struct scsi_cmnd {
+  ...
+  SCp = {
+    ptr = 0x0,   <--- iscsi_task
+    this_residual = 0,
+    ...
+  },
+}
+
+To prevent this, we take a ref to the cmd under the back (completion) lock
+so if the completion side were to call iscsi_complete_task() on the task
+while the timer/eh paths are not holding the back_lock it will not be freed
+from under us.
+
+Note that this requires the previous patch, "scsi: libiscsi: Drop
+taskqueuelock" because bnx2i sleeps in its cleanup_task callout if the cmd
+is aborted. If the EH/timer and completion path are racing we don't know
+which path will do the last put. The previous patch moved the operations we
+needed to do under the forward lock to cleanup_queued_task.  Once that has
+run we can drop the forward lock for the cmd and bnx2i no longer has to
+worry about if the EH, timer or completion path did the ast put and if the
+forward lock is held or not since it won't be.
+
+Link: https://lore.kernel.org/r/20210207044608.27585-4-michael.christie@oracle.com
+Reported-by: Wu Bo <wubo40@huawei.com>
+Reviewed-by: Lee Duncan <lduncan@suse.com>
+Signed-off-by: Mike Christie <michael.christie@oracle.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+

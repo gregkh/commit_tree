@@ -1,0 +1,53 @@
+scsi: mvsas: Pass gfp_t flags to libsas event notifiers
+
+mvsas calls the non _gfp version of the libsas event notifiers API, leading
+to the buggy call chains below:
+
+  mvsas/mv_sas.c: mvs_work_queue() [process context]
+  spin_lock_irqsave(mvs_info::lock, )
+    -> libsas/sas_event.c: sas_notify_phy_event()
+      -> sas_alloc_event()
+        -> in_interrupt() = false
+          -> invalid GFP_KERNEL allocation
+    -> libsas/sas_event.c: sas_notify_port_event()
+      -> sas_alloc_event()
+        -> in_interrupt() = false
+          -> invalid GFP_KERNEL allocation
+
+Use the new event notifiers API instead, which requires callers to
+explicitly pass the gfp_t memory allocation flags.
+
+Below are context analysis for the modified functions:
+
+=> mvs_bytes_dmaed():
+
+Since it is invoked from both process and atomic contexts, let its callers
+pass the gfp_t flags. Call chains:
+
+  scsi_scan.c: do_scsi_scan_host() [has msleep()]
+    -> shost->hostt->scan_start()
+    -> [mvsas/mv_init.c: Scsi_Host::scsi_host_template .scan_start = mvs_scan_start()]
+    -> mvsas/mv_sas.c: mvs_scan_start()
+      -> mvs_bytes_dmaed(..., GFP_KERNEL)
+
+  mvsas/mv_sas.c: mvs_work_queue()
+  spin_lock_irqsave(mvs_info::lock,)
+    -> mvs_bytes_dmaed(..., GFP_ATOMIC)
+
+  mvsas/mv_64xx.c: mvs_64xx_isr() || mvsas/mv_94xx.c: mvs_94xx_isr()
+    -> mvsas/mv_chips.h: mvs_int_full()
+      -> mvsas/mv_sas.c: mvs_int_port()
+        -> mvs_bytes_dmaed(..., GFP_ATOMIC);
+
+=> mvs_work_queue():
+
+Invoked from process context, but it calls all the libsas event notifier
+APIs under a spin_lock_irqsave(). Pass GFP_ATOMIC.
+
+Link: https://lore.kernel.org/r/20210118100955.1761652-5-a.darwish@linutronix.de
+Fixes: 1c393b970e0f ("scsi: libsas: Use dynamic alloced work to avoid sas event lost")
+Cc: Jason Yan <yanaijie@huawei.com>
+Reviewed-by: John Garry <john.garry@huawei.com>
+Signed-off-by: Ahmed S. Darwish <a.darwish@linutronix.de>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+

@@ -1,0 +1,59 @@
+wireguard: queueing: get rid of per-peer ring buffers
+
+Having two ring buffers per-peer means that every peer results in two
+massive ring allocations. On an 8-core x86_64 machine, this commit
+reduces the per-peer allocation from 18,688 bytes to 1,856 bytes, which
+is an 90% reduction. Ninety percent! With some single-machine
+deployments approaching 500,000 peers, we're talking about a reduction
+from 7 gigs of memory down to 700 megs of memory.
+
+In order to get rid of these per-peer allocations, this commit switches
+to using a list-based queueing approach. Currently GSO fragments are
+chained together using the skb->next pointer (the skb_list_* singly
+linked list approach), so we form the per-peer queue around the unused
+skb->prev pointer (which sort of makes sense because the links are
+pointing backwards). Use of skb_queue_* is not possible here, because
+that is based on doubly linked lists and spinlocks. Multiple cores can
+write into the queue at any given time, because its writes occur in the
+start_xmit path or in the udp_recv path. But reads happen in a single
+workqueue item per-peer, amounting to a multi-producer, single-consumer
+paradigm.
+
+The MPSC queue is implemented locklessly and never blocks. However, it
+is not linearizable (though it is serializable), with a very tight and
+unlikely race on writes, which, when hit (some tiny fraction of the
+0.15% of partial adds on a fully loaded 16-core x86_64 system), causes
+the queue reader to terminate early. However, because every packet sent
+queues up the same workqueue item after it is fully added, the worker
+resumes again, and stopping early isn't actually a problem, since at
+that point the packet wouldn't have yet been added to the encryption
+queue. These properties allow us to avoid disabling interrupts or
+spinning. The design is based on Dmitry Vyukov's algorithm [1].
+
+Performance-wise, ordinarily list-based queues aren't preferable to
+ringbuffers, because of cache misses when following pointers around.
+However, we *already* have to follow the adjacent pointers when working
+through fragments, so there shouldn't actually be any change there. A
+potential downside is that dequeueing is a bit more complicated, but the
+ptr_ring structure used prior had a spinlock when dequeueing, so all and
+all the difference appears to be a wash.
+
+Actually, from profiling, the biggest performance hit, by far, of this
+commit winds up being atomic_add_unless(count, 1, max) and atomic_
+dec(count), which account for the majority of CPU time, according to
+perf. In that sense, the previous ring buffer was superior in that it
+could check if it was full by head==tail, which the list-based approach
+cannot do.
+
+But all and all, this enables us to get massive memory savings, allowing
+WireGuard to scale for real world deployments, without taking much of a
+performance hit.
+
+[1] http://www.1024cores.net/home/lock-free-algorithms/queues/intrusive-mpsc-node-based-queue
+
+Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+Reviewed-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Fixes: e7096c131e51 ("net: WireGuard secure network tunnel")
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+
