@@ -1,0 +1,54 @@
+sched: Fix migration_cpu_stop() requeueing
+
+When affine_move_task(p) is called on a running task @p, which is not
+otherwise already changing affinity, we'll first set
+p->migration_pending and then do:
+
+	 stop_one_cpu(cpu_of_rq(rq), migration_cpu_stop, &arg);
+
+This then gets us to migration_cpu_stop() running on the CPU that was
+previously running our victim task @p.
+
+If we find that our task is no longer on that runqueue (this can
+happen because of a concurrent migration due to load-balance etc.),
+then we'll end up at the:
+
+	} else if (dest_cpu < 1 || pending) {
+
+branch. Which we'll take because we set pending earlier. Here we first
+check if the task @p has already satisfied the affinity constraints,
+if so we bail early [A]. Otherwise we'll reissue migration_cpu_stop()
+onto the CPU that is now hosting our task @p:
+
+	stop_one_cpu_nowait(cpu_of(rq), migration_cpu_stop,
+			    &pending->arg, &pending->stop_work);
+
+Except, we've never initialized pending->arg, which will be all 0s.
+
+This then results in running migration_cpu_stop() on the next CPU with
+arg->p == NULL, which gives the by now obvious result of fireworks.
+
+The cure is to change affine_move_task() to always use pending->arg,
+furthermore we can use the exact same pattern as the
+SCA_MIGRATE_ENABLE case, since we'll block on the pending->done
+completion anyway, no point in adding yet another completion in
+stop_one_cpu().
+
+This then gives a clear distinction between the two
+migration_cpu_stop() use cases:
+
+  - sched_exec() / migrate_task_to() : arg->pending == NULL
+  - affine_move_task() : arg->pending != NULL;
+
+And we can have it ignore p->migration_pending when !arg->pending. Any
+stop work from sched_exec() / migrate_task_to() is in addition to stop
+works from affine_move_task(), which will be sufficient to issue the
+completion.
+
+Fixes: 6d337eab041d ("sched: Fix migrate_disable() vs set_cpus_allowed_ptr()")
+Cc: stable@kernel.org
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Reviewed-by: Valentin Schneider <valentin.schneider@arm.com>
+Link: https://lkml.kernel.org/r/20210224131355.357743989@infradead.org
+

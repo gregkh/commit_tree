@@ -1,0 +1,38 @@
+btrfs: fix race between extent freeing/allocation when using bitmaps
+
+During allocation the allocator will try to allocate an extent using
+cluster policy. Once the current cluster is exhausted it will remove the
+entry under btrfs_free_cluster::lock and subsequently acquire
+btrfs_free_space_ctl::tree_lock to dispose of the already-deleted entry
+and adjust btrfs_free_space_ctl::total_bitmap. This poses a problem
+because there exists a race condition between removing the entry under
+one lock and doing the necessary accounting holding a different lock
+since extent freeing only uses the 2nd lock. This can result in the
+following situation:
+
+T1:                                    T2:
+btrfs_alloc_from_cluster               insert_into_bitmap <holds tree_lock>
+ if (entry->bytes == 0)                   if (block_group && !list_empty(&block_group->cluster_list)) {
+    rb_erase(entry)
+
+ spin_unlock(&cluster->lock);
+   (total_bitmaps is still 4)           spin_lock(&cluster->lock);
+                                         <doesn't find entry in cluster->root>
+ spin_lock(&ctl->tree_lock);             <goes to new_bitmap label, adds
+<blocked since T2 holds tree_lock>       <a new entry and calls add_new_bitmap>
+					    recalculate_thresholds  <crashes,
+                                              due to total_bitmaps
+					      becoming 5 and triggering
+					      an ASSERT>
+
+To fix this ensure that once depleted, the cluster entry is deleted when
+both cluster lock and tree locks are held in the allocator (T1), this
+ensures that even if there is a race with a concurrent
+insert_into_bitmap call it will correctly find the entry in the cluster
+and add the new space to it.
+
+CC: <stable@vger.kernel.org> # 4.4+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Nikolay Borisov <nborisov@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

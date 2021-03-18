@@ -1,0 +1,48 @@
+btrfs: fix race between swap file activation and snapshot creation
+
+When creating a snapshot we check if the current number of swap files, in
+the root, is non-zero, and if it is, we error out and warn that we can not
+create the snapshot because there are active swap files.
+
+However this is racy because when a task started activation of a swap
+file, another task might have started already snapshot creation and might
+have seen the counter for the number of swap files as zero. This means
+that after the swap file is activated we may end up with a snapshot of the
+same root successfully created, and therefore when the first write to the
+swap file happens it has to fall back into COW mode, which should never
+happen for active swap files.
+
+Basically what can happen is:
+
+1) Task A starts snapshot creation and enters ioctl.c:create_snapshot().
+   There it sees that root->nr_swapfiles has a value of 0 so it continues;
+
+2) Task B enters btrfs_swap_activate(). It is not aware that another task
+   started snapshot creation but it did not finish yet. It increments
+   root->nr_swapfiles from 0 to 1;
+
+3) Task B checks that the file meets all requirements to be an active
+   swap file - it has NOCOW set, there are no snapshots for the inode's
+   root at the moment, no file holes, no reflinked extents, etc;
+
+4) Task B returns success and now the file is an active swap file;
+
+5) Task A commits the transaction to create the snapshot and finishes.
+   The swap file's extents are now shared between the original root and
+   the snapshot;
+
+6) A write into an extent of the swap file is attempted - there is a
+   snapshot of the file's root, so we fall back to COW mode and therefore
+   the physical location of the extent changes on disk.
+
+So fix this by taking the snapshot lock during swap file activation before
+locking the extent range, as that is the order in which we lock these
+during buffered writes.
+
+Fixes: ed46ff3d42378 ("Btrfs: support swap files")
+CC: stable@vger.kernel.org # 5.4+
+Reviewed-by: Anand Jain <anand.jain@oracle.com>
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

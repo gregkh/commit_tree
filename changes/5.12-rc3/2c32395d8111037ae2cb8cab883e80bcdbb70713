@@ -1,0 +1,37 @@
+io_uring: fix __tctx_task_work() ctx race
+
+There is an unlikely but possible race using a freed context. That's
+because req->task_work.func() can free a request, but we won't
+necessarily find a completion in submit_state.comp and so all ctx refs
+may be put by the time we do mutex_lock(&ctx->uring_ctx);
+
+There are several reasons why it can miss going through
+submit_state.comp: 1) req->task_work.func() didn't complete it itself,
+but punted to iowq (e.g. reissue) and it got freed later, or a similar
+situation with it overflowing and getting flushed by someone else, or
+being submitted to IRQ completion, 2) As we don't hold the uring_lock,
+someone else can do io_submit_flush_completions() and put our ref.
+3) Bugs and code obscurities, e.g. failing to propagate issue_flags
+properly.
+
+One example is as follows
+
+  CPU1                                  |  CPU2
+=======================================================================
+@req->task_work.func()                  |
+  -> @req overflwed,                    |
+     so submit_state.comp,nr==0         |
+                                        | flush overflows, and free @req
+                                        | ctx refs == 0, free it
+ctx is dead, but we do                  |
+	lock + flush + unlock           |
+
+So take a ctx reference for each new ctx we see in __tctx_task_work(),
+and do release it until we do all our flushing.
+
+Fixes: 65453d1efbd2 ("io_uring: enable req cache for task_work items")
+Reported-by: syzbot+a157ac7c03a56397f553@syzkaller.appspotmail.com
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+[axboe: fold in my one-liner and fix ref mismatch]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

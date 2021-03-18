@@ -1,0 +1,86 @@
+btrfs: subpage: fix the false data csum mismatch error
+
+[BUG]
+When running fstresss, we can hit strange data csum mismatch where the
+on-disk data is in fact correct (passes scrub).
+
+With some extra debug info added, we have the following traces:
+
+  0482us: btrfs_do_readpage: root=5 ino=284 offset=393216, submit force=0 pgoff=0 iosize=8192
+  0494us: btrfs_do_readpage: root=5 ino=284 offset=401408, submit force=0 pgoff=8192 iosize=4096
+  0498us: btrfs_submit_data_bio: root=5 ino=284 bio first bvec=393216 len=8192
+  0591us: btrfs_do_readpage: root=5 ino=284 offset=405504, submit force=0 pgoff=12288 iosize=36864
+  0594us: btrfs_submit_data_bio: root=5 ino=284 bio first bvec=401408 len=4096
+  0863us: btrfs_submit_data_bio: root=5 ino=284 bio first bvec=405504 len=36864
+  0933us: btrfs_verify_data_csum: root=5 ino=284 offset=393216 len=8192
+  0967us: btrfs_do_readpage: root=5 ino=284 offset=442368, skip beyond isize pgoff=49152 iosize=16384
+  1047us: btrfs_verify_data_csum: root=5 ino=284 offset=401408 len=4096
+  1163us: btrfs_verify_data_csum: root=5 ino=284 offset=405504 len=36864
+  1290us: check_data_csum: !!! root=5 ino=284 offset=438272 pg_off=45056 !!!
+  7387us: end_bio_extent_readpage: root=5 ino=284 before pending_read_bios=0
+
+[CAUSE]
+Normally we expect all submitted bio reads to only touch the range we
+specified, and under subpage context, it means we should only touch the
+range specified in each bvec.
+
+But in data read path, inside end_bio_extent_readpage(), we have page
+zeroing which only takes regular page size into consideration.
+
+This means for subpage if we have an inode whose content looks like below:
+
+  0       16K     32K     48K     64K
+  |///////|       |///////|       |
+
+  |//| = data needs to be read from disk
+  |  | = hole
+
+And i_size is 64K initially.
+
+Then the following race can happen:
+
+		T1		|		T2
+--------------------------------+--------------------------------
+btrfs_do_readpage()		|
+|- isize = 64K;			|
+|  At this time, the isize is 	|
+|  64K				|
+|				|
+|- submit_extent_page()		|
+|  submit previous assembled bio|
+|  assemble bio for [0, 16K)	|
+|				|
+|- submit_extent_page()		|
+   submit read bio for [0, 16K) |
+   assemble read bio for	|
+   [32K, 48K)			|
+ 				|
+				| btrfs_setsize()
+				| |- i_size_write(, 16K);
+				|    Now i_size is only 16K
+end_io() for [0K, 16K)		|
+|- end_bio_extent_readpage()	|
+   |- btrfs_verify_data_csum()  |
+   |  No csum error		|
+   |- i_size = 16K;		|
+   |- zero_user_segment(16K,	|
+      PAGE_SIZE);		|
+      !!! We zeroed range	|
+      !!! [32K, 48K)		|
+				| end_io for [32K, 48K)
+				| |- end_bio_extent_readpage()
+				|    |- btrfs_verify_data_csum()
+				|       ! CSUM MISMATCH !
+				|       ! As the range is zeroed now !
+
+[FIX]
+To fix the problem, make end_bio_extent_readpage() to only zero the
+range of bvec.
+
+The bug only affects subpage read-write support, as for full read-only
+mount we can't change i_size thus won't hit the race condition.
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+
