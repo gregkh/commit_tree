@@ -1,0 +1,47 @@
+KVM: x86: Protect userspace MSR filter with SRCU, and set atomically-ish
+
+Fix a plethora of issues with MSR filtering by installing the resulting
+filter as an atomic bundle instead of updating the live filter one range
+at a time.  The KVM_X86_SET_MSR_FILTER ioctl() isn't truly atomic, as
+the hardware MSR bitmaps won't be updated until the next VM-Enter, but
+the relevant software struct is atomically updated, which is what KVM
+really needs.
+
+Similar to the approach used for modifying memslots, make arch.msr_filter
+a SRCU-protected pointer, do all the work configuring the new filter
+outside of kvm->lock, and then acquire kvm->lock only when the new filter
+has been vetted and created.  That way vCPU readers either see the old
+filter or the new filter in their entirety, not some half-baked state.
+
+Yuan Yao pointed out a use-after-free in ksm_msr_allowed() due to a
+TOCTOU bug, but that's just the tip of the iceberg...
+
+  - Nothing is __rcu annotated, making it nigh impossible to audit the
+    code for correctness.
+  - kvm_add_msr_filter() has an unpaired smp_wmb().  Violation of kernel
+    coding style aside, the lack of a smb_rmb() anywhere casts all code
+    into doubt.
+  - kvm_clear_msr_filter() has a double free TOCTOU bug, as it grabs
+    count before taking the lock.
+  - kvm_clear_msr_filter() also has memory leak due to the same TOCTOU bug.
+
+The entire approach of updating the live filter is also flawed.  While
+installing a new filter is inherently racy if vCPUs are running, fixing
+the above issues also makes it trivial to ensure certain behavior is
+deterministic, e.g. KVM can provide deterministic behavior for MSRs with
+identical settings in the old and new filters.  An atomic update of the
+filter also prevents KVM from getting into a half-baked state, e.g. if
+installing a filter fails, the existing approach would leave the filter
+in a half-baked state, having already committed whatever bits of the
+filter were already processed.
+
+[*] https://lkml.kernel.org/r/20210312083157.25403-1-yaoyuan0329os@gmail.com
+
+Fixes: 1a155254ff93 ("KVM: x86: Introduce MSR filtering")
+Cc: stable@vger.kernel.org
+Cc: Alexander Graf <graf@amazon.com>
+Reported-by: Yuan Yao <yaoyuan0329os@gmail.com>
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210316184436.2544875-2-seanjc@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+
