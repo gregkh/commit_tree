@@ -1,0 +1,67 @@
+xfs: reduce buffer log item shadow allocations
+
+When we modify btrees repeatedly, we regularly increase the size of
+the logged region by a single chunk at a time (per transaction
+commit). This results in the CIL formatting code having to
+reallocate the log vector buffer every time the buffer dirty region
+grows. Hence over a typical 4kB btree buffer, we might grow the log
+vector 4096/128 = 32x over a short period where we repeatedly add
+or remove records to/from the buffer over a series of running
+transaction. This means we are doing 32 memory allocations and frees
+over this time during a performance critical path in the journal.
+
+The amount of space tracked in the CIL for the object is calculated
+during the ->iop_format() call for the buffer log item, but the
+buffer memory allocated for it is calculated by the ->iop_size()
+call. The size callout determines the size of the buffer, the format
+call determines the space used in the buffer.
+
+Hence we can oversize the buffer space required in the size
+calculation without impacting the amount of space used and accounted
+to the CIL for the changes being logged. This allows us to reduce
+the number of allocations by rounding up the buffer size to allow
+for future growth. This can safe a substantial amount of CPU time in
+this path:
+
+-   46.52%     2.02%  [kernel]                  [k] xfs_log_commit_cil
+   - 44.49% xfs_log_commit_cil
+      - 30.78% _raw_spin_lock
+         - 30.75% do_raw_spin_lock
+              30.27% __pv_queued_spin_lock_slowpath
+
+(oh, ouch!)
+....
+      - 1.05% kmem_alloc_large
+         - 1.02% kmem_alloc
+              0.94% __kmalloc
+
+This overhead here us what this patch is aimed at. After:
+
+      - 0.76% kmem_alloc_large
+         - 0.75% kmem_alloc
+              0.70% __kmalloc
+
+The size of 512 bytes is based on the bitmap chunk size being 128
+bytes and that random directory entry updates almost never require
+more than 3-4 128 byte regions to be logged in the directory block.
+
+The other observation is for per-ag btrees. When we are inserting
+into a new btree block, we'll pack it from the front. Hence the
+first few records land in the first 128 bytes so we log only 128
+bytes, the next 8-16 records land in the second region so now we log
+256 bytes. And so on.  If we are doing random updates, it will only
+allocate every 4 random 128 byte regions that are dirtied instead of
+every single one.
+
+Any larger than 512 bytes and I noticed an increase in memory
+footprint in my scalability workloads. Any less than this and I
+didn't really see any significant benefit to CPU usage.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Chandan Babu R <chandanrlinux@gmail.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Gao Xiang <hsiangkao@redhat.com>
+

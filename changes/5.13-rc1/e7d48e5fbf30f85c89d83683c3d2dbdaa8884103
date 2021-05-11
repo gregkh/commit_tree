@@ -1,0 +1,76 @@
+net: enetc: add a mini driver for the Integrated Endpoint Register Block
+
+The NXP ENETC is a 4-port Ethernet controller which 'smells' to
+operating systems like 4 distinct PCIe PFs with SR-IOV, each PF having
+its own driver instance, but in fact there are some hardware resources
+which are shared between all ports, like for example the 256 KB SRAM
+FIFO between the MACs and the Host Transfer Agent which DMAs frames to
+DRAM.
+
+To hide the stuff that cannot be neatly exposed per port, the hardware
+designers came up with this idea of having a dedicated register block
+which is supposed to be populated by the bootloader, and contains
+everything configuration-related: MAC addresses, FIFO partitioning, etc.
+
+When a port is reset using PCIe Function Level Reset, its defaults are
+transferred from the IERB configuration. Most of the time, the settings
+made through the IERB are read-only in the port's memory space (if they
+are even visible), so they cannot be modified at runtime.
+
+Linux doesn't have any advanced FIFO partitioning requirements at all,
+but when reading through the hardware manual, it became clear that, even
+though there are many good 'recommendations' for default values, many of
+them were not actually put in practice on LS1028A. So we end up with a
+default configuration that:
+
+(a) does not have enough TX and RX byte credits to support the max MTU
+    of 9600 (which the Linux driver claims already) properly (at full speed)
+(b) allows the FIFO to be overrun with RX traffic, potentially
+    overwriting internal data structures.
+
+The last part sounds a bit catastrophic, but it isn't. Frames are
+supposed to transit the FIFO for a very short time, but they can
+actually accumulate there under 2 conditions:
+
+(a) there is very severe congestion on DRAM memory, or
+(b) the RX rings visible to the operating system were configured for
+    lossless operation, and they just ran out of free buffers to copy
+    the frame to. This is what is used to put backpressure onto the MAC
+    with flow control.
+
+So since ENETC has not supported flow control thus far, RX FIFO overruns
+were never seen with Linux. But with the addition of flow control, we
+should configure some registers to prevent this from happening. What we
+are trying to protect against are bad actors which continue to send us
+traffic despite the fact that we have signaled a PAUSE condition. Of
+course we can't be lossless in that case, but it is best to configure
+the FIFO to do tail dropping rather than letting it overrun.
+
+So in a nutshell, this driver is a fixup for all the IERB default values
+that should have been but aren't.
+
+The IERB configuration needs to be done _before_ the PFs are enabled.
+So every PF searches for the presence of the "fsl,ls1028a-enetc-ierb"
+node in the device tree, and if it finds it, it "registers" with the
+IERB, which means that it requests the IERB to fix up its default
+values. This is done through -EPROBE_DEFER. The IERB driver is part of
+the fsl_enetc module, but is technically a platform driver, since the
+IERB is a good old fashioned MMIO region, as opposed to ENETC ports
+which pretend to be PCIe devices.
+
+The driver was already configuring ENETC_PTXMBAR (FIFO allocation for
+TX) because due to an omission, TXMBAR is a read/write register in the
+PF memory space. But the manual is quite clear that the formula for this
+should depend upon the TX byte credits (TXBCR). In turn, the TX byte
+credits are only readable/writable through the IERB. So if we want to
+ensure that the TXBCR register also has a value that is correct and in
+line with TXMBAR, there is simply no way this can be done from the PF
+driver, access to the IERB is needed.
+
+I could have modified U-Boot to fix up the IERB values, but that is
+quite undesirable, as old U-Boot versions are likely to be floating
+around for quite some time from now.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

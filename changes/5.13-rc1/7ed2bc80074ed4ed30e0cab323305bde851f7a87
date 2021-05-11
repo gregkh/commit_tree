@@ -1,0 +1,72 @@
+net: enetc: add support for XDP_TX
+
+For reflecting packets back into the interface they came from, we create
+an array of TX software BDs derived from the RX software BDs. Therefore,
+we need to extend the TX software BD structure to contain most of the
+stuff that's already present in the RX software BD structure, for
+reasons that will become evident in a moment.
+
+For a frame with the XDP_TX verdict, we don't reuse any buffer right
+away as we do for XDP_DROP (the same page half) or XDP_PASS (the other
+page half, same as the skb code path).
+
+Because the buffer transfers ownership from the RX ring to the TX ring,
+reusing any page half right away is very dangerous. So what we can do is
+we can recycle the same page half as soon as TX is complete.
+
+The code path is:
+enetc_poll
+-> enetc_clean_rx_ring_xdp
+   -> enetc_xdp_tx
+   -> enetc_refill_rx_ring
+(time passes, another MSI interrupt is raised)
+enetc_poll
+-> enetc_clean_tx_ring
+   -> enetc_recycle_xdp_tx_buff
+
+But that creates a problem, because there is a potentially large time
+window between enetc_xdp_tx and enetc_recycle_xdp_tx_buff, period in
+which we'll have less and less RX buffers.
+
+Basically, when the ship starts sinking, the knee-jerk reaction is to
+let enetc_refill_rx_ring do what it does for the standard skb code path
+(refill every 16 consumed buffers), but that turns out to be very
+inefficient. The problem is that we have no rx_swbd->page at our
+disposal from the enetc_reuse_page path, so enetc_refill_rx_ring would
+have to call enetc_new_page for every buffer that we refill (if we
+choose to refill at this early stage). Very inefficient, it only makes
+the problem worse, because page allocation is an expensive process, and
+CPU time is exactly what we're lacking.
+
+Additionally, there is an even bigger problem: if we let
+enetc_refill_rx_ring top up the ring's buffers again from the RX path,
+remember that the buffers sent to transmission haven't disappeared
+anywhere. They will be eventually sent, and processed in
+enetc_clean_tx_ring, and an attempt will be made to recycle them.
+But surprise, the RX ring is already full of new buffers, because we
+were premature in deciding that we should refill. So not only we took
+the expensive decision of allocating new pages, but now we must throw
+away perfectly good and reusable buffers.
+
+So what we do is we implement an elastic refill mechanism, which keeps
+track of the number of in-flight XDP_TX buffer descriptors. We top up
+the RX ring only up to the total ring capacity minus the number of BDs
+that are in flight (because we know that those BDs will return to us
+eventually).
+
+The enetc driver manages 1 RX ring per CPU, and the default TX ring
+management is the same. So we do XDP_TX towards the TX ring of the same
+index, because it is affined to the same CPU. This will probably not
+produce great results when we have a tc-taprio/tc-mqprio qdisc on the
+interface, because in that case, the number of TX rings might be
+greater, but I didn't add any checks for that yet (mostly because I
+didn't know what checks to add).
+
+It should also be noted that we need to change the DMA mapping direction
+for RX buffers, since they may now be reflected into the TX ring of the
+same device. We choose to use DMA_BIDIRECTIONAL instead of unmapping and
+remapping as DMA_TO_DEVICE, because performance is better this way.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

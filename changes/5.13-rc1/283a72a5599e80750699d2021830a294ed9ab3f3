@@ -1,0 +1,92 @@
+nexthop: Add implementation of resilient next-hop groups
+
+At this moment, there is only one type of next-hop group: an mpath group,
+which implements the hash-threshold algorithm.
+
+To select a next hop, hash-threshold algorithm first assigns a range of
+hashes to each next hop in the group, and then selects the next hop by
+comparing the SKB hash with the individual ranges. When a next hop is
+removed from the group, the ranges are recomputed, which leads to
+reassignment of parts of hash space from one next hop to another. While
+there will usually be some overlap between the previous and the new
+distribution, some traffic flows change the next hop that they resolve to.
+That causes problems e.g. as established TCP connections are reset, because
+the traffic is forwarded to a server that is not familiar with the
+connection.
+
+Resilient hashing is a technique to address the above problem. Resilient
+next-hop group has another layer of indirection between the group itself
+and its constituent next hops: a hash table. The selection algorithm uses a
+straightforward modulo operation to choose a hash bucket, and then reads
+the next hop that this bucket contains, and forwards traffic there.
+
+This indirection brings an important feature. In the hash-threshold
+algorithm, the range of hashes associated with a next hop must be
+continuous. With a hash table, mapping between the hash table buckets and
+the individual next hops is arbitrary. Therefore when a next hop is deleted
+the buckets that held it are simply reassigned to other next hops. When
+weights of next hops in a group are altered, it may be possible to choose a
+subset of buckets that are currently not used for forwarding traffic, and
+use those to satisfy the new next-hop distribution demands, keeping the
+"busy" buckets intact. This way, established flows are ideally kept being
+forwarded to the same endpoints through the same paths as before the
+next-hop group change.
+
+In a nutshell, the algorithm works as follows. Each next hop has a number
+of buckets that it wants to have, according to its weight and the number of
+buckets in the hash table. In case of an event that might cause bucket
+allocation change, the numbers for individual next hops are updated,
+similarly to how ranges are updated for mpath group next hops. Following
+that, a new "upkeep" algorithm runs, and for idle buckets that belong to a
+next hop that is currently occupying more buckets than it wants (it is
+"overweight"), it migrates the buckets to one of the next hops that has
+fewer buckets than it wants (it is "underweight"). If, after this, there
+are still underweight next hops, another upkeep run is scheduled to a
+future time.
+
+Chances are there are not enough "idle" buckets to satisfy the new demands.
+The algorithm has knobs to select both what it means for a bucket to be
+idle, and for whether and when to forcefully migrate buckets if there keeps
+being an insufficient number of idle buckets.
+
+There are three users of the resilient data structures.
+
+- The forwarding code accesses them under RCU, and does not modify them
+  except for updating the time a selected bucket was last used.
+
+- Netlink code, running under RTNL, which may modify the data.
+
+- The delayed upkeep code, which may modify the data. This runs unlocked,
+  and mutual exclusion between the RTNL code and the delayed upkeep is
+  maintained by canceling the delayed work synchronously before the RTNL
+  code touches anything. Later it restarts the delayed work if necessary.
+
+The RTNL code has to implement next-hop group replacement, next hop
+removal, etc. For removal, the mpath code uses a neat trick of having a
+backup next hop group structure, doing the necessary changes offline, and
+then RCU-swapping them in. However, the hash tables for resilient hashing
+are about an order of magnitude larger than the groups themselves (the size
+might be e.g. 4K entries), and it was felt that keeping two of them is an
+overkill. Both the primary next-hop group and the spare therefore use the
+same resilient table, and writers are careful to keep all references valid
+for the forwarding code. The hash table references next-hop group entries
+from the next-hop group that is currently in the primary role (i.e. not
+spare). During the transition from primary to spare, the table references a
+mix of both the primary group and the spare. When a next hop is deleted,
+the corresponding buckets are not set to NULL, but instead marked as empty,
+so that the pointer is valid and can be used by the forwarding code. The
+buckets are then migrated to a new next-hop group entry during upkeep. The
+only times that the hash table is invalid is the very beginning and very
+end of its lifetime. Between those points, it is always kept valid.
+
+This patch introduces the core support code itself. It does not handle
+notifications towards drivers, which are kept as if the group were an mpath
+one. It does not handle netlink either. The only bit currently exposed to
+user space is the new next-hop group type, and that is currently bounced.
+There is therefore no way to actually access this code.
+
+Signed-off-by: Petr Machata <petrm@nvidia.com>
+Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+Reviewed-by: David Ahern <dsahern@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

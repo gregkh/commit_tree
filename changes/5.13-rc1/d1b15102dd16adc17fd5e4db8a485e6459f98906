@@ -1,0 +1,82 @@
+net: enetc: add support for XDP_DROP and XDP_PASS
+
+For the RX ring, enetc uses an allocation scheme based on pages split
+into two buffers, which is already very efficient in terms of preventing
+reallocations / maximizing reuse, so I see no reason why I would change
+that.
+
+ +--------+--------+--------+--------+--------+--------+--------+
+ |        |        |        |        |        |        |        |
+ | half B | half B | half B | half B | half B | half B | half B |
+ |        |        |        |        |        |        |        |
+ +--------+--------+--------+--------+--------+--------+--------+
+ |        |        |        |        |        |        |        |
+ | half A | half A | half A | half A | half A | half A | half A | RX ring
+ |        |        |        |        |        |        |        |
+ +--------+--------+--------+--------+--------+--------+--------+
+     ^                                                     ^
+     |                                                     |
+ next_to_clean                                       next_to_alloc
+                                                      next_to_use
+
+                   +--------+--------+--------+--------+--------+
+                   |        |        |        |        |        |
+                   | half B | half B | half B | half B | half B |
+                   |        |        |        |        |        |
+ +--------+--------+--------+--------+--------+--------+--------+
+ |        |        |        |        |        |        |        |
+ | half B | half B | half A | half A | half A | half A | half A | RX ring
+ |        |        |        |        |        |        |        |
+ +--------+--------+--------+--------+--------+--------+--------+
+ |        |        |   ^                                   ^
+ | half A | half A |   |                                   |
+ |        |        | next_to_clean                   next_to_use
+ +--------+--------+
+              ^
+              |
+         next_to_alloc
+
+then when enetc_refill_rx_ring is called, whose purpose is to advance
+next_to_use, it sees that it can take buffers up to next_to_alloc, and
+it says "oh, hey, rx_swbd->page isn't NULL, I don't need to allocate
+one!".
+
+The only problem is that for default PAGE_SIZE values of 4096, buffer
+sizes are 2048 bytes. While this is enough for normal skb allocations at
+an MTU of 1500 bytes, for XDP it isn't, because the XDP headroom is 256
+bytes, and including skb_shared_info and alignment, we end up being able
+to make use of only 1472 bytes, which is insufficient for the default
+MTU.
+
+To solve that problem, we implement scatter/gather processing in the
+driver, because we would really like to keep the existing allocation
+scheme. A packet of 1500 bytes is received in a buffer of 1472 bytes and
+another one of 28 bytes.
+
+Because the headroom required by XDP is different (and much larger) than
+the one required by the network stack, whenever a BPF program is added
+or deleted on the port, we drain the existing RX buffers and seed new
+ones with the required headroom. We also keep the required headroom in
+rx_ring->buffer_offset.
+
+The simplest way to implement XDP_PASS, where an skb must be created, is
+to create an xdp_buff based on the next_to_clean RX BDs, but not clear
+those BDs from the RX ring yet, just keep the original index at which
+the BDs for this frame started. Then, if the verdict is XDP_PASS,
+instead of converting the xdb_buff to an skb, we replay a call to
+enetc_build_skb (just as in the normal enetc_clean_rx_ring case),
+starting from the original BD index.
+
+We would also like to be minimally invasive to the regular RX data path,
+and not check whether there is a BPF program attached to the ring on
+every packet. So we create a separate RX ring processing function for
+XDP.
+
+Because we only install/remove the BPF program while the interface is
+down, we forgo the rcu_read_lock() in enetc_clean_rx_ring, since there
+shouldn't be any circumstance in which we are processing packets and
+there is a potentially freed BPF program attached to the RX ring.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

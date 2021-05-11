@@ -1,0 +1,52 @@
+f2fs: Fix a hungtask problem in atomic write
+
+In the cache writing process, if it is an atomic file, increase the page
+count of F2FS_WB_CP_DATA, otherwise increase the page count of
+F2FS_WB_DATA.
+
+When you step into the hook branch due to insufficient memory in
+f2fs_write_begin, f2fs_drop_inmem_pages_all will be called to traverse
+all atomic inodes and clear the FI_ATOMIC_FILE mark of all atomic files.
+
+In f2fs_drop_inmem_pages，first acquire the inmem_lock , revoke all the
+inmem_pages, and then clear the FI_ATOMIC_FILE mark. Before this mark is
+cleared, other threads may hold inmem_lock to add inmem_pages to the inode
+that has just been emptied inmem_pages, and increase the page count of
+F2FS_WB_CP_DATA.
+
+When the IO returns, it is found that the FI_ATOMIC_FILE flag is cleared
+by f2fs_drop_inmem_pages_all, and f2fs_is_atomic_file returns false,which
+causes the page count of F2FS_WB_DATA to be decremented. The page count of
+F2FS_WB_CP_DATA cannot be cleared. Finally, hungtask is triggered in
+f2fs_wait_on_all_pages because get_pages will never return zero.
+
+process A:				process B:
+f2fs_drop_inmem_pages_all
+->f2fs_drop_inmem_pages of inode#1
+    ->mutex_lock(&fi->inmem_lock)
+    ->__revoke_inmem_pages of inode#1	f2fs_ioc_commit_atomic_write
+    ->mutex_unlock(&fi->inmem_lock)	->f2fs_commit_inmem_pages of inode#1
+					->mutex_lock(&fi->inmem_lock)
+					->__f2fs_commit_inmem_pages
+					    ->f2fs_do_write_data_page
+					        ->f2fs_outplace_write_data
+					            ->do_write_page
+					                ->f2fs_submit_page_write
+					                    ->inc_page_count(sbi, F2FS_WB_CP_DATA )
+					->mutex_unlock(&fi->inmem_lock)
+    ->spin_lock(&sbi->inode_lock[ATOMIC_FILE]);
+    ->clear_inode_flag(inode, FI_ATOMIC_FILE)
+    ->spin_unlock(&sbi->inode_lock[ATOMIC_FILE])
+					f2fs_write_end_io
+					->dec_page_count(sbi, F2FS_WB_DATA );
+
+We can fix the problem by putting the action of clearing the FI_ATOMIC_FILE
+mark into the inmem_lock lock. This operation can ensure that no one will
+submit the inmem pages before the FI_ATOMIC_FILE mark is cleared, so that
+there will be no atomic writes waiting for writeback.
+
+Fixes: 57864ae5ce3a ("f2fs: limit # of inmemory pages")
+Signed-off-by: Yi Zhuang <zhuangyi1@huawei.com>
+Reviewed-by: Chao Yu <yuchao0@huawei.com>
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+

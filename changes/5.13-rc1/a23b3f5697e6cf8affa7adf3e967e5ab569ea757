@@ -1,0 +1,163 @@
+xsk: Update rings for load-acquire/store-release barriers
+
+Currently, the AF_XDP rings uses general smp_{r,w,}mb() barriers on
+the kernel-side. On most modern architectures
+load-acquire/store-release barriers perform better, and results in
+simpler code for circular ring buffers.
+
+This change updates the XDP socket rings to use
+load-acquire/store-release barriers.
+
+It is important to note that changing from the old smp_{r,w,}mb()
+barriers, to load-acquire/store-release barriers does not break
+compatibility. The old semantics work with the new one, and vice
+versa.
+
+As pointed out by "Documentation/memory-barriers.txt" in the "SMP
+BARRIER PAIRING" section:
+
+  "General barriers pair with each other, though they also pair with
+  most other types of barriers, albeit without multicopy atomicity.
+  An acquire barrier pairs with a release barrier, but both may also
+  pair with other barriers, including of course general barriers."
+
+How different barriers behaves and pairs is outlined in
+"tools/memory-model/Documentation/cheatsheet.txt".
+
+In order to make sure that compatibility is not broken, LKMM herd7
+based litmus tests can be constructed and verified.
+
+We generalize the XDP socket ring to a one entry ring, and create two
+scenarios; One where the ring is full, where only the consumer can
+proceed, followed by the producer. One where the ring is empty, where
+only the producer can proceed, followed by the consumer. Each scenario
+is then expanded to four different tests: general producer/general
+consumer, general producer/acqrel consumer, acqrel producer/general
+consumer, acqrel producer/acqrel consumer. In total eight tests.
+
+The empty ring test:
+  C spsc-rb+empty
+
+  // Simple one entry ring:
+  // prod cons     allowed action       prod cons
+  //    0    0 =>       prod          =>   1    0
+  //    0    1 =>       cons          =>   0    0
+  //    1    0 =>       cons          =>   1    1
+  //    1    1 =>       prod          =>   0    1
+
+  {}
+
+  // We start at prod==0, cons==0, data==0, i.e. nothing has been
+  // written to the ring. From here only the producer can start, and
+  // should write 1. Afterwards, consumer can continue and read 1 to
+  // data. Can we enter state prod==1, cons==1, but consumer observed
+  // the incorrect value of 0?
+
+  P0(int *prod, int *cons, int *data)
+  {
+     ... producer
+  }
+
+  P1(int *prod, int *cons, int *data)
+  {
+     ... consumer
+  }
+
+  exists( 1:d=0 /\ prod=1 /\ cons=1 );
+
+The full ring test:
+  C spsc-rb+full
+
+  // Simple one entry ring:
+  // prod cons     allowed action       prod cons
+  //    0    0 =>       prod          =>   1    0
+  //    0    1 =>       cons          =>   0    0
+  //    1    0 =>       cons          =>   1    1
+  //    1    1 =>       prod          =>   0    1
+
+  { prod = 1; }
+
+  // We start at prod==1, cons==0, data==1, i.e. producer has
+  // written 0, so from here only the consumer can start, and should
+  // consume 0. Afterwards, producer can continue and write 1 to
+  // data. Can we enter state prod==0, cons==1, but consumer observed
+  // the write of 1?
+
+  P0(int *prod, int *cons, int *data)
+  {
+    ... producer
+  }
+
+  P1(int *prod, int *cons, int *data)
+  {
+    ... consumer
+  }
+
+  exists( 1:d=1 /\ prod=0 /\ cons=1 );
+
+where P0 and P1 are:
+
+  P0(int *prod, int *cons, int *data)
+  {
+  	int p;
+
+  	p = READ_ONCE(*prod);
+  	if (READ_ONCE(*cons) == p) {
+  		WRITE_ONCE(*data, 1);
+  		smp_wmb();
+  		WRITE_ONCE(*prod, p ^ 1);
+  	}
+  }
+
+  P0(int *prod, int *cons, int *data)
+  {
+  	int p;
+
+  	p = READ_ONCE(*prod);
+  	if (READ_ONCE(*cons) == p) {
+  		WRITE_ONCE(*data, 1);
+  		smp_store_release(prod, p ^ 1);
+  	}
+  }
+
+  P1(int *prod, int *cons, int *data)
+  {
+  	int c;
+  	int d = -1;
+
+  	c = READ_ONCE(*cons);
+  	if (READ_ONCE(*prod) != c) {
+  		smp_rmb();
+  		d = READ_ONCE(*data);
+  		smp_mb();
+  		WRITE_ONCE(*cons, c ^ 1);
+  	}
+  }
+
+  P1(int *prod, int *cons, int *data)
+  {
+  	int c;
+  	int d = -1;
+
+  	c = READ_ONCE(*cons);
+  	if (smp_load_acquire(prod) != c) {
+  		d = READ_ONCE(*data);
+  		smp_store_release(cons, c ^ 1);
+  	}
+  }
+
+The full LKMM litmus tests are found at [1].
+
+On x86-64 systems the l2fwd AF_XDP xdpsock sample performance
+increases by 1%. This is mostly due to that the smp_mb() is removed,
+which is a relatively expensive operation on these
+platforms. Weakly-ordered platforms, such as ARM64 might benefit even
+more.
+
+[1] https://github.com/bjoto/litmus-xsk
+
+Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/20210305094113.413544-2-bjorn.topel@gmail.com
+

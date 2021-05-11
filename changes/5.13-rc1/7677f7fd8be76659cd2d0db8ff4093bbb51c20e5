@@ -1,0 +1,172 @@
+userfaultfd: add minor fault registration mode
+
+Patch series "userfaultfd: add minor fault handling", v9.
+
+Overview
+========
+
+This series adds a new userfaultfd feature, UFFD_FEATURE_MINOR_HUGETLBFS.
+When enabled (via the UFFDIO_API ioctl), this feature means that any
+hugetlbfs VMAs registered with UFFDIO_REGISTER_MODE_MISSING will *also*
+get events for "minor" faults.  By "minor" fault, I mean the following
+situation:
+
+Let there exist two mappings (i.e., VMAs) to the same page(s) (shared
+memory).  One of the mappings is registered with userfaultfd (in minor
+mode), and the other is not.  Via the non-UFFD mapping, the underlying
+pages have already been allocated & filled with some contents.  The UFFD
+mapping has not yet been faulted in; when it is touched for the first
+time, this results in what I'm calling a "minor" fault.  As a concrete
+example, when working with hugetlbfs, we have huge_pte_none(), but
+find_lock_page() finds an existing page.
+
+We also add a new ioctl to resolve such faults: UFFDIO_CONTINUE.  The idea
+is, userspace resolves the fault by either a) doing nothing if the
+contents are already correct, or b) updating the underlying contents using
+the second, non-UFFD mapping (via memcpy/memset or similar, or something
+fancier like RDMA, or etc...).  In either case, userspace issues
+UFFDIO_CONTINUE to tell the kernel "I have ensured the page contents are
+correct, carry on setting up the mapping".
+
+Use Case
+========
+
+Consider the use case of VM live migration (e.g. under QEMU/KVM):
+
+1. While a VM is still running, we copy the contents of its memory to a
+   target machine. The pages are populated on the target by writing to the
+   non-UFFD mapping, using the setup described above. The VM is still running
+   (and therefore its memory is likely changing), so this may be repeated
+   several times, until we decide the target is "up to date enough".
+
+2. We pause the VM on the source, and start executing on the target machine.
+   During this gap, the VM's user(s) will *see* a pause, so it is desirable to
+   minimize this window.
+
+3. Between the last time any page was copied from the source to the target, and
+   when the VM was paused, the contents of that page may have changed - and
+   therefore the copy we have on the target machine is out of date. Although we
+   can keep track of which pages are out of date, for VMs with large amounts of
+   memory, it is "slow" to transfer this information to the target machine. We
+   want to resume execution before such a transfer would complete.
+
+4. So, the guest begins executing on the target machine. The first time it
+   touches its memory (via the UFFD-registered mapping), userspace wants to
+   intercept this fault. Userspace checks whether or not the page is up to date,
+   and if not, copies the updated page from the source machine, via the non-UFFD
+   mapping. Finally, whether a copy was performed or not, userspace issues a
+   UFFDIO_CONTINUE ioctl to tell the kernel "I have ensured the page contents
+   are correct, carry on setting up the mapping".
+
+We don't have to do all of the final updates on-demand. The userfaultfd manager
+can, in the background, also copy over updated pages once it receives the map of
+which pages are up-to-date or not.
+
+Interaction with Existing APIs
+==============================
+
+Because this is a feature, a registered VMA could potentially receive both
+missing and minor faults.  I spent some time thinking through how the
+existing API interacts with the new feature:
+
+UFFDIO_CONTINUE cannot be used to resolve non-minor faults, as it does not
+allocate a new page.  If UFFDIO_CONTINUE is used on a non-minor fault:
+
+- For non-shared memory or shmem, -EINVAL is returned.
+- For hugetlb, -EFAULT is returned.
+
+UFFDIO_COPY and UFFDIO_ZEROPAGE cannot be used to resolve minor faults.
+Without modifications, the existing codepath assumes a new page needs to
+be allocated.  This is okay, since userspace must have a second
+non-UFFD-registered mapping anyway, thus there isn't much reason to want
+to use these in any case (just memcpy or memset or similar).
+
+- If UFFDIO_COPY is used on a minor fault, -EEXIST is returned.
+- If UFFDIO_ZEROPAGE is used on a minor fault, -EEXIST is returned (or -EINVAL
+  in the case of hugetlb, as UFFDIO_ZEROPAGE is unsupported in any case).
+- UFFDIO_WRITEPROTECT simply doesn't work with shared memory, and returns
+  -ENOENT in that case (regardless of the kind of fault).
+
+Future Work
+===========
+
+This series only supports hugetlbfs.  I have a second series in flight to
+support shmem as well, extending the functionality.  This series is more
+mature than the shmem support at this point, and the functionality works
+fully on hugetlbfs, so this series can be merged first and then shmem
+support will follow.
+
+This patch (of 6):
+
+This feature allows userspace to intercept "minor" faults.  By "minor"
+faults, I mean the following situation:
+
+Let there exist two mappings (i.e., VMAs) to the same page(s).  One of the
+mappings is registered with userfaultfd (in minor mode), and the other is
+not.  Via the non-UFFD mapping, the underlying pages have already been
+allocated & filled with some contents.  The UFFD mapping has not yet been
+faulted in; when it is touched for the first time, this results in what
+I'm calling a "minor" fault.  As a concrete example, when working with
+hugetlbfs, we have huge_pte_none(), but find_lock_page() finds an existing
+page.
+
+This commit adds the new registration mode, and sets the relevant flag on
+the VMAs being registered.  In the hugetlb fault path, if we find that we
+have huge_pte_none(), but find_lock_page() does indeed find an existing
+page, then we have a "minor" fault, and if the VMA has the userfaultfd
+registration flag, we call into userfaultfd to handle it.
+
+This is implemented as a new registration mode, instead of an API feature.
+This is because the alternative implementation has significant drawbacks
+[1].
+
+However, doing it this was requires we allocate a VM_* flag for the new
+registration mode.  On 32-bit systems, there are no unused bits, so this
+feature is only supported on architectures with
+CONFIG_ARCH_USES_HIGH_VMA_FLAGS.  When attempting to register a VMA in
+MINOR mode on 32-bit architectures, we return -EINVAL.
+
+[1] https://lore.kernel.org/patchwork/patch/1380226/
+
+[peterx@redhat.com: fix minor fault page leak]
+  Link: https://lkml.kernel.org/r/20210322175132.36659-1-peterx@redhat.com
+
+Link: https://lkml.kernel.org/r/20210301222728.176417-1-axelrasmussen@google.com
+Link: https://lkml.kernel.org/r/20210301222728.176417-2-axelrasmussen@google.com
+Signed-off-by: Axel Rasmussen <axelrasmussen@google.com>
+Reviewed-by: Peter Xu <peterx@redhat.com>
+Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Chinwen Chang <chinwen.chang@mediatek.com>
+Cc: Huang Ying <ying.huang@intel.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: Lokesh Gidra <lokeshgidra@google.com>
+Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: "Michal Koutn" <mkoutny@suse.com>
+Cc: Michel Lespinasse <walken@google.com>
+Cc: Mike Rapoport <rppt@linux.vnet.ibm.com>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Shaohua Li <shli@fb.com>
+Cc: Shawn Anastasio <shawn@anastas.io>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Steven Price <steven.price@arm.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Adam Ruprecht <ruprecht@google.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Cannon Matthews <cannonmatthews@google.com>
+Cc: "Dr . David Alan Gilbert" <dgilbert@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Mina Almasry <almasrymina@google.com>
+Cc: Oliver Upton <oupton@google.com>
+Cc: Kirill A. Shutemov <kirill@shutemov.name>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,163 @@
+btrfs: exclude mmaps while doing remap
+
+Darrick reported a potential issue to me where we could allow mmap
+writes after validating a page range matched in the case of dedupe.
+Generally we rely on lock page -> lock extent with the ordered flush to
+protect us, but this is done after we check the pages because we use the
+generic helpers, so we could modify the page in between doing the check
+and locking the range.
+
+There also exists a deadlock, as described by Filipe
+
+"""
+When cloning a file range, we lock the inodes, flush any delalloc within
+the respective file ranges, wait for any ordered extents and then lock the
+file ranges in both inodes. This means that right after we flush delalloc
+and before we lock the file ranges, memory mapped writes can come in and
+dirty pages in the file ranges of the clone operation.
+
+Most of the time this is harmless and causes no problems. However, if we
+are low on available metadata space, we can later end up in a deadlock
+when starting a transaction to replace file extent items. This happens if
+when allocating metadata space for the transaction, we need to wait for
+the async reclaim thread to release space and the reclaim thread needs to
+flush delalloc for the inode that got the memory mapped write and has its
+range locked by the clone task.
+
+Basically what happens is the following:
+
+1) A clone operation locks inodes A and B, flushes delalloc for both
+   inodes in the respective file ranges and waits for any ordered extents
+   in those ranges to complete;
+
+2) Before the clone task locks the file ranges, another task does a
+   memory mapped write (which does not lock the inode) for one of the
+   inodes of the clone operation. So now we have a dirty page in one of
+   the ranges used by the clone operation;
+
+3) The clone operation locks the file ranges for inodes A and B;
+
+4) Later, when iterating over the file extents of inode A, the clone
+   task attempts to start a transaction. There's not enough available
+   free metadata space, so the async reclaim task is started (if not
+   running already) and we wait for someone to wake us up on our
+   reservation ticket;
+
+5) The async reclaim task is not able to release space by any other
+   means and decides to flush delalloc for the inode of the clone
+   operation;
+
+6) The workqueue job used to flush the inode blocks when starting
+   delalloc for the inode, since the file range is currently locked by
+   the clone task;
+
+7) But the clone task is waiting on its reservation ticket and the async
+   reclaim task is waiting on the flush job to complete, which can't
+   progress since the clone task has the file range locked. So unless
+   some other task is able to release space, for example an ordered
+   extent for some other inode completes, we have a deadlock between all
+   these tasks;
+
+When this happens stack traces like the following show up in dmesg/syslog:
+
+ INFO: task kworker/u16:11:1810830 blocked for more than 120 seconds.
+       Tainted: G    B   W         5.10.0-rc4-btrfs-next-73 #1
+ "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+ task:kworker/u16:11  state:D stack:    0 pid:1810830 ppid:     2 flags:0x00004000
+ Workqueue: btrfs-flush_delalloc btrfs_work_helper [btrfs]
+ Call Trace:
+  __schedule+0x5d1/0xcf0
+  schedule+0x45/0xe0
+  lock_extent_bits+0x1e6/0x2d0 [btrfs]
+  ? finish_wait+0x90/0x90
+  btrfs_invalidatepage+0x32c/0x390 [btrfs]
+  ? __mod_memcg_state+0x8e/0x160
+  __extent_writepage+0x2d4/0x400 [btrfs]
+  extent_write_cache_pages+0x2b2/0x500 [btrfs]
+  ? lock_release+0x20e/0x4c0
+  ? trace_hardirqs_on+0x1b/0xf0
+  extent_writepages+0x43/0x90 [btrfs]
+  ? lock_acquire+0x1a3/0x490
+  do_writepages+0x43/0xe0
+  ? __filemap_fdatawrite_range+0xa4/0x100
+  __filemap_fdatawrite_range+0xc5/0x100
+  btrfs_run_delalloc_work+0x17/0x40 [btrfs]
+  btrfs_work_helper+0xf1/0x600 [btrfs]
+  process_one_work+0x24e/0x5e0
+  worker_thread+0x50/0x3b0
+  ? process_one_work+0x5e0/0x5e0
+  kthread+0x153/0x170
+  ? kthread_mod_delayed_work+0xc0/0xc0
+  ret_from_fork+0x22/0x30
+ INFO: task kworker/u16:1:2426217 blocked for more than 120 seconds.
+       Tainted: G    B   W         5.10.0-rc4-btrfs-next-73 #1
+ "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+ task:kworker/u16:1   state:D stack:    0 pid:2426217 ppid:     2 flags:0x00004000
+ Workqueue: events_unbound btrfs_async_reclaim_metadata_space [btrfs]
+ Call Trace:
+  __schedule+0x5d1/0xcf0
+  ? kvm_clock_read+0x14/0x30
+  ? wait_for_completion+0x81/0x110
+  schedule+0x45/0xe0
+  schedule_timeout+0x30c/0x580
+  ? _raw_spin_unlock_irqrestore+0x3c/0x60
+  ? lock_acquire+0x1a3/0x490
+  ? try_to_wake_up+0x7a/0xa20
+  ? lock_release+0x20e/0x4c0
+  ? lock_acquired+0x199/0x490
+  ? wait_for_completion+0x81/0x110
+  wait_for_completion+0xab/0x110
+  start_delalloc_inodes+0x2af/0x390 [btrfs]
+  btrfs_start_delalloc_roots+0x12d/0x250 [btrfs]
+  flush_space+0x24f/0x660 [btrfs]
+  btrfs_async_reclaim_metadata_space+0x1bb/0x480 [btrfs]
+  process_one_work+0x24e/0x5e0
+  worker_thread+0x20f/0x3b0
+  ? process_one_work+0x5e0/0x5e0
+  kthread+0x153/0x170
+  ? kthread_mod_delayed_work+0xc0/0xc0
+  ret_from_fork+0x22/0x30
+(...)
+several other tasks blocked on inode locks held by the clone task below
+(...)
+ RIP: 0033:0x7f61efe73fff
+ Code: Unable to access opcode bytes at RIP 0x7f61efe73fd5.
+ RSP: 002b:00007ffc3371bbe8 EFLAGS: 00000202 ORIG_RAX: 000000000000013c
+ RAX: ffffffffffffffda RBX: 00007ffc3371bea0 RCX: 00007f61efe73fff
+ RDX: 00000000ffffff9c RSI: 0000560fbd604690 RDI: 00000000ffffff9c
+ RBP: 00007ffc3371beb0 R08: 0000000000000002 R09: 0000560fbd5d75f0
+ R10: 0000560fbd5d81f0 R11: 0000000000000202 R12: 0000000000000002
+ R13: 000000000000000b R14: 00007ffc3371bea0 R15: 00007ffc3371beb0
+ task: fdm-stress        state:D stack:    0 pid:2508234 ppid:2508153 flags:0x00004000
+ Call Trace:
+  __schedule+0x5d1/0xcf0
+  ? _raw_spin_unlock_irqrestore+0x3c/0x60
+  schedule+0x45/0xe0
+  __reserve_bytes+0x4a4/0xb10 [btrfs]
+  ? finish_wait+0x90/0x90
+  btrfs_reserve_metadata_bytes+0x29/0x190 [btrfs]
+  btrfs_block_rsv_add+0x1f/0x50 [btrfs]
+  start_transaction+0x2d1/0x760 [btrfs]
+  btrfs_replace_file_extents+0x120/0x930 [btrfs]
+  ? lock_release+0x20e/0x4c0
+  btrfs_clone+0x3e4/0x7e0 [btrfs]
+  ? btrfs_lookup_first_ordered_extent+0x8e/0x100 [btrfs]
+  btrfs_clone_files+0xf6/0x150 [btrfs]
+  btrfs_remap_file_range+0x324/0x3d0 [btrfs]
+  do_clone_file_range+0xd4/0x1f0
+  vfs_clone_file_range+0x4d/0x230
+  ? lock_release+0x20e/0x4c0
+  ioctl_file_clone+0x8f/0xc0
+  do_vfs_ioctl+0x342/0x750
+  __x64_sys_ioctl+0x62/0xb0
+  do_syscall_64+0x33/0x80
+  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+"""
+
+Fix both of these issues by excluding mmaps from happening we are doing
+any sort of remap, which prevents this race completely.
+
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

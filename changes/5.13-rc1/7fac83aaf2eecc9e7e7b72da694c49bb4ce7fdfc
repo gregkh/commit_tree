@@ -1,0 +1,185 @@
+perf stat: Introduce 'bperf' to share hardware PMCs with BPF
+
+The perf tool uses performance monitoring counters (PMCs) to monitor
+system performance. The PMCs are limited hardware resources. For
+example, Intel CPUs have 3x fixed PMCs and 4x programmable PMCs per cpu.
+
+Modern data center systems use these PMCs in many different ways: system
+level monitoring, (maybe nested) container level monitoring, per process
+monitoring, profiling (in sample mode), etc. In some cases, there are
+more active perf_events than available hardware PMCs. To allow all
+perf_events to have a chance to run, it is necessary to do expensive
+time multiplexing of events.
+
+On the other hand, many monitoring tools count the common metrics
+(cycles, instructions). It is a waste to have multiple tools create
+multiple perf_events of "cycles" and occupy multiple PMCs.
+
+bperf tries to reduce such wastes by allowing multiple perf_events of
+"cycles" or "instructions" (at different scopes) to share PMUs. Instead
+of having each perf-stat session to read its own perf_events, bperf uses
+BPF programs to read the perf_events and aggregate readings to BPF maps.
+Then, the perf-stat session(s) reads the values from these BPF maps.
+
+Please refer to the comment before the definition of bperf_ops for the
+description of bperf architecture.
+
+bperf is off by default. To enable it, pass --bpf-counters option to
+perf-stat. bperf uses a BPF hashmap to share information about BPF
+programs and maps used by bperf. This map is pinned to bpffs. The
+default path is /sys/fs/bpf/perf_attr_map. The user could change the
+path with option --bpf-attr-map.
+
+Committer testing:
+
+  # dmesg|grep "Performance Events" -A5
+  [    0.225277] Performance Events: Fam17h+ core perfctr, AMD PMU driver.
+  [    0.225280] ... version:                0
+  [    0.225280] ... bit width:              48
+  [    0.225281] ... generic registers:      6
+  [    0.225281] ... value mask:             0000ffffffffffff
+  [    0.225281] ... max period:             00007fffffffffff
+  #
+  #  for a in $(seq 6) ; do perf stat -a -e cycles,instructions sleep 100000 & done
+  [1] 2436231
+  [2] 2436232
+  [3] 2436233
+  [4] 2436234
+  [5] 2436235
+  [6] 2436236
+  # perf stat -a -e cycles,instructions sleep 0.1
+
+   Performance counter stats for 'system wide':
+
+         310,326,987      cycles                                                        (41.87%)
+         236,143,290      instructions              #    0.76  insn per cycle           (41.87%)
+
+         0.100800885 seconds time elapsed
+
+  #
+
+We can see that the counters were enabled for this workload 41.87% of
+the time.
+
+Now with --bpf-counters:
+
+  #  for a in $(seq 32) ; do perf stat --bpf-counters -a -e cycles,instructions sleep 100000 & done
+  [1] 2436514
+  [2] 2436515
+  [3] 2436516
+  [4] 2436517
+  [5] 2436518
+  [6] 2436519
+  [7] 2436520
+  [8] 2436521
+  [9] 2436522
+  [10] 2436523
+  [11] 2436524
+  [12] 2436525
+  [13] 2436526
+  [14] 2436527
+  [15] 2436528
+  [16] 2436529
+  [17] 2436530
+  [18] 2436531
+  [19] 2436532
+  [20] 2436533
+  [21] 2436534
+  [22] 2436535
+  [23] 2436536
+  [24] 2436537
+  [25] 2436538
+  [26] 2436539
+  [27] 2436540
+  [28] 2436541
+  [29] 2436542
+  [30] 2436543
+  [31] 2436544
+  [32] 2436545
+  #
+  # ls -la /sys/fs/bpf/perf_attr_map
+  -rw-------. 1 root root 0 Mar 23 14:53 /sys/fs/bpf/perf_attr_map
+  # bpftool map | grep bperf | wc -l
+  64
+  #
+
+  # bpftool map | tail
+  1265: percpu_array  name accum_readings  flags 0x0
+  	key 4B  value 24B  max_entries 1  memlock 4096B
+  1266: hash  name filter  flags 0x0
+  	key 4B  value 4B  max_entries 1  memlock 4096B
+  1267: array  name bperf_fo.bss  flags 0x400
+  	key 4B  value 8B  max_entries 1  memlock 4096B
+  	btf_id 996
+  	pids perf(2436545)
+  1268: percpu_array  name accum_readings  flags 0x0
+  	key 4B  value 24B  max_entries 1  memlock 4096B
+  1269: hash  name filter  flags 0x0
+  	key 4B  value 4B  max_entries 1  memlock 4096B
+  1270: array  name bperf_fo.bss  flags 0x400
+  	key 4B  value 8B  max_entries 1  memlock 4096B
+  	btf_id 997
+  	pids perf(2436541)
+  1285: array  name pid_iter.rodata  flags 0x480
+  	key 4B  value 4B  max_entries 1  memlock 4096B
+  	btf_id 1017  frozen
+  	pids bpftool(2437504)
+  1286: array  flags 0x0
+  	key 4B  value 32B  max_entries 1  memlock 4096B
+  #
+  # bpftool map dump id 1268 | tail
+  value (CPU 21):
+  8f f3 bc ca 00 00 00 00  80 fd 2a d1 4d 00 00 00
+  80 fd 2a d1 4d 00 00 00
+  value (CPU 22):
+  7e d5 64 4d 00 00 00 00  a4 8a 2e ee 4d 00 00 00
+  a4 8a 2e ee 4d 00 00 00
+  value (CPU 23):
+  a7 78 3e 06 01 00 00 00  b2 34 94 f6 4d 00 00 00
+  b2 34 94 f6 4d 00 00 00
+  Found 1 element
+  # bpftool map dump id 1268 | tail
+  value (CPU 21):
+  c6 8b d9 ca 00 00 00 00  20 c6 fc 83 4e 00 00 00
+  20 c6 fc 83 4e 00 00 00
+  value (CPU 22):
+  9c b4 d2 4d 00 00 00 00  3e 0c df 89 4e 00 00 00
+  3e 0c df 89 4e 00 00 00
+  value (CPU 23):
+  18 43 66 06 01 00 00 00  5b 69 ed 83 4e 00 00 00
+  5b 69 ed 83 4e 00 00 00
+  Found 1 element
+  # bpftool map dump id 1268 | tail
+  value (CPU 21):
+  f2 6e db ca 00 00 00 00  92 67 4c ba 4e 00 00 00
+  92 67 4c ba 4e 00 00 00
+  value (CPU 22):
+  dc 8e e1 4d 00 00 00 00  d9 32 7a c5 4e 00 00 00
+  d9 32 7a c5 4e 00 00 00
+  value (CPU 23):
+  bd 2b 73 06 01 00 00 00  7c 73 87 bf 4e 00 00 00
+  7c 73 87 bf 4e 00 00 00
+  Found 1 element
+  #
+
+  # perf stat --bpf-counters -a -e cycles,instructions sleep 0.1
+
+   Performance counter stats for 'system wide':
+
+       119,410,122      cycles
+       152,105,479      instructions              #    1.27  insn per cycle
+
+       0.101395093 seconds time elapsed
+
+  #
+
+See? We had the counters enabled all the time.
+
+Signed-off-by: Song Liu <songliubraving@fb.com>
+Reviewed-by: Jiri Olsa <jolsa@kernel.org>
+Acked-by: Namhyung Kim <namhyung@kernel.org>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: kernel-team@fb.com
+Link: http://lore.kernel.org/lkml/20210316211837.910506-2-songliubraving@fb.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+

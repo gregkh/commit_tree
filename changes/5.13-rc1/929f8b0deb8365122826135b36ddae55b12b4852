@@ -1,0 +1,75 @@
+xfs: optimise xfs_buf_item_size/format for contiguous regions
+
+We process the buf_log_item bitmap one set bit at a time with
+xfs_next_bit() so we can detect if a region crosses a memcpy
+discontinuity in the buffer data address. This has massive overhead
+on large buffers (e.g. 64k directory blocks) because we do a lot of
+unnecessary checks and xfs_buf_offset() calls.
+
+For example, 16-way concurrent create workload on debug kernel
+running CPU bound has this at the top of the profile at ~120k
+create/s on 64kb directory block size:
+
+  20.66%  [kernel]  [k] xfs_dir3_leaf_check_int
+   7.10%  [kernel]  [k] memcpy
+   6.22%  [kernel]  [k] xfs_next_bit
+   3.55%  [kernel]  [k] xfs_buf_offset
+   3.53%  [kernel]  [k] xfs_buf_item_format
+   3.34%  [kernel]  [k] __pv_queued_spin_lock_slowpath
+   3.04%  [kernel]  [k] do_raw_spin_lock
+   2.84%  [kernel]  [k] xfs_buf_item_size_segment.isra.0
+   2.31%  [kernel]  [k] __raw_callee_save___pv_queued_spin_unlock
+   1.36%  [kernel]  [k] xfs_log_commit_cil
+
+(debug checks hurt large blocks)
+
+The only buffers with discontinuities in the data address are
+unmapped buffers, and they are only used for inode cluster buffers
+and only for logging unlinked pointers. IOWs, it is -rare- that we
+even need to detect a discontinuity in the buffer item formatting
+code.
+
+Optimise all this by using xfs_contig_bits() to find the size of
+the contiguous regions, then test for a discontiunity inside it. If
+we find one, do the slow "bit at a time" method we do now. If we
+don't, then just copy the entire contiguous range in one go.
+
+Profile now looks like:
+
+  25.26%  [kernel]  [k] xfs_dir3_leaf_check_int
+   9.25%  [kernel]  [k] memcpy
+   5.01%  [kernel]  [k] __pv_queued_spin_lock_slowpath
+   2.84%  [kernel]  [k] do_raw_spin_lock
+   2.22%  [kernel]  [k] __raw_callee_save___pv_queued_spin_unlock
+   1.88%  [kernel]  [k] xfs_buf_find
+   1.53%  [kernel]  [k] memmove
+   1.47%  [kernel]  [k] xfs_log_commit_cil
+....
+   0.34%  [kernel]  [k] xfs_buf_item_format
+....
+   0.21%  [kernel]  [k] xfs_buf_offset
+....
+   0.16%  [kernel]  [k] xfs_contig_bits
+....
+   0.13%  [kernel]  [k] xfs_buf_item_size_segment.isra.0
+
+So the bit scanning over for the dirty region tracking for the
+buffer log items is basically gone. Debug overhead hurts even more
+now...
+
+Perf comparison
+
+		dir block	 creates		unlink
+		size (kb)	time	rate		time
+
+Original	 4		4m08s	220k		 5m13s
+Original	64		7m21s	115k		13m25s
+Patched		 4		3m59s	230k		 5m03s
+Patched		64		6m23s	143k		12m33s
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+

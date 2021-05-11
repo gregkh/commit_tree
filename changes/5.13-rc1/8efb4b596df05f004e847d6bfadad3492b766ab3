@@ -1,0 +1,149 @@
+mm: vmscan: use nid from shrink_control for tracepoint
+
+Patch series "Make shrinker's nr_deferred memcg aware", v10.
+
+Recently huge amount one-off slab drop was seen on some vfs metadata
+heavy workloads, it turned out there were huge amount accumulated
+nr_deferred objects seen by the shrinker.
+
+On our production machine, I saw absurd number of nr_deferred shown as
+the below tracing result:
+
+  <...>-48776 [032] .... 27970562.458916: mm_shrink_slab_start:
+  super_cache_scan+0x0/0x1a0 ffff9a83046f3458: nid: 0 objects to shrink
+  2531805877005 gfp_flags GFP_HIGHUSER_MOVABLE pgs_scanned 32 lru_pgs
+  9300 cache items 1667 delta 11 total_scan 833
+
+There are 2.5 trillion deferred objects on one node, assuming all of them
+are dentry (192 bytes per object), so the total size of deferred on one
+node is ~480TB.  It is definitely ridiculous.
+
+I managed to reproduce this problem with kernel build workload plus
+negative dentry generator.
+
+First step, run the below kernel build test script:
+
+NR_CPUS=`cat /proc/cpuinfo | grep -e processor | wc -l`
+
+cd /root/Buildarea/linux-stable
+
+for i in `seq 1500`; do
+        cgcreate -g memory:kern_build
+        echo 4G > /sys/fs/cgroup/memory/kern_build/memory.limit_in_bytes
+
+        echo 3 > /proc/sys/vm/drop_caches
+        cgexec -g memory:kern_build make clean > /dev/null 2>&1
+        cgexec -g memory:kern_build make -j$NR_CPUS > /dev/null 2>&1
+
+        cgdelete -g memory:kern_build
+done
+
+Then run the below negative dentry generator script:
+
+NR_CPUS=`cat /proc/cpuinfo | grep -e processor | wc -l`
+
+mkdir /sys/fs/cgroup/memory/test
+echo $$ > /sys/fs/cgroup/memory/test/tasks
+
+for i in `seq $NR_CPUS`; do
+        while true; do
+                FILE=`head /dev/urandom | tr -dc A-Za-z0-9 | head -c 64`
+                cat $FILE 2>/dev/null
+        done &
+done
+
+Then kswapd will shrink half of dentry cache in just one loop as the below
+tracing result showed:
+
+	kswapd0-475   [028] .... 305968.252561: mm_shrink_slab_start: super_cache_scan+0x0/0x190 0000000024acf00c: nid: 0 objects to shrink 4994376020 gfp_flags GFP_KERNEL cache items 93689873 delta 45746 total_scan 46844936 priority 12
+	kswapd0-475   [021] .... 306013.099399: mm_shrink_slab_end: super_cache_scan+0x0/0x190 0000000024acf00c: nid: 0 unused scan count 4994376020 new scan count 4947576838 total_scan 8 last shrinker return val 46844928
+
+There were huge number of deferred objects before the shrinker was called,
+the behavior does match the code but it might be not desirable from the
+user's stand of point.
+
+The excessive amount of nr_deferred might be accumulated due to various
+reasons, for example:
+
+* GFP_NOFS allocation
+
+* Significant times of small amount scan (< scan_batch, 1024 for vfs
+  metadata)
+
+However the LRUs of slabs are per memcg (memcg-aware shrinkers) but the
+deferred objects is per shrinker, this may have some bad effects:
+
+* Poor isolation among memcgs.  Some memcgs which happen to have
+  frequent limit reclaim may get nr_deferred accumulated to a huge number,
+  then other innocent memcgs may take the fall.  In our case the main
+  workload was hit.
+
+* Unbounded deferred objects.  There is no cap for deferred objects, it
+  can outgrow ridiculously as the tracing result showed.
+
+* Easy to get out of control.  Although shrinkers take into account
+  deferred objects, but it can go out of control easily.  One
+  misconfigured memcg could incur absurd amount of deferred objects in a
+  period of time.
+
+* Sort of reclaim problems, i.e.  over reclaim, long reclaim latency,
+  etc.  There may be hundred GB slab caches for vfe metadata heavy
+  workload, shrink half of them may take minutes.  We observed latency
+  spike due to the prolonged reclaim.
+
+These issues also have been discussed in
+https://lore.kernel.org/linux-mm/20200916185823.5347-1-shy828301@gmail.com/.
+The patchset is the outcome of that discussion.
+
+So this patchset makes nr_deferred per-memcg to tackle the problem.  It
+does:
+
+* Have memcg_shrinker_deferred per memcg per node, just like what
+  shrinker_map does.  Instead it is an atomic_long_t array, each element
+  represent one shrinker even though the shrinker is not memcg aware, this
+  simplifies the implementation.  For memcg aware shrinkers, the deferred
+  objects are just accumulated to its own memcg.  The shrinkers just see
+  nr_deferred from its own memcg.  Non memcg aware shrinkers still use
+  global nr_deferred from struct shrinker.
+
+* Once the memcg is offlined, its nr_deferred will be reparented to its
+  parent along with LRUs.
+
+* The root memcg has memcg_shrinker_deferred array too.  It simplifies
+  the handling of reparenting to root memcg.
+
+* Cap nr_deferred to 2x of the length of lru.  The idea is borrowed from
+  Dave Chinner's series
+  (https://lore.kernel.org/linux-xfs/20191031234618.15403-1-david@fromorbit.com/)
+
+The downside is each memcg has to allocate extra memory to store the
+nr_deferred array.  On our production environment, there are typically
+around 40 shrinkers, so each memcg needs ~320 bytes.  10K memcgs would
+need ~3.2MB memory.  It seems fine.
+
+We have been running the patched kernel on some hosts of our fleet (test
+and production) for months, it works very well.  The monitor data shows
+the working set is sustained as expected.
+
+This patch (of 13):
+
+The tracepoint's nid should show what node the shrink happens on, the
+start tracepoint uses nid from shrinkctl, but the nid might be set to 0
+before end tracepoint if the shrinker is not NUMA aware, so the tracing
+log may show the shrink happens on one node but end up on the other node.
+It seems confusing.  And the following patch will remove using nid
+directly in do_shrink_slab(), this patch also helps cleanup the code.
+
+Link: https://lkml.kernel.org/r/20210311190845.9708-1-shy828301@gmail.com
+Link: https://lkml.kernel.org/r/20210311190845.9708-2-shy828301@gmail.com
+Signed-off-by: Yang Shi <shy828301@gmail.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Acked-by: Roman Gushchin <guro@fb.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,69 @@
+afs: Fix speculative status fetches
+
+The generic/464 xfstest causes kAFS to emit occasional warnings of the
+form:
+
+        kAFS: vnode modified {100055:8a} 30->31 YFS.StoreData64 (c=6015)
+
+This indicates that the data version received back from the server did not
+match the expected value (the DV should be incremented monotonically for
+each individual modification op committed to a vnode).
+
+What is happening is that a lookup call is doing a bulk status fetch
+speculatively on a bunch of vnodes in a directory besides getting the
+status of the vnode it's actually interested in.  This is racing with a
+StoreData operation (though it could also occur with, say, a MakeDir op).
+
+On the client, a modification operation locks the vnode, but the bulk
+status fetch only locks the parent directory, so no ordering is imposed
+there (thereby avoiding an avenue to deadlock).
+
+On the server, the StoreData op handler doesn't lock the vnode until it's
+received all the request data, and downgrades the lock after committing the
+data until it has finished sending change notifications to other clients -
+which allows the status fetch to occur before it has finished.
+
+This means that:
+
+ - a status fetch can access the target vnode either side of the exclusive
+   section of the modification
+
+ - the status fetch could start before the modification, yet finish after,
+   and vice-versa.
+
+ - the status fetch and the modification RPCs can complete in either order.
+
+ - the status fetch can return either the before or the after DV from the
+   modification.
+
+ - the status fetch might regress the locally cached DV.
+
+Some of these are handled by the previous fix[1], but that's not sufficient
+because it checks the DV it received against the DV it cached at the start
+of the op, but the DV might've been updated in the meantime by a locally
+generated modification op.
+
+Fix this by the following means:
+
+ (1) Keep track of when we're performing a modification operation on a
+     vnode.  This is done by marking vnode parameters with a 'modification'
+     note that causes the AFS_VNODE_MODIFYING flag to be set on the vnode
+     for the duration.
+
+ (2) Alter the speculation race detection to ignore speculative status
+     fetches if either the vnode is marked as being modified or the data
+     version number is not what we expected.
+
+Note that whilst the "vnode modified" warning does get recovered from as it
+causes the client to refetch the status at the next opportunity, it will
+also invalidate the pagecache, so changes might get lost.
+
+Fixes: a9e5c87ca744 ("afs: Fix speculative status fetch going out of order wrt to modifications")
+Reported-by: Marc Dionne <marc.dionne@auristor.com>
+Signed-off-by: David Howells <dhowells@redhat.com>
+Tested-and-reviewed-by: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+Link: https://lore.kernel.org/r/160605082531.252452.14708077925602709042.stgit@warthog.procyon.org.uk/ [1]
+Link: https://lore.kernel.org/linux-fsdevel/161961335926.39335.2552653972195467566.stgit@warthog.procyon.org.uk/ # v1
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

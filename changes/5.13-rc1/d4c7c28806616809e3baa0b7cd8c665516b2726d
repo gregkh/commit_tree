@@ -1,0 +1,82 @@
+timekeeping: Allow runtime PM from change_clocksource()
+
+The struct clocksource callbacks enable() and disable() are described as a
+way to allow clock sources to enter a power save mode. See commit
+4614e6adafa2 ("clocksource: add enable() and disable() callbacks")
+
+But using runtime PM from these callbacks triggers a cyclic lockdep warning when
+switching clock source using change_clocksource().
+
+  # echo e60f0000.timer > /sys/devices/system/clocksource/clocksource0/current_clocksource
+   ======================================================
+   WARNING: possible circular locking dependency detected
+   ------------------------------------------------------
+   migration/0/11 is trying to acquire lock:
+   ffff0000403ed220 (&dev->power.lock){-...}-{2:2}, at: __pm_runtime_resume+0x40/0x74
+
+   but task is already holding lock:
+   ffff8000113c8f88 (tk_core.seq.seqcount){----}-{0:0}, at: multi_cpu_stop+0xa4/0x190
+
+   which lock already depends on the new lock.
+
+   the existing dependency chain (in reverse order) is:
+
+   -> #2 (tk_core.seq.seqcount){----}-{0:0}:
+          ktime_get+0x28/0xa0
+          hrtimer_start_range_ns+0x210/0x2dc
+          generic_sched_clock_init+0x70/0x88
+          sched_clock_init+0x40/0x64
+          start_kernel+0x494/0x524
+
+   -> #1 (hrtimer_bases.lock){-.-.}-{2:2}:
+          hrtimer_start_range_ns+0x68/0x2dc
+          rpm_suspend+0x308/0x5dc
+          rpm_idle+0xc4/0x2a4
+          pm_runtime_work+0x98/0xc0
+          process_one_work+0x294/0x6f0
+          worker_thread+0x70/0x45c
+          kthread+0x154/0x160
+          ret_from_fork+0x10/0x20
+
+   -> #0 (&dev->power.lock){-...}-{2:2}:
+          _raw_spin_lock_irqsave+0x7c/0xc4
+          __pm_runtime_resume+0x40/0x74
+          sh_cmt_start+0x1c4/0x260
+          sh_cmt_clocksource_enable+0x28/0x50
+          change_clocksource+0x9c/0x160
+          multi_cpu_stop+0xa4/0x190
+          cpu_stopper_thread+0x90/0x154
+          smpboot_thread_fn+0x244/0x270
+          kthread+0x154/0x160
+          ret_from_fork+0x10/0x20
+
+   other info that might help us debug this:
+
+   Chain exists of:
+     &dev->power.lock --> hrtimer_bases.lock --> tk_core.seq.seqcount
+
+    Possible unsafe locking scenario:
+
+          CPU0                    CPU1
+          ----                    ----
+     lock(tk_core.seq.seqcount);
+                                  lock(hrtimer_bases.lock);
+                                  lock(tk_core.seq.seqcount);
+     lock(&dev->power.lock);
+
+    *** DEADLOCK ***
+
+   2 locks held by migration/0/11:
+    #0: ffff8000113c9278 (timekeeper_lock){-.-.}-{2:2}, at: change_clocksource+0x2c/0x160
+    #1: ffff8000113c8f88 (tk_core.seq.seqcount){----}-{0:0}, at: multi_cpu_stop+0xa4/0x190
+
+Rework change_clocksource() so it enables the new clocksource and disables
+the old clocksource outside of the timekeeper_lock and seqcount write held
+region. There is no requirement that these callbacks are invoked from the
+lock held region.
+
+Signed-off-by: Niklas Söderlund <niklas.soderlund+renesas@ragnatech.se>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Wolfram Sang <wsa+renesas@sang-engineering.com>
+Link: https://lore.kernel.org/r/20210211134318.323910-1-niklas.soderlund+renesas@ragnatech.se
+

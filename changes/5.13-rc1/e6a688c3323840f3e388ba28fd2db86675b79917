@@ -1,0 +1,112 @@
+xfs: initialise attr fork on inode create
+
+When we allocate a new inode, we often need to add an attribute to
+the inode as part of the create. This can happen as a result of
+needing to add default ACLs or security labels before the inode is
+made visible to userspace.
+
+This is highly inefficient right now. We do the create transaction
+to allocate the inode, then we do an "add attr fork" transaction to
+modify the just created empty inode to set the inode fork offset to
+allow attributes to be stored, then we go and do the attribute
+creation.
+
+This means 3 transactions instead of 1 to allocate an inode, and
+this greatly increases the load on the CIL commit code, resulting in
+excessive contention on the CIL spin locks and performance
+degradation:
+
+ 18.99%  [kernel]                [k] __pv_queued_spin_lock_slowpath
+  3.57%  [kernel]                [k] do_raw_spin_lock
+  2.51%  [kernel]                [k] __raw_callee_save___pv_queued_spin_unlock
+  2.48%  [kernel]                [k] memcpy
+  2.34%  [kernel]                [k] xfs_log_commit_cil
+
+The typical profile resulting from running fsmark on a selinux enabled
+filesytem is adds this overhead to the create path:
+
+  - 15.30% xfs_init_security
+     - 15.23% security_inode_init_security
+	- 13.05% xfs_initxattrs
+	   - 12.94% xfs_attr_set
+	      - 6.75% xfs_bmap_add_attrfork
+		 - 5.51% xfs_trans_commit
+		    - 5.48% __xfs_trans_commit
+		       - 5.35% xfs_log_commit_cil
+			  - 3.86% _raw_spin_lock
+			     - do_raw_spin_lock
+				  __pv_queued_spin_lock_slowpath
+		 - 0.70% xfs_trans_alloc
+		      0.52% xfs_trans_reserve
+	      - 5.41% xfs_attr_set_args
+		 - 5.39% xfs_attr_set_shortform.constprop.0
+		    - 4.46% xfs_trans_commit
+		       - 4.46% __xfs_trans_commit
+			  - 4.33% xfs_log_commit_cil
+			     - 2.74% _raw_spin_lock
+				- do_raw_spin_lock
+				     __pv_queued_spin_lock_slowpath
+			       0.60% xfs_inode_item_format
+		      0.90% xfs_attr_try_sf_addname
+	- 1.99% selinux_inode_init_security
+	   - 1.02% security_sid_to_context_force
+	      - 1.00% security_sid_to_context_core
+		 - 0.92% sidtab_entry_to_string
+		    - 0.90% sidtab_sid2str_get
+			 0.59% sidtab_sid2str_put.part.0
+	   - 0.82% selinux_determine_inode_label
+	      - 0.77% security_transition_sid
+		   0.70% security_compute_sid.part.0
+
+And fsmark creation rate performance drops by ~25%. The key point to
+note here is that half the additional overhead comes from adding the
+attribute fork to the newly created inode. That's crazy, considering
+we can do this same thing at inode create time with a couple of
+lines of code and no extra overhead.
+
+So, if we know we are going to add an attribute immediately after
+creating the inode, let's just initialise the attribute fork inside
+the create transaction and chop that whole chunk of code out of
+the create fast path. This completely removes the performance
+drop caused by enabling SELinux, and the profile looks like:
+
+     - 8.99% xfs_init_security
+         - 9.00% security_inode_init_security
+            - 6.43% xfs_initxattrs
+               - 6.37% xfs_attr_set
+                  - 5.45% xfs_attr_set_args
+                     - 5.42% xfs_attr_set_shortform.constprop.0
+                        - 4.51% xfs_trans_commit
+                           - 4.54% __xfs_trans_commit
+                              - 4.59% xfs_log_commit_cil
+                                 - 2.67% _raw_spin_lock
+                                    - 3.28% do_raw_spin_lock
+                                         3.08% __pv_queued_spin_lock_slowpath
+                                   0.66% xfs_inode_item_format
+                        - 0.90% xfs_attr_try_sf_addname
+                  - 0.60% xfs_trans_alloc
+            - 2.35% selinux_inode_init_security
+               - 1.25% security_sid_to_context_force
+                  - 1.21% security_sid_to_context_core
+                     - 1.19% sidtab_entry_to_string
+                        - 1.20% sidtab_sid2str_get
+                           - 0.86% sidtab_sid2str_put.part.0
+                              - 0.62% _raw_spin_lock_irqsave
+                                 - 0.77% do_raw_spin_lock
+                                      __pv_queued_spin_lock_slowpath
+               - 0.84% selinux_determine_inode_label
+                  - 0.83% security_transition_sid
+                       0.86% security_compute_sid.part.0
+
+Which indicates the XFS overhead of creating the selinux xattr has
+been halved. This doesn't fix the CIL lock contention problem, just
+means it's not a limiting factor for this workload. Lock contention
+in the security subsystems is going to be an issue soon, though...
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+[djwong: fix compilation error when CONFIG_SECURITY=n]
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Gao Xiang <hsiangkao@redhat.com>
+

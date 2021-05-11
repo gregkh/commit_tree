@@ -1,0 +1,79 @@
+signal: Allow tasks to cache one sigqueue struct
+
+The idea for this originates from the real time tree to make signal
+delivery for realtime applications more efficient. In quite some of these
+application scenarios a control tasks signals workers to start their
+computations. There is usually only one signal per worker on flight.  This
+works nicely as long as the kmem cache allocations do not hit the slow path
+and cause latencies.
+
+To cure this an optimistic caching was introduced (limited to RT tasks)
+which allows a task to cache a single sigqueue in a pointer in task_struct
+instead of handing it back to the kmem cache after consuming a signal. When
+the next signal is sent to the task then the cached sigqueue is used
+instead of allocating a new one. This solved the problem for this set of
+application scenarios nicely.
+
+The task cache is not preallocated so the first signal sent to a task goes
+always to the cache allocator. The cached sigqueue stays around until the
+task exits and is freed when task::sighand is dropped.
+
+After posting this solution for mainline the discussion came up whether
+this would be useful in general and should not be limited to realtime
+tasks: https://lore.kernel.org/r/m11rcu7nbr.fsf@fess.ebiederm.org
+
+One concern leading to the original limitation was to avoid a large amount
+of pointlessly cached sigqueues in alive tasks. The other concern was
+vs. RLIMIT_SIGPENDING as these cached sigqueues are not accounted for.
+
+The accounting problem is real, but on the other hand slightly academic.
+After gathering some statistics it turned out that after boot of a regular
+distro install there are less than 10 sigqueues cached in ~1500 tasks.
+
+In case of a 'mass fork and fire signal to child' scenario the extra 80
+bytes of memory per task are well in the noise of the overall memory
+consumption of the fork bomb.
+
+If this should be limited then this would need an extra counter in struct
+user, more atomic instructions and a seperate rlimit. Yet another tunable
+which is mostly unused.
+
+The caching is actually used. After boot and a full kernel compile on a
+64CPU machine with make -j128 the number of 'allocations' looks like this:
+
+  From slab:	   23996
+  From task cache: 52223
+
+I.e. it reduces the number of slab cache operations by ~68%.
+
+A typical pattern there is:
+
+<...>-58490 __sigqueue_alloc:  for 58488 from slab ffff8881132df460
+<...>-58488 __sigqueue_free:   cache ffff8881132df460
+<...>-58488 __sigqueue_alloc:  for 1149 from cache ffff8881103dc550
+  bash-1149 exit_task_sighand: free ffff8881132df460
+  bash-1149 __sigqueue_free:   cache ffff8881103dc550
+
+The interesting sequence is that the exiting task 58488 grabs the sigqueue
+from bash's task cache to signal exit and bash sticks it back into it's own
+cache. Lather, rinse and repeat.
+
+The caching is probably not noticable for the general use case, but the
+benefit for latency sensitive applications is clear. While kmem caches are
+usually just serving from the fast path the slab merging (default) can
+depending on the usage pattern of the merged slabs cause occasional slow
+path allocations.
+
+The time spared per cached entry is a few micro seconds per signal which is
+not relevant for e.g. a kernel build, but for signal heavy workloads it's
+measurable.
+
+As there is no real downside of this caching mechanism making it
+unconditionally available is preferred over more conditional code or new
+magic tunables.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+Link: https://lkml.kernel.org/r/87sg4lbmxo.fsf@nanos.tec.linutronix.de
+

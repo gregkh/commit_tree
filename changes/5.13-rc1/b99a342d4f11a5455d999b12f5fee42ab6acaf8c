@@ -1,0 +1,69 @@
+NUMA balancing: reduce TLB flush via delaying mapping on hint page fault
+
+With NUMA balancing, in hint page fault handler, the faulting page will be
+migrated to the accessing node if necessary.  During the migration, TLB
+will be shot down on all CPUs that the process has run on recently.
+Because in the hint page fault handler, the PTE will be made accessible
+before the migration is tried.  The overhead of TLB shooting down can be
+high, so it's better to be avoided if possible.  In fact, if we delay
+mapping the page until migration, that can be avoided.  This is what this
+patch doing.
+
+For the multiple threads applications, it's possible that a page is
+accessed by multiple threads almost at the same time.  In the original
+implementation, because the first thread will install the accessible PTE
+before migrating the page, the other threads may access the page directly
+before the page is made inaccessible again during migration.  While with
+the patch, the second thread will go through the page fault handler too.
+And because of the PageLRU() checking in the following code path,
+
+  migrate_misplaced_page()
+    numamigrate_isolate_page()
+      isolate_lru_page()
+
+the migrate_misplaced_page() will return 0, and the PTE will be made
+accessible in the second thread.
+
+This will introduce a little more overhead.  But we think the possibility
+for a page to be accessed by the multiple threads at the same time is low,
+and the overhead difference isn't too large.  If this becomes a problem in
+some workloads, we need to consider how to reduce the overhead.
+
+To test the patch, we run a test case as follows on a 2-socket Intel
+server (1 NUMA node per socket) with 128GB DRAM (64GB per socket).
+
+1. Run a memory eater on NUMA node 1 to use 40GB memory before running
+   pmbench.
+
+2. Run pmbench (normal accessing pattern) with 8 processes, and 8
+   threads per process, so there are 64 threads in total.  The
+   working-set size of each process is 8960MB, so the total working-set
+   size is 8 * 8960MB = 70GB.  The CPU of all pmbench processes is bound
+   to node 1.  The pmbench processes will access some DRAM on node 0.
+
+3. After the pmbench processes run for 10 seconds, kill the memory
+   eater.  Now, some pages will be migrated from node 0 to node 1 via
+   NUMA balancing.
+
+Test results show that, with the patch, the pmbench throughput (page
+accesses/s) increases 5.5%.  The number of the TLB shootdowns interrupts
+reduces 98% (from ~4.7e7 to ~9.7e5) with about 9.2e6 pages (35.8GB)
+migrated.  From the perf profile, it can be found that the CPU cycles
+spent by try_to_unmap() and its callees reduces from 6.02% to 0.47%.  That
+is, the CPU cycles spent by TLB shooting down decreases greatly.
+
+Link: https://lkml.kernel.org/r/20210408132236.1175607-1-ying.huang@intel.com
+Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+Reviewed-by: Mel Gorman <mgorman@suse.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: "Matthew Wilcox" <willy@infradead.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Michel Lespinasse <walken@google.com>
+Cc: Arjun Roy <arjunroy@google.com>
+Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

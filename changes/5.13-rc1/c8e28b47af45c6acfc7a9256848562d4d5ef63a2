@@ -1,0 +1,126 @@
+mm,page_alloc: bail out earlier on -ENOMEM in alloc_contig_migrate_range
+
+Patch series "Make alloc_contig_range handle Hugetlb pages", v10.
+
+alloc_contig_range lacks the ability to handle HugeTLB pages.  This can
+be problematic for some users, e.g: CMA and virtio-mem, where those
+users will fail the call if alloc_contig_range ever sees a HugeTLB page,
+even when those pages lay in ZONE_MOVABLE and are free.  That problem
+can be easily solved by replacing the page in the free hugepage pool.
+
+In-use HugeTLB are no exception though, as those can be isolated and
+migrated as any other LRU or Movable page.
+
+This aims to improve alloc_contig_range->isolate_migratepages_block, so
+that HugeTLB pages can be recognized and handled.
+
+Since we also need to start reporting errors down the chain (e.g:
+-ENOMEM due to not be able to allocate a new hugetlb page),
+isolate_migratepages_{range,block} interfaces need to change to start
+reporting error codes instead of the pfn == 0 vs pfn != 0 scheme it is
+using right now.  From now on, isolate_migratepages_block will not
+return the next pfn to be scanned anymore, but -EINTR, -ENOMEM or 0, so
+we the next pfn to be scanned will be recorded in cc->migrate_pfn field
+(as it is already done in isolate_migratepages_range()).
+
+Below is an insight from David (thanks), where the problem can clearly be
+seen:
+
+ "Start a VM with 4G. Hotplug 1G via virtio-mem and online it to
+  ZONE_MOVABLE. Allocate 512 huge pages.
+
+  [root@localhost ~]# cat /proc/meminfo
+  MemTotal:        5061512 kB
+  MemFree:         3319396 kB
+  MemAvailable:    3457144 kB
+  ...
+  HugePages_Total:     512
+  HugePages_Free:      512
+  HugePages_Rsvd:        0
+  HugePages_Surp:        0
+  Hugepagesize:       2048 kB
+
+  The huge pages get partially allocate from ZONE_MOVABLE. Try unplugging
+  1G via virtio-mem (remember, all ZONE_MOVABLE). Inside the guest:
+
+  [  180.058992] alloc_contig_range: [1b8000, 1c0000) PFNs busy
+  [  180.060531] alloc_contig_range: [1b8000, 1c0000) PFNs busy
+  [  180.061972] alloc_contig_range: [1b8000, 1c0000) PFNs busy
+  [  180.063413] alloc_contig_range: [1b8000, 1c0000) PFNs busy
+  [  180.064838] alloc_contig_range: [1b8000, 1c0000) PFNs busy
+  [  180.065848] alloc_contig_range: [1bfc00, 1c0000) PFNs busy
+  [  180.066794] alloc_contig_range: [1bfc00, 1c0000) PFNs busy
+  [  180.067738] alloc_contig_range: [1bfc00, 1c0000) PFNs busy
+  [  180.068669] alloc_contig_range: [1bfc00, 1c0000) PFNs busy
+  [  180.069598] alloc_contig_range: [1bfc00, 1c0000) PFNs busy"
+
+And then with this patchset running:
+
+ "Same experiment with ZONE_MOVABLE:
+
+  a) Free huge pages: all memory can get unplugged again.
+
+  b) Allocated/populated but idle huge pages: all memory can get unplugged
+     again.
+
+  c) Allocated/populated but all 512 huge pages are read/written in a
+     loop: all memory can get unplugged again, but I get a single
+
+     [  121.192345] alloc_contig_range: [180000, 188000) PFNs busy
+
+     Most probably because it happened to try migrating a huge page
+     while it was busy.  As virtio-mem retries on ZONE_MOVABLE a couple of
+     times, it can deal with this temporary failure.
+
+  Last but not least, I did something extreme:
+
+  # cat /proc/meminfo
+  MemTotal:        5061568 kB
+  MemFree:          186560 kB
+  MemAvailable:     354524 kB
+  ...
+  HugePages_Total:    2048
+  HugePages_Free:     2048
+  HugePages_Rsvd:        0
+  HugePages_Surp:        0
+
+  Triggering unplug would require to dissolve+alloc - which now fails
+  when trying to allocate an additional ~512 huge pages (1G).
+
+  As expected, I can properly see memory unplug not fully succeeding.  +
+  I get a fairly continuous stream of
+
+  [  226.611584] alloc_contig_range: [19f400, 19f800) PFNs busy
+  ...
+
+  But more importantly, the hugepage count remains stable, as configured
+  by the admin (me):
+
+  HugePages_Total:    2048
+  HugePages_Free:     2048
+  HugePages_Rsvd:        0
+  HugePages_Surp:        0"
+
+This patch (of 7):
+
+Currently, __alloc_contig_migrate_range can generate -EINTR, -ENOMEM or
+-EBUSY, and report them down the chain.  The problem is that when
+migrate_pages() reports -ENOMEM, we keep going till we exhaust all the
+try-attempts (5 at the moment) instead of bailing out.
+
+migrate_pages() bails out right away on -ENOMEM because it is considered a
+fatal error.  Do the same here instead of keep going and retrying.  Note
+that this is not fixing a real issue, just a cosmetic change.  Although we
+can save some cycles by backing off ealier
+
+Link: https://lkml.kernel.org/r/20210419075413.1064-1-osalvador@suse.de
+Link: https://lkml.kernel.org/r/20210419075413.1064-2-osalvador@suse.de
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

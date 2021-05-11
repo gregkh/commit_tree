@@ -1,0 +1,61 @@
+cfg80211: fix locking in netlink owner interface destruction
+
+Harald Arnesen reported [1] a deadlock at reboot time, and after
+he captured a stack trace a picture developed of what's going on:
+
+The distribution he's using is using iwd (not wpa_supplicant) to
+manage wireless. iwd will usually use the "socket owner" option
+when it creates new interfaces, so that they're automatically
+destroyed when it quits (unexpectedly or otherwise). This is also
+done by wpa_supplicant, but it doesn't do it for the normal one,
+only for additional ones, which is different with iwd.
+
+Anyway, during shutdown, iwd quits while the netdev is still UP,
+i.e. IFF_UP is set. This causes the stack trace that Linus so
+nicely transcribed from the pictures:
+
+cfg80211_destroy_iface_wk() takes wiphy_lock
+ -> cfg80211_destroy_ifaces()
+  ->ieee80211_del_iface
+    ->ieeee80211_if_remove
+      ->cfg80211_unregister_wdev
+        ->unregister_netdevice_queue
+          ->dev_close_many
+            ->__dev_close_many
+              ->raw_notifier_call_chain
+                ->cfg80211_netdev_notifier_call
+and that last call tries to take wiphy_lock again.
+
+In commit a05829a7222e ("cfg80211: avoid holding the RTNL when
+calling the driver") I had taken into account the possibility of
+recursing from cfg80211 into cfg80211_netdev_notifier_call() via
+the network stack, but only for NETDEV_UNREGISTER, not for what
+happens here, NETDEV_GOING_DOWN and NETDEV_DOWN notifications.
+
+Additionally, while this worked still back in commit 78f22b6a3a92
+("cfg80211: allow userspace to take ownership of interfaces"), it
+missed another corner case: unregistering a netdev will cause
+dev_close() to be called, and thus stop wireless operations (e.g.
+disconnecting), but there are some types of virtual interfaces in
+wifi that don't have a netdev - for that we need an additional
+call to cfg80211_leave().
+
+So, to fix this mess, change cfg80211_destroy_ifaces() to not
+require the wiphy_lock(), but instead make it acquire it, but
+only after it has actually closed all the netdevs on the list,
+and then call cfg80211_leave() as well before removing them
+from the driver, to fix the second issue. The locking change in
+this requires modifying the nl80211 call to not get the wiphy
+lock passed in, but acquire it by itself after flushing any
+potentially pending destruction requests.
+
+[1] https://lore.kernel.org/r/09464e67-f3de-ac09-28a3-e27b7914ee7d@skogtun.org
+
+Cc: stable@vger.kernel.org # 5.12
+Reported-by: Harald Arnesen <harald@skogtun.org>
+Fixes: 776a39b8196d ("cfg80211: call cfg80211_destroy_ifaces() with wiphy lock held")
+Fixes: 78f22b6a3a92 ("cfg80211: allow userspace to take ownership of interfaces")
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Tested-by: Harald Arnesen <harald@skogtun.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

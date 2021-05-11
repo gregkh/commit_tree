@@ -1,0 +1,103 @@
+xfs: remove obsolete AGF counter debugging
+
+In commit f8f2835a9cf3 we changed the behavior of XFS to use EFIs to
+remove blocks from an overfilled AGFL because there were complaints
+about transaction overruns that stemmed from trying to free multiple
+blocks in a single transaction.
+
+Unfortunately, that commit missed a subtlety in the debug-mode
+transaction accounting when a realtime volume is attached.  If a
+realtime file undergoes a data fork mapping change such that realtime
+extents are allocated (or freed) in the same transaction that a data
+device block is also allocated (or freed), we can trip a debugging
+assertion.  This can happen (for example) if a realtime extent is
+allocated and it is necessary to reshape the bmbt to hold the new
+mapping.
+
+When we go to allocate a bmbt block from an AG, the first thing the data
+device block allocator does is ensure that the freelist is the proper
+length.  If the freelist is too long, it will trim the freelist to the
+proper length.
+
+In debug mode, trimming the freelist calls xfs_trans_agflist_delta() to
+record the decrement in the AG free list count.  Prior to f8f28 we would
+put the free block back in the free space btrees in the same
+transaction, which calls xfs_trans_agblocks_delta() to record the
+increment in the AG free block count.  Since AGFL blocks are included in
+the global free block count (fdblocks), there is no corresponding
+fdblocks update, so the AGFL free satisfies the following condition in
+xfs_trans_apply_sb_deltas:
+
+	/*
+	 * Check that superblock mods match the mods made to AGF counters.
+	 */
+	ASSERT((tp->t_fdblocks_delta + tp->t_res_fdblocks_delta) ==
+	       (tp->t_ag_freeblks_delta + tp->t_ag_flist_delta +
+		tp->t_ag_btree_delta));
+
+The comparison here used to be: (X + 0) == ((X+1) + -1 + 0), where X is
+the number blocks that were allocated.
+
+After commit f8f28 we defer the block freeing to the next chained
+transaction, which means that the calls to xfs_trans_agflist_delta and
+xfs_trans_agblocks_delta occur in separate transactions.  The (first)
+transaction that shortens the free list trips on the comparison, which
+has now become:
+
+(X + 0) == ((X) + -1 + 0)
+
+because we haven't freed the AGFL block yet; we've only logged an
+intention to free it.  When the second transaction (the deferred free)
+commits, it will evaluate the expression as:
+
+(0 + 0) == (1 + 0 + 0)
+
+and trip over that in turn.
+
+At this point, the astute reader may note that the two commits tagged by
+this patch have been in the kernel for a long time but haven't generated
+any bug reports.  How is it that the author became aware of this bug?
+
+This originally surfaced as an intermittent failure when I was testing
+realtime rmap, but a different bug report by Zorro Lang reveals the same
+assertion occuring on !lazysbcount filesystems.
+
+The common factor to both reports (and why this problem wasn't
+previously reported) becomes apparent if we consider when
+xfs_trans_apply_sb_deltas is called by __xfs_trans_commit():
+
+	if (tp->t_flags & XFS_TRANS_SB_DIRTY)
+		xfs_trans_apply_sb_deltas(tp);
+
+With a modern lazysbcount filesystem, transactions update only the
+percpu counters, so they don't need to set XFS_TRANS_SB_DIRTY, hence
+xfs_trans_apply_sb_deltas is rarely called.
+
+However, updates to the count of free realtime extents are not part of
+lazysbcount, so XFS_TRANS_SB_DIRTY will be set on transactions adding or
+removing data fork mappings to realtime files; similarly,
+XFS_TRANS_SB_DIRTY is always set on !lazysbcount filesystems.
+
+Dave mentioned in response to an earlier version of this patch:
+
+"IIUC, what you are saying is that this debug code is simply not
+exercised in normal testing and hasn't been for the past decade?  And it
+still won't be exercised on anything other than realtime device testing?
+
+"...it was debugging code from 1994 that was largely turned into dead
+code when lazysbcounters were introduced in 2007. Hence I'm not sure it
+holds any value anymore."
+
+This debugging code isn't especially helpful - you can modify the
+flcount on one AG and the freeblks of another AG, and it won't trigger.
+Add the fact that nobody noticed for a decade, and let's just get rid of
+it (and start testing realtime :P).
+
+This bug was found by running generic/051 on either a V4 filesystem
+lacking lazysbcount; or a V5 filesystem with a realtime volume.
+
+Cc: bfoster@redhat.com, zlang@redhat.com
+Fixes: f8f2835a9cf3 ("xfs: defer agfl block frees when dfops is available")
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+

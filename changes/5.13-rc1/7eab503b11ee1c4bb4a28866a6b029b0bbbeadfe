@@ -1,0 +1,45 @@
+net: enetc: use dedicated TX rings for XDP
+
+It is possible for one CPU to perform TX hashing (see netdev_pick_tx)
+between the 8 ENETC TX rings, and the TX hashing to select TX queue 1.
+
+At the same time, it is possible for the other CPU to already use TX
+ring 1 for XDP (either XDP_TX or XDP_REDIRECT). Since there is no mutual
+exclusion between XDP and the network stack, we run into an issue
+because the ENETC TX procedure is not reentrant.
+
+The obvious approach would be to just make XDP take the lock of the
+network stack's TX queue corresponding to the ring it's about to enqueue
+in.
+
+For XDP_REDIRECT, this is quite straightforward, a lock at the beginning
+and end of enetc_xdp_xmit() should do the trick.
+
+But for XDP_TX, it's a bit more complicated. For one, we do TX batching
+all by ourselves for frames with the XDP_TX verdict. This is something
+we would like to keep the way it is, for performance reasons. But
+batching means that the network stack's lock should be kept from the
+first enqueued XDP_TX frame and until we ring the doorbell. That is
+mostly fine, except for cases when in the same NAPI loop we have mixed
+XDP_TX and XDP_REDIRECT frames. So if enetc_xdp_xmit() gets called while
+we are holding the lock from the RX NAPI, then bam, deadlock. The naive
+answer could be 'just flush the XDP_TX frames first, then release the
+network stack's TX queue lock, then call xdp_do_flush_map()'. But even
+xdp_do_redirect() is capable of flushing the batched XDP_REDIRECT
+frames, so unless we unlock/relock the TX queue around xdp_do_redirect(),
+there simply isn't any clean way to protect XDP_TX from concurrent
+network stack .ndo_start_xmit() on another CPU.
+
+So we need to take a different approach, and that is to reserve two
+rings for the sole use of XDP. We leave TX rings
+0..ndev->real_num_tx_queues-1 to be handled by the network stack, and we
+pick them from the end of the priv->tx_ring array.
+
+We make an effort to keep the mapping done by enetc_alloc_msix() which
+decides which CPU handles the TX completions of which TX ring in its
+NAPI poll. So the XDP TX ring of CPU 0 is handled by TX ring 6, and the
+XDP TX ring of CPU 1 is handled by TX ring 7.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
