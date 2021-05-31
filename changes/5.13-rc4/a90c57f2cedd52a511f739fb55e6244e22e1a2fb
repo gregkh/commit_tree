@@ -1,0 +1,82 @@
+net: sched: fix packet stuck problem for lockless qdisc
+
+Lockless qdisc has below concurrent problem:
+    cpu0                 cpu1
+     .                     .
+q->enqueue                 .
+     .                     .
+qdisc_run_begin()          .
+     .                     .
+dequeue_skb()              .
+     .                     .
+sch_direct_xmit()          .
+     .                     .
+     .                q->enqueue
+     .             qdisc_run_begin()
+     .            return and do nothing
+     .                     .
+qdisc_run_end()            .
+
+cpu1 enqueue a skb without calling __qdisc_run() because cpu0
+has not released the lock yet and spin_trylock() return false
+for cpu1 in qdisc_run_begin(), and cpu0 do not see the skb
+enqueued by cpu1 when calling dequeue_skb() because cpu1 may
+enqueue the skb after cpu0 calling dequeue_skb() and before
+cpu0 calling qdisc_run_end().
+
+Lockless qdisc has below another concurrent problem when
+tx_action is involved:
+
+cpu0(serving tx_action)     cpu1             cpu2
+          .                   .                .
+          .              q->enqueue            .
+          .            qdisc_run_begin()       .
+          .              dequeue_skb()         .
+          .                   .            q->enqueue
+          .                   .                .
+          .             sch_direct_xmit()      .
+          .                   .         qdisc_run_begin()
+          .                   .       return and do nothing
+          .                   .                .
+ clear __QDISC_STATE_SCHED    .                .
+ qdisc_run_begin()            .                .
+ return and do nothing        .                .
+          .                   .                .
+          .            qdisc_run_end()         .
+
+This patch fixes the above data race by:
+1. If the first spin_trylock() return false and STATE_MISSED is
+   not set, set STATE_MISSED and retry another spin_trylock() in
+   case other CPU may not see STATE_MISSED after it releases the
+   lock.
+2. reschedule if STATE_MISSED is set after the lock is released
+   at the end of qdisc_run_end().
+
+For tx_action case, STATE_MISSED is also set when cpu1 is at the
+end if qdisc_run_end(), so tx_action will be rescheduled again
+to dequeue the skb enqueued by cpu2.
+
+Clear STATE_MISSED before retrying a dequeuing when dequeuing
+returns NULL in order to reduce the overhead of the second
+spin_trylock() and __netif_schedule() calling.
+
+Also clear the STATE_MISSED before calling __netif_schedule()
+at the end of qdisc_run_end() to avoid doing another round of
+dequeuing in the pfifo_fast_dequeue().
+
+The performance impact of this patch, tested using pktgen and
+dummy netdev with pfifo_fast qdisc attached:
+
+ threads  without+this_patch   with+this_patch      delta
+    1        2.61Mpps            2.60Mpps           -0.3%
+    2        3.97Mpps            3.82Mpps           -3.7%
+    4        5.62Mpps            5.59Mpps           -0.5%
+    8        2.78Mpps            2.77Mpps           -0.3%
+   16        2.22Mpps            2.22Mpps           -0.0%
+
+Fixes: 6b3ba9146fe6 ("net: sched: allow qdiscs to handle locking")
+Acked-by: Jakub Kicinski <kuba@kernel.org>
+Tested-by: Juergen Gross <jgross@suse.com>
+Signed-off-by: Yunsheng Lin <linyunsheng@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

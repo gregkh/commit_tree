@@ -1,0 +1,69 @@
+xfs: bunmapi has unnecessary AG lock ordering issues
+
+large directory block size operations are assert failing because
+xfs_bunmapi() is not completely removing fragmented directory blocks
+like so:
+
+XFS: Assertion failed: done, file: fs/xfs/libxfs/xfs_dir2.c, line: 677
+....
+Call Trace:
+ xfs_dir2_shrink_inode+0x1a8/0x210
+ xfs_dir2_block_to_sf+0x2ae/0x410
+ xfs_dir2_block_removename+0x21a/0x280
+ xfs_dir_removename+0x195/0x1d0
+ xfs_rename+0xb79/0xc50
+ ? avc_has_perm+0x8d/0x1a0
+ ? avc_has_perm_noaudit+0x9a/0x120
+ xfs_vn_rename+0xdb/0x150
+ vfs_rename+0x719/0xb50
+ ? __lookup_hash+0x6a/0xa0
+ do_renameat2+0x413/0x5e0
+ __x64_sys_rename+0x45/0x50
+ do_syscall_64+0x3a/0x70
+ entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+We are aborting the bunmapi() pass because of this specific chunk of
+code:
+
+                /*
+                 * Make sure we don't touch multiple AGF headers out of order
+                 * in a single transaction, as that could cause AB-BA deadlocks.
+                 */
+                if (!wasdel && !isrt) {
+                        agno = XFS_FSB_TO_AGNO(mp, del.br_startblock);
+                        if (prev_agno != NULLAGNUMBER && prev_agno > agno)
+                                break;
+                        prev_agno = agno;
+                }
+
+This is designed to prevent deadlocks in AGF locking when freeing
+multiple extents by ensuring that we only ever lock in increasing
+AG number order. Unfortunately, this also violates the "bunmapi will
+always succeed" semantic that some high level callers depend on,
+such as xfs_dir2_shrink_inode(), xfs_da_shrink_inode() and
+xfs_inactive_symlink_rmt().
+
+This AG lock ordering was introduced back in 2017 to fix deadlocks
+triggered by generic/299 as reported here:
+
+https://lore.kernel.org/linux-xfs/800468eb-3ded-9166-20a4-047de8018582@gmail.com/
+
+This codebase is old enough that it was before we were defering all
+AG based extent freeing from within xfs_bunmapi(). THat is, we never
+actually lock AGs in xfs_bunmapi() any more - every non-rt based
+extent free is added to the defer ops list, as is all BMBT block
+freeing. And RT extents are not RT based, so there's no lock
+ordering issues associated with them.
+
+Hence this AGF lock ordering code is both broken and dead. Let's
+just remove it so that the large directory block code works reliably
+again.
+
+Tested against xfs/538 and generic/299 which is the original test
+that exposed the deadlocks that this code fixed.
+
+Fixes: 5b094d6dac04 ("xfs: fix multi-AG deadlock in xfs_bunmapi")
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+

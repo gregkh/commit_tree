@@ -1,0 +1,52 @@
+io_uring: fix data race to avoid potential NULL-deref
+
+Commit ba5ef6dc8a82 ("io_uring: fortify tctx/io_wq cleanup") introduced
+setting tctx->io_wq to NULL a bit earlier. This has caused KCSAN to
+detect a data race between accesses to tctx->io_wq:
+
+  write to 0xffff88811d8df330 of 8 bytes by task 3709 on cpu 1:
+   io_uring_clean_tctx                  fs/io_uring.c:9042 [inline]
+   __io_uring_cancel                    fs/io_uring.c:9136
+   io_uring_files_cancel                include/linux/io_uring.h:16 [inline]
+   do_exit                              kernel/exit.c:781
+   do_group_exit                        kernel/exit.c:923
+   get_signal                           kernel/signal.c:2835
+   arch_do_signal_or_restart            arch/x86/kernel/signal.c:789
+   handle_signal_work                   kernel/entry/common.c:147 [inline]
+   exit_to_user_mode_loop               kernel/entry/common.c:171 [inline]
+   ...
+  read to 0xffff88811d8df330 of 8 bytes by task 6412 on cpu 0:
+   io_uring_try_cancel_iowq             fs/io_uring.c:8911 [inline]
+   io_uring_try_cancel_requests         fs/io_uring.c:8933
+   io_ring_exit_work                    fs/io_uring.c:8736
+   process_one_work                     kernel/workqueue.c:2276
+   ...
+
+With the config used, KCSAN only reports data races with value changes:
+this implies that in the case here we also know that tctx->io_wq was
+non-NULL. Therefore, depending on interleaving, we may end up with:
+
+              [CPU 0]                 |        [CPU 1]
+  io_uring_try_cancel_iowq()          | io_uring_clean_tctx()
+    if (!tctx->io_wq) // false        |   ...
+    ...                               |   tctx->io_wq = NULL
+    io_wq_cancel_cb(tctx->io_wq, ...) |   ...
+      -> NULL-deref                   |
+
+Note: It is likely that thus far we've gotten lucky and the compiler
+optimizes the double-read into a single read into a register -- but this
+is never guaranteed, and can easily change with a different config!
+
+Fix the data race by restoring the previous behaviour, where both
+setting io_wq to NULL and put of the wq are _serialized_ after
+concurrent io_uring_try_cancel_iowq() via acquisition of the uring_lock
+and removal of the node in io_uring_del_task_file().
+
+Fixes: ba5ef6dc8a82 ("io_uring: fortify tctx/io_wq cleanup")
+Suggested-by: Pavel Begunkov <asml.silence@gmail.com>
+Reported-by: syzbot+bf2b3d0435b9b728946c@syzkaller.appspotmail.com
+Signed-off-by: Marco Elver <elver@google.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Link: https://lore.kernel.org/r/20210527092547.2656514-1-elver@google.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+
