@@ -1,0 +1,70 @@
+mm/thp: unmap_mapping_page() to fix THP truncate_cleanup_page()
+
+There is a race between THP unmapping and truncation, when truncate sees
+pmd_none() and skips the entry, after munmap's zap_huge_pmd() cleared
+it, but before its page_remove_rmap() gets to decrement
+compound_mapcount: generating false "BUG: Bad page cache" reports that
+the page is still mapped when deleted.  This commit fixes that, but not
+in the way I hoped.
+
+The first attempt used try_to_unmap(page, TTU_SYNC|TTU_IGNORE_MLOCK)
+instead of unmap_mapping_range() in truncate_cleanup_page(): it has
+often been an annoyance that we usually call unmap_mapping_range() with
+no pages locked, but there apply it to a single locked page.
+try_to_unmap() looks more suitable for a single locked page.
+
+However, try_to_unmap_one() contains a VM_BUG_ON_PAGE(!pvmw.pte,page):
+it is used to insert THP migration entries, but not used to unmap THPs.
+Copy zap_huge_pmd() and add THP handling now? Perhaps, but their TLB
+needs are different, I'm too ignorant of the DAX cases, and couldn't
+decide how far to go for anon+swap.  Set that aside.
+
+The second attempt took a different tack: make no change in truncate.c,
+but modify zap_huge_pmd() to insert an invalidated huge pmd instead of
+clearing it initially, then pmd_clear() between page_remove_rmap() and
+unlocking at the end.  Nice.  But powerpc blows that approach out of the
+water, with its serialize_against_pte_lookup(), and interesting pgtable
+usage.  It would need serious help to get working on powerpc (with a
+minor optimization issue on s390 too).  Set that aside.
+
+Just add an "if (page_mapped(page)) synchronize_rcu();" or other such
+delay, after unmapping in truncate_cleanup_page()? Perhaps, but though
+that's likely to reduce or eliminate the number of incidents, it would
+give less assurance of whether we had identified the problem correctly.
+
+This successful iteration introduces "unmap_mapping_page(page)" instead
+of try_to_unmap(), and goes the usual unmap_mapping_range_tree() route,
+with an addition to details.  Then zap_pmd_range() watches for this
+case, and does spin_unlock(pmd_lock) if so - just like
+page_vma_mapped_walk() now does in the PVMW_SYNC case.  Not pretty, but
+safe.
+
+Note that unmap_mapping_page() is doing a VM_BUG_ON(!PageLocked) to
+assert its interface; but currently that's only used to make sure that
+page->mapping is stable, and zap_pmd_range() doesn't care if the page is
+locked or not.  Along these lines, in invalidate_inode_pages2_range()
+move the initial unmap_mapping_range() out from under page lock, before
+then calling unmap_mapping_page() under page lock if still mapped.
+
+Link: https://lkml.kernel.org/r/a2a4a148-cdd8-942c-4ef8-51b77f643dbe@google.com
+Fixes: fc127da085c2 ("truncate: handle file thp")
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jue Wang <juew@google.com>
+Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Wang Yugui <wangyugui@e16-tech.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
