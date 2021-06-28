@@ -1,0 +1,101 @@
+kthread: prevent deadlock when kthread_mod_delayed_work() races with kthread_cancel_delayed_work_sync()
+
+The system might hang with the following backtrace:
+
+	schedule+0x80/0x100
+	schedule_timeout+0x48/0x138
+	wait_for_common+0xa4/0x134
+	wait_for_completion+0x1c/0x2c
+	kthread_flush_work+0x114/0x1cc
+	kthread_cancel_work_sync.llvm.16514401384283632983+0xe8/0x144
+	kthread_cancel_delayed_work_sync+0x18/0x2c
+	xxxx_pm_notify+0xb0/0xd8
+	blocking_notifier_call_chain_robust+0x80/0x194
+	pm_notifier_call_chain_robust+0x28/0x4c
+	suspend_prepare+0x40/0x260
+	enter_state+0x80/0x3f4
+	pm_suspend+0x60/0xdc
+	state_store+0x108/0x144
+	kobj_attr_store+0x38/0x88
+	sysfs_kf_write+0x64/0xc0
+	kernfs_fop_write_iter+0x108/0x1d0
+	vfs_write+0x2f4/0x368
+	ksys_write+0x7c/0xec
+
+It is caused by the following race between kthread_mod_delayed_work()
+and kthread_cancel_delayed_work_sync():
+
+CPU0				CPU1
+
+Context: Thread A		Context: Thread B
+
+kthread_mod_delayed_work()
+  spin_lock()
+  __kthread_cancel_work()
+     spin_unlock()
+     del_timer_sync()
+				kthread_cancel_delayed_work_sync()
+				  spin_lock()
+				  __kthread_cancel_work()
+				    spin_unlock()
+				    del_timer_sync()
+				    spin_lock()
+
+				  work->canceling++
+				  spin_unlock
+     spin_lock()
+   queue_delayed_work()
+     // dwork is put into the worker->delayed_work_list
+
+   spin_unlock()
+
+				  kthread_flush_work()
+     // flush_work is put at the tail of the dwork
+
+				    wait_for_completion()
+
+Context: IRQ
+
+  kthread_delayed_work_timer_fn()
+    spin_lock()
+    list_del_init(&work->node);
+    spin_unlock()
+
+BANG: flush_work is not longer linked and will never get proceed.
+
+The problem is that kthread_mod_delayed_work() checks work->canceling
+flag before canceling the timer.
+
+A simple solution is to (re)check work->canceling after
+__kthread_cancel_work().  But then it is not clear what should be
+returned when __kthread_cancel_work() removed the work from the queue
+(list) and it can't queue it again with the new @delay.
+
+The return value might be used for reference counting.  The caller has
+to know whether a new work has been queued or an existing one was
+replaced.
+
+The proper solution is that kthread_mod_delayed_work() will remove the
+work from the queue (list) _only_ when work->canceling is not set.  The
+flag must be checked after the timer is stopped and the remaining
+operations can be done under worker->lock.
+
+Note that kthread_mod_delayed_work() could remove the timer and then
+bail out.  It is fine.  The other canceling caller needs to cancel the
+timer as well.  The important thing is that the queue (list)
+manipulation is done atomically under worker->lock.
+
+Link: https://lkml.kernel.org/r/20210610133051.15337-3-pmladek@suse.com
+Fixes: 9a6b06c8d9a220860468a ("kthread: allow to modify delayed kthread work")
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+Reported-by: Martin Liu <liumartin@google.com>
+Cc: <jenhaochen@google.com>
+Cc: Minchan Kim <minchan@google.com>
+Cc: Nathan Chancellor <nathan@kernel.org>
+Cc: Nick Desaulniers <ndesaulniers@google.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

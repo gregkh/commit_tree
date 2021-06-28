@@ -1,0 +1,68 @@
+Revert "signal: Allow tasks to cache one sigqueue struct"
+
+This reverts commits 4bad58ebc8bc4f20d89cff95417c9b4674769709 (and
+399f8dd9a866e107639eabd3c1979cd526ca3a98, which tried to fix it).
+
+I do not believe these are correct, and I'm about to release 5.13, so am
+reverting them out of an abundance of caution.
+
+The locking is odd, and appears broken.
+
+On the allocation side (in __sigqueue_alloc()), the locking is somewhat
+straightforward: it depends on sighand->siglock.  Since one caller
+doesn't hold that lock, it further then tests 'sigqueue_flags' to avoid
+the case with no locks held.
+
+On the freeing side (in sigqueue_cache_or_free()), there is no locking
+at all, and the logic instead depends on 'current' being a single
+thread, and not able to race with itself.
+
+To make things more exciting, there's also the data race between freeing
+a signal and allocating one, which is handled by using WRITE_ONCE() and
+READ_ONCE(), and being mutually exclusive wrt the initial state (ie
+freeing will only free if the old state was NULL, while allocating will
+obviously only use the value if it was non-NULL, so only one or the
+other will actually act on the value).
+
+However, while the free->alloc paths do seem mutually exclusive thanks
+to just the data value dependency, it's not clear what the memory
+ordering constraints are on it.  Could writes from the previous
+allocation possibly be delayed and seen by the new allocation later,
+causing logical inconsistencies?
+
+So it's all very exciting and unusual.
+
+And in particular, it seems that the freeing side is incorrect in
+depending on "current" being single-threaded.  Yes, 'current' is a
+single thread, but in the presense of asynchronous events even a single
+thread can have data races.
+
+And such asynchronous events can and do happen, with interrupts causing
+signals to be flushed and thus free'd (for example - sending a
+SIGCONT/SIGSTOP can happen from interrupt context, and can flush
+previously queued process control signals).
+
+So regardless of all the other questions about the memory ordering and
+locking for this new cached allocation, the sigqueue_cache_or_free()
+assumptions seem to be fundamentally incorrect.
+
+It may be that people will show me the errors of my ways, and tell me
+why this is all safe after all.  We can reinstate it if so.  But my
+current belief is that the WRITE_ONCE() that sets the cached entry needs
+to be a smp_store_release(), and the READ_ONCE() that finds a cached
+entry needs to be a smp_load_acquire() to handle memory ordering
+correctly.
+
+And the sequence in sigqueue_cache_or_free() would need to either use a
+lock or at least be interrupt-safe some way (perhaps by using something
+like the percpu 'cmpxchg': it doesn't need to be SMP-safe, but like the
+percpu operations it needs to be interrupt-safe).
+
+Fixes: 399f8dd9a866 ("signal: Prevent sigqueue caching after task got released")
+Fixes: 4bad58ebc8bc ("signal: Allow tasks to cache one sigqueue struct")
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Christian Brauner <christian.brauner@ubuntu.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
