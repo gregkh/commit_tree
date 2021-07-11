@@ -1,0 +1,368 @@
+commit e0c3e706e94deeaa75c5f9fb91cd24b3c71b4793
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Sun Jul 11 12:46:41 2021 +0200
+
+    Linux 4.9.275
+    
+    Link: https://lore.kernel.org/r/20210709131542.410636747@linuxfoundation.org
+    Tested-by: Jon Hunter <jonathanh@nvidia.com>
+    Tested-by: Shuah Khan <skhan@linuxfoundation.org>
+    Tested-by: Linux Kernel Functional Testing <lkft@linaro.org>
+    Tested-by: Guenter Roeck <linux@roeck-us.net>
+    Tested-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 01df0e31cb208a6b16b2d19e746a2d203cc24682
+Author: Juergen Gross <jgross@suse.com>
+Date:   Wed Jun 23 15:09:13 2021 +0200
+
+    xen/events: reset active flag for lateeoi events later
+    
+    commit 3de218ff39b9e3f0d453fe3154f12a174de44b25 upstream.
+    
+    In order to avoid a race condition for user events when changing
+    cpu affinity reset the active flag only when EOI-ing the event.
+    
+    This is working fine as all user events are lateeoi events. Note that
+    lateeoi_ack_mask_dynirq() is not modified as there is no explicit call
+    to xen_irq_lateeoi() expected later.
+    
+    Cc: stable@vger.kernel.org
+    Reported-by: Julien Grall <julien@xen.org>
+    Fixes: b6622798bc50b62 ("xen/events: avoid handling the same event on two cpus at the same time")
+    Tested-by: Julien Grall <julien@xen.org>
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+    Reviewed-by: Boris Ostrovsky <boris.ostrvsky@oracle.com>
+    Link: https://lore.kernel.org/r/20210623130913.9405-1-jgross@suse.com
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 5d27e1503b17db8571a4e71b6146644ab29c18a7
+Author: Petr Mladek <pmladek@suse.com>
+Date:   Thu Jun 24 18:39:48 2021 -0700
+
+    kthread: prevent deadlock when kthread_mod_delayed_work() races with kthread_cancel_delayed_work_sync()
+    
+    commit 5fa54346caf67b4b1b10b1f390316ae466da4d53 upstream.
+    
+    The system might hang with the following backtrace:
+    
+            schedule+0x80/0x100
+            schedule_timeout+0x48/0x138
+            wait_for_common+0xa4/0x134
+            wait_for_completion+0x1c/0x2c
+            kthread_flush_work+0x114/0x1cc
+            kthread_cancel_work_sync.llvm.16514401384283632983+0xe8/0x144
+            kthread_cancel_delayed_work_sync+0x18/0x2c
+            xxxx_pm_notify+0xb0/0xd8
+            blocking_notifier_call_chain_robust+0x80/0x194
+            pm_notifier_call_chain_robust+0x28/0x4c
+            suspend_prepare+0x40/0x260
+            enter_state+0x80/0x3f4
+            pm_suspend+0x60/0xdc
+            state_store+0x108/0x144
+            kobj_attr_store+0x38/0x88
+            sysfs_kf_write+0x64/0xc0
+            kernfs_fop_write_iter+0x108/0x1d0
+            vfs_write+0x2f4/0x368
+            ksys_write+0x7c/0xec
+    
+    It is caused by the following race between kthread_mod_delayed_work()
+    and kthread_cancel_delayed_work_sync():
+    
+    CPU0                            CPU1
+    
+    Context: Thread A               Context: Thread B
+    
+    kthread_mod_delayed_work()
+      spin_lock()
+      __kthread_cancel_work()
+         spin_unlock()
+         del_timer_sync()
+                                    kthread_cancel_delayed_work_sync()
+                                      spin_lock()
+                                      __kthread_cancel_work()
+                                        spin_unlock()
+                                        del_timer_sync()
+                                        spin_lock()
+    
+                                      work->canceling++
+                                      spin_unlock
+         spin_lock()
+       queue_delayed_work()
+         // dwork is put into the worker->delayed_work_list
+    
+       spin_unlock()
+    
+                                      kthread_flush_work()
+         // flush_work is put at the tail of the dwork
+    
+                                        wait_for_completion()
+    
+    Context: IRQ
+    
+      kthread_delayed_work_timer_fn()
+        spin_lock()
+        list_del_init(&work->node);
+        spin_unlock()
+    
+    BANG: flush_work is not longer linked and will never get proceed.
+    
+    The problem is that kthread_mod_delayed_work() checks work->canceling
+    flag before canceling the timer.
+    
+    A simple solution is to (re)check work->canceling after
+    __kthread_cancel_work().  But then it is not clear what should be
+    returned when __kthread_cancel_work() removed the work from the queue
+    (list) and it can't queue it again with the new @delay.
+    
+    The return value might be used for reference counting.  The caller has
+    to know whether a new work has been queued or an existing one was
+    replaced.
+    
+    The proper solution is that kthread_mod_delayed_work() will remove the
+    work from the queue (list) _only_ when work->canceling is not set.  The
+    flag must be checked after the timer is stopped and the remaining
+    operations can be done under worker->lock.
+    
+    Note that kthread_mod_delayed_work() could remove the timer and then
+    bail out.  It is fine.  The other canceling caller needs to cancel the
+    timer as well.  The important thing is that the queue (list)
+    manipulation is done atomically under worker->lock.
+    
+    Link: https://lkml.kernel.org/r/20210610133051.15337-3-pmladek@suse.com
+    Fixes: 9a6b06c8d9a220860468a ("kthread: allow to modify delayed kthread work")
+    Signed-off-by: Petr Mladek <pmladek@suse.com>
+    Reported-by: Martin Liu <liumartin@google.com>
+    Cc: <jenhaochen@google.com>
+    Cc: Minchan Kim <minchan@google.com>
+    Cc: Nathan Chancellor <nathan@kernel.org>
+    Cc: Nick Desaulniers <ndesaulniers@google.com>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 392cfdd660491857137c35cba7496fb7446afe4f
+Author: Petr Mladek <pmladek@suse.com>
+Date:   Thu Jun 24 18:39:45 2021 -0700
+
+    kthread_worker: split code for canceling the delayed work timer
+    
+    commit 34b3d5344719d14fd2185b2d9459b3abcb8cf9d8 upstream.
+    
+    Patch series "kthread_worker: Fix race between kthread_mod_delayed_work()
+    and kthread_cancel_delayed_work_sync()".
+    
+    This patchset fixes the race between kthread_mod_delayed_work() and
+    kthread_cancel_delayed_work_sync() including proper return value
+    handling.
+    
+    This patch (of 2):
+    
+    Simple code refactoring as a preparation step for fixing a race between
+    kthread_mod_delayed_work() and kthread_cancel_delayed_work_sync().
+    
+    It does not modify the existing behavior.
+    
+    Link: https://lkml.kernel.org/r/20210610133051.15337-2-pmladek@suse.com
+    Signed-off-by: Petr Mladek <pmladek@suse.com>
+    Cc: <jenhaochen@google.com>
+    Cc: Martin Liu <liumartin@google.com>
+    Cc: Minchan Kim <minchan@google.com>
+    Cc: Nathan Chancellor <nathan@kernel.org>
+    Cc: Nick Desaulniers <ndesaulniers@google.com>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 22226752e45934480f63cc8e43abb13b7e59f4fb
+Author: Christian König <christian.koenig@amd.com>
+Date:   Fri Jun 11 14:34:50 2021 +0200
+
+    drm/nouveau: fix dma_address check for CPU/GPU sync
+    
+    [ Upstream commit d330099115597bbc238d6758a4930e72b49ea9ba ]
+    
+    AGP for example doesn't have a dma_address array.
+    
+    Signed-off-by: Christian König <christian.koenig@amd.com>
+    Acked-by: Alex Deucher <alexander.deucher@amd.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20210614110517.1624-1-christian.koenig@amd.com
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 8b289e6d55a6dc2341020bc632fe7bddcd5a07d3
+Author: ManYi Li <limanyi@uniontech.com>
+Date:   Fri Jun 11 17:44:02 2021 +0800
+
+    scsi: sr: Return appropriate error code when disk is ejected
+    
+    [ Upstream commit 7dd753ca59d6c8cc09aa1ed24f7657524803c7f3 ]
+    
+    Handle a reported media event code of 3. This indicates that the media has
+    been removed from the drive and user intervention is required to proceed.
+    Return DISK_EVENT_EJECT_REQUEST in that case.
+    
+    Link: https://lore.kernel.org/r/20210611094402.23884-1-limanyi@uniontech.com
+    Signed-off-by: ManYi Li <limanyi@uniontech.com>
+    Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit c52e6f64804267cc8c9f26ab41588eeeae6fb9a7
+Author: Hugh Dickins <hughd@google.com>
+Date:   Thu Jun 24 18:39:52 2021 -0700
+
+    mm, futex: fix shared futex pgoff on shmem huge page
+    
+    [ Upstream commit fe19bd3dae3d15d2fbfdb3de8839a6ea0fe94264 ]
+    
+    If more than one futex is placed on a shmem huge page, it can happen
+    that waking the second wakes the first instead, and leaves the second
+    waiting: the key's shared.pgoff is wrong.
+    
+    When 3.11 commit 13d60f4b6ab5 ("futex: Take hugepages into account when
+    generating futex_key"), the only shared huge pages came from hugetlbfs,
+    and the code added to deal with its exceptional page->index was put into
+    hugetlb source.  Then that was missed when 4.8 added shmem huge pages.
+    
+    page_to_pgoff() is what others use for this nowadays: except that, as
+    currently written, it gives the right answer on hugetlbfs head, but
+    nonsense on hugetlbfs tails.  Fix that by calling hugetlbfs-specific
+    hugetlb_basepage_index() on PageHuge tails as well as on head.
+    
+    Yes, it's unconventional to declare hugetlb_basepage_index() there in
+    pagemap.h, rather than in hugetlb.h; but I do not expect anything but
+    page_to_pgoff() ever to need it.
+    
+    [akpm@linux-foundation.org: give hugetlb_basepage_index() prototype the correct scope]
+    
+    Link: https://lkml.kernel.org/r/b17d946b-d09-326e-b42a-52884c36df32@google.com
+    Fixes: 800d8c63b2e9 ("shmem: add huge pages support")
+    Reported-by: Neel Natu <neelnatu@google.com>
+    Signed-off-by: Hugh Dickins <hughd@google.com>
+    Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+    Acked-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+    Cc: Zhang Yi <wetpzy@gmail.com>
+    Cc: Mel Gorman <mgorman@techsingularity.net>
+    Cc: Mike Kravetz <mike.kravetz@oracle.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Darren Hart <dvhart@infradead.org>
+    Cc: Davidlohr Bueso <dave@stgolabs.net>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    
+    Note on stable backport: leave redundant #include <linux/hugetlb.h>
+    in kernel/futex.c, to avoid conflict over the header files included.
+    Resolved trivial conflicts in include/linux/hugetlb.h.
+    
+    Signed-off-by: Hugh Dickins <hughd@google.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 07cc82b921bc60194bdc4a2ccea7d69f2d789348
+Author: Yang Shi <shy828301@gmail.com>
+Date:   Tue Jun 15 18:24:07 2021 -0700
+
+    mm: thp: replace DEBUG_VM BUG with VM_WARN when unmap fails for split
+    
+    [ Upstream commit 504e070dc08f757bccaed6d05c0f53ecbfac8a23 ]
+    
+    When debugging the bug reported by Wang Yugui [1], try_to_unmap() may
+    fail, but the first VM_BUG_ON_PAGE() just checks page_mapcount() however
+    it may miss the failure when head page is unmapped but other subpage is
+    mapped.  Then the second DEBUG_VM BUG() that check total mapcount would
+    catch it.  This may incur some confusion.
+    
+    As this is not a fatal issue, so consolidate the two DEBUG_VM checks
+    into one VM_WARN_ON_ONCE_PAGE().
+    
+    [1] https://lore.kernel.org/linux-mm/20210412180659.B9E3.409509F4@e16-tech.com/
+    
+    Link: https://lkml.kernel.org/r/d0f0db68-98b8-ebfb-16dc-f29df24cf012@google.com
+    Signed-off-by: Yang Shi <shy828301@gmail.com>
+    Reviewed-by: Zi Yan <ziy@nvidia.com>
+    Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+    Signed-off-by: Hugh Dickins <hughd@google.com>
+    Cc: Alistair Popple <apopple@nvidia.com>
+    Cc: Jan Kara <jack@suse.cz>
+    Cc: Jue Wang <juew@google.com>
+    Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+    Cc: Miaohe Lin <linmiaohe@huawei.com>
+    Cc: Minchan Kim <minchan@kernel.org>
+    Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+    Cc: Oscar Salvador <osalvador@suse.de>
+    Cc: Peter Xu <peterx@redhat.com>
+    Cc: Ralph Campbell <rcampbell@nvidia.com>
+    Cc: Shakeel Butt <shakeelb@google.com>
+    Cc: Wang Yugui <wangyugui@e16-tech.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    
+    Note on stable backport: fixed up variables, split_queue_lock, tree_lock
+    in split_huge_page_to_list(); adapted to early version of unmap_page().
+    
+    Signed-off-by: Hugh Dickins <hughd@google.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 2b123e354eff9d24a5e27efb2cb70f2720509f92
+Author: Alex Shi <alexs@kernel.org>
+Date:   Fri Dec 18 14:01:31 2020 -0800
+
+    mm: add VM_WARN_ON_ONCE_PAGE() macro
+    
+    [ Upstream commit a4055888629bc0467d12d912cd7c90acdf3d9b12 part ]
+    
+    Add VM_WARN_ON_ONCE_PAGE() macro.
+    
+    Link: https://lkml.kernel.org/r/1604283436-18880-3-git-send-email-alex.shi@linux.alibaba.com
+    Signed-off-by: Alex Shi <alex.shi@linux.alibaba.com>
+    Acked-by: Michal Hocko <mhocko@suse.com>
+    Acked-by: Hugh Dickins <hughd@google.com>
+    Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+    Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    
+    Note on stable backport: original commit was titled
+    mm/memcg: warning on !memcg after readahead page charged
+    which included uses of this macro in mm/memcontrol.c: here omitted.
+    
+    Signed-off-by: Hugh Dickins <hughd@google.com>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+
+commit 88a899fa2032b34ef3ac5dae3c70c8394fa5287c
+Author: Michal Hocko <mhocko@kernel.org>
+Date:   Thu Apr 5 16:25:30 2018 -0700
+
+    include/linux/mmdebug.h: make VM_WARN* non-rvals
+    
+    [ Upstream commit 91241681c62a5a690c88eb2aca027f094125eaac ]
+    
+    At present the construct
+    
+            if (VM_WARN(...))
+    
+    will compile OK with CONFIG_DEBUG_VM=y and will fail with
+    CONFIG_DEBUG_VM=n.  The reason is that VM_{WARN,BUG}* have always been
+    special wrt.  {WARN/BUG}* and never generate any code when DEBUG_VM is
+    disabled.  So we cannot really use it in conditionals.
+    
+    We considered changing things so that this construct works in both cases
+    but that might cause unwanted code generation with CONFIG_DEBUG_VM=n.
+    It is safer and simpler to make the build fail in both cases.
+    
+    [akpm@linux-foundation.org: changelog]
+    Signed-off-by: Michal Hocko <mhocko@suse.com>
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
