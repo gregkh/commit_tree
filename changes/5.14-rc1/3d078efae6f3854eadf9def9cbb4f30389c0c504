@@ -1,0 +1,70 @@
+btrfs: subpage: fix a rare race between metadata endio and eb freeing
+
+[BUG]
+There is a very rare ASSERT() triggering during full fstests run for
+subpage rw support.
+
+No other reproducer so far.
+
+The ASSERT() gets triggered for metadata read in
+btrfs_page_set_uptodate() inside end_page_read().
+
+[CAUSE]
+There is still a small race window for metadata only, the race could
+happen like this:
+
+                T1                  |              T2
+------------------------------------+-----------------------------
+end_bio_extent_readpage()           |
+|- btrfs_validate_metadata_buffer() |
+|  |- free_extent_buffer()          |
+|     Still have 2 refs             |
+|- end_page_read()                  |
+   |- if (unlikely(PagePrivate())   |
+   |  The page still has Private    |
+   |                                | free_extent_buffer()
+   |                                | |  Only one ref 1, will be
+   |                                | |  released
+   |                                | |- detach_extent_buffer_page()
+   |                                |    |- btrfs_detach_subpage()
+   |- btrfs_set_page_uptodate()     |
+      The page no longer has Private|
+      >>> ASSERT() triggered <<<    |
+
+This race window is super small, thus pretty hard to hit, even with so
+many runs of fstests.
+
+But the race window is still there, we have to go another way to solve
+it other than relying on random PagePrivate() check.
+
+Data path is not affected, as it will lock the page before reading,
+while unlocking the page after the last read has finished, thus no race
+window.
+
+[FIX]
+This patch will fix the bug by repurposing btrfs_subpage::readers.
+
+Now btrfs_subpage::readers will be a member shared by both metadata and
+data.
+
+For metadata path, we don't do the page unlock as metadata only relies
+on extent locking.
+
+At the same time, teach page_range_has_eb() to take
+btrfs_subpage::readers into consideration.
+
+So that even if the last eb of a page gets freed, page::private won't be
+detached as long as there still are pending end_page_read() calls.
+
+By this we eliminate the race window, this will slight increase the
+metadata memory usage, as the page may not be released as frequently as
+usual.  But it should not be a big deal.
+
+The code got introduced in ("btrfs: submit read time repair only for
+each corrupted sector"), but the fix is in a separate patch to keep the
+problem description and the crash is rare so it should not hurt
+bisectability.
+
+Signed-off-by: Qu Wegruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

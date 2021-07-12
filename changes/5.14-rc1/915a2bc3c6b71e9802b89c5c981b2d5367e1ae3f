@@ -1,0 +1,99 @@
+sched/isolation: Reconcile rcu_nocbs= and nohz_full=
+
+We have a mismatch between RCU and isolation -- in relation to what is
+considered the maximum valid CPU number.
+
+This matters because nohz_full= and rcu_nocbs= are joined at the hip; in
+fact the former will enforce the latter.  So we don't want a CPU mask to
+be valid for one and denied for the other.
+
+The difference 1st appeared as of v4.15; further details are below.
+
+As it is confusing to anyone who isn't looking at the code regularly, a
+reminder is in order; three values exist here:
+
+  CONFIG_NR_CPUS  - compiled in maximum cap on number of CPUs supported.
+  nr_cpu_ids      - possible # of CPUs (typically reflects what ACPI says)
+  cpus_present    - actual number of present/detected/installed CPUs.
+
+For this example, I'll refer to NR_CPUS=64 from "make defconfig" and
+nr_cpu_ids=6 for ACPI reporting on a board that could run a six core,
+and present=4 for a quad that is physically in the socket.  From dmesg:
+
+ smpboot: Allowing 6 CPUs, 2 hotplug CPUs
+ setup_percpu: NR_CPUS:64 nr_cpumask_bits:64 nr_cpu_ids:6 nr_node_ids:1
+ rcu: 	RCU restricting CPUs from NR_CPUS=64 to nr_cpu_ids=6.
+ smp: Brought up 1 node, 4 CPUs
+
+And from userspace, see:
+
+   paul@trash:/sys/devices/system/cpu$ cat present
+   0-3
+   paul@trash:/sys/devices/system/cpu$ cat possible
+   0-5
+   paul@trash:/sys/devices/system/cpu$ cat kernel_max
+   63
+
+Everything is fine if we boot 5x5 for rcu/nohz:
+
+  Command line: BOOT_IMAGE=/boot/bzImage nohz_full=2-5 rcu_nocbs=2-5 root=/dev/sda1 ro
+  NO_HZ: Full dynticks CPUs: 2-5.
+  rcu: 	Offload RCU callbacks from CPUs: 2-5.
+
+..even though there is no CPU 4 or 5.  Both RCU and nohz_full are OK.
+Now we push that > 6 but less than NR_CPU and with 15x15 we get:
+
+  Command line: BOOT_IMAGE=/boot/bzImage rcu_nocbs=2-15 nohz_full=2-15 root=/dev/sda1 ro
+  rcu: 	Note: kernel parameter 'rcu_nocbs=', 'nohz_full', or 'isolcpus=' contains nonexistent CPUs.
+  rcu: 	Offload RCU callbacks from CPUs: 2-5.
+
+These are both functionally equivalent, as we are only changing flags on
+phantom CPUs that don't exist, but note the kernel interpretation changes.
+And worse, it only changes for one of the two - which is the problem.
+
+RCU doesn't care if you want to restrict the flags on phantom CPUs but
+clearly nohz_full does after this change from v4.15.
+
+ edb9382175c3: ("sched/isolation: Move isolcpus= handling to the housekeeping code")
+
+ -       if (cpulist_parse(str, non_housekeeping_mask) < 0) {
+ -               pr_warn("Housekeeping: Incorrect nohz_full cpumask\n");
+ +       err = cpulist_parse(str, non_housekeeping_mask);
+ +       if (err < 0 || cpumask_last(non_housekeeping_mask) >= nr_cpu_ids) {
+ +               pr_warn("Housekeeping: nohz_full= or isolcpus= incorrect CPU range\n");
+
+To be clear, the sanity check on "possible" (nr_cpu_ids) is new here.
+
+The goal was reasonable ; not wanting housekeeping to land on a
+not-possible CPU, but note two things:
+
+  1) this is an exclusion list, not an inclusion list; we are tracking
+     non_housekeeping CPUs; not ones who are explicitly assigned housekeeping
+
+  2) we went one further in 9219565aa890 ("sched/isolation: Require a present CPU in housekeeping mask")
+     - ensuring that housekeeping was sanity checking against present and not just possible CPUs.
+
+To be clear, this means the check added in v4.15 is doubly redundant.
+And more importantly, overly strict/restrictive.
+
+We care now, because the bitmap boot arg parsing now knows that a value
+of "N" is NR_CPUS; the size of the bitmap, but the bitmap code doesn't
+know anything about the subtleties of our max/possible/present CPU
+specifics as outlined above.
+
+So drop the check added in v4.15 (edb9382175c3) and make RCU and
+nohz_full both in alignment again on NR_CPUS so "N" works for both,
+and then they can fall back to nr_cpu_ids internally just as before.
+
+  Command line: BOOT_IMAGE=/boot/bzImage nohz_full=2-N rcu_nocbs=2-N root=/dev/sda1 ro
+  NO_HZ: Full dynticks CPUs: 2-5.
+  rcu: 	Offload RCU callbacks from CPUs: 2-5.
+
+As shown above, with this change, RCU and nohz_full are in sync, even
+with the use of the "N" placeholder.  Same result is achieved with "15".
+
+Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Paul E. McKenney <paulmck@kernel.org>
+Link: https://lore.kernel.org/r/20210419042659.1134916-1-paul.gortmaker@windriver.com
+

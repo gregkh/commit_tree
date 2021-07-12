@@ -1,0 +1,119 @@
+mm/page_alloc: split per cpu page lists and zone stats
+
+The PCP (per-cpu page allocator in page_alloc.c) shares locking
+requirements with vmstat and the zone lock which is inconvenient and
+causes some issues.  For example, the PCP list and vmstat share the same
+per-cpu space meaning that it's possible that vmstat updates dirty cache
+lines holding per-cpu lists across CPUs unless padding is used.  Second,
+PREEMPT_RT does not want to disable IRQs for too long in the page
+allocator.
+
+This series splits the locking requirements and uses locks types more
+suitable for PREEMPT_RT, reduces the time when special locking is required
+for stats and reduces the time when IRQs need to be disabled on
+!PREEMPT_RT kernels.
+
+Why local_lock?  PREEMPT_RT considers the following sequence to be unsafe
+as documented in Documentation/locking/locktypes.rst
+
+   local_irq_disable();
+   spin_lock(&lock);
+
+The pcp allocator has this sequence for rmqueue_pcplist (local_irq_save)
+-> __rmqueue_pcplist -> rmqueue_bulk (spin_lock).  While it's possible to
+separate this out, it generally means there are points where we enable
+IRQs and reenable them again immediately.  To prevent a migration and the
+per-cpu pointer going stale, migrate_disable is also needed.  That is a
+custom lock that is similar, but worse, than local_lock.  Furthermore, on
+PREEMPT_RT, it's undesirable to leave IRQs disabled for too long.  By
+converting to local_lock which disables migration on PREEMPT_RT, the
+locking requirements can be separated and start moving the protections for
+PCP, stats and the zone lock to PREEMPT_RT-safe equivalent locking.  As a
+bonus, local_lock also means that PROVE_LOCKING does something useful.
+
+After that, it's obvious that zone_statistics incurs too much overhead and
+leaves IRQs disabled for longer than necessary on !PREEMPT_RT kernels.
+zone_statistics uses perfectly accurate counters requiring IRQs be
+disabled for parallel RMW sequences when inaccurate ones like vm_events
+would do.  The series makes the NUMA statistics (NUMA_HIT and friends)
+inaccurate counters that then require no special protection on
+!PREEMPT_RT.
+
+The bulk page allocator can then do stat updates in bulk with IRQs enabled
+which should improve the efficiency.  Technically, this could have been
+done without the local_lock and vmstat conversion work and the order
+simply reflects the timing of when different series were implemented.
+
+Finally, there are places where we conflate IRQs being disabled for the
+PCP with the IRQ-safe zone spinlock.  The remainder of the series reduces
+the scope of what is protected by disabled IRQs on !PREEMPT_RT kernels.
+By the end of the series, page_alloc.c does not call local_irq_save so the
+locking scope is a bit clearer.  The one exception is that modifying
+NR_FREE_PAGES still happens in places where it's known the IRQs are
+disabled as it's harmless for PREEMPT_RT and would be expensive to split
+the locking there.
+
+No performance data is included because despite the overhead of the stats,
+it's within the noise for most workloads on !PREEMPT_RT.  However, Jesper
+Dangaard Brouer ran a page allocation microbenchmark on a E5-1650 v4 @
+3.60GHz CPU on the first version of this series.  Focusing on the array
+variant of the bulk page allocator reveals the following.
+
+(CPU: Intel(R) Xeon(R) CPU E5-1650 v4 @ 3.60GHz)
+ARRAY variant: time_bulk_page_alloc_free_array: step=bulk size
+
+         Baseline        Patched
+ 1       56.383          54.225 (+3.83%)
+ 2       40.047          35.492 (+11.38%)
+ 3       37.339          32.643 (+12.58%)
+ 4       35.578          30.992 (+12.89%)
+ 8       33.592          29.606 (+11.87%)
+ 16      32.362          28.532 (+11.85%)
+ 32      31.476          27.728 (+11.91%)
+ 64      30.633          27.252 (+11.04%)
+ 128     30.596          27.090 (+11.46%)
+
+While this is a positive outcome, the series is more likely to be
+interesting to the RT people in terms of getting parts of the PREEMPT_RT
+tree into mainline.
+
+This patch (of 9):
+
+The per-cpu page allocator lists and the per-cpu vmstat deltas are stored
+in the same struct per_cpu_pages even though vmstats have no direct impact
+on the per-cpu page lists.  This is inconsistent because the vmstats for a
+node are stored on a dedicated structure.  The bigger issue is that the
+per_cpu_pages structure is not cache-aligned and stat updates either cache
+conflict with adjacent per-cpu lists incurring a runtime cost or padding
+is required incurring a memory cost.
+
+This patch splits the per-cpu pagelists and the vmstat deltas into
+separate structures.  It's mostly a mechanical conversion but some
+variable renaming is done to clearly distinguish the per-cpu pages
+structure (pcp) from the vmstats (pzstats).
+
+Superficially, this appears to increase the size of the per_cpu_pages
+structure but the movement of expire fills a structure hole so there is no
+impact overall.
+
+[mgorman@techsingularity.net: make it W=1 cleaner]
+  Link: https://lkml.kernel.org/r/20210514144622.GA3735@techsingularity.net
+[mgorman@techsingularity.net: make it W=1 even cleaner]
+  Link: https://lkml.kernel.org/r/20210516140705.GB3735@techsingularity.net
+[lkp@intel.com: check struct per_cpu_zonestat has a non-zero size]
+[vbabka@suse.cz: Init zone->per_cpu_zonestats properly]
+
+Link: https://lkml.kernel.org/r/20210512095458.30632-1-mgorman@techsingularity.net
+Link: https://lkml.kernel.org/r/20210512095458.30632-2-mgorman@techsingularity.net
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Chuck Lever <chuck.lever@oracle.com>
+Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,67 @@
+hugetlb: address ref count racing in prep_compound_gigantic_page
+
+In [1], Jann Horn points out a possible race between
+prep_compound_gigantic_page and __page_cache_add_speculative.  The root
+cause of the possible race is prep_compound_gigantic_page uncondittionally
+setting the ref count of pages to zero.  It does this because
+prep_compound_gigantic_page is handed a 'group' of pages from an allocator
+and needs to convert that group of pages to a compound page.  The ref
+count of each page in this 'group' is one as set by the allocator.
+However, the ref count of compound page tail pages must be zero.
+
+The potential race comes about when ref counted pages are returned from
+the allocator.  When this happens, other mm code could also take a
+reference on the page.  __page_cache_add_speculative is one such example.
+Therefore, prep_compound_gigantic_page can not just set the ref count of
+pages to zero as it does today.  Doing so would lose the reference taken
+by any other code.  This would lead to BUGs in code checking ref counts
+and could possibly even lead to memory corruption.
+
+There are two possible ways to address this issue.
+
+1) Make all allocators of gigantic groups of pages be able to return a
+   properly constructed compound page.
+
+2) Make prep_compound_gigantic_page be more careful when constructing a
+   compound page.
+
+This patch takes approach 2.
+
+In prep_compound_gigantic_page, use cmpxchg to only set ref count to zero
+if it is one.  If the cmpxchg fails, call synchronize_rcu() in the hope
+that the extra ref count will be driopped during a rcu grace period.  This
+is not a performance critical code path and the wait should be
+accceptable.  If the ref count is still inflated after the grace period,
+then undo any modifications made and return an error.
+
+Currently prep_compound_gigantic_page is type void and does not return
+errors.  Modify the two callers to check for and handle error returns.  On
+error, the caller must free the 'group' of pages as they can not be used
+to form a gigantic page.  After freeing pages, the runtime caller
+(alloc_fresh_huge_page) will retry the allocation once.  Boot time
+allocations can not be retried.
+
+The routine prep_compound_page also unconditionally sets the ref count of
+compound page tail pages to zero.  However, in this case the buddy
+allocator is constructing a compound page from freshly allocated pages.
+The ref count on those freshly allocated pages is already zero, so the
+set_page_count(p, 0) is unnecessary and could lead to confusion.  Just
+remove it.
+
+[1] https://lore.kernel.org/linux-mm/CAG48ez23q0Jy9cuVnwAe7t_fdhMk2S7N5Hdi-GLcCeq5bsfLxw@mail.gmail.com/
+
+Link: https://lkml.kernel.org/r/20210622021423.154662-3-mike.kravetz@oracle.com
+Fixes: 58a84aa92723 ("thp: set compound tail page _count to zero")
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reported-by: Jann Horn <jannh@google.com>
+Cc: Youquan Song <youquan.song@intel.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: "Kirill A . Shutemov" <kirill@shutemov.name>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

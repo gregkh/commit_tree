@@ -1,0 +1,61 @@
+tcp: Keep TCP_CLOSE sockets in the reuseport group.
+
+When we close a listening socket, to migrate its connections to another
+listener in the same reuseport group, we have to handle two kinds of child
+sockets. One is that a listening socket has a reference to, and the other
+is not.
+
+The former is the TCP_ESTABLISHED/TCP_SYN_RECV sockets, and they are in the
+accept queue of their listening socket. So we can pop them out and push
+them into another listener's queue at close() or shutdown() syscalls. On
+the other hand, the latter, the TCP_NEW_SYN_RECV socket is during the
+three-way handshake and not in the accept queue. Thus, we cannot access
+such sockets at close() or shutdown() syscalls. Accordingly, we have to
+migrate immature sockets after their listening socket has been closed.
+
+Currently, if their listening socket has been closed, TCP_NEW_SYN_RECV
+sockets are freed at receiving the final ACK or retransmitting SYN+ACKs. At
+that time, if we could select a new listener from the same reuseport group,
+no connection would be aborted. However, we cannot do that because
+reuseport_detach_sock() sets NULL to sk_reuseport_cb and forbids access to
+the reuseport group from closed sockets.
+
+This patch allows TCP_CLOSE sockets to remain in the reuseport group and
+access it while any child socket references them. The point is that
+reuseport_detach_sock() was called twice from inet_unhash() and
+sk_destruct(). This patch replaces the first reuseport_detach_sock() with
+reuseport_stop_listen_sock(), which checks if the reuseport group is
+capable of migration. If capable, it decrements num_socks, moves the socket
+backwards in socks[] and increments num_closed_socks. When all connections
+are migrated, sk_destruct() calls reuseport_detach_sock() to remove the
+socket from socks[], decrement num_closed_socks, and set NULL to
+sk_reuseport_cb.
+
+By this change, closed or shutdowned sockets can keep sk_reuseport_cb.
+Consequently, calling listen() after shutdown() can cause EADDRINUSE or
+EBUSY in inet_csk_bind_conflict() or reuseport_add_sock() which expects
+such sockets not to have the reuseport group. Therefore, this patch also
+loosens such validation rules so that a socket can listen again if it has a
+reuseport group with num_closed_socks more than 0.
+
+When such sockets listen again, we handle them in reuseport_resurrect(). If
+there is an existing reuseport group (reuseport_add_sock() path), we move
+the socket from the old group to the new one and free the old one if
+necessary. If there is no existing group (reuseport_alloc() path), we
+allocate a new reuseport group, detach sk from the old one, and free it if
+necessary, not to break the current shutdown behaviour:
+
+  - we cannot carry over the eBPF prog of shutdowned sockets
+  - we cannot attach/detach an eBPF prog to/from listening sockets via
+    shutdowned sockets
+
+Note that when the number of sockets gets over U16_MAX, we try to detach a
+closed socket randomly to make room for the new listening socket in
+reuseport_grow().
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/bpf/20210612123224.12525-4-kuniyu@amazon.co.jp
+

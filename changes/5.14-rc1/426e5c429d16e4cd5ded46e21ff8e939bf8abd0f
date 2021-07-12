@@ -1,0 +1,260 @@
+mm: memory_hotplug: factor out bootmem core functions to bootmem_info.c
+
+Patch series "Free some vmemmap pages of HugeTLB page", v23.
+
+This patch series will free some vmemmap pages(struct page structures)
+associated with each HugeTLB page when preallocated to save memory.
+
+In order to reduce the difficulty of the first version of code review.  In
+this version, we disable PMD/huge page mapping of vmemmap if this feature
+was enabled.  This acutely eliminates a bunch of the complex code doing
+page table manipulation.  When this patch series is solid, we cam add the
+code of vmemmap page table manipulation in the future.
+
+The struct page structures (page structs) are used to describe a physical
+page frame.  By default, there is an one-to-one mapping from a page frame
+to it's corresponding page struct.
+
+The HugeTLB pages consist of multiple base page size pages and is
+supported by many architectures.  See hugetlbpage.rst in the Documentation
+directory for more details.  On the x86 architecture, HugeTLB pages of
+size 2MB and 1GB are currently supported.  Since the base page size on x86
+is 4KB, a 2MB HugeTLB page consists of 512 base pages and a 1GB HugeTLB
+page consists of 4096 base pages.  For each base page, there is a
+corresponding page struct.
+
+Within the HugeTLB subsystem, only the first 4 page structs are used to
+contain unique information about a HugeTLB page.  HUGETLB_CGROUP_MIN_ORDER
+provides this upper limit.  The only 'useful' information in the remaining
+page structs is the compound_head field, and this field is the same for
+all tail pages.
+
+By removing redundant page structs for HugeTLB pages, memory can returned
+to the buddy allocator for other uses.
+
+When the system boot up, every 2M HugeTLB has 512 struct page structs which
+size is 8 pages(sizeof(struct page) * 512 / PAGE_SIZE).
+
+    HugeTLB                  struct pages(8 pages)         page frame(8 pages)
+ +-----------+ ---virt_to_page---> +-----------+   mapping to   +-----------+
+ |           |                     |     0     | -------------> |     0     |
+ |           |                     +-----------+                +-----------+
+ |           |                     |     1     | -------------> |     1     |
+ |           |                     +-----------+                +-----------+
+ |           |                     |     2     | -------------> |     2     |
+ |           |                     +-----------+                +-----------+
+ |           |                     |     3     | -------------> |     3     |
+ |           |                     +-----------+                +-----------+
+ |           |                     |     4     | -------------> |     4     |
+ |    2MB    |                     +-----------+                +-----------+
+ |           |                     |     5     | -------------> |     5     |
+ |           |                     +-----------+                +-----------+
+ |           |                     |     6     | -------------> |     6     |
+ |           |                     +-----------+                +-----------+
+ |           |                     |     7     | -------------> |     7     |
+ |           |                     +-----------+                +-----------+
+ |           |
+ |           |
+ |           |
+ +-----------+
+
+The value of page->compound_head is the same for all tail pages.  The
+first page of page structs (page 0) associated with the HugeTLB page
+contains the 4 page structs necessary to describe the HugeTLB.  The only
+use of the remaining pages of page structs (page 1 to page 7) is to point
+to page->compound_head.  Therefore, we can remap pages 2 to 7 to page 1.
+Only 2 pages of page structs will be used for each HugeTLB page.  This
+will allow us to free the remaining 6 pages to the buddy allocator.
+
+Here is how things look after remapping.
+
+    HugeTLB                  struct pages(8 pages)         page frame(8 pages)
+ +-----------+ ---virt_to_page---> +-----------+   mapping to   +-----------+
+ |           |                     |     0     | -------------> |     0     |
+ |           |                     +-----------+                +-----------+
+ |           |                     |     1     | -------------> |     1     |
+ |           |                     +-----------+                +-----------+
+ |           |                     |     2     | ----------------^ ^ ^ ^ ^ ^
+ |           |                     +-----------+                   | | | | |
+ |           |                     |     3     | ------------------+ | | | |
+ |           |                     +-----------+                     | | | |
+ |           |                     |     4     | --------------------+ | | |
+ |    2MB    |                     +-----------+                       | | |
+ |           |                     |     5     | ----------------------+ | |
+ |           |                     +-----------+                         | |
+ |           |                     |     6     | ------------------------+ |
+ |           |                     +-----------+                           |
+ |           |                     |     7     | --------------------------+
+ |           |                     +-----------+
+ |           |
+ |           |
+ |           |
+ +-----------+
+
+When a HugeTLB is freed to the buddy system, we should allocate 6 pages
+for vmemmap pages and restore the previous mapping relationship.
+
+Apart from 2MB HugeTLB page, we also have 1GB HugeTLB page.  It is similar
+to the 2MB HugeTLB page.  We also can use this approach to free the
+vmemmap pages.
+
+In this case, for the 1GB HugeTLB page, we can save 4094 pages.  This is a
+very substantial gain.  On our server, run some SPDK/QEMU applications
+which will use 1024GB HugeTLB page.  With this feature enabled, we can
+save ~16GB (1G hugepage)/~12GB (2MB hugepage) memory.
+
+Because there are vmemmap page tables reconstruction on the
+freeing/allocating path, it increases some overhead.  Here are some
+overhead analysis.
+
+1) Allocating 10240 2MB HugeTLB pages.
+
+   a) With this patch series applied:
+   # time echo 10240 > /proc/sys/vm/nr_hugepages
+
+   real     0m0.166s
+   user     0m0.000s
+   sys      0m0.166s
+
+   # bpftrace -e 'kprobe:alloc_fresh_huge_page { @start[tid] = nsecs; }
+     kretprobe:alloc_fresh_huge_page /@start[tid]/ { @latency = hist(nsecs -
+     @start[tid]); delete(@start[tid]); }'
+   Attaching 2 probes...
+
+   @latency:
+   [8K, 16K)           5476 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+   [16K, 32K)          4760 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@       |
+   [32K, 64K)             4 |                                                    |
+
+   b) Without this patch series:
+   # time echo 10240 > /proc/sys/vm/nr_hugepages
+
+   real     0m0.067s
+   user     0m0.000s
+   sys      0m0.067s
+
+   # bpftrace -e 'kprobe:alloc_fresh_huge_page { @start[tid] = nsecs; }
+     kretprobe:alloc_fresh_huge_page /@start[tid]/ { @latency = hist(nsecs -
+     @start[tid]); delete(@start[tid]); }'
+   Attaching 2 probes...
+
+   @latency:
+   [4K, 8K)           10147 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+   [8K, 16K)             93 |                                                    |
+
+   Summarize: this feature is about ~2x slower than before.
+
+2) Freeing 10240 2MB HugeTLB pages.
+
+   a) With this patch series applied:
+   # time echo 0 > /proc/sys/vm/nr_hugepages
+
+   real     0m0.213s
+   user     0m0.000s
+   sys      0m0.213s
+
+   # bpftrace -e 'kprobe:free_pool_huge_page { @start[tid] = nsecs; }
+     kretprobe:free_pool_huge_page /@start[tid]/ { @latency = hist(nsecs -
+     @start[tid]); delete(@start[tid]); }'
+   Attaching 2 probes...
+
+   @latency:
+   [8K, 16K)              6 |                                                    |
+   [16K, 32K)         10227 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+   [32K, 64K)             7 |                                                    |
+
+   b) Without this patch series:
+   # time echo 0 > /proc/sys/vm/nr_hugepages
+
+   real     0m0.081s
+   user     0m0.000s
+   sys      0m0.081s
+
+   # bpftrace -e 'kprobe:free_pool_huge_page { @start[tid] = nsecs; }
+     kretprobe:free_pool_huge_page /@start[tid]/ { @latency = hist(nsecs -
+     @start[tid]); delete(@start[tid]); }'
+   Attaching 2 probes...
+
+   @latency:
+   [4K, 8K)            6805 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+   [8K, 16K)           3427 |@@@@@@@@@@@@@@@@@@@@@@@@@@                          |
+   [16K, 32K)             8 |                                                    |
+
+   Summary: The overhead of __free_hugepage is about ~2-3x slower than before.
+
+Although the overhead has increased, the overhead is not significant.
+Like Mike said, "However, remember that the majority of use cases create
+HugeTLB pages at or shortly after boot time and add them to the pool.  So,
+additional overhead is at pool creation time.  There is no change to
+'normal run time' operations of getting a page from or returning a page to
+the pool (think page fault/unmap)".
+
+Despite the overhead and in addition to the memory gains from this series.
+The following data is obtained by Joao Martins.  Very thanks to his
+effort.
+
+There's an additional benefit which is page (un)pinners will see an improvement
+and Joao presumes because there are fewer memmap pages and thus the tail/head
+pages are staying in cache more often.
+
+Out of the box Joao saw (when comparing linux-next against linux-next +
+this series) with gup_test and pinning a 16G HugeTLB file (with 1G pages):
+
+	get_user_pages(): ~32k -> ~9k
+	unpin_user_pages(): ~75k -> ~70k
+
+Usually any tight loop fetching compound_head(), or reading tail pages
+data (e.g.  compound_head) benefit a lot.  There's some unpinning
+inefficiencies Joao was fixing[2], but with that in added it shows even
+more:
+
+	unpin_user_pages(): ~27k -> ~3.8k
+
+[1] https://lore.kernel.org/linux-mm/20210409205254.242291-1-mike.kravetz@oracle.com/
+[2] https://lore.kernel.org/linux-mm/20210204202500.26474-1-joao.m.martins@oracle.com/
+
+This patch (of 9):
+
+Move bootmem info registration common API to individual bootmem_info.c.
+And we will use {get,put}_page_bootmem() to initialize the page for the
+vmemmap pages or free the vmemmap pages to buddy in the later patch.  So
+move them out of CONFIG_MEMORY_HOTPLUG_SPARSE.  This is just code movement
+without any functional change.
+
+Link: https://lkml.kernel.org/r/20210510030027.56044-1-songmuchun@bytedance.com
+Link: https://lkml.kernel.org/r/20210510030027.56044-2-songmuchun@bytedance.com
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Acked-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
+Tested-by: Chen Huang <chenhuang5@huawei.com>
+Tested-by: Bodeddula Balasubramaniam <bodeddub@amazon.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: x86@kernel.org
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Oliver Neukum <oneukum@suse.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Joerg Roedel <jroedel@suse.de>
+Cc: Mina Almasry <almasrymina@google.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Barry Song <song.bao.hua@hisilicon.com>
+Cc: HORIGUCHI NAOYA <naoya.horiguchi@nec.com>
+Cc: Joao Martins <joao.m.martins@oracle.com>
+Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
+Cc: Balbir Singh <bsingharora@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

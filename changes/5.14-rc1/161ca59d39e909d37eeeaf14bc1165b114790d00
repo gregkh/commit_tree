@@ -1,0 +1,108 @@
+net: dsa: reference count the MDB entries at the cross-chip notifier level
+
+Ever since the cross-chip notifiers were introduced, the design was
+meant to be simplistic and just get the job done without worrying too
+much about dangling resources left behind.
+
+For example, somebody installs an MDB entry on sw0p0 in this daisy chain
+topology. It gets installed using ds->ops->port_mdb_add() on sw0p0,
+sw1p4 and sw2p4.
+
+                                                    |
+           sw0p0     sw0p1     sw0p2     sw0p3     sw0p4
+        [  user ] [  user ] [  user ] [  dsa  ] [  cpu  ]
+        [   x   ] [       ] [       ] [       ] [       ]
+                                          |
+                                          +---------+
+                                                    |
+           sw1p0     sw1p1     sw1p2     sw1p3     sw1p4
+        [  user ] [  user ] [  user ] [  dsa  ] [  dsa  ]
+        [       ] [       ] [       ] [       ] [   x   ]
+                                          |
+                                          +---------+
+                                                    |
+           sw2p0     sw2p1     sw2p2     sw2p3     sw2p4
+        [  user ] [  user ] [  user ] [  user ] [  dsa  ]
+        [       ] [       ] [       ] [       ] [   x   ]
+
+Then the same person deletes that MDB entry. The cross-chip notifier for
+deletion only matches sw0p0:
+
+                                                    |
+           sw0p0     sw0p1     sw0p2     sw0p3     sw0p4
+        [  user ] [  user ] [  user ] [  dsa  ] [  cpu  ]
+        [   x   ] [       ] [       ] [       ] [       ]
+                                          |
+                                          +---------+
+                                                    |
+           sw1p0     sw1p1     sw1p2     sw1p3     sw1p4
+        [  user ] [  user ] [  user ] [  dsa  ] [  dsa  ]
+        [       ] [       ] [       ] [       ] [       ]
+                                          |
+                                          +---------+
+                                                    |
+           sw2p0     sw2p1     sw2p2     sw2p3     sw2p4
+        [  user ] [  user ] [  user ] [  user ] [  dsa  ]
+        [       ] [       ] [       ] [       ] [       ]
+
+Why?
+
+Because the DSA links are 'trunk' ports, if we just go ahead and delete
+the MDB from sw1p4 and sw2p4 directly, we might delete those multicast
+entries when they are still needed. Just consider the fact that somebody
+does:
+
+- add a multicast MAC address towards sw0p0 [ via the cross-chip
+  notifiers it gets installed on the DSA links too ]
+- add the same multicast MAC address towards sw0p1 (another port of that
+  same switch)
+- delete the same multicast MAC address from sw0p0.
+
+At this point, if we deleted the MAC address from the DSA links, it
+would be flooded, even though there is still an entry on switch 0 which
+needs it not to.
+
+So that is why deletions only match the targeted source port and nothing
+on DSA links. Of course, dangling resources means that the hardware
+tables will eventually run out given enough additions/removals, but hey,
+at least it's simple.
+
+But there is a bigger concern which needs to be addressed, and that is
+our support for SWITCHDEV_OBJ_ID_HOST_MDB. DSA simply translates such an
+object into a dsa_port_host_mdb_add() which ends up as ds->ops->port_mdb_add()
+on the upstream port, and a similar thing happens on deletion:
+dsa_port_host_mdb_del() will trigger ds->ops->port_mdb_del() on the
+upstream port.
+
+When there are 2 VLAN-unaware bridges spanning the same switch (which is
+a use case DSA proudly supports), each bridge will install its own
+SWITCHDEV_OBJ_ID_HOST_MDB entries. But upon deletion, DSA goes ahead and
+emits a DSA_NOTIFIER_MDB_DEL for dp->cpu_dp, which is shared between the
+user ports enslaved to br0 and the user ports enslaved to br1. Not good.
+The host-trapped multicast addresses installed by br1 will be deleted
+when any state changes in br0 (IGMP timers expire, or ports leave, etc).
+
+To avoid this, we could of course go the route of the zero-sum game and
+delete the DSA_NOTIFIER_MDB_DEL call for dp->cpu_dp. But the better
+design is to just admit that on shared ports like DSA links and CPU
+ports, we should be reference counting calls, even if this consumes some
+dynamic memory which DSA has traditionally avoided. On the flip side,
+the hardware tables of switches are limited in size, so it would be good
+if the OS managed them properly instead of having them eventually
+overflow.
+
+To address the memory usage concern, we only apply the refcounting of
+MDB entries on ports that are really shared (CPU ports and DSA links)
+and not on user ports. In a typical single-switch setup, this means only
+the CPU port (and the host MDB entries are not that many, really).
+
+The name of the newly introduced data structures (dsa_mac_addr) is
+chosen in such a way that will be reusable for host FDB entries (next
+patch).
+
+With this change, we can finally have the same matching logic for the
+MDB additions and deletions, as well as for their host-trapped variants.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

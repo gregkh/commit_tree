@@ -1,0 +1,120 @@
+percpu: implement partial chunk depopulation
+
+From Roman ("percpu: partial chunk depopulation"):
+In our [Facebook] production experience the percpu memory allocator is
+sometimes struggling with returning the memory to the system. A typical
+example is a creation of several thousands memory cgroups (each has
+several chunks of the percpu data used for vmstats, vmevents,
+ref counters etc). Deletion and complete releasing of these cgroups
+doesn't always lead to a shrinkage of the percpu memory, so that
+sometimes there are several GB's of memory wasted.
+
+The underlying problem is the fragmentation: to release an underlying
+chunk all percpu allocations should be released first. The percpu
+allocator tends to top up chunks to improve the utilization. It means
+new small-ish allocations (e.g. percpu ref counters) are placed onto
+almost filled old-ish chunks, effectively pinning them in memory.
+
+This patchset solves this problem by implementing a partial depopulation
+of percpu chunks: chunks with many empty pages are being asynchronously
+depopulated and the pages are returned to the system.
+
+To illustrate the problem the following script can be used:
+--
+
+cd /sys/fs/cgroup
+
+mkdir percpu_test
+echo "+memory" > percpu_test/cgroup.subtree_control
+
+cat /proc/meminfo | grep Percpu
+
+for i in `seq 1 1000`; do
+    mkdir percpu_test/cg_"${i}"
+    for j in `seq 1 10`; do
+	mkdir percpu_test/cg_"${i}"_"${j}"
+    done
+done
+
+cat /proc/meminfo | grep Percpu
+
+for i in `seq 1 1000`; do
+    for j in `seq 1 10`; do
+	rmdir percpu_test/cg_"${i}"_"${j}"
+    done
+done
+
+sleep 10
+
+cat /proc/meminfo | grep Percpu
+
+for i in `seq 1 1000`; do
+    rmdir percpu_test/cg_"${i}"
+done
+
+rmdir percpu_test
+--
+
+It creates 11000 memory cgroups and removes every 10 out of 11.
+It prints the initial size of the percpu memory, the size after
+creating all cgroups and the size after deleting most of them.
+
+Results:
+  vanilla:
+    ./percpu_test.sh
+    Percpu:             7488 kB
+    Percpu:           481152 kB
+    Percpu:           481152 kB
+
+  with this patchset applied:
+    ./percpu_test.sh
+    Percpu:             7488 kB
+    Percpu:           481408 kB
+    Percpu:           135552 kB
+
+The total size of the percpu memory was reduced by more than 3.5 times.
+
+This patch:
+
+This patch implements partial depopulation of percpu chunks.
+
+As of now, a chunk can be depopulated only as a part of the final
+destruction, if there are no more outstanding allocations. However
+to minimize a memory waste it might be useful to depopulate a
+partially filed chunk, if a small number of outstanding allocations
+prevents the chunk from being fully reclaimed.
+
+This patch implements the following depopulation process: it scans
+over the chunk pages, looks for a range of empty and populated pages
+and performs the depopulation. To avoid races with new allocations,
+the chunk is previously isolated. After the depopulation the chunk is
+sidelined to a special list or freed. New allocations prefer using
+active chunks to sidelined chunks. If a sidelined chunk is used, it is
+reintegrated to the active lists.
+
+The depopulation is scheduled on the free path if the chunk is all of
+the following:
+  1) has more than 1/4 of total pages free and populated
+  2) the system has enough free percpu pages aside of this chunk
+  3) isn't the reserved chunk
+  4) isn't the first chunk
+If it's already depopulated but got free populated pages, it's a good
+target too. The chunk is moved to a special slot,
+pcpu_to_depopulate_slot, chunk->isolated is set, and the balance work
+item is scheduled. On isolation, these pages are removed from the
+pcpu_nr_empty_pop_pages. It is constantly replaced to the
+to_depopulate_slot when it meets these qualifications.
+
+pcpu_reclaim_populated() iterates over the to_depopulate_slot until it
+becomes empty. The depopulation is performed in the reverse direction to
+keep populated pages close to the beginning. Depopulated chunks are
+sidelined to preferentially avoid them for new allocations. When no
+active chunk can suffice a new allocation, sidelined chunks are first
+checked before creating a new chunk.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Co-developed-by: Dennis Zhou <dennis@kernel.org>
+Signed-off-by: Dennis Zhou <dennis@kernel.org>
+Tested-by: Pratik Sampat <psampat@linux.ibm.com>
+Signed-off-by: Dennis Zhou <dennis@kernel.org>
+

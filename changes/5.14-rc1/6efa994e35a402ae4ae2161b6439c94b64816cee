@@ -1,0 +1,88 @@
+cifs: retry lookup and readdir when EAGAIN is returned.
+
+According to the investigation performed by Jacob Shivers at Red Hat,
+cifs_lookup and cifs_readdir leak EAGAIN when the user session is
+deleted on the server. Fix this issue by implementing a retry with
+limits, as is implemented in cifs_revalidate_dentry_attr.
+
+Reproducer based on the work by Jacob Shivers:
+
+  ~~~
+  $ cat readdir-cifs-test.sh
+  #!/bin/bash
+
+  # Install and configure powershell and sshd on the windows
+  #  server as descibed in
+  # https://docs.microsoft.com/en-us/windows-server/administration/openssh/openssh_overview
+  # This script uses expect(1)
+
+  USER=dude
+  SERVER=192.168.0.2
+  RPATH=root
+  PASS='password'
+
+  function debug_funcs {
+  	for line in $@ ; do
+  		echo "func $line +p" > /sys/kernel/debug/dynamic_debug/control
+  	done
+  }
+
+  function setup {
+  	echo 1 > /proc/fs/cifs/cifsFYI
+  	debug_funcs wait_for_compound_request \
+                smb2_query_dir_first cifs_readdir \
+                compound_send_recv cifs_reconnect_tcon \
+                generic_ip_connect cifs_reconnect \
+                smb2_reconnect_server smb2_reconnect \
+                cifs_readv_from_socket cifs_readv_receive
+  	tcpdump -i eth0 -w cifs.pcap host 192.168.2.182 & sleep 5
+  	dmesg -C
+  }
+
+  function test_call {
+  	if [[ $1 == 1 ]] ; then
+  		tracer="strace -tt -f -s 4096 -o trace-$(date -Iseconds).txt"
+  	fi
+        # Change the command here to anything appropriate
+  	$tracer ls $2 > /dev/null
+  	res=$?
+  	if [[ $1 == 1 ]] ; then
+  		if [[ $res == 0 ]] ; then
+  			1>&2 echo success
+  		else
+  			1>&2 echo "failure ($res)"
+  		fi
+  	fi
+  }
+
+  mountpoint /mnt > /dev/null || mount -t cifs -o username=$USER,pass=$PASS //$SERVER/$RPATH /mnt
+
+  test_call 0 /mnt/
+
+  /usr/bin/expect << EOF
+  	set timeout 60
+
+  	spawn ssh $USER@$SERVER
+
+  	expect "yes/no" {
+  		send "yes\r"
+  		expect "*?assword" { send "$PASS\r" }
+  	} "*?assword" { send "$PASS\r" }
+
+  	expect ">" { send "powershell close-smbsession -force\r" }
+  	expect ">" { send "exit\r" }
+  	expect eof
+  EOF
+
+  sysctl -w vm.drop_caches=2 > /dev/null
+  sysctl -w vm.drop_caches=2 > /dev/null
+
+  setup
+
+  test_call 1 /mnt/
+  ~~~
+
+Signed-off-by: Thiago Rafael Becker <trbecker@gmail.com>
+Acked-by: Ronnie Sahlberg <lsahlber@redhat.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+

@@ -1,0 +1,109 @@
+perf/x86: Reset the dirty counter to prevent the leak for an RDPMC task
+
+The counter value of a perf task may leak to another RDPMC task.
+For example, a perf stat task as below is running on CPU 0.
+
+    perf stat -e 'branches,cycles' -- taskset -c 0 ./workload
+
+In the meantime, an RDPMC task, which is also running on CPU 0, may read
+the GP counters periodically. (The RDPMC task creates a fixed event,
+but read four GP counters.)
+
+    $./rdpmc_read_all_counters
+    index 0x0 value 0x8001e5970f99
+    index 0x1 value 0x8005d750edb6
+    index 0x2 value 0x0
+    index 0x3 value 0x0
+
+    index 0x0 value 0x8002358e48a5
+    index 0x1 value 0x8006bd1e3bc9
+    index 0x2 value 0x0
+    index 0x3 value 0x0
+
+It is a potential security issue. Once the attacker knows what the other
+thread is counting. The PerfMon counter can be used as a side-channel to
+attack cryptosystems.
+
+The counter value of the perf stat task leaks to the RDPMC task because
+perf never clears the counter when it's stopped.
+
+Three methods were considered to address the issue.
+
+ - Unconditionally reset the counter in x86_pmu_del(). It can bring extra
+   overhead even when there is no RDPMC task running.
+
+ - Only reset the un-assigned dirty counters when the RDPMC task is
+   scheduled in via sched_task(). It fails for the below case.
+
+	Thread A			Thread B
+
+	clone(CLONE_THREAD) --->
+	set_affine(0)
+					set_affine(1)
+					while (!event-enabled)
+						;
+	event = perf_event_open()
+	mmap(event)
+	ioctl(event, IOC_ENABLE); --->
+					RDPMC
+
+   Counters are still leaked to the thread B.
+
+ - Only reset the un-assigned dirty counters before updating the CR4.PCE
+   bit. The method is implemented here.
+
+The dirty counter is a counter, on which the assigned event has been
+deleted, but the counter is not reset. To track the dirty counters,
+add a 'dirty' variable in the struct cpu_hw_events.
+
+The security issue can only be found with an RDPMC task. To enable the
+RDMPC, the CR4.PCE bit has to be updated. Add a
+perf_clear_dirty_counters() right before updating the CR4.PCE bit to
+clear the existing dirty counters. Only the current un-assigned dirty
+counters are reset, because the RDPMC assigned dirty counters will be
+updated soon.
+
+After applying the patch,
+
+        $ ./rdpmc_read_all_counters
+        index 0x0 value 0x0
+        index 0x1 value 0x0
+        index 0x2 value 0x0
+        index 0x3 value 0x0
+
+        index 0x0 value 0x0
+        index 0x1 value 0x0
+        index 0x2 value 0x0
+        index 0x3 value 0x0
+
+Performance
+
+The performance of a context switch only be impacted when there are two
+or more perf users and one of the users must be an RDPMC user. In other
+cases, there is no performance impact.
+
+The worst-case occurs when there are two users: the RDPMC user only
+uses one counter; while the other user uses all available counters.
+When the RDPMC task is scheduled in, all the counters, other than the
+RDPMC assigned one, have to be reset.
+
+Test results for the worst-case, using a modified lat_ctx as measured
+on an Ice Lake platform, which has 8 GP and 3 FP counters (ignoring
+SLOTS).
+
+    lat_ctx -s 128K -N 1000 processes 2
+
+Without the patch:
+  The context switch time is 4.97 us
+
+With the patch:
+  The context switch time is 5.16 us
+
+There is ~4% performance drop for the context switching time in the
+worst-case.
+
+Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/1623693582-187370-1-git-send-email-kan.liang@linux.intel.com
+

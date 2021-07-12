@@ -1,0 +1,67 @@
+ALSA: usb-audio: Reduce latency at playback start, take#2
+
+This is another attempt for the reduction of the latency at the start
+of a USB audio playback stream.  The first attempt in the commit
+9ce650a75a3b caused an unexpected regression (a deadlock with pipewire
+usage) and was later reverted by the commit 4b820e167bf6.  The devils
+are always living in details, of course; the cause of the deadlock was
+the call of snd_pcm_period_elapsed() inside prepare_playback_urb()
+callback.  In the original code, this callback is never called from
+the stream lock context as it's driven solely from the URB complete
+callback.  Along with the movement of the URB submission into the
+trigger START, this prepare call may be also executed in the stream
+lock context, hence it deadlocked with the another lock in
+snd_pcm_period_elapsed().  (Note that this happens only conditionally
+with a small period size that matches with the URB buffer length,
+which was a reason I overlooked during my tests.  Also, the problem
+wasn't seen in the capture stream because the capture stream handles
+the period-elapsed only at retire callback that isn't executed at the
+trigger.)
+
+If it were only about avoiding the deadlock, it'd be possible to use
+snd_pcm_period_elapsed_under_stream_lock() as a solution.  However, in
+general, the period elapsed notification must be sent after the actual
+stream start, and replacing the call wouldn't satisfy the pattern.
+A better option is to delay the notification after the stream start
+procedure finished, instead.  In the case of USB framework, one of the
+fitting place would be the complete callback of the first URB.
+
+So, as a workaround of the deadlock and the order fixes above, in
+addition to the re-applying the changes in the commit 9ce650a75a3,
+this patch introduces a new flag indicating the delayed period-elapsed
+handling and sets it under the possible deadlock condition
+(i.e. prepare callback being called before subs->running is set).
+Once when the flag is set, the period-elapsed call is handled at a
+later URB complete call instead.
+
+As a reference for the original motivation for the low-latency change,
+I cite here again:
+
+| USB-audio driver behaves a bit strangely for the playback stream --
+| namely, it starts sending silent packets at PCM prepare state while
+| the actual data is submitted at first when the trigger START is
+| kicked off.  This is a workaround for the behavior where URBs are
+| processed too quickly at the beginning.  That is, if we start
+| submitting URBs at trigger START, the first few URBs will be
+| immediately completed, and this would result in the immediate
+| period-elapsed calls right after the start, which may confuse
+| applications.
+|
+| OTOH, submitting the data after silent URBs would, of course, result
+| in a certain delay of the actual data processing, and this is rather
+| more serious problem on modern systems, in practice.
+|
+| This patch tries to revert the workaround and lets the URB
+| submission starting at PCM trigger for the playback again.  As far
+| as I've tested with various backends (native ALSA, PA, JACK, PW), I
+| haven't seen any problems (famous last words :)
+|
+| Note that the capture stream handling needs no such workaround,
+| since the capture is driven per received URB.
+
+Link: https://lore.kernel.org/r/4e71531f-4535-fd46-040e-506a3c256bbd@marcan.st
+Link: https://lore.kernel.org/r/s5hbl7li0fe.wl-tiwai@suse.de
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Link: https://lore.kernel.org/r/20210707112447.27485-1-tiwai@suse.de
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+

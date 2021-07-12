@@ -1,0 +1,393 @@
+mm/madvise: introduce MADV_POPULATE_(READ|WRITE) to prefault page tables
+
+I. Background: Sparse Memory Mappings
+
+When we manage sparse memory mappings dynamically in user space - also
+sometimes involving MAP_NORESERVE - we want to dynamically populate/
+discard memory inside such a sparse memory region.  Example users are
+hypervisors (especially implementing memory ballooning or similar
+technologies like virtio-mem) and memory allocators.  In addition, we want
+to fail in a nice way (instead of generating SIGBUS) if populating does
+not succeed because we are out of backend memory (which can happen easily
+with file-based mappings, especially tmpfs and hugetlbfs).
+
+While MADV_DONTNEED, MADV_REMOVE and FALLOC_FL_PUNCH_HOLE allow for
+reliably discarding memory for most mapping types, there is no generic
+approach to populate page tables and preallocate memory.
+
+Although mmap() supports MAP_POPULATE, it is not applicable to the concept
+of sparse memory mappings, where we want to populate/discard dynamically
+and avoid expensive/problematic remappings.  In addition, we never
+actually report errors during the final populate phase - it is best-effort
+only.
+
+fallocate() can be used to preallocate file-based memory and fail in a
+safe way.  However, it cannot really be used for any private mappings on
+anonymous files via memfd due to COW semantics.  In addition, fallocate()
+does not actually populate page tables, so we still always get pagefaults
+on first access - which is sometimes undesired (i.e., real-time workloads)
+and requires real prefaulting of page tables, not just a preallocation of
+backend storage.  There might be interesting use cases for sparse memory
+regions along with mlockall(MCL_ONFAULT) which fallocate() cannot satisfy
+as it does not prefault page tables.
+
+II. On preallcoation/prefaulting from user space
+
+Because we don't have a proper interface, what applications (like QEMU and
+databases) end up doing is touching (i.e., reading+writing one byte to not
+overwrite existing data) all individual pages.
+
+However, that approach
+1) Can result in wear on storage backing, because we end up reading/writing
+   each page; this is especially a problem for dax/pmem.
+2) Can result in mmap_sem contention when prefaulting via multiple
+   threads.
+3) Requires expensive signal handling, especially to catch SIGBUS in case
+   of hugetlbfs/shmem/file-backed memory. For example, this is
+   problematic in hypervisors like QEMU where SIGBUS handlers might already
+   be used by other subsystems concurrently to e.g, handle hardware errors.
+   "Simply" doing preallocation concurrently from other thread is not that
+   easy.
+
+III. On MADV_WILLNEED
+
+Extending MADV_WILLNEED is not an option because
+1. It would change the semantics: "Expect access in the near future." and
+   "might be a good idea to read some pages" vs. "Definitely populate/
+   preallocate all memory and definitely fail on errors.".
+2. Existing users (like virtio-balloon in QEMU when deflating the balloon)
+   don't want populate/prealloc semantics. They treat this rather as a hint
+   to give a little performance boost without too much overhead - and don't
+   expect that a lot of memory might get consumed or a lot of time
+   might be spent.
+
+IV. MADV_POPULATE_READ and MADV_POPULATE_WRITE
+
+Let's introduce MADV_POPULATE_READ and MADV_POPULATE_WRITE, inspired by
+MAP_POPULATE, with the following semantics:
+1. MADV_POPULATE_READ can be used to prefault page tables just like
+   manually reading each individual page. This will not break any COW
+   mappings. The shared zero page might get mapped and no backend storage
+   might get preallocated -- allocation might be deferred to
+   write-fault time. Especially shared file mappings require an explicit
+   fallocate() upfront to actually preallocate backend memory (blocks in
+   the file system) in case the file might have holes.
+2. If MADV_POPULATE_READ succeeds, all page tables have been populated
+   (prefaulted) readable once.
+3. MADV_POPULATE_WRITE can be used to preallocate backend memory and
+   prefault page tables just like manually writing (or
+   reading+writing) each individual page. This will break any COW
+   mappings -- e.g., the shared zeropage is never populated.
+4. If MADV_POPULATE_WRITE succeeds, all page tables have been populated
+   (prefaulted) writable once.
+5. MADV_POPULATE_READ and MADV_POPULATE_WRITE cannot be applied to special
+   mappings marked with VM_PFNMAP and VM_IO. Also, proper access
+   permissions (e.g., PROT_READ, PROT_WRITE) are required. If any such
+   mapping is encountered, madvise() fails with -EINVAL.
+6. If MADV_POPULATE_READ or MADV_POPULATE_WRITE fails, some page tables
+   might have been populated.
+7. MADV_POPULATE_READ and MADV_POPULATE_WRITE will return -EHWPOISON
+   when encountering a HW poisoned page in the range.
+8. Similar to MAP_POPULATE, MADV_POPULATE_READ and MADV_POPULATE_WRITE
+   cannot protect from the OOM (Out Of Memory) handler killing the
+   process.
+
+While the use case for MADV_POPULATE_WRITE is fairly obvious (i.e.,
+preallocate memory and prefault page tables for VMs), one issue is that
+whenever we prefault pages writable, the pages have to be marked dirty,
+because the CPU could dirty them any time.  while not a real problem for
+hugetlbfs or dax/pmem, it can be a problem for shared file mappings: each
+page will be marked dirty and has to be written back later when evicting.
+
+MADV_POPULATE_READ allows for optimizing this scenario: Pre-read a whole
+mapping from backend storage without marking it dirty, such that eviction
+won't have to write it back.  As discussed above, shared file mappings
+might require an explciit fallocate() upfront to achieve
+preallcoation+prepopulation.
+
+Although sparse memory mappings are the primary use case, this will also
+be useful for other preallocate/prefault use cases where MAP_POPULATE is
+not desired or the semantics of MAP_POPULATE are not sufficient: as one
+example, QEMU users can trigger preallocation/prefaulting of guest RAM
+after the mapping was created -- and don't want errors to be silently
+suppressed.
+
+Looking at the history, MADV_POPULATE was already proposed in 2013 [1],
+however, the main motivation back than was performance improvements --
+which should also still be the case.
+
+V. Single-threaded performance comparison
+
+I did a short experiment, prefaulting page tables on completely *empty
+mappings/files* and repeated the experiment 10 times.  The results
+correspond to the shortest execution time.  In general, the performance
+benefit for huge pages is negligible with small mappings.
+
+V.1: Private mappings
+
+POPULATE_READ and POPULATE_WRITE is fastest.  Note that
+Reading/POPULATE_READ will populate the shared zeropage where applicable
+-- which result in short population times.
+
+The fastest way to allocate backend storage (here: swap or huge pages) and
+prefault page tables is POPULATE_WRITE.
+
+V.2: Shared mappings
+
+fallocate() is fastest, however, doesn't prefault page tables.
+POPULATE_WRITE is faster than simple writes and read/writes.
+POPULATE_READ is faster than simple reads.
+
+Without a fd, the fastest way to allocate backend storage and prefault
+page tables is POPULATE_WRITE.  With an fd, the fastest way is usually
+FALLOCATE+POPULATE_READ or FALLOCATE+POPULATE_WRITE respectively; one
+exception are actual files: FALLOCATE+Read is slightly faster than
+FALLOCATE+POPULATE_READ.
+
+The fastest way to allocate backend storage prefault page tables is
+FALLOCATE+POPULATE_WRITE -- except when dealing with actual files; then,
+FALLOCATE+POPULATE_READ is fastest and won't directly mark all pages as
+dirty.
+
+v.3: Detailed results
+
+==================================================
+2 MiB MAP_PRIVATE:
+**************************************************
+Anon 4 KiB     : Read                     :     0.119 ms
+Anon 4 KiB     : Write                    :     0.222 ms
+Anon 4 KiB     : Read/Write               :     0.380 ms
+Anon 4 KiB     : POPULATE_READ            :     0.060 ms
+Anon 4 KiB     : POPULATE_WRITE           :     0.158 ms
+Memfd 4 KiB    : Read                     :     0.034 ms
+Memfd 4 KiB    : Write                    :     0.310 ms
+Memfd 4 KiB    : Read/Write               :     0.362 ms
+Memfd 4 KiB    : POPULATE_READ            :     0.039 ms
+Memfd 4 KiB    : POPULATE_WRITE           :     0.229 ms
+Memfd 2 MiB    : Read                     :     0.030 ms
+Memfd 2 MiB    : Write                    :     0.030 ms
+Memfd 2 MiB    : Read/Write               :     0.030 ms
+Memfd 2 MiB    : POPULATE_READ            :     0.030 ms
+Memfd 2 MiB    : POPULATE_WRITE           :     0.030 ms
+tmpfs          : Read                     :     0.033 ms
+tmpfs          : Write                    :     0.313 ms
+tmpfs          : Read/Write               :     0.406 ms
+tmpfs          : POPULATE_READ            :     0.039 ms
+tmpfs          : POPULATE_WRITE           :     0.285 ms
+file           : Read                     :     0.033 ms
+file           : Write                    :     0.351 ms
+file           : Read/Write               :     0.408 ms
+file           : POPULATE_READ            :     0.039 ms
+file           : POPULATE_WRITE           :     0.290 ms
+hugetlbfs      : Read                     :     0.030 ms
+hugetlbfs      : Write                    :     0.030 ms
+hugetlbfs      : Read/Write               :     0.030 ms
+hugetlbfs      : POPULATE_READ            :     0.030 ms
+hugetlbfs      : POPULATE_WRITE           :     0.030 ms
+**************************************************
+4096 MiB MAP_PRIVATE:
+**************************************************
+Anon 4 KiB     : Read                     :   237.940 ms
+Anon 4 KiB     : Write                    :   708.409 ms
+Anon 4 KiB     : Read/Write               :  1054.041 ms
+Anon 4 KiB     : POPULATE_READ            :   124.310 ms
+Anon 4 KiB     : POPULATE_WRITE           :   572.582 ms
+Memfd 4 KiB    : Read                     :   136.928 ms
+Memfd 4 KiB    : Write                    :   963.898 ms
+Memfd 4 KiB    : Read/Write               :  1106.561 ms
+Memfd 4 KiB    : POPULATE_READ            :    78.450 ms
+Memfd 4 KiB    : POPULATE_WRITE           :   805.881 ms
+Memfd 2 MiB    : Read                     :   357.116 ms
+Memfd 2 MiB    : Write                    :   357.210 ms
+Memfd 2 MiB    : Read/Write               :   357.606 ms
+Memfd 2 MiB    : POPULATE_READ            :   356.094 ms
+Memfd 2 MiB    : POPULATE_WRITE           :   356.937 ms
+tmpfs          : Read                     :   137.536 ms
+tmpfs          : Write                    :   954.362 ms
+tmpfs          : Read/Write               :  1105.954 ms
+tmpfs          : POPULATE_READ            :    80.289 ms
+tmpfs          : POPULATE_WRITE           :   822.826 ms
+file           : Read                     :   137.874 ms
+file           : Write                    :   987.025 ms
+file           : Read/Write               :  1107.439 ms
+file           : POPULATE_READ            :    80.413 ms
+file           : POPULATE_WRITE           :   857.622 ms
+hugetlbfs      : Read                     :   355.607 ms
+hugetlbfs      : Write                    :   355.729 ms
+hugetlbfs      : Read/Write               :   356.127 ms
+hugetlbfs      : POPULATE_READ            :   354.585 ms
+hugetlbfs      : POPULATE_WRITE           :   355.138 ms
+**************************************************
+2 MiB MAP_SHARED:
+**************************************************
+Anon 4 KiB     : Read                     :     0.394 ms
+Anon 4 KiB     : Write                    :     0.348 ms
+Anon 4 KiB     : Read/Write               :     0.400 ms
+Anon 4 KiB     : POPULATE_READ            :     0.326 ms
+Anon 4 KiB     : POPULATE_WRITE           :     0.273 ms
+Anon 2 MiB     : Read                     :     0.030 ms
+Anon 2 MiB     : Write                    :     0.030 ms
+Anon 2 MiB     : Read/Write               :     0.030 ms
+Anon 2 MiB     : POPULATE_READ            :     0.030 ms
+Anon 2 MiB     : POPULATE_WRITE           :     0.030 ms
+Memfd 4 KiB    : Read                     :     0.412 ms
+Memfd 4 KiB    : Write                    :     0.372 ms
+Memfd 4 KiB    : Read/Write               :     0.419 ms
+Memfd 4 KiB    : POPULATE_READ            :     0.343 ms
+Memfd 4 KiB    : POPULATE_WRITE           :     0.288 ms
+Memfd 4 KiB    : FALLOCATE                :     0.137 ms
+Memfd 4 KiB    : FALLOCATE+Read           :     0.446 ms
+Memfd 4 KiB    : FALLOCATE+Write          :     0.330 ms
+Memfd 4 KiB    : FALLOCATE+Read/Write     :     0.454 ms
+Memfd 4 KiB    : FALLOCATE+POPULATE_READ  :     0.379 ms
+Memfd 4 KiB    : FALLOCATE+POPULATE_WRITE :     0.268 ms
+Memfd 2 MiB    : Read                     :     0.030 ms
+Memfd 2 MiB    : Write                    :     0.030 ms
+Memfd 2 MiB    : Read/Write               :     0.030 ms
+Memfd 2 MiB    : POPULATE_READ            :     0.030 ms
+Memfd 2 MiB    : POPULATE_WRITE           :     0.030 ms
+Memfd 2 MiB    : FALLOCATE                :     0.030 ms
+Memfd 2 MiB    : FALLOCATE+Read           :     0.031 ms
+Memfd 2 MiB    : FALLOCATE+Write          :     0.031 ms
+Memfd 2 MiB    : FALLOCATE+Read/Write     :     0.031 ms
+Memfd 2 MiB    : FALLOCATE+POPULATE_READ  :     0.030 ms
+Memfd 2 MiB    : FALLOCATE+POPULATE_WRITE :     0.030 ms
+tmpfs          : Read                     :     0.416 ms
+tmpfs          : Write                    :     0.369 ms
+tmpfs          : Read/Write               :     0.425 ms
+tmpfs          : POPULATE_READ            :     0.346 ms
+tmpfs          : POPULATE_WRITE           :     0.295 ms
+tmpfs          : FALLOCATE                :     0.139 ms
+tmpfs          : FALLOCATE+Read           :     0.447 ms
+tmpfs          : FALLOCATE+Write          :     0.333 ms
+tmpfs          : FALLOCATE+Read/Write     :     0.454 ms
+tmpfs          : FALLOCATE+POPULATE_READ  :     0.380 ms
+tmpfs          : FALLOCATE+POPULATE_WRITE :     0.272 ms
+file           : Read                     :     0.191 ms
+file           : Write                    :     0.511 ms
+file           : Read/Write               :     0.524 ms
+file           : POPULATE_READ            :     0.196 ms
+file           : POPULATE_WRITE           :     0.434 ms
+file           : FALLOCATE                :     0.004 ms
+file           : FALLOCATE+Read           :     0.197 ms
+file           : FALLOCATE+Write          :     0.554 ms
+file           : FALLOCATE+Read/Write     :     0.480 ms
+file           : FALLOCATE+POPULATE_READ  :     0.201 ms
+file           : FALLOCATE+POPULATE_WRITE :     0.381 ms
+hugetlbfs      : Read                     :     0.030 ms
+hugetlbfs      : Write                    :     0.030 ms
+hugetlbfs      : Read/Write               :     0.030 ms
+hugetlbfs      : POPULATE_READ            :     0.030 ms
+hugetlbfs      : POPULATE_WRITE           :     0.030 ms
+hugetlbfs      : FALLOCATE                :     0.030 ms
+hugetlbfs      : FALLOCATE+Read           :     0.031 ms
+hugetlbfs      : FALLOCATE+Write          :     0.031 ms
+hugetlbfs      : FALLOCATE+Read/Write     :     0.030 ms
+hugetlbfs      : FALLOCATE+POPULATE_READ  :     0.030 ms
+hugetlbfs      : FALLOCATE+POPULATE_WRITE :     0.030 ms
+**************************************************
+4096 MiB MAP_SHARED:
+**************************************************
+Anon 4 KiB     : Read                     :  1053.090 ms
+Anon 4 KiB     : Write                    :   913.642 ms
+Anon 4 KiB     : Read/Write               :  1060.350 ms
+Anon 4 KiB     : POPULATE_READ            :   893.691 ms
+Anon 4 KiB     : POPULATE_WRITE           :   782.885 ms
+Anon 2 MiB     : Read                     :   358.553 ms
+Anon 2 MiB     : Write                    :   358.419 ms
+Anon 2 MiB     : Read/Write               :   357.992 ms
+Anon 2 MiB     : POPULATE_READ            :   357.533 ms
+Anon 2 MiB     : POPULATE_WRITE           :   357.808 ms
+Memfd 4 KiB    : Read                     :  1078.144 ms
+Memfd 4 KiB    : Write                    :   942.036 ms
+Memfd 4 KiB    : Read/Write               :  1100.391 ms
+Memfd 4 KiB    : POPULATE_READ            :   925.829 ms
+Memfd 4 KiB    : POPULATE_WRITE           :   804.394 ms
+Memfd 4 KiB    : FALLOCATE                :   304.632 ms
+Memfd 4 KiB    : FALLOCATE+Read           :  1163.359 ms
+Memfd 4 KiB    : FALLOCATE+Write          :   933.186 ms
+Memfd 4 KiB    : FALLOCATE+Read/Write     :  1187.304 ms
+Memfd 4 KiB    : FALLOCATE+POPULATE_READ  :  1013.660 ms
+Memfd 4 KiB    : FALLOCATE+POPULATE_WRITE :   794.560 ms
+Memfd 2 MiB    : Read                     :   358.131 ms
+Memfd 2 MiB    : Write                    :   358.099 ms
+Memfd 2 MiB    : Read/Write               :   358.250 ms
+Memfd 2 MiB    : POPULATE_READ            :   357.563 ms
+Memfd 2 MiB    : POPULATE_WRITE           :   357.334 ms
+Memfd 2 MiB    : FALLOCATE                :   356.735 ms
+Memfd 2 MiB    : FALLOCATE+Read           :   358.152 ms
+Memfd 2 MiB    : FALLOCATE+Write          :   358.331 ms
+Memfd 2 MiB    : FALLOCATE+Read/Write     :   358.018 ms
+Memfd 2 MiB    : FALLOCATE+POPULATE_READ  :   357.286 ms
+Memfd 2 MiB    : FALLOCATE+POPULATE_WRITE :   357.523 ms
+tmpfs          : Read                     :  1087.265 ms
+tmpfs          : Write                    :   950.840 ms
+tmpfs          : Read/Write               :  1107.567 ms
+tmpfs          : POPULATE_READ            :   922.605 ms
+tmpfs          : POPULATE_WRITE           :   810.094 ms
+tmpfs          : FALLOCATE                :   306.320 ms
+tmpfs          : FALLOCATE+Read           :  1169.796 ms
+tmpfs          : FALLOCATE+Write          :   933.730 ms
+tmpfs          : FALLOCATE+Read/Write     :  1191.610 ms
+tmpfs          : FALLOCATE+POPULATE_READ  :  1020.474 ms
+tmpfs          : FALLOCATE+POPULATE_WRITE :   798.945 ms
+file           : Read                     :   654.101 ms
+file           : Write                    :  1259.142 ms
+file           : Read/Write               :  1289.509 ms
+file           : POPULATE_READ            :   661.642 ms
+file           : POPULATE_WRITE           :  1106.816 ms
+file           : FALLOCATE                :     1.864 ms
+file           : FALLOCATE+Read           :   656.328 ms
+file           : FALLOCATE+Write          :  1153.300 ms
+file           : FALLOCATE+Read/Write     :  1180.613 ms
+file           : FALLOCATE+POPULATE_READ  :   668.347 ms
+file           : FALLOCATE+POPULATE_WRITE :   996.143 ms
+hugetlbfs      : Read                     :   357.245 ms
+hugetlbfs      : Write                    :   357.413 ms
+hugetlbfs      : Read/Write               :   357.120 ms
+hugetlbfs      : POPULATE_READ            :   356.321 ms
+hugetlbfs      : POPULATE_WRITE           :   356.693 ms
+hugetlbfs      : FALLOCATE                :   355.927 ms
+hugetlbfs      : FALLOCATE+Read           :   357.074 ms
+hugetlbfs      : FALLOCATE+Write          :   357.120 ms
+hugetlbfs      : FALLOCATE+Read/Write     :   356.983 ms
+hugetlbfs      : FALLOCATE+POPULATE_READ  :   356.413 ms
+hugetlbfs      : FALLOCATE+POPULATE_WRITE :   356.266 ms
+**************************************************
+
+[1] https://lkml.org/lkml/2013/6/27/698
+
+[akpm@linux-foundation.org: coding style fixes]
+
+Link: https://lkml.kernel.org/r/20210419135443.12822-3-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Michael S. Tsirkin <mst@redhat.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Richard Henderson <rth@twiddle.net>
+Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+Cc: Matt Turner <mattst88@gmail.com>
+Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Cc: "James E.J. Bottomley" <James.Bottomley@HansenPartnership.com>
+Cc: Helge Deller <deller@gmx.de>
+Cc: Chris Zankel <chris@zankel.net>
+Cc: Max Filippov <jcmvbkbc@gmail.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Rolf Eike Beer <eike-kernel@sf-tec.de>
+Cc: Ram Pai <linuxram@us.ibm.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

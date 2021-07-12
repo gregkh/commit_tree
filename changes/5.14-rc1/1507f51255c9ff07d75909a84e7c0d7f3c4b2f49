@@ -1,0 +1,151 @@
+mm: introduce memfd_secret system call to create "secret" memory areas
+
+Introduce "memfd_secret" system call with the ability to create memory
+areas visible only in the context of the owning process and not mapped not
+only to other processes but in the kernel page tables as well.
+
+The secretmem feature is off by default and the user must explicitly
+enable it at the boot time.
+
+Once secretmem is enabled, the user will be able to create a file
+descriptor using the memfd_secret() system call.  The memory areas created
+by mmap() calls from this file descriptor will be unmapped from the kernel
+direct map and they will be only mapped in the page table of the processes
+that have access to the file descriptor.
+
+Secretmem is designed to provide the following protections:
+
+* Enhanced protection (in conjunction with all the other in-kernel
+  attack prevention systems) against ROP attacks.  Seceretmem makes
+  "simple" ROP insufficient to perform exfiltration, which increases the
+  required complexity of the attack.  Along with other protections like
+  the kernel stack size limit and address space layout randomization which
+  make finding gadgets is really hard, absence of any in-kernel primitive
+  for accessing secret memory means the one gadget ROP attack can't work.
+  Since the only way to access secret memory is to reconstruct the missing
+  mapping entry, the attacker has to recover the physical page and insert
+  a PTE pointing to it in the kernel and then retrieve the contents.  That
+  takes at least three gadgets which is a level of difficulty beyond most
+  standard attacks.
+
+* Prevent cross-process secret userspace memory exposures.  Once the
+  secret memory is allocated, the user can't accidentally pass it into the
+  kernel to be transmitted somewhere.  The secreremem pages cannot be
+  accessed via the direct map and they are disallowed in GUP.
+
+* Harden against exploited kernel flaws.  In order to access secretmem,
+  a kernel-side attack would need to either walk the page tables and
+  create new ones, or spawn a new privileged uiserspace process to perform
+  secrets exfiltration using ptrace.
+
+The file descriptor based memory has several advantages over the
+"traditional" mm interfaces, such as mlock(), mprotect(), madvise().  File
+descriptor approach allows explicit and controlled sharing of the memory
+areas, it allows to seal the operations.  Besides, file descriptor based
+memory paves the way for VMMs to remove the secret memory range from the
+userspace hipervisor process, for instance QEMU.  Andy Lutomirski says:
+
+  "Getting fd-backed memory into a guest will take some possibly major
+  work in the kernel, but getting vma-backed memory into a guest without
+  mapping it in the host user address space seems much, much worse."
+
+memfd_secret() is made a dedicated system call rather than an extension to
+memfd_create() because it's purpose is to allow the user to create more
+secure memory mappings rather than to simply allow file based access to
+the memory.  Nowadays a new system call cost is negligible while it is way
+simpler for userspace to deal with a clear-cut system calls than with a
+multiplexer or an overloaded syscall.  Moreover, the initial
+implementation of memfd_secret() is completely distinct from
+memfd_create() so there is no much sense in overloading memfd_create() to
+begin with.  If there will be a need for code sharing between these
+implementation it can be easily achieved without a need to adjust user
+visible APIs.
+
+The secret memory remains accessible in the process context using uaccess
+primitives, but it is not exposed to the kernel otherwise; secret memory
+areas are removed from the direct map and functions in the
+follow_page()/get_user_page() family will refuse to return a page that
+belongs to the secret memory area.
+
+Once there will be a use case that will require exposing secretmem to the
+kernel it will be an opt-in request in the system call flags so that user
+would have to decide what data can be exposed to the kernel.
+
+Removing of the pages from the direct map may cause its fragmentation on
+architectures that use large pages to map the physical memory which
+affects the system performance.  However, the original Kconfig text for
+CONFIG_DIRECT_GBPAGES said that gigabyte pages in the direct map "...  can
+improve the kernel's performance a tiny bit ..." (commit 00d1c5e05736
+("x86: add gbpages switches")) and the recent report [1] showed that "...
+although 1G mappings are a good default choice, there is no compelling
+evidence that it must be the only choice".  Hence, it is sufficient to
+have secretmem disabled by default with the ability of a system
+administrator to enable it at boot time.
+
+Pages in the secretmem regions are unevictable and unmovable to avoid
+accidental exposure of the sensitive data via swap or during page
+migration.
+
+Since the secretmem mappings are locked in memory they cannot exceed
+RLIMIT_MEMLOCK.  Since these mappings are already locked independently
+from mlock(), an attempt to mlock()/munlock() secretmem range would fail
+and mlockall()/munlockall() will ignore secretmem mappings.
+
+However, unlike mlock()ed memory, secretmem currently behaves more like
+long-term GUP: secretmem mappings are unmovable mappings directly consumed
+by user space.  With default limits, there is no excessive use of
+secretmem and it poses no real problem in combination with
+ZONE_MOVABLE/CMA, but in the future this should be addressed to allow
+balanced use of large amounts of secretmem along with ZONE_MOVABLE/CMA.
+
+A page that was a part of the secret memory area is cleared when it is
+freed to ensure the data is not exposed to the next user of that page.
+
+The following example demonstrates creation of a secret mapping (error
+handling is omitted):
+
+	fd = memfd_secret(0);
+	ftruncate(fd, MAP_SIZE);
+	ptr = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE,
+		   MAP_SHARED, fd, 0);
+
+[1] https://lore.kernel.org/linux-mm/213b4567-46ce-f116-9cdf-bbd0c884eb3c@linux.intel.com/
+
+[akpm@linux-foundation.org: suppress Kconfig whine]
+
+Link: https://lkml.kernel.org/r/20210518072034.31572-5-rppt@kernel.org
+Signed-off-by: Mike Rapoport <rppt@linux.ibm.com>
+Acked-by: Hagen Paul Pfeifer <hagen@jauu.net>
+Acked-by: James Bottomley <James.Bottomley@HansenPartnership.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christopher Lameter <cl@linux.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Elena Reshetova <elena.reshetova@intel.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: James Bottomley <jejb@linux.ibm.com>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+Cc: Palmer Dabbelt <palmer@dabbelt.com>
+Cc: Palmer Dabbelt <palmerdabbelt@google.com>
+Cc: Paul Walmsley <paul.walmsley@sifive.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Cc: Roman Gushchin <guro@fb.com>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tycho Andersen <tycho@tycho.ws>
+Cc: Will Deacon <will@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: kernel test robot <lkp@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

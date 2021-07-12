@@ -1,0 +1,92 @@
+net: sched: implement TCQ_F_CAN_BYPASS for lockless qdisc
+
+Currently pfifo_fast has both TCQ_F_CAN_BYPASS and TCQ_F_NOLOCK
+flag set, but queue discipline by-pass does not work for lockless
+qdisc because skb is always enqueued to qdisc even when the qdisc
+is empty, see __dev_xmit_skb().
+
+This patch calls sch_direct_xmit() to transmit the skb directly
+to the driver for empty lockless qdisc, which aviod enqueuing
+and dequeuing operation.
+
+As qdisc->empty is not reliable to indicate a empty qdisc because
+there is a time window between enqueuing and setting qdisc->empty.
+So we use the MISSED state added in commit a90c57f2cedd ("net:
+sched: fix packet stuck problem for lockless qdisc"), which
+indicate there is lock contention, suggesting that it is better
+not to do the qdisc bypass in order to avoid packet out of order
+problem.
+
+In order to make MISSED state reliable to indicate a empty qdisc,
+we need to ensure that testing and clearing of MISSED state is
+within the protection of qdisc->seqlock, only setting MISSED state
+can be done without the protection of qdisc->seqlock. A MISSED
+state testing is added without the protection of qdisc->seqlock to
+aviod doing unnecessary spin_trylock() for contention case.
+
+As the enqueuing is not within the protection of qdisc->seqlock,
+there is still a potential data race as mentioned by Jakub [1]:
+
+      thread1               thread2             thread3
+qdisc_run_begin() # true
+                        qdisc_run_begin(q)
+                             set(MISSED)
+pfifo_fast_dequeue
+  clear(MISSED)
+  # recheck the queue
+qdisc_run_end()
+                            enqueue skb1
+                                             qdisc empty # true
+                                          qdisc_run_begin() # true
+                                          sch_direct_xmit() # skb2
+                         qdisc_run_begin()
+                            set(MISSED)
+
+When above happens, skb1 enqueued by thread2 is transmited after
+skb2 is transmited by thread3 because MISSED state setting and
+enqueuing is not under the qdisc->seqlock. If qdisc bypass is
+disabled, skb1 has better chance to be transmited quicker than
+skb2.
+
+This patch does not take care of the above data race, because we
+view this as similar as below:
+Even at the same time CPU1 and CPU2 write the skb to two socket
+which both heading to the same qdisc, there is no guarantee that
+which skb will hit the qdisc first, because there is a lot of
+factor like interrupt/softirq/cache miss/scheduling afffecting
+that.
+
+There are below cases that need special handling:
+1. When MISSED state is cleared before another round of dequeuing
+   in pfifo_fast_dequeue(), and __qdisc_run() might not be able to
+   dequeue all skb in one round and call __netif_schedule(), which
+   might result in a non-empty qdisc without MISSED set. In order
+   to avoid this, the MISSED state is set for lockless qdisc and
+   __netif_schedule() will be called at the end of qdisc_run_end.
+
+2. The MISSED state also need to be set for lockless qdisc instead
+   of calling __netif_schedule() directly when requeuing a skb for
+   a similar reason.
+
+3. For netdev queue stopped case, the MISSED case need clearing
+   while the netdev queue is stopped, otherwise there may be
+   unnecessary __netif_schedule() calling. So a new DRAINING state
+   is added to indicate this case, which also indicate a non-empty
+   qdisc.
+
+4. As there is already netif_xmit_frozen_or_stopped() checking in
+   dequeue_skb() and sch_direct_xmit(), which are both within the
+   protection of qdisc->seqlock, but the same checking in
+   __dev_xmit_skb() is without the protection, which might cause
+   empty indication of a lockless qdisc to be not reliable. So
+   remove the checking in __dev_xmit_skb(), and the checking in
+   the protection of qdisc->seqlock seems enough to avoid the cpu
+   consumption problem for netdev queue stopped case.
+
+1. https://lkml.org/lkml/2021/5/29/215
+
+Acked-by: Jakub Kicinski <kuba@kernel.org>
+Tested-by: Vladimir Oltean <vladimir.oltean@nxp.com> # flexcan
+Signed-off-by: Yunsheng Lin <linyunsheng@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

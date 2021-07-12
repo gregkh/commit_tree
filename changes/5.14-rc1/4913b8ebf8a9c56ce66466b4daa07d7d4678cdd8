@@ -1,0 +1,94 @@
+net: dsa: add support for the SJA1110 native tagging protocol
+
+The SJA1110 has improved a few things compared to SJA1105:
+
+- To send a control packet from the host port with SJA1105, one needed
+  to program a one-shot "management route" over SPI. This is no longer
+  true with SJA1110, you can actually send "in-band control extensions"
+  in the packets sent by DSA, these are in fact DSA tags which contain
+  the destination port and switch ID.
+
+- When receiving a control packet from the switch with SJA1105, the
+  source port and switch ID were written in bytes 3 and 4 of the
+  destination MAC address of the frame (which was a very poor shot at a
+  DSA header). If the control packet also had an RX timestamp, that
+  timestamp was sent in an actual follow-up packet, so there were
+  reordering concerns on multi-core/multi-queue DSA masters, where the
+  metadata frame with the RX timestamp might get processed before the
+  actual packet to which that timestamp belonged (there is no way to
+  pair a packet to its timestamp other than the order in which they were
+  received). On SJA1110, this is no longer true, control packets have
+  the source port, switch ID and timestamp all in the DSA tags.
+
+- Timestamps from the switch were partial: to get a 64-bit timestamp as
+  required by PTP stacks, one would need to take the partial 24-bit or
+  32-bit timestamp from the packet, then read the current PTP time very
+  quickly, and then patch in the high bits of the current PTP time into
+  the captured partial timestamp, to reconstruct what the full 64-bit
+  timestamp must have been. That is awful because packet processing is
+  done in NAPI context, but reading the current PTP time is done over
+  SPI and therefore needs sleepable context.
+
+But it also aggravated a few things:
+
+- Not only is there a DSA header in SJA1110, but there is a DSA trailer
+  in fact, too. So DSA needs to be extended to support taggers which
+  have both a header and a trailer. Very unconventional - my understanding
+  is that the trailer exists because the timestamps couldn't be prepared
+  in time for putting them in the header area.
+
+- Like SJA1105, not all packets sent to the CPU have the DSA tag added
+  to them, only control packets do:
+
+  * the ones which match the destination MAC filters/traps in
+    MAC_FLTRES1 and MAC_FLTRES0
+  * the ones which match FDB entries which have TRAP or TAKETS bits set
+
+  So we could in theory hack something up to request the switch to take
+  timestamps for all packets that reach the CPU, and those would be
+  DSA-tagged and contain the source port / switch ID by virtue of the
+  fact that there needs to be a timestamp trailer provided. BUT:
+
+- The SJA1110 does not parse its own DSA tags in a way that is useful
+  for routing in cross-chip topologies, a la Marvell. And the sja1105
+  driver already supports cross-chip bridging from the SJA1105 days.
+  It does that by automatically setting up the DSA links as VLAN trunks
+  which contain all the necessary tag_8021q RX VLANs that must be
+  communicated between the switches that span the same bridge. So when
+  using tag_8021q on sja1105, it is possible to have 2 switches with
+  ports sw0p0, sw0p1, sw1p0, sw1p1, and 2 VLAN-unaware bridges br0 and
+  br1, and br0 can take sw0p0 and sw1p0, and br1 can take sw0p1 and
+  sw1p1, and forwarding will happen according to the expected rules of
+  the Linux bridge.
+  We like that, and we don't want that to go away, so as a matter of
+  fact, the SJA1110 tagger still needs to support tag_8021q.
+
+So the sja1110 tagger is a hybrid between tag_8021q for data packets,
+and the native hardware support for control packets.
+
+On RX, packets have a 13-byte trailer if they contain an RX timestamp.
+That trailer is padded in such a way that its byte 8 (the start of the
+"residence time" field - not parsed by Linux because we don't care) is
+aligned on a 16 byte boundary. So the padding has a variable length
+between 0 and 15 bytes. The DSA header contains the offset of the
+beginning of the padding relative to the beginning of the frame (and the
+end of the padding is obviously the end of the packet minus 13 bytes,
+the length of the trailer). So we discard it.
+
+Packets which don't have a trailer contain the source port and switch ID
+information in the header (they are "trap-to-host" packets). Packets
+which have a trailer contain the source port and switch ID in the trailer.
+
+On TX, the destination port mask and switch ID is always in the trailer,
+so we always need to say in the header that a trailer is present.
+
+The header needs a custom EtherType and this was chosen as 0xdadc, after
+0xdada which is for Marvell and 0xdadb which is for VLANs in
+VLAN-unaware mode on SJA1105 (and SJA1110 in fact too).
+
+Because we use tag_8021q in concert with the native tagging protocol,
+control packets will have 2 DSA tags.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

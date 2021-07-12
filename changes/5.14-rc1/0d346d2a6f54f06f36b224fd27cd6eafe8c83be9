@@ -1,0 +1,360 @@
+media: v4l2-subdev: add subdev-wide state struct
+
+We have 'struct v4l2_subdev_pad_config' which contains configuration for
+a single pad used for the TRY functionality, and an array of those
+structs is passed to various v4l2_subdev_pad_ops.
+
+I was working on subdev internal routing between pads, and realized that
+there's no way to add TRY functionality for routes, which is not pad
+specific configuration. Adding a separate struct for try-route config
+wouldn't work either, as e.g. set-fmt needs to know the try-route
+configuration to propagate the settings.
+
+This patch adds a new struct, 'struct v4l2_subdev_state' (which at the
+moment only contains the v4l2_subdev_pad_config array) and the new
+struct is used in most of the places where v4l2_subdev_pad_config was
+used. All v4l2_subdev_pad_ops functions taking v4l2_subdev_pad_config
+are changed to instead take v4l2_subdev_state.
+
+The changes to drivers/media/v4l2-core/v4l2-subdev.c and
+include/media/v4l2-subdev.h were written by hand, and all the driver
+changes were done with the semantic patch below. The spatch needs to be
+applied to a select list of directories. I used the following shell
+commands to apply the spatch:
+
+dirs="drivers/media/i2c drivers/media/platform drivers/media/usb drivers/media/test-drivers/vimc drivers/media/pci drivers/staging/media"
+for dir in $dirs; do spatch -j8 --dir --include-headers --no-show-diff --in-place --sp-file v4l2-subdev-state.cocci $dir; done
+
+Note that Coccinelle chokes on a few drivers (gcc extensions?). With
+minor changes we can make Coccinelle run fine, and these changes can be
+reverted after spatch. The diff for these changes is:
+
+For drivers/media/i2c/s5k5baf.c:
+
+	@@ -1481,7 +1481,7 @@ static int s5k5baf_set_selection(struct v4l2_subdev *sd,
+	 				&s5k5baf_cis_rect,
+	 				v4l2_subdev_get_try_crop(sd, cfg, PAD_CIS),
+	 				v4l2_subdev_get_try_compose(sd, cfg, PAD_CIS),
+	-				v4l2_subdev_get_try_crop(sd, cfg, PAD_OUT)
+	+				v4l2_subdev_get_try_crop(sd, cfg, PAD_OUT),
+	 			};
+	 		s5k5baf_set_rect_and_adjust(rects, rtype, &sel->r);
+	 		return 0;
+
+For drivers/media/platform/s3c-camif/camif-capture.c:
+
+	@@ -1230,7 +1230,7 @@ static int s3c_camif_subdev_get_fmt(struct v4l2_subdev *sd,
+	 		*mf = camif->mbus_fmt;
+	 		break;
+
+	-	case CAMIF_SD_PAD_SOURCE_C...CAMIF_SD_PAD_SOURCE_P:
+	+	case CAMIF_SD_PAD_SOURCE_C:
+	 		/* crop rectangle at camera interface input */
+	 		mf->width = camif->camif_crop.width;
+	 		mf->height = camif->camif_crop.height;
+	@@ -1332,7 +1332,7 @@ static int s3c_camif_subdev_set_fmt(struct v4l2_subdev *sd,
+	 		}
+	 		break;
+
+	-	case CAMIF_SD_PAD_SOURCE_C...CAMIF_SD_PAD_SOURCE_P:
+	+	case CAMIF_SD_PAD_SOURCE_C:
+	 		/* Pixel format can be only changed on the sink pad. */
+	 		mf->code = camif->mbus_fmt.code;
+	 		mf->width = crop->width;
+
+The semantic patch is:
+
+// <smpl>
+
+// Change function parameter
+
+@@
+identifier func;
+identifier cfg;
+@@
+
+ func(...,
+-   struct v4l2_subdev_pad_config *cfg
++   struct v4l2_subdev_state *sd_state
+    , ...)
+ {
+ <...
+- cfg
++ sd_state
+ ...>
+ }
+
+// Change function declaration parameter
+
+@@
+identifier func;
+identifier cfg;
+type T;
+@@
+T func(...,
+-   struct v4l2_subdev_pad_config *cfg
++   struct v4l2_subdev_state *sd_state
+    , ...);
+
+// Change function return value
+
+@@
+identifier func;
+@@
+- struct v4l2_subdev_pad_config
++ struct v4l2_subdev_state
+ *func(...)
+ {
+    ...
+ }
+
+// Change function declaration return value
+
+@@
+identifier func;
+@@
+- struct v4l2_subdev_pad_config
++ struct v4l2_subdev_state
+ *func(...);
+
+// Some drivers pass a local pad_cfg for a single pad to a called function. Wrap it
+// inside a pad_state.
+
+@@
+identifier func;
+identifier pad_cfg;
+@@
+func(...)
+{
+    ...
+    struct v4l2_subdev_pad_config pad_cfg;
++   struct v4l2_subdev_state pad_state = { .pads = &pad_cfg };
+
+    <+...
+
+(
+    v4l2_subdev_call
+|
+    sensor_call
+|
+    isi_try_fse
+|
+    isc_try_fse
+|
+    saa_call_all
+)
+    (...,
+-   &pad_cfg
++   &pad_state
+    ,...)
+
+    ...+>
+}
+
+// If the function uses fields from pad_config, access via state->pads
+
+@@
+identifier func;
+identifier state;
+@@
+ func(...,
+    struct v4l2_subdev_state *state
+    , ...)
+ {
+    <...
+(
+-   state->try_fmt
++   state->pads->try_fmt
+|
+-   state->try_crop
++   state->pads->try_crop
+|
+-   state->try_compose
++   state->pads->try_compose
+)
+    ...>
+}
+
+// If the function accesses the filehandle, use fh->state instead
+
+@@
+struct v4l2_subdev_fh *fh;
+@@
+-    fh->pad
++    fh->state
+
+@@
+struct v4l2_subdev_fh fh;
+@@
+-    fh.pad
++    fh.state
+
+// Start of vsp1 specific
+
+@@
+@@
+struct vsp1_entity {
+    ...
+-    struct v4l2_subdev_pad_config *config;
++    struct v4l2_subdev_state *config;
+    ...
+};
+
+@@
+symbol entity;
+@@
+vsp1_entity_init(...)
+{
+    ...
+    entity->config =
+-    v4l2_subdev_alloc_pad_config
++    v4l2_subdev_alloc_state
+    (&entity->subdev);
+    ...
+}
+
+@@
+symbol entity;
+@@
+vsp1_entity_destroy(...)
+{
+    ...
+-   v4l2_subdev_free_pad_config
++   v4l2_subdev_free_state
+    (entity->config);
+    ...
+}
+
+@exists@
+identifier func =~ "(^vsp1.*)|(hsit_set_format)|(sru_enum_frame_size)|(sru_set_format)|(uif_get_selection)|(uif_set_selection)|(uds_enum_frame_size)|(uds_set_format)|(brx_set_format)|(brx_get_selection)|(histo_get_selection)|(histo_set_selection)|(brx_set_selection)";
+symbol config;
+@@
+func(...) {
+    ...
+-    struct v4l2_subdev_pad_config *config;
++    struct v4l2_subdev_state *config;
+    ...
+}
+
+// End of vsp1 specific
+
+// Start of rcar specific
+
+@@
+identifier sd;
+identifier pad_cfg;
+@@
+ rvin_try_format(...)
+ {
+    ...
+-   struct v4l2_subdev_pad_config *pad_cfg;
++   struct v4l2_subdev_state *sd_state;
+    ...
+-   pad_cfg = v4l2_subdev_alloc_pad_config(sd);
++   sd_state = v4l2_subdev_alloc_state(sd);
+    <...
+-   pad_cfg
++   sd_state
+    ...>
+-   v4l2_subdev_free_pad_config(pad_cfg);
++   v4l2_subdev_free_state(sd_state);
+    ...
+ }
+
+// End of rcar specific
+
+// Start of rockchip specific
+
+@@
+identifier func =~ "(rkisp1_rsz_get_pad_fmt)|(rkisp1_rsz_get_pad_crop)|(rkisp1_rsz_register)";
+symbol rsz;
+symbol pad_cfg;
+@@
+
+ func(...)
+ {
++   struct v4l2_subdev_state state = { .pads = rsz->pad_cfg };
+    ...
+-   rsz->pad_cfg
++   &state
+    ...
+ }
+
+@@
+identifier func =~ "(rkisp1_isp_get_pad_fmt)|(rkisp1_isp_get_pad_crop)";
+symbol isp;
+symbol pad_cfg;
+@@
+
+ func(...)
+ {
++   struct v4l2_subdev_state state = { .pads = isp->pad_cfg };
+    ...
+-   isp->pad_cfg
++   &state
+    ...
+ }
+
+@@
+symbol rkisp1;
+symbol isp;
+symbol pad_cfg;
+@@
+
+ rkisp1_isp_register(...)
+ {
++   struct v4l2_subdev_state state = { .pads = rkisp1->isp.pad_cfg };
+    ...
+-   rkisp1->isp.pad_cfg
++   &state
+    ...
+ }
+
+// End of rockchip specific
+
+// Start of tegra-video specific
+
+@@
+identifier sd;
+identifier pad_cfg;
+@@
+ __tegra_channel_try_format(...)
+ {
+    ...
+-   struct v4l2_subdev_pad_config *pad_cfg;
++   struct v4l2_subdev_state *sd_state;
+    ...
+-   pad_cfg = v4l2_subdev_alloc_pad_config(sd);
++   sd_state = v4l2_subdev_alloc_state(sd);
+    <...
+-   pad_cfg
++   sd_state
+    ...>
+-   v4l2_subdev_free_pad_config(pad_cfg);
++   v4l2_subdev_free_state(sd_state);
+    ...
+ }
+
+@@
+identifier sd_state;
+@@
+ __tegra_channel_try_format(...)
+ {
+    ...
+    struct v4l2_subdev_state *sd_state;
+    <...
+-   sd_state->try_crop
++   sd_state->pads->try_crop
+    ...>
+ }
+
+// End of tegra-video specific
+
+// </smpl>
+
+Signed-off-by: Tomi Valkeinen <tomi.valkeinen@ideasonboard.com>
+Acked-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Acked-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+Signed-off-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+Signed-off-by: Mauro Carvalho Chehab <mchehab+huawei@kernel.org>
+

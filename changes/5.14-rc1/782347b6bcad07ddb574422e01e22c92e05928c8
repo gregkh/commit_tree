@@ -1,0 +1,51 @@
+xdp: Add proper __rcu annotations to redirect map entries
+
+XDP_REDIRECT works by a three-step process: the bpf_redirect() and
+bpf_redirect_map() helpers will lookup the target of the redirect and store
+it (along with some other metadata) in a per-CPU struct bpf_redirect_info.
+Next, when the program returns the XDP_REDIRECT return code, the driver
+will call xdp_do_redirect() which will use the information thus stored to
+actually enqueue the frame into a bulk queue structure (that differs
+slightly by map type, but shares the same principle). Finally, before
+exiting its NAPI poll loop, the driver will call xdp_do_flush(), which will
+flush all the different bulk queues, thus completing the redirect.
+
+Pointers to the map entries will be kept around for this whole sequence of
+steps, protected by RCU. However, there is no top-level rcu_read_lock() in
+the core code; instead drivers add their own rcu_read_lock() around the XDP
+portions of the code, but somewhat inconsistently as Martin discovered[0].
+However, things still work because everything happens inside a single NAPI
+poll sequence, which means it's between a pair of calls to
+local_bh_disable()/local_bh_enable(). So Paul suggested[1] that we could
+document this intention by using rcu_dereference_check() with
+rcu_read_lock_bh_held() as a second parameter, thus allowing sparse and
+lockdep to verify that everything is done correctly.
+
+This patch does just that: we add an __rcu annotation to the map entry
+pointers and remove the various comments explaining the NAPI poll assurance
+strewn through devmap.c in favour of a longer explanation in filter.c. The
+goal is to have one coherent documentation of the entire flow, and rely on
+the RCU annotations as a "standard" way of communicating the flow in the
+map code (which can additionally be understood by sparse and lockdep).
+
+The RCU annotation replacements result in a fairly straight-forward
+replacement where READ_ONCE() becomes rcu_dereference_check(), WRITE_ONCE()
+becomes rcu_assign_pointer() and xchg() and cmpxchg() gets wrapped in the
+proper constructs to cast the pointer back and forth between __rcu and
+__kernel address space (for the benefit of sparse). The one complication is
+that xskmap has a few constructions where double-pointers are passed back
+and forth; these simply all gain __rcu annotations, and only the final
+reference/dereference to the inner-most pointer gets changed.
+
+With this, everything can be run through sparse without eliciting
+complaints, and lockdep can verify correctness even without the use of
+rcu_read_lock() in the drivers. Subsequent patches will clean these up from
+the drivers.
+
+[0] https://lore.kernel.org/bpf/20210415173551.7ma4slcbqeyiba2r@kafai-mbp.dhcp.thefacebook.com/
+[1] https://lore.kernel.org/bpf/20210419165837.GA975577@paulmck-ThinkPad-P17-Gen-1/
+
+Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20210624160609.292325-6-toke@redhat.com
+

@@ -1,0 +1,81 @@
+um: Fix stack pointer alignment
+
+GCC assumes that stack is aligned to 16-byte on call sites [1].
+Since GCC 8, GCC began using 16-byte aligned SSE instructions to
+implement assignments to structs on stack. When
+CC_OPTIMIZE_FOR_PERFORMANCE is enabled, this affects
+os-Linux/sigio.c, write_sigio_thread:
+
+  struct pollfds *fds, tmp;
+  tmp = current_poll;
+
+Note that struct pollfds is exactly 16 bytes in size.
+GCC 8+ generates assembly similar to:
+
+  movdqa (%rdi),%xmm0
+  movaps %xmm0,-0x50(%rbp)
+
+This is an issue, because movaps will #GP if -0x50(%rbp) is not
+aligned to 16 bytes [2], and how rbp gets assigned to is via glibc
+clone thread_start, then function prologue, going though execution
+trace similar to (showing only relevant instructions):
+
+  sub    $0x10,%rsi
+  mov    %rcx,0x8(%rsi)
+  mov    %rdi,(%rsi)
+  syscall
+  pop    %rax
+  pop    %rdi
+  callq  *%rax
+  push   %rbp
+  mov    %rsp,%rbp
+
+The stack pointer always points to the topmost element on stack,
+rather then the space right above the topmost. On push, the
+pointer decrements first before writing to the memory pointed to
+by it. Therefore, there is no need to have the stack pointer
+pointer always point to valid memory unless the stack is poped;
+so the `- sizeof(void *)` in the code is unnecessary.
+
+On the other hand, glibc reserves the 16 bytes it needs on stack
+and pops itself, so by the call instruction the stack pointer
+is exactly the caller-supplied sp. It then push the 16 bytes of
+the return address and the saved stack pointer, so the base
+pointer will be 16-byte aligned if and only if the caller
+supplied sp is 16-byte aligned. Therefore, the caller must supply
+a 16-byte aligned pointer, which `stack + UM_KERN_PAGE_SIZE`
+already satisfies.
+
+On a side note, musl is unaffected by this issue because it forces
+16 byte alignment via `and $-16,%rsi` in its clone wrapper.
+Similarly, glibc i386 is also unaffected because it has
+`andl $0xfffffff0, %ecx`.
+
+To reproduce this bug, enable CONFIG_UML_RTC and
+CC_OPTIMIZE_FOR_PERFORMANCE. uml_rtc will call
+add_sigio_fd which will then cause write_sigio_thread to either go
+into segfault loop or panic with "Segfault with no mm".
+
+Similarly, signal stacks will be aligned by the host kernel upon
+signal delivery. `- sizeof(void *)` to sigaltstack is
+unconventional and extraneous.
+
+On a related note, initialization of longjmp buffers do require
+`- sizeof(void *)`. This is to account for the return address
+that would have been pushed to the stack at the call site.
+
+The reason for uml to respect 16-byte alignment, rather than
+telling GCC to assume 8-byte alignment like the host kernel since
+commit d9b0cde91c60 ("x86-64, gcc: Use
+-mpreferred-stack-boundary=3 if supported"), is because uml links
+against libc. There is no reason to assume libc is also compiled
+with that flag and assumes 8-byte alignment rather than 16-byte.
+
+[1] https://gcc.gnu.org/bugzilla/show_bug.cgi?id=40838
+[2] https://c9x.me/x86/html/file_module_x86_id_180.html
+
+Signed-off-by: YiFei Zhu <zhuyifei1999@gmail.com>
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Reviewed-by: Johannes Berg <johannes@sipsolutions.net>
+Signed-off-by: Richard Weinberger <richard@nod.at>
+

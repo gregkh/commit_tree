@@ -1,0 +1,151 @@
+mm: memory: add orig_pmd to struct vm_fault
+
+Pach series "mm: thp: use generic THP migration for NUMA hinting fault", v3.
+
+When the THP NUMA fault support was added THP migration was not supported
+yet.  So the ad hoc THP migration was implemented in NUMA fault handling.
+Since v4.14 THP migration has been supported so it doesn't make too much
+sense to still keep another THP migration implementation rather than using
+the generic migration code.  It is definitely a maintenance burden to keep
+two THP migration implementation for different code paths and it is more
+error prone.  Using the generic THP migration implementation allows us
+remove the duplicate code and some hacks needed by the old ad hoc
+implementation.
+
+A quick grep shows x86_64, PowerPC (book3s), ARM64 ans S390 support both
+THP and NUMA balancing.  The most of them support THP migration except for
+S390.  Zi Yan tried to add THP migration support for S390 before but it
+was not accepted due to the design of S390 PMD.  For the discussion,
+please see: https://lkml.org/lkml/2018/4/27/953.
+
+Per the discussion with Gerald Schaefer in v1 it is acceptible to skip
+huge PMD for S390 for now.
+
+I saw there were some hacks about gup from git history, but I didn't
+figure out if they have been removed or not since I just found FOLL_NUMA
+code in the current gup implementation and they seems useful.
+
+Patch #1 ~ #2 are preparation patches.
+Patch #3 is the real meat.
+Patch #4 ~ #6 keep consistent counters and behaviors with before.
+Patch #7 skips change huge PMD to prot_none if thp migration is not supported.
+
+Test
+----
+Did some tests to measure the latency of do_huge_pmd_numa_page.  The test
+VM has 80 vcpus and 64G memory.  The test would create 2 processes to
+consume 128G memory together which would incur memory pressure to cause
+THP splits.  And it also creates 80 processes to hog cpu, and the memory
+consumer processes are bound to different nodes periodically in order to
+increase NUMA faults.
+
+The below test script is used:
+
+echo 3 > /proc/sys/vm/drop_caches
+
+# Run stress-ng for 24 hours
+./stress-ng/stress-ng --vm 2 --vm-bytes 64G --timeout 24h &
+PID=$!
+
+./stress-ng/stress-ng --cpu $NR_CPUS --timeout 24h &
+
+# Wait for vm stressors forked
+sleep 5
+
+PID_1=`pgrep -P $PID | awk 'NR == 1'`
+PID_2=`pgrep -P $PID | awk 'NR == 2'`
+
+JOB1=`pgrep -P $PID_1`
+JOB2=`pgrep -P $PID_2`
+
+# Bind load jobs to different nodes periodically to force generate
+# cross node memory access
+while [ -d "/proc/$PID" ]
+do
+        taskset -apc 8 $JOB1
+        taskset -apc 8 $JOB2
+        sleep 300
+        taskset -apc 58 $JOB1
+        taskset -apc 58 $JOB2
+        sleep 300
+done
+
+With the above test the histogram of latency of do_huge_pmd_numa_page is
+as shown below.  Since the number of do_huge_pmd_numa_page varies
+drastically for each run (should be due to scheduler), so I converted the
+raw number to percentage.
+
+                             patched               base
+@us[stress-ng]:
+[0]                          3.57%                 0.16%
+[1]                          55.68%                18.36%
+[2, 4)                       10.46%                40.44%
+[4, 8)                       7.26%                 17.82%
+[8, 16)                      21.12%                13.41%
+[16, 32)                     1.06%                 4.27%
+[32, 64)                     0.56%                 4.07%
+[64, 128)                    0.16%                 0.35%
+[128, 256)                   < 0.1%                < 0.1%
+[256, 512)                   < 0.1%                < 0.1%
+[512, 1K)                    < 0.1%                < 0.1%
+[1K, 2K)                     < 0.1%                < 0.1%
+[2K, 4K)                     < 0.1%                < 0.1%
+[4K, 8K)                     < 0.1%                < 0.1%
+[8K, 16K)                    < 0.1%                < 0.1%
+[16K, 32K)                   < 0.1%                < 0.1%
+[32K, 64K)                   < 0.1%                < 0.1%
+
+Per the result, patched kernel is even slightly better than the base
+kernel.  I think this is because the lock contention against THP split is
+less than base kernel due to the refactor.
+
+To exclude the affect from THP split, I also did test w/o memory pressure.
+No obvious regression is spotted.  The below is the test result *w/o*
+memory pressure.
+
+                           patched                  base
+@us[stress-ng]:
+[0]                        7.97%                   18.4%
+[1]                        69.63%                  58.24%
+[2, 4)                     4.18%                   2.63%
+[4, 8)                     0.22%                   0.17%
+[8, 16)                    1.03%                   0.92%
+[16, 32)                   0.14%                   < 0.1%
+[32, 64)                   < 0.1%                  < 0.1%
+[64, 128)                  < 0.1%                  < 0.1%
+[128, 256)                 < 0.1%                  < 0.1%
+[256, 512)                 0.45%                   1.19%
+[512, 1K)                  15.45%                  17.27%
+[1K, 2K)                   < 0.1%                  < 0.1%
+[2K, 4K)                   < 0.1%                  < 0.1%
+[4K, 8K)                   < 0.1%                  < 0.1%
+[8K, 16K)                  0.86%                   0.88%
+[16K, 32K)                 < 0.1%                  0.15%
+[32K, 64K)                 < 0.1%                  < 0.1%
+[64K, 128K)                < 0.1%                  < 0.1%
+[128K, 256K)               < 0.1%                  < 0.1%
+
+The series also survived a series of tests that exercise NUMA balancing
+migrations by Mel.
+
+This patch (of 7):
+
+Add orig_pmd to struct vm_fault so the "orig_pmd" parameter used by huge
+page fault could be removed, just like its PTE counterpart does.
+
+Link: https://lkml.kernel.org/r/20210518200801.7413-1-shy828301@gmail.com
+Link: https://lkml.kernel.org/r/20210518200801.7413-2-shy828301@gmail.com
+Signed-off-by: Yang Shi <shy828301@gmail.com>
+Acked-by: Mel Gorman <mgorman@suse.de>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Huang Ying <ying.huang@intel.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

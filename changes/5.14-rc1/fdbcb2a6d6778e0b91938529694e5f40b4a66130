@@ -1,0 +1,136 @@
+mm/memcg: move mod_objcg_state() to memcontrol.c
+
+Patch series "mm/memcg: Reduce kmemcache memory accounting overhead", v6.
+
+With the recent introduction of the new slab memory controller, we
+eliminate the need for having separate kmemcaches for each memory cgroup
+and reduce overall kernel memory usage.  However, we also add additional
+memory accounting overhead to each call of kmem_cache_alloc() and
+kmem_cache_free().
+
+For workloads that require a lot of kmemcache allocations and
+de-allocations, they may experience performance regression as illustrated
+in [1] and [2].
+
+A simple kernel module that performs repeated loop of 100,000,000
+kmem_cache_alloc() and kmem_cache_free() of either a small 32-byte object
+or a big 4k object at module init time with a batch size of 4 (4 kmalloc's
+followed by 4 kfree's) is used for benchmarking.  The benchmarking tool
+was run on a kernel based on linux-next-20210419.  The test was run on a
+CascadeLake server with turbo-boosting disable to reduce run-to-run
+variation.
+
+The small object test exercises mainly the object stock charging and
+vmstat update code paths.  The large object test also exercises the
+refill_obj_stock() and __memcg_kmem_charge()/__memcg_kmem_uncharge() code
+paths.
+
+With memory accounting disabled, the run time was 3.130s with both small
+object big object tests.
+
+With memory accounting enabled, both cgroup v1 and v2 showed similar
+results in the small object test.  The performance results of the large
+object test, however, differed between cgroup v1 and v2.
+
+The execution times with the application of various patches in the
+patchset were:
+
+  Applied patches   Run time   Accounting overhead   %age 1   %age 2
+  ---------------   --------   -------------------   ------   ------
+
+  Small 32-byte object:
+       None          11.634s         8.504s          100.0%   271.7%
+        1-2           9.425s         6.295s           74.0%   201.1%
+        1-3           9.708s         6.578s           77.4%   210.2%
+        1-4           8.062s         4.932s           58.0%   157.6%
+
+  Large 4k object (v2):
+       None          22.107s        18.977s          100.0%   606.3%
+        1-2          20.960s        17.830s           94.0%   569.6%
+        1-3          14.238s        11.108s           58.5%   354.9%
+        1-4          11.329s         8.199s           43.2%   261.9%
+
+  Large 4k object (v1):
+       None          36.807s        33.677s          100.0%  1075.9%
+        1-2          36.648s        33.518s           99.5%  1070.9%
+        1-3          22.345s        19.215s           57.1%   613.9%
+        1-4          18.662s        15.532s           46.1%   496.2%
+
+  N.B. %age 1 = overhead/unpatched overhead
+       %age 2 = overhead/accounting disabled time
+
+Patch 2 (vmstat data stock caching) helps in both the small object test
+and the large v2 object test. It doesn't help much in v1 big object test.
+
+Patch 3 (refill_obj_stock improvement) does help the small object test
+but offer significant performance improvement for the large object test
+(both v1 and v2).
+
+Patch 4 (eliminating irq disable/enable) helps in all test cases.
+
+To test for the extreme case, a multi-threaded kmalloc/kfree
+microbenchmark was run on the 2-socket 48-core 96-thread system with
+96 testing threads in the same memcg doing kmalloc+kfree of a 4k object
+with accounting enabled for 10s. The total number of kmalloc+kfree done
+in kilo operations per second (kops/s) were as follows:
+
+  Applied patches   v1 kops/s   v1 change   v2 kops/s   v2 change
+  ---------------   ---------   ---------   ---------   ---------
+       None           3,520        1.00X      6,242        1.00X
+        1-2           4,304        1.22X      8,478        1.36X
+        1-3           4,731        1.34X    418,142       66.99X
+        1-4           4,587        1.30X    438,838       70.30X
+
+With memory accounting disabled, the kmalloc/kfree rate was 1,481,291
+kop/s. This test shows how significant the memory accouting overhead
+can be in some extreme situations.
+
+For this multithreaded test, the improvement from patch 2 mainly
+comes from the conditional atomic xchg of objcg->nr_charged_bytes in
+mod_objcg_state(). By using an unconditional xchg, the operation rates
+were similar to the unpatched kernel.
+
+Patch 3 elminates the single highly contended cacheline of
+objcg->nr_charged_bytes for cgroup v2 leading to a huge performance
+improvement. Cgroup v1, however, still has another highly contended
+cacheline in the shared page counter &memcg->kmem. So the improvement
+is only modest.
+
+Patch 4 helps in cgroup v2, but performs worse in cgroup v1 as
+eliminating the irq_disable/irq_enable overhead seems to aggravate the
+cacheline contention.
+
+[1] https://lore.kernel.org/linux-mm/20210408193948.vfktg3azh2wrt56t@gabell/T/#u
+[2] https://lore.kernel.org/lkml/20210114025151.GA22932@xsang-OptiPlex-9020/
+
+This patch (of 4):
+
+mod_objcg_state() is moved from mm/slab.h to mm/memcontrol.c so that
+further optimization can be done to it in later patches without exposing
+unnecessary details to other mm components.
+
+Link: https://lkml.kernel.org/r/20210506150007.16288-1-longman@redhat.com
+Link: https://lkml.kernel.org/r/20210506150007.16288-2-longman@redhat.com
+Signed-off-by: Waiman Long <longman@redhat.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Acked-by: Roman Gushchin <guro@fb.com>
+Cc: Alex Shi <alex.shi@linux.alibaba.com>
+Cc: Chris Down <chris@chrisdown.name>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Masayoshi Mizuma <msys.mizuma@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Xing Zhengjun <zhengjun.xing@linux.intel.com>
+Cc: Yafang Shao <laoar.shao@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

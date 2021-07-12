@@ -1,0 +1,97 @@
+xfs: Fix CIL throttle hang when CIL space used going backwards
+
+A hang with tasks stuck on the CIL hard throttle was reported and
+largely diagnosed by Donald Buczek, who discovered that it was a
+result of the CIL context space usage decrementing in committed
+transactions once the hard throttle limit had been hit and processes
+were already blocked.  This resulted in the CIL push not waking up
+those waiters because the CIL context was no longer over the hard
+throttle limit.
+
+The surprising aspect of this was the CIL space usage going
+backwards regularly enough to trigger this situation. Assumptions
+had been made in design that the relogging process would only
+increase the size of the objects in the CIL, and so that space would
+only increase.
+
+This change and commit message fixes the issue and documents the
+result of an audit of the triggers that can cause the CIL space to
+go backwards, how large the backwards steps tend to be, the
+frequency in which they occur, and what the impact on the CIL
+accounting code is.
+
+Even though the CIL ctx->space_used can go backwards, it will only
+do so if the log item is already logged to the CIL and contains a
+space reservation for it's entire logged state. This is tracked by
+the shadow buffer state on the log item. If the item is not
+previously logged in the CIL it has no shadow buffer nor log vector,
+and hence the entire size of the logged item copied to the log
+vector is accounted to the CIL space usage. i.e.  it will always go
+up in this case.
+
+If the item has a log vector (i.e. already in the CIL) and the size
+decreases, then the existing log vector will be overwritten and the
+space usage will go down. This is the only condition where the space
+usage reduces, and it can only occur when an item is already tracked
+in the CIL. Hence we are safe from CIL space usage underruns as a
+result of log items decreasing in size when they are relogged.
+
+Typically this reduction in CIL usage occurs from metadata blocks
+being free, such as when a btree block merge occurs or a directory
+enter/xattr entry is removed and the da-tree is reduced in size.
+This generally results in a reduction in size of around a single
+block in the CIL, but also tends to increase the number of log
+vectors because the parent and sibling nodes in the tree needs to be
+updated when a btree block is removed. If a multi-level merge
+occurs, then we see reduction in size of 2+ blocks, but again the
+log vector count goes up.
+
+The other vector is inode fork size changes, which only log the
+current size of the fork and ignore the previously logged size when
+the fork is relogged. Hence if we are removing items from the inode
+fork (dir/xattr removal in shortform, extent record removal in
+extent form, etc) the relogged size of the inode for can decrease.
+
+No other log items can decrease in size either because they are a
+fixed size (e.g. dquots) or they cannot be relogged (e.g. relogging
+an intent actually creates a new intent log item and doesn't relog
+the old item at all.) Hence the only two vectors for CIL context
+size reduction are relogging inode forks and marking buffers active
+in the CIL as stale.
+
+Long story short: the majority of the code does the right thing and
+handles the reduction in log item size correctly, and only the CIL
+hard throttle implementation is problematic and needs fixing. This
+patch makes that fix, as well as adds comments in the log item code
+that result in items shrinking in size when they are relogged as a
+clear reminder that this can and does happen frequently.
+
+The throttle fix is based upon the change Donald proposed, though it
+goes further to ensure that once the throttle is activated, it
+captures all tasks until the CIL push issues a wakeup, regardless of
+whether the CIL space used has gone back under the throttle
+threshold.
+
+This ensures that we prevent tasks reducing the CIL slightly under
+the throttle threshold and then making more changes that push it
+well over the throttle limit. This is acheived by checking if the
+throttle wait queue is already active as a condition of throttling.
+Hence once we start throttling, we continue to apply the throttle
+until the CIL context push wakes everything on the wait queue.
+
+We can use waitqueue_active() for the waitqueue manipulations and
+checks as they are all done under the ctx->xc_push_lock. Hence the
+waitqueue has external serialisation and we can safely peek inside
+the wait queue without holding the internal waitqueue locks.
+
+Many thanks to Donald for his diagnostic and analysis work to
+isolate the cause of this hang.
+
+Reported-and-tested-by: Donald Buczek <buczek@molgen.mpg.de>
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Chandan Babu R <chandanrlinux@gmail.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+

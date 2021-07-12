@@ -1,0 +1,82 @@
+net: dsa: sja1105: send multiple spi_messages instead of using cs_change
+
+The sja1105 driver has been described by Mark Brown as "not using the
+[ SPI ] API at all idiomatically" due to the use of cs_change:
+https://patchwork.kernel.org/project/netdevbpf/patch/20210520135031.2969183-1-olteanv@gmail.com/
+
+According to include/linux/spi/spi.h, the chip select is supposed to be
+asserted for the entire length of a SPI message, as long as cs_change is
+false for all member transfers. The cs_change flag changes the following:
+
+(i) When a non-final SPI transfer has cs_change = true, the chip select
+    should temporarily deassert and then reassert starting with the next
+    transfer.
+(ii) When a final SPI transfer has cs_change = true, the chip select
+     should remain asserted until the following SPI message.
+
+The sja1105 driver only uses cs_change for its first property, to form a
+single SPI message whose layout can be seen below:
+
+                                             this is an entire, single spi_message
+           _______________________________________________________________________________________________
+          /                                                                                               \
+          +-------------+---------------+-------------+---------------+ ... +-------------+---------------+
+          | hdr_xfer[0] | chunk_xfer[0] | hdr_xfer[1] | chunk_xfer[1] |     | hdr_xfer[n] | chunk_xfer[n] |
+          +-------------+---------------+-------------+---------------+ ... +-------------+---------------+
+cs_change      false          true           false           true                false          false
+
+           ____________________________  _____________________________       _____________________________
+CS line __/                            \/                             \ ... /                             \__
+
+The fact of the matter is that spi_max_message_size() has an ambiguous
+meaning if any non-final transfer has cs_change = true.
+
+If the SPI master has a limitation in that it cannot keep the chip
+select asserted for more than, say, 200 bytes (like the spi-sc18is602),
+the normal thing for it to do is to implement .max_transfer_size and
+.max_message_size, and limit both to 200: in the "worst case" where
+cs_change is always false, then the controller can, indeed, not send
+messages larger than 200 bytes.
+
+But the fact that the SPI controller's max_message_size does not
+necessarily mean that we cannot send messages larger than that.
+Notably, if the SPI master special-cases the transfers with cs_change
+and treats every chip select toggling as an entirely new transaction,
+then a SPI message can easily exceed that limit. So there is a
+temptation to ignore the controller's reported max_message_size when
+using cs_change = true in non-final transfers.
+
+But that can lead to false conclusions. As Mark points out, the SPI
+controller might have a different kind of limitation with the max
+message size, that has nothing at all to do with how long it can keep
+the chip select asserted.
+For example, that might be the case if the device is able to offload the
+chip select changes to the hardware as part of the data stream, and it
+packs the entire stream of commands+data (corresponding to a SPI
+message) into a single DMA transfer that is itself limited in size.
+
+So the only thing we can do is avoid ambiguity by not using cs_change at
+all. Instead of sending a single spi_message, we now send multiple SPI
+messages as follows:
+
+                  spi_message 0                 spi_message 1                       spi_message n
+           ____________________________   ___________________________        _____________________________
+          /                            \ /                           \      /                             \
+          +-------------+---------------+-------------+---------------+ ... +-------------+---------------+
+          | hdr_xfer[0] | chunk_xfer[0] | hdr_xfer[1] | chunk_xfer[1] |     | hdr_xfer[n] | chunk_xfer[n] |
+          +-------------+---------------+-------------+---------------+ ... +-------------+---------------+
+cs_change      false          true           false           true                false          false
+
+           ____________________________  _____________________________       _____________________________
+CS line __/                            \/                             \ ... /                             \__
+
+which is clearer because the max_message_size limit is now easier to
+enforce. What is transmitted on the wire stays, of course, the same.
+
+Additionally, because we send no more than 2 transfers at a time, we now
+avoid dynamic memory allocation too, which might be seen as an
+improvement by some.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

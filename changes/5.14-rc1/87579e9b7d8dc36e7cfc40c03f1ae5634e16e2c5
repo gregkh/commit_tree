@@ -1,0 +1,96 @@
+loop: use worker per cgroup instead of kworker
+
+Patch series "Charge loop device i/o to issuing cgroup", v14.
+
+The loop device runs all i/o to the backing file on a separate kworker
+thread which results in all i/o being charged to the root cgroup.  This
+allows a loop device to be used to trivially bypass resource limits and
+other policy.  This patch series fixes this gap in accounting.
+
+A simple script to demonstrate this behavior on cgroupv2 machine:
+
+'''
+#!/bin/bash
+set -e
+
+CGROUP=/sys/fs/cgroup/test.slice
+LOOP_DEV=/dev/loop0
+
+if [[ ! -d $CGROUP ]]
+then
+    sudo mkdir $CGROUP
+fi
+
+grep oom_kill $CGROUP/memory.events
+
+# Set a memory limit, write more than that limit to tmpfs -> OOM kill
+sudo unshare -m bash -c "
+echo \$\$ > $CGROUP/cgroup.procs;
+echo 0 > $CGROUP/memory.swap.max;
+echo 64M > $CGROUP/memory.max;
+mount -t tmpfs -o size=512m tmpfs /tmp;
+dd if=/dev/zero of=/tmp/file bs=1M count=256" || true
+
+grep oom_kill $CGROUP/memory.events
+
+# Set a memory limit, write more than that limit through loopback
+# device -> no OOM kill
+sudo unshare -m bash -c "
+echo \$\$ > $CGROUP/cgroup.procs;
+echo 0 > $CGROUP/memory.swap.max;
+echo 64M > $CGROUP/memory.max;
+mount -t tmpfs -o size=512m tmpfs /tmp;
+truncate -s 512m /tmp/backing_file
+losetup $LOOP_DEV /tmp/backing_file
+dd if=/dev/zero of=$LOOP_DEV bs=1M count=256;
+losetup -D $LOOP_DEV" || true
+
+grep oom_kill $CGROUP/memory.events
+'''
+
+Naively charging cgroups could result in priority inversions through the
+single kworker thread in the case where multiple cgroups are
+reading/writing to the same loop device.  This patch series does some
+minor modification to the loop driver so that each cgroup can make forward
+progress independently to avoid this inversion.
+
+With this patch series applied, the above script triggers OOM kills when
+writing through the loop device as expected.
+
+This patch (of 3):
+
+Existing uses of loop device may have multiple cgroups reading/writing to
+the same device.  Simply charging resources for I/O to the backing file
+could result in priority inversion where one cgroup gets synchronously
+blocked, holding up all other I/O to the loop device.
+
+In order to avoid this priority inversion, we use a single workqueue where
+each work item is a "struct loop_worker" which contains a queue of struct
+loop_cmds to issue.  The loop device maintains a tree mapping blk css_id
+-> loop_worker.  This allows each cgroup to independently make forward
+progress issuing I/O to the backing file.
+
+There is also a single queue for I/O associated with the rootcg which can
+be used in cases of extreme memory shortage where we cannot allocate a
+loop_worker.
+
+The locking for the tree and queues is fairly heavy handed - we acquire a
+per-loop-device spinlock any time either is accessed.  The existing
+implementation serializes all I/O through a single thread anyways, so I
+don't believe this is any worse.
+
+[colin.king@canonical.com: fixes]
+
+Link: https://lkml.kernel.org/r/20210610173944.1203706-1-schatzberg.dan@gmail.com
+Link: https://lkml.kernel.org/r/20210610173944.1203706-2-schatzberg.dan@gmail.com
+Signed-off-by: Dan Schatzberg <schatzberg.dan@gmail.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Acked-by: Jens Axboe <axboe@kernel.dk>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Chris Down <chris@chrisdown.name>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

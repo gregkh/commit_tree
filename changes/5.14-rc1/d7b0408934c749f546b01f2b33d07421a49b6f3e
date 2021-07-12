@@ -1,0 +1,50 @@
+xfrm: policy: Read seqcount outside of rcu-read side in xfrm_policy_lookup_bytype
+
+xfrm_policy_lookup_bytype loops on seqcount mutex xfrm_policy_hash_generation
+within an RCU read side critical section. Although ill advised, this is fine if
+the loop is bounded.
+
+xfrm_policy_hash_generation wraps mutex hash_resize_mutex, which is used to
+serialize writers (xfrm_hash_resize, xfrm_hash_rebuild). This is fine too.
+
+On PREEMPT_RT=y, the read_seqcount_begin call within xfrm_policy_lookup_bytype
+emits a mutex lock/unlock for hash_resize_mutex. Mutex locking is fine, since
+RCU read side critical sections are allowed to sleep with PREEMPT_RT.
+
+xfrm_hash_resize can, however, block on synchronize_rcu while holding
+hash_resize_mutex.
+
+This leads to the following situation on PREEMPT_RT, where the writer is
+blocked on RCU grace period expiry, while the reader is blocked on a lock held
+by the writer:
+
+Thead 1 (xfrm_hash_resize)	Thread 2 (xfrm_policy_lookup_bytype)
+
+				rcu_read_lock();
+mutex_lock(&hash_resize_mutex);
+				read_seqcount_begin(&xfrm_policy_hash_generation);
+				mutex_lock(&hash_resize_mutex); // block
+xfrm_bydst_resize();
+synchronize_rcu(); // block
+		<RCU stalls in xfrm_policy_lookup_bytype>
+
+Move the read_seqcount_begin call outside of the RCU read side critical section,
+and do an rcu_read_unlock/retry if we got stale data within the critical section.
+
+On non-PREEMPT_RT, this shortens the time spent within RCU read side critical
+section in case the seqcount needs a retry, and avoids unbounded looping.
+
+Fixes: 77cc278f7b20 ("xfrm: policy: Use sequence counters with associated lock")
+Signed-off-by: Varad Gautam <varad.gautam@suse.com>
+Cc: linux-rt-users <linux-rt-users@vger.kernel.org>
+Cc: netdev@vger.kernel.org
+Cc: stable@vger.kernel.org # v4.9
+Cc: Steffen Klassert <steffen.klassert@secunet.com>
+Cc: Herbert Xu <herbert@gondor.apana.org.au>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: Jakub Kicinski <kuba@kernel.org>
+Cc: Florian Westphal <fw@strlen.de>
+Cc: "Ahmed S. Darwish" <a.darwish@linutronix.de>
+Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+Acked-by: Ahmed S. Darwish <a.darwish@linutronix.de>
+

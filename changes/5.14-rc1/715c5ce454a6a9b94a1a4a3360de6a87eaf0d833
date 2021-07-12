@@ -1,0 +1,220 @@
+libbpf: Add low level TC-BPF management API
+
+This adds functions that wrap the netlink API used for adding, manipulating,
+and removing traffic control filters.
+
+The API summary:
+
+A bpf_tc_hook represents a location where a TC-BPF filter can be attached.
+This means that creating a hook leads to creation of the backing qdisc,
+while destruction either removes all filters attached to a hook, or destroys
+qdisc if requested explicitly (as discussed below).
+
+The TC-BPF API functions operate on this bpf_tc_hook to attach, replace,
+query, and detach tc filters. All functions return 0 on success, and a
+negative error code on failure.
+
+bpf_tc_hook_create - Create a hook
+Parameters:
+	@hook - Cannot be NULL, ifindex > 0, attach_point must be set to
+		proper enum constant. Note that parent must be unset when
+		attach_point is one of BPF_TC_INGRESS or BPF_TC_EGRESS. Note
+		that as an exception BPF_TC_INGRESS|BPF_TC_EGRESS is also a
+		valid value for attach_point.
+
+		Returns -EOPNOTSUPP when hook has attach_point as BPF_TC_CUSTOM.
+
+bpf_tc_hook_destroy - Destroy a hook
+Parameters:
+	@hook - Cannot be NULL. The behaviour depends on value of
+		attach_point. If BPF_TC_INGRESS, all filters attached to
+		the ingress hook will be detached. If BPF_TC_EGRESS, all
+		filters attached to the egress hook will be detached. If
+		BPF_TC_INGRESS|BPF_TC_EGRESS, the clsact qdisc will be
+		deleted, also detaching all filters. As before, parent must
+		be unset for these attach_points, and set for BPF_TC_CUSTOM.
+
+		It is advised that if the qdisc is operated on by many programs,
+		then the program at least check that there are no other existing
+		filters before deleting the clsact qdisc. An example is shown
+		below:
+
+		DECLARE_LIBBPF_OPTS(bpf_tc_hook, .ifindex = if_nametoindex("lo"),
+				    .attach_point = BPF_TC_INGRESS);
+		/* set opts as NULL, as we're not really interested in
+		 * getting any info for a particular filter, but just
+	 	 * detecting its presence.
+		 */
+		r = bpf_tc_query(&hook, NULL);
+		if (r == -ENOENT) {
+			/* no filters */
+			hook.attach_point = BPF_TC_INGRESS|BPF_TC_EGREESS;
+			return bpf_tc_hook_destroy(&hook);
+		} else {
+			/* failed or r == 0, the latter means filters do exist */
+			return r;
+		}
+
+		Note that there is a small race between checking for no
+		filters and deleting the qdisc. This is currently unavoidable.
+
+		Returns -EOPNOTSUPP when hook has attach_point as BPF_TC_CUSTOM.
+
+bpf_tc_attach - Attach a filter to a hook
+Parameters:
+	@hook - Cannot be NULL. Represents the hook the filter will be
+		attached to. Requirements for ifindex and attach_point are
+		same as described in bpf_tc_hook_create, but BPF_TC_CUSTOM
+		is also supported.  In that case, parent must be set to the
+		handle where the filter will be attached (using BPF_TC_PARENT).
+		E.g. to set parent to 1:16 like in tc command line, the
+		equivalent would be BPF_TC_PARENT(1, 16).
+
+	@opts - Cannot be NULL. The following opts are optional:
+		* handle   - The handle of the filter
+		* priority - The priority of the filter
+			     Must be >= 0 and <= UINT16_MAX
+		Note that when left unset, they will be auto-allocated by
+		the kernel. The following opts must be set:
+		* prog_fd - The fd of the loaded SCHED_CLS prog
+		The following opts must be unset:
+		* prog_id - The ID of the BPF prog
+		The following opts are optional:
+		* flags - Currently only BPF_TC_F_REPLACE is allowed. It
+			  allows replacing an existing filter instead of
+			  failing with -EEXIST.
+		The following opts will be filled by bpf_tc_attach on a
+		successful attach operation if they are unset:
+		* handle   - The handle of the attached filter
+		* priority - The priority of the attached filter
+		* prog_id  - The ID of the attached SCHED_CLS prog
+		This way, the user can know what the auto allocated values
+		for optional opts like handle and priority are for the newly
+		attached filter, if they were unset.
+
+		Note that some other attributes are set to fixed default
+		values listed below (this holds for all bpf_tc_* APIs):
+		protocol as ETH_P_ALL, direct action mode, chain index of 0,
+		and class ID of 0 (this can be set by writing to the
+		skb->tc_classid field from the BPF program).
+
+bpf_tc_detach
+Parameters:
+	@hook - Cannot be NULL. Represents the hook the filter will be
+		detached from. Requirements are same as described above
+		in bpf_tc_attach.
+
+	@opts - Cannot be NULL. The following opts must be set:
+		* handle, priority
+		The following opts must be unset:
+		* prog_fd, prog_id, flags
+
+bpf_tc_query
+Parameters:
+	@hook - Cannot be NULL. Represents the hook where the filter lookup will
+		be performed. Requirements are same as described above in
+		bpf_tc_attach().
+
+	@opts - Cannot be NULL. The following opts must be set:
+		* handle, priority
+		The following opts must be unset:
+		* prog_fd, prog_id, flags
+		The following fields will be filled by bpf_tc_query upon a
+		successful lookup:
+		* prog_id
+
+Some usage examples (using BPF skeleton infrastructure):
+
+BPF program (test_tc_bpf.c):
+
+	#include <linux/bpf.h>
+	#include <bpf/bpf_helpers.h>
+
+	SEC("classifier")
+	int cls(struct __sk_buff *skb)
+	{
+		return 0;
+	}
+
+Userspace loader:
+
+	struct test_tc_bpf *skel = NULL;
+	int fd, r;
+
+	skel = test_tc_bpf__open_and_load();
+	if (!skel)
+		return -ENOMEM;
+
+	fd = bpf_program__fd(skel->progs.cls);
+
+	DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex =
+			    if_nametoindex("lo"), .attach_point =
+			    BPF_TC_INGRESS);
+	/* Create clsact qdisc */
+	r = bpf_tc_hook_create(&hook);
+	if (r < 0)
+		goto end;
+
+	DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts, .prog_fd = fd);
+	r = bpf_tc_attach(&hook, &opts);
+	if (r < 0)
+		goto end;
+	/* Print the auto allocated handle and priority */
+	printf("Handle=%u", opts.handle);
+	printf("Priority=%u", opts.priority);
+
+	opts.prog_fd = opts.prog_id = 0;
+	bpf_tc_detach(&hook, &opts);
+end:
+	test_tc_bpf__destroy(skel);
+
+This is equivalent to doing the following using tc command line:
+  # tc qdisc add dev lo clsact
+  # tc filter add dev lo ingress bpf obj foo.o sec classifier da
+  # tc filter del dev lo ingress handle <h> prio <p> bpf
+... where the handle and priority can be found using:
+  # tc filter show dev lo ingress
+
+Another example replacing a filter (extending prior example):
+
+	/* We can also choose both (or one), let's try replacing an
+	 * existing filter.
+	 */
+	DECLARE_LIBBPF_OPTS(bpf_tc_opts, replace_opts, .handle =
+			    opts.handle, .priority = opts.priority,
+			    .prog_fd = fd);
+	r = bpf_tc_attach(&hook, &replace_opts);
+	if (r == -EEXIST) {
+		/* Expected, now use BPF_TC_F_REPLACE to replace it */
+		replace_opts.flags = BPF_TC_F_REPLACE;
+		return bpf_tc_attach(&hook, &replace_opts);
+	} else if (r < 0) {
+		return r;
+	}
+	/* There must be no existing filter with these
+	 * attributes, so cleanup and return an error.
+	 */
+	replace_opts.prog_fd = replace_opts.prog_id = 0;
+	bpf_tc_detach(&hook, &replace_opts);
+	return -1;
+
+To obtain info of a particular filter:
+
+	/* Find info for filter with handle 1 and priority 50 */
+	DECLARE_LIBBPF_OPTS(bpf_tc_opts, info_opts, .handle = 1,
+			    .priority = 50);
+	r = bpf_tc_query(&hook, &info_opts);
+	if (r == -ENOENT)
+		printf("Filter not found");
+	else if (r < 0)
+		return r;
+	printf("Prog ID: %u", info_opts.prog_id);
+	return 0;
+
+Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Co-developed-by: Daniel Borkmann <daniel@iogearbox.net> # libbpf API design
+[ Daniel: also did major patch cleanup ]
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Reviewed-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/20210512103451.989420-3-memxor@gmail.com
+

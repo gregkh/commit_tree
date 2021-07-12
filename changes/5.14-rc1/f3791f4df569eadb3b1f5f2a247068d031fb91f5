@@ -1,0 +1,91 @@
+Fix UCOUNT_RLIMIT_SIGPENDING counter leak
+
+We must properly handle an errors when we increase the rlimit counter
+and the ucounts reference counter. We have to this with RCU protection
+to prevent possible use-after-free that could occur due to concurrent
+put_cred_rcu().
+
+The following reproducer triggers the problem:
+
+  $ cat testcase.sh
+  case "${STEP:-0}" in
+  0)
+	ulimit -Si 1
+	ulimit -Hi 1
+	STEP=1 unshare -rU "$0"
+	killall sleep
+	;;
+  1)
+	for i in 1 2 3 4 5; do unshare -rU sleep 5 & done
+	;;
+  esac
+
+with the KASAN report being along the lines of
+
+  BUG: KASAN: use-after-free in put_ucounts+0x17/0xa0
+  Write of size 4 at addr ffff8880045f031c by task swapper/2/0
+
+  CPU: 2 PID: 0 Comm: swapper/2 Not tainted 5.13.0+ #19
+  Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 1.14.0-alt4 04/01/2014
+  Call Trace:
+   <IRQ>
+   put_ucounts+0x17/0xa0
+   put_cred_rcu+0xd5/0x190
+   rcu_core+0x3bf/0xcb0
+   __do_softirq+0xe3/0x341
+   irq_exit_rcu+0xbe/0xe0
+   sysvec_apic_timer_interrupt+0x6a/0x90
+   </IRQ>
+   asm_sysvec_apic_timer_interrupt+0x12/0x20
+   default_idle_call+0x53/0x130
+   do_idle+0x311/0x3c0
+   cpu_startup_entry+0x14/0x20
+   secondary_startup_64_no_verify+0xc2/0xcb
+
+  Allocated by task 127:
+   kasan_save_stack+0x1b/0x40
+   __kasan_kmalloc+0x7c/0x90
+   alloc_ucounts+0x169/0x2b0
+   set_cred_ucounts+0xbb/0x170
+   ksys_unshare+0x24c/0x4e0
+   __x64_sys_unshare+0x16/0x20
+   do_syscall_64+0x37/0x70
+   entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+  Freed by task 0:
+   kasan_save_stack+0x1b/0x40
+   kasan_set_track+0x1c/0x30
+   kasan_set_free_info+0x20/0x30
+   __kasan_slab_free+0xeb/0x120
+   kfree+0xaa/0x460
+   put_cred_rcu+0xd5/0x190
+   rcu_core+0x3bf/0xcb0
+   __do_softirq+0xe3/0x341
+
+  The buggy address belongs to the object at ffff8880045f0300
+   which belongs to the cache kmalloc-192 of size 192
+  The buggy address is located 28 bytes inside of
+   192-byte region [ffff8880045f0300, ffff8880045f03c0)
+  The buggy address belongs to the page:
+  page:000000008de0a388 refcount:1 mapcount:0 mapping:0000000000000000 index:0xffff8880045f0000 pfn:0x45f0
+  flags: 0x100000000000200(slab|node=0|zone=1)
+  raw: 0100000000000200 ffffea00000f4640 0000000a0000000a ffff888001042a00
+  raw: ffff8880045f0000 000000008010000d 00000001ffffffff 0000000000000000
+  page dumped because: kasan: bad access detected
+
+  Memory state around the buggy address:
+   ffff8880045f0200: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+   ffff8880045f0280: fb fb fb fb fb fb fb fb fc fc fc fc fc fc fc fc
+  >ffff8880045f0300: fa fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+                              ^
+   ffff8880045f0380: fb fb fb fb fb fb fb fb fc fc fc fc fc fc fc fc
+   ffff8880045f0400: fa fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+  ==================================================================
+  Disabling lock debugging due to kernel taint
+
+Fixes: d64696905554 ("Reimplement RLIMIT_SIGPENDING on top of ucounts")
+Cc: Eric W. Biederman <ebiederm@xmission.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Alexey Gladkov <legion@kernel.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

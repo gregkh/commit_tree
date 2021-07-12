@@ -1,0 +1,67 @@
+xfs: don't wait on future iclogs when pushing the CIL
+
+The iclogbuf ring attached to the struct xlog is circular, hence the
+first and last iclogs in the ring can only be determined by
+comparing them against the log->l_iclog pointer.
+
+In xfs_cil_push_work(), we want to wait on previous iclogs that were
+issued so that we can flush them to stable storage with the commit
+record write, and it simply waits on the previous iclog in the ring.
+This, however, leads to CIL push hangs in generic/019 like so:
+
+task:kworker/u33:0   state:D stack:12680 pid:    7 ppid:     2 flags:0x00004000
+Workqueue: xfs-cil/pmem1 xlog_cil_push_work
+Call Trace:
+ __schedule+0x30b/0x9f0
+ schedule+0x68/0xe0
+ xlog_wait_on_iclog+0x121/0x190
+ ? wake_up_q+0xa0/0xa0
+ xlog_cil_push_work+0x994/0xa10
+ ? _raw_spin_lock+0x15/0x20
+ ? xfs_swap_extents+0x920/0x920
+ process_one_work+0x1ab/0x390
+ worker_thread+0x56/0x3d0
+ ? rescuer_thread+0x3c0/0x3c0
+ kthread+0x14d/0x170
+ ? __kthread_bind_mask+0x70/0x70
+ ret_from_fork+0x1f/0x30
+
+With other threads blocking in either xlog_state_get_iclog_space()
+waiting for iclog space or xlog_grant_head_wait() waiting for log
+reservation space.
+
+The problem here is that the previous iclog on the ring might
+actually be a future iclog. That is, if log->l_iclog points at
+commit_iclog, commit_iclog is the first (oldest) iclog in the ring
+and there are no previous iclogs pending as they have all completed
+their IO and been activated again. IOWs, commit_iclog->ic_prev
+points to an iclog that will be written in the future, not one that
+has been written in the past.
+
+Hence, in this case, waiting on the ->ic_prev iclog is incorrect
+behaviour, and depending on the state of the future iclog, we can
+end up with a circular ABA wait cycle and we hang.
+
+The fix is made more complex by the fact that many iclogs states
+cannot be used to determine if the iclog is a past or future iclog.
+Hence we have to determine past iclogs by checking the LSN of the
+iclog rather than their state. A past ACTIVE iclog will have a LSN
+of zero, while a future ACTIVE iclog will have a LSN greater than
+the current iclog. We don't wait on either of these cases.
+
+Similarly, a future iclog that hasn't completed IO will have an LSN
+greater than the current iclog and so we don't wait on them. A past
+iclog that is still undergoing IO completion will have a LSN less
+than the current iclog and those are the only iclogs that we need to
+wait on.
+
+Hence we can use the iclog LSN to determine what iclogs we need to
+wait on here.
+
+Fixes: 5fd9256ce156 ("xfs: separate CIL commit record IO")
+Reported-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+

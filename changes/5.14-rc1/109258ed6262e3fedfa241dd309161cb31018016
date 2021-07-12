@@ -1,0 +1,57 @@
+net: phy: nxp-c45-tja11xx: fix potential RX timestamp wraparound
+
+The reconstruction procedure for partial timestamps reads the current
+PTP time and fills in the low 2 bits of the second portion, as well as
+the nanoseconds portion, from the actual hardware packet timestamp.
+Critically, the reconstruction procedure works because it assumes that
+the current PTP time is strictly larger than the hardware timestamp was:
+it detects a 2-bit wraparound of the 'seconds' portion by checking whether
+the 'seconds' portion of the partial hardware timestamp is larger than
+the 'seconds' portion of the current time. That can only happen if the
+hardware timestamp was captured by the PHY during the last phase of a
+'modulo 4 seconds' interval, and the current PTP time was read by the
+driver during the initial phase of the next 'modulo 4 seconds' interval.
+
+The partial RX timestamps are added to priv->rx_queue in
+nxp_c45_rxtstamp() and they are processed potentially in parallel by the
+aux worker thread in nxp_c45_do_aux_work(). This means that it is
+possible for nxp_c45_do_aux_work() to process more than one RX timestamp
+during the same schedule.
+
+There is one premature optimization that will cause issues: for RX
+timestamping, the driver reads the current time only once, and it uses
+that to reconstruct all PTP RX timestamps in the queue. For the second
+and later timestamps, this will be an issue if we are processing two RX
+timestamps which are to the left and to the right, respectively, of a
+4-bit wraparound of the 'seconds' portion of the PTP time, and the
+current PTP time is also pre-wraparound.
+
+ 0.000000000        4.000000000        8.000000000        12.000000000
+ |..................|..................|..................|............>
+                 ^ ^ ^ ^                                            time
+                 | | | |
+                 | | | process hwts 1 and hwts 2
+                 | | |
+                 | | hwts 2
+                 | |
+                 | read current PTP time
+                 |
+                 hwts 1
+
+What will happen in that case is that hwts 2 (post-wraparound) will use
+a stale current PTP time that is pre-wraparound.
+But nxp_c45_reconstruct_ts will not detect this condition, because it is
+not coded up for it, so it will reconstruct hwts 2 with a current time
+from the previous 4 second interval (i.e. 0.something instead of
+4.something).
+
+This is solvable by making sure that the full 64-bit current time is
+always read after the PHY has taken the partial RX timestamp. We do this
+by reading the current PTP time for every timestamp in the RX queue.
+
+Fixes: 514def5dd339 ("phy: nxp-c45-tja11xx: add timestamping support")
+Cc: Richard Cochran <richardcochran@gmail.com>
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Reviewed-by: Russell King (Oracle) <rmk+kernel@armlinux.org.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

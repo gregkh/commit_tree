@@ -1,0 +1,192 @@
+powerpc/32s: Rework Kernel Userspace Access Protection
+
+On book3s/32, KUAP is provided by toggling Ks bit in segment registers.
+One segment register addresses 256M of virtual memory.
+
+At the time being, KUAP implements a complex logic to apply the
+unlock/lock on the exact number of segments covering the user range
+to access, with saving the boundaries of the range of segments in
+a member of thread struct.
+
+But most if not all user accesses are within a single segment.
+
+Rework KUAP with a different approach:
+- Open only one segment, the one corresponding to the starting
+address of the range to be accessed.
+- If a second segment is involved, it will generate a page fault. The
+segment will then be open by the page fault handler.
+
+The kuap member of thread struct will now contain:
+- The start address of the current on going user access, that will be
+used to know which segment to lock at the end of the user access.
+- ~0 when no user access is open
+- ~1 when additionnal segments are opened by a page fault.
+
+Then, at lock time
+- When only one segment is open, close it.
+- When several segments are open, close all user segments.
+
+Almost 100% of the time, only one segment will be involved.
+
+In interrupts, inline the function that unlock/lock all segments,
+because not inlining them implies a lot of register save/restore.
+
+With the patch, writing value 128 in userspace in perf_copy_attr() is
+done with 16 instructions:
+
+    3890:	93 82 04 dc 	stw     r28,1244(r2)
+    3894:	7d 20 e5 26 	mfsrin  r9,r28
+    3898:	55 29 00 80 	rlwinm  r9,r9,0,2,0
+    389c:	7d 20 e1 e4 	mtsrin  r9,r28
+    38a0:	4c 00 01 2c 	isync
+
+    38a4:	39 20 00 80 	li      r9,128
+    38a8:	91 3c 00 00 	stw     r9,0(r28)
+
+    38ac:	81 42 04 dc 	lwz     r10,1244(r2)
+    38b0:	39 00 ff ff 	li      r8,-1
+    38b4:	91 02 04 dc 	stw     r8,1244(r2)
+    38b8:	2c 0a ff fe 	cmpwi   r10,-2
+    38bc:	41 82 00 88 	beq     3944 <perf_copy_attr+0x36c>
+    38c0:	7d 20 55 26 	mfsrin  r9,r10
+    38c4:	65 29 40 00 	oris    r9,r9,16384
+    38c8:	7d 20 51 e4 	mtsrin  r9,r10
+    38cc:	4c 00 01 2c 	isync
+...
+    3944:	48 00 00 01 	bl      3944 <perf_copy_attr+0x36c>
+			3944: R_PPC_REL24	kuap_lock_all_ool
+
+Before the patch it was 118 instructions. In reality only 42 are
+executed in most cases, but GCC is not able to see that a properly
+aligned user access cannot involve more than one segment.
+
+    5060:	39 1d 00 04 	addi    r8,r29,4
+    5064:	3d 20 b0 00 	lis     r9,-20480
+    5068:	7c 08 48 40 	cmplw   r8,r9
+    506c:	40 81 00 08 	ble     5074 <perf_copy_attr+0x2cc>
+    5070:	3d 00 b0 00 	lis     r8,-20480
+    5074:	39 28 ff ff 	addi    r9,r8,-1
+    5078:	57 aa 00 06 	rlwinm  r10,r29,0,0,3
+    507c:	55 29 27 3e 	rlwinm  r9,r9,4,28,31
+    5080:	39 29 00 01 	addi    r9,r9,1
+    5084:	7d 29 53 78 	or      r9,r9,r10
+    5088:	91 22 04 dc 	stw     r9,1244(r2)
+    508c:	7d 20 ed 26 	mfsrin  r9,r29
+    5090:	55 29 00 80 	rlwinm  r9,r9,0,2,0
+    5094:	7c 08 50 40 	cmplw   r8,r10
+    5098:	40 81 00 c0 	ble     5158 <perf_copy_attr+0x3b0>
+    509c:	7d 46 50 f8 	not     r6,r10
+    50a0:	7c c6 42 14 	add     r6,r6,r8
+    50a4:	54 c6 27 be 	rlwinm  r6,r6,4,30,31
+    50a8:	7d 20 51 e4 	mtsrin  r9,r10
+    50ac:	3c ea 10 00 	addis   r7,r10,4096
+    50b0:	39 29 01 11 	addi    r9,r9,273
+    50b4:	7f 88 38 40 	cmplw   cr7,r8,r7
+    50b8:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    50bc:	40 9d 00 9c 	ble     cr7,5158 <perf_copy_attr+0x3b0>
+
+    50c0:	2f 86 00 00 	cmpwi   cr7,r6,0
+    50c4:	41 9e 00 4c 	beq     cr7,5110 <perf_copy_attr+0x368>
+    50c8:	2f 86 00 01 	cmpwi   cr7,r6,1
+    50cc:	41 9e 00 2c 	beq     cr7,50f8 <perf_copy_attr+0x350>
+    50d0:	2f 86 00 02 	cmpwi   cr7,r6,2
+    50d4:	41 9e 00 14 	beq     cr7,50e8 <perf_copy_attr+0x340>
+    50d8:	7d 20 39 e4 	mtsrin  r9,r7
+    50dc:	39 29 01 11 	addi    r9,r9,273
+    50e0:	3c e7 10 00 	addis   r7,r7,4096
+    50e4:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    50e8:	7d 20 39 e4 	mtsrin  r9,r7
+    50ec:	39 29 01 11 	addi    r9,r9,273
+    50f0:	3c e7 10 00 	addis   r7,r7,4096
+    50f4:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    50f8:	7d 20 39 e4 	mtsrin  r9,r7
+    50fc:	3c e7 10 00 	addis   r7,r7,4096
+    5100:	39 29 01 11 	addi    r9,r9,273
+    5104:	7f 88 38 40 	cmplw   cr7,r8,r7
+    5108:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    510c:	40 9d 00 4c 	ble     cr7,5158 <perf_copy_attr+0x3b0>
+    5110:	7d 20 39 e4 	mtsrin  r9,r7
+    5114:	39 29 01 11 	addi    r9,r9,273
+    5118:	3c c7 10 00 	addis   r6,r7,4096
+    511c:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    5120:	7d 20 31 e4 	mtsrin  r9,r6
+    5124:	39 29 01 11 	addi    r9,r9,273
+    5128:	3c c6 10 00 	addis   r6,r6,4096
+    512c:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    5130:	7d 20 31 e4 	mtsrin  r9,r6
+    5134:	39 29 01 11 	addi    r9,r9,273
+    5138:	3c c7 30 00 	addis   r6,r7,12288
+    513c:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    5140:	7d 20 31 e4 	mtsrin  r9,r6
+    5144:	3c e7 40 00 	addis   r7,r7,16384
+    5148:	39 29 01 11 	addi    r9,r9,273
+    514c:	7f 88 38 40 	cmplw   cr7,r8,r7
+    5150:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    5154:	41 9d ff bc 	bgt     cr7,5110 <perf_copy_attr+0x368>
+
+    5158:	4c 00 01 2c 	isync
+    515c:	39 20 00 80 	li      r9,128
+    5160:	91 3d 00 00 	stw     r9,0(r29)
+
+    5164:	38 e0 00 00 	li      r7,0
+    5168:	90 e2 04 dc 	stw     r7,1244(r2)
+    516c:	7d 20 ed 26 	mfsrin  r9,r29
+    5170:	65 29 40 00 	oris    r9,r9,16384
+    5174:	40 81 00 c0 	ble     5234 <perf_copy_attr+0x48c>
+    5178:	7d 47 50 f8 	not     r7,r10
+    517c:	7c e7 42 14 	add     r7,r7,r8
+    5180:	54 e7 27 be 	rlwinm  r7,r7,4,30,31
+    5184:	7d 20 51 e4 	mtsrin  r9,r10
+    5188:	3d 4a 10 00 	addis   r10,r10,4096
+    518c:	39 29 01 11 	addi    r9,r9,273
+    5190:	7c 08 50 40 	cmplw   r8,r10
+    5194:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    5198:	40 81 00 9c 	ble     5234 <perf_copy_attr+0x48c>
+
+    519c:	2c 07 00 00 	cmpwi   r7,0
+    51a0:	41 82 00 4c 	beq     51ec <perf_copy_attr+0x444>
+    51a4:	2c 07 00 01 	cmpwi   r7,1
+    51a8:	41 82 00 2c 	beq     51d4 <perf_copy_attr+0x42c>
+    51ac:	2c 07 00 02 	cmpwi   r7,2
+    51b0:	41 82 00 14 	beq     51c4 <perf_copy_attr+0x41c>
+    51b4:	7d 20 51 e4 	mtsrin  r9,r10
+    51b8:	39 29 01 11 	addi    r9,r9,273
+    51bc:	3d 4a 10 00 	addis   r10,r10,4096
+    51c0:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    51c4:	7d 20 51 e4 	mtsrin  r9,r10
+    51c8:	39 29 01 11 	addi    r9,r9,273
+    51cc:	3d 4a 10 00 	addis   r10,r10,4096
+    51d0:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    51d4:	7d 20 51 e4 	mtsrin  r9,r10
+    51d8:	3d 4a 10 00 	addis   r10,r10,4096
+    51dc:	39 29 01 11 	addi    r9,r9,273
+    51e0:	7c 08 50 40 	cmplw   r8,r10
+    51e4:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    51e8:	40 81 00 4c 	ble     5234 <perf_copy_attr+0x48c>
+    51ec:	7d 20 51 e4 	mtsrin  r9,r10
+    51f0:	39 29 01 11 	addi    r9,r9,273
+    51f4:	3c ea 10 00 	addis   r7,r10,4096
+    51f8:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    51fc:	7d 20 39 e4 	mtsrin  r9,r7
+    5200:	39 29 01 11 	addi    r9,r9,273
+    5204:	3c e7 10 00 	addis   r7,r7,4096
+    5208:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    520c:	7d 20 39 e4 	mtsrin  r9,r7
+    5210:	39 29 01 11 	addi    r9,r9,273
+    5214:	3c ea 30 00 	addis   r7,r10,12288
+    5218:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    521c:	7d 20 39 e4 	mtsrin  r9,r7
+    5220:	3d 4a 40 00 	addis   r10,r10,16384
+    5224:	39 29 01 11 	addi    r9,r9,273
+    5228:	7c 08 50 40 	cmplw   r8,r10
+    522c:	55 29 02 06 	rlwinm  r9,r9,0,8,3
+    5230:	41 81 ff bc 	bgt     51ec <perf_copy_attr+0x444>
+
+    5234:	4c 00 01 2c 	isync
+
+Signed-off-by: Christophe Leroy <christophe.leroy@csgroup.eu>
+[mpe: Export the ool handlers to fix build errors]
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/d9121f96a7c4302946839a0771f5d1daeeb6968c.1622708530.git.christophe.leroy@csgroup.eu
+
+
