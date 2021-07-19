@@ -1,0 +1,81 @@
+KVM: nSVM: Fix L1 state corruption upon return from SMM
+
+VMCB split commit 4995a3685f1b ("KVM: SVM: Use a separate vmcb for the
+nested L2 guest") broke return from SMM when we entered there from guest
+(L2) mode. Gen2 WS2016/Hyper-V is known to do this on boot. The problem
+manifests itself like this:
+
+  kvm_exit:             reason EXIT_RSM rip 0x7ffbb280 info 0 0
+  kvm_emulate_insn:     0:7ffbb280: 0f aa
+  kvm_smm_transition:   vcpu 0: leaving SMM, smbase 0x7ffb3000
+  kvm_nested_vmrun:     rip: 0x000000007ffbb280 vmcb: 0x0000000008224000
+    nrip: 0xffffffffffbbe119 int_ctl: 0x01020000 event_inj: 0x00000000
+    npt: on
+  kvm_nested_intercepts: cr_read: 0000 cr_write: 0010 excp: 40060002
+    intercepts: fd44bfeb 0000217f 00000000
+  kvm_entry:            vcpu 0, rip 0xffffffffffbbe119
+  kvm_exit:             reason EXIT_NPF rip 0xffffffffffbbe119 info
+    200000006 1ab000
+  kvm_nested_vmexit:    vcpu 0 reason npf rip 0xffffffffffbbe119 info1
+    0x0000000200000006 info2 0x00000000001ab000 intr_info 0x00000000
+    error_code 0x00000000
+  kvm_page_fault:       address 1ab000 error_code 6
+  kvm_nested_vmexit_inject: reason EXIT_NPF info1 200000006 info2 1ab000
+    int_info 0 int_info_err 0
+  kvm_entry:            vcpu 0, rip 0x7ffbb280
+  kvm_exit:             reason EXIT_EXCP_GP rip 0x7ffbb280 info 0 0
+  kvm_emulate_insn:     0:7ffbb280: 0f aa
+  kvm_inj_exception:    #GP (0x0)
+
+Note: return to L2 succeeded but upon first exit to L1 its RIP points to
+'RSM' instruction but we're not in SMM.
+
+The problem appears to be that VMCB01 gets irreversibly destroyed during
+SMM execution. Previously, we used to have 'hsave' VMCB where regular
+(pre-SMM) L1's state was saved upon nested_svm_vmexit() but now we just
+switch to VMCB01 from VMCB02.
+
+Pre-split (working) flow looked like:
+- SMM is triggered during L2's execution
+- L2's state is pushed to SMRAM
+- nested_svm_vmexit() restores L1's state from 'hsave'
+- SMM -> RSM
+- enter_svm_guest_mode() switches to L2 but keeps 'hsave' intact so we have
+  pre-SMM (and pre L2 VMRUN) L1's state there
+- L2's state is restored from SMRAM
+- upon first exit L1's state is restored from L1.
+
+This was always broken with regards to svm_get_nested_state()/
+svm_set_nested_state(): 'hsave' was never a part of what's being
+save and restored so migration happening during SMM triggered from L2 would
+never restore L1's state correctly.
+
+Post-split flow (broken) looks like:
+- SMM is triggered during L2's execution
+- L2's state is pushed to SMRAM
+- nested_svm_vmexit() switches to VMCB01 from VMCB02
+- SMM -> RSM
+- enter_svm_guest_mode() switches from VMCB01 to VMCB02 but pre-SMM VMCB01
+  is already lost.
+- L2's state is restored from SMRAM
+- upon first exit L1's state is restored from VMCB01 but it is corrupted
+ (reflects the state during 'RSM' execution).
+
+VMX doesn't have this problem because unlike VMCB, VMCS keeps both guest
+and host state so when we switch back to VMCS02 L1's state is intact there.
+
+To resolve the issue we need to save L1's state somewhere. We could've
+created a third VMCB for SMM but that would require us to modify saved
+state format. L1's architectural HSAVE area (pointed by MSR_VM_HSAVE_PA)
+seems appropriate: L0 is free to save any (or none) of L1's state there.
+Currently, KVM does 'none'.
+
+Note, for nested state migration to succeed, both source and destination
+hypervisors must have the fix. We, however, don't need to create a new
+flag indicating the fact that HSAVE area is now populated as migration
+during SMM triggered from L2 was always broken.
+
+Fixes: 4995a3685f1b ("KVM: SVM: Use a separate vmcb for the nested L2 guest")
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+

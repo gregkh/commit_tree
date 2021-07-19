@@ -1,0 +1,66 @@
+nvme-pci: fix multiple races in nvme_setup_io_queues
+
+Below two paths could overlap each other if we power off a drive quickly
+after powering it on. There are multiple races in nvme_setup_io_queues()
+because of shutdown_lock missing and improper use of NVMEQ_ENABLED bit.
+
+nvme_reset_work()                                nvme_remove()
+  nvme_setup_io_queues()                           nvme_dev_disable()
+  ...                                              ...
+A1  clear NVMEQ_ENABLED bit for admin queue          lock
+    retry:                                       B1  nvme_suspend_io_queues()
+A2    pci_free_irq() admin queue                 B2  nvme_suspend_queue() admin queue
+A3    pci_free_irq_vectors()                         nvme_pci_disable()
+A4    nvme_setup_irqs();                         B3    pci_free_irq_vectors()
+      ...                                            unlock
+A5    queue_request_irq() for admin queue
+      set NVMEQ_ENABLED bit
+      ...
+      nvme_create_io_queues()
+A6      result = queue_request_irq();
+        set NVMEQ_ENABLED bit
+      ...
+      fail to allocate enough IO queues:
+A7      nvme_suspend_io_queues()
+        goto retry
+
+If B3 runs in between A1 and A2, it will crash if irqaction haven't
+been freed by A2. B2 is supposed to free admin queue IRQ but it simply
+can't fulfill the job as A1 has cleared NVMEQ_ENABLED bit.
+
+Fix: combine A1 A2 so IRQ get freed as soon as the NVMEQ_ENABLED bit
+gets cleared.
+
+After solved #1, A2 could race with B3 if A2 is freeing IRQ while B3
+is checking irqaction. A3 also could race with B2 if B2 is freeing
+IRQ while A3 is checking irqaction.
+
+Fix: A2 and A3 take lock for mutual exclusion.
+
+A3 could race with B3 since they could run free_msi_irqs() in parallel.
+
+Fix: A3 takes lock for mutual exclusion.
+
+A4 could fail to allocate all needed IRQ vectors if A3 and A4 are
+interrupted by B3.
+
+Fix: A4 takes lock for mutual exclusion.
+
+If A5/A6 happened after B2/B1, B3 will crash since irqaction is not NULL.
+They are just allocated by A5/A6.
+
+Fix: Lock queue_request_irq() and setting of NVMEQ_ENABLED bit.
+
+A7 could get chance to pci_free_irq() for certain IO queue while B3 is
+checking irqaction.
+
+Fix: A7 takes lock.
+
+nvme_dev->online_queues need to be protected by shutdown_lock. Since it
+is not atomic, both paths could modify it using its own copy.
+
+Co-developed-by: Yuanyuan Zhong <yzhong@purestorage.com>
+Signed-off-by: Casey Chen <cachen@purestorage.com>
+Reviewed-by: Keith Busch <kbusch@kernel.org>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+

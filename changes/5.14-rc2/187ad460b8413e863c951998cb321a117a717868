@@ -1,0 +1,72 @@
+mm/page_alloc: avoid page allocator recursion with pagesets.lock held
+
+Syzbot is reporting potential deadlocks due to pagesets.lock when
+PAGE_OWNER is enabled.  One example from Desmond Cheong Zhi Xi is as
+follows
+
+  __alloc_pages_bulk()
+    local_lock_irqsave(&pagesets.lock, flags) <---- outer lock here
+    prep_new_page():
+      post_alloc_hook():
+        set_page_owner():
+          __set_page_owner():
+            save_stack():
+              stack_depot_save():
+                alloc_pages():
+                  alloc_page_interleave():
+                    __alloc_pages():
+                      get_page_from_freelist():
+                        rm_queue():
+                          rm_queue_pcplist():
+                            local_lock_irqsave(&pagesets.lock, flags);
+                            *** DEADLOCK ***
+
+Zhang, Qiang also reported
+
+  BUG: sleeping function called from invalid context at mm/page_alloc.c:5179
+  in_atomic(): 0, irqs_disabled(): 1, non_block: 0, pid: 1, name: swapper/0
+  .....
+  __dump_stack lib/dump_stack.c:79 [inline]
+  dump_stack_lvl+0xcd/0x134 lib/dump_stack.c:96
+  ___might_sleep.cold+0x1f1/0x237 kernel/sched/core.c:9153
+  prepare_alloc_pages+0x3da/0x580 mm/page_alloc.c:5179
+  __alloc_pages+0x12f/0x500 mm/page_alloc.c:5375
+  alloc_page_interleave+0x1e/0x200 mm/mempolicy.c:2147
+  alloc_pages+0x238/0x2a0 mm/mempolicy.c:2270
+  stack_depot_save+0x39d/0x4e0 lib/stackdepot.c:303
+  save_stack+0x15e/0x1e0 mm/page_owner.c:120
+  __set_page_owner+0x50/0x290 mm/page_owner.c:181
+  prep_new_page mm/page_alloc.c:2445 [inline]
+  __alloc_pages_bulk+0x8b9/0x1870 mm/page_alloc.c:5313
+  alloc_pages_bulk_array_node include/linux/gfp.h:557 [inline]
+  vm_area_alloc_pages mm/vmalloc.c:2775 [inline]
+  __vmalloc_area_node mm/vmalloc.c:2845 [inline]
+  __vmalloc_node_range+0x39d/0x960 mm/vmalloc.c:2947
+  __vmalloc_node mm/vmalloc.c:2996 [inline]
+  vzalloc+0x67/0x80 mm/vmalloc.c:3066
+
+There are a number of ways it could be fixed.  The page owner code could
+be audited to strip GFP flags that allow sleeping but it'll impair the
+functionality of PAGE_OWNER if allocations fail.  The bulk allocator could
+add a special case to release/reacquire the lock for prep_new_page and
+lookup PCP after the lock is reacquired at the cost of performance.  The
+pages requiring prep could be tracked using the least significant bit and
+looping through the array although it is more complicated for the list
+interface.  The options are relatively complex and the second one still
+incurs a performance penalty when PAGE_OWNER is active so this patch takes
+the simple approach -- disable bulk allocation of PAGE_OWNER is active.
+The caller will be forced to allocate one page at a time incurring a
+performance penalty but PAGE_OWNER is already a performance penalty.
+
+Link: https://lkml.kernel.org/r/20210708081434.GV3840@techsingularity.net
+Fixes: dbbee9d5cd83 ("mm/page_alloc: convert per-cpu list protection to local_lock")
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Reported-by: Desmond Cheong Zhi Xi <desmondcheongzx@gmail.com>
+Reported-by: "Zhang, Qiang" <Qiang.Zhang@windriver.com>
+Reported-by: syzbot+127fd7828d6eeb611703@syzkaller.appspotmail.com
+Tested-by: syzbot+127fd7828d6eeb611703@syzkaller.appspotmail.com
+Acked-by: Rafael Aquini <aquini@redhat.com>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

@@ -1,0 +1,66 @@
+btrfs: fix deadlock with concurrent chunk allocations involving system chunks
+
+When a task attempting to allocate a new chunk verifies that there is not
+currently enough free space in the system space_info and there is another
+task that allocated a new system chunk but it did not finish yet the
+creation of the respective block group, it waits for that other task to
+finish creating the block group. This is to avoid exhaustion of the system
+chunk array in the superblock, which is limited, when we have a thundering
+herd of tasks allocating new chunks. This problem was described and fixed
+by commit eafa4fd0ad0607 ("btrfs: fix exhaustion of the system chunk array
+due to concurrent allocations").
+
+However there are two very similar scenarios where this can lead to a
+deadlock:
+
+1) Task B allocated a new system chunk and task A is waiting on task B
+   to finish creation of the respective system block group. However before
+   task B ends its transaction handle and finishes the creation of the
+   system block group, it attempts to allocate another chunk (like a data
+   chunk for an fallocate operation for a very large range). Task B will
+   be unable to progress and allocate the new chunk, because task A set
+   space_info->chunk_alloc to 1 and therefore it loops at
+   btrfs_chunk_alloc() waiting for task A to finish its chunk allocation
+   and set space_info->chunk_alloc to 0, but task A is waiting on task B
+   to finish creation of the new system block group, therefore resulting
+   in a deadlock;
+
+2) Task B allocated a new system chunk and task A is waiting on task B to
+   finish creation of the respective system block group. By the time that
+   task B enter the final phase of block group allocation, which happens
+   at btrfs_create_pending_block_groups(), when it modifies the extent
+   tree, the device tree or the chunk tree to insert the items for some
+   new block group, it needs to allocate a new chunk, so it ends up at
+   btrfs_chunk_alloc() and keeps looping there because task A has set
+   space_info->chunk_alloc to 1, but task A is waiting for task B to
+   finish creation of the new system block group and release the reserved
+   system space, therefore resulting in a deadlock.
+
+In short, the problem is if a task B needs to allocate a new chunk after
+it previously allocated a new system chunk and if another task A is
+currently waiting for task B to complete the allocation of the new system
+chunk.
+
+Unfortunately this deadlock scenario introduced by the previous fix for
+the system chunk array exhaustion problem does not have a simple and short
+fix, and requires a big change to rework the chunk allocation code so that
+chunk btree updates are all made in the first phase of chunk allocation.
+And since this deadlock regression is being frequently hit on zoned
+filesystems and the system chunk array exhaustion problem is triggered
+in more extreme cases (originally observed on PowerPC with a node size
+of 64K when running the fallocate tests from stress-ng), revert the
+changes from that commit. The next patch in the series, with a subject
+of "btrfs: rework chunk allocation to avoid exhaustion of the system
+chunk array" does the necessary changes to fix the system chunk array
+exhaustion problem.
+
+Reported-by: Naohiro Aota <naohiro.aota@wdc.com>
+Link: https://lore.kernel.org/linux-btrfs/20210621015922.ewgbffxuawia7liz@naota-xeon/
+Fixes: eafa4fd0ad0607 ("btrfs: fix exhaustion of the system chunk array due to concurrent allocations")
+CC: stable@vger.kernel.org # 5.12+
+Tested-by: Shin'ichiro Kawasaki <shinichiro.kawasaki@wdc.com>
+Tested-by: Naohiro Aota <naohiro.aota@wdc.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Tested-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+
