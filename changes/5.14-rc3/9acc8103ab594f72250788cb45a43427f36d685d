@@ -1,0 +1,98 @@
+btrfs: fix unpersisted i_size on fsync after expanding truncate
+
+If we have an inode that does not have the full sync flag set, was changed
+in the current transaction, then it is logged while logging some other
+inode (like its parent directory for example), its i_size is increased by
+a truncate operation, the log is synced through an fsync of some other
+inode and then finally we explicitly call fsync on our inode, the new
+i_size is not persisted.
+
+The following example shows how to trigger it, with comments explaining
+how and why the issue happens:
+
+  $ mkfs.btrfs -f /dev/sdc
+  $ mount /dev/sdc /mnt
+
+  $ touch /mnt/foo
+  $ xfs_io -f -c "pwrite -S 0xab 0 1M" /mnt/bar
+
+  $ sync
+
+  # Fsync bar, this will be a noop since the file has not yet been
+  # modified in the current transaction. The goal here is to clear
+  # BTRFS_INODE_NEEDS_FULL_SYNC from the inode's runtime flags.
+  $ xfs_io -c "fsync" /mnt/bar
+
+  # Now rename both files, without changing their parent directory.
+  $ mv /mnt/bar /mnt/bar2
+  $ mv /mnt/foo /mnt/foo2
+
+  # Increase the size of bar2 with a truncate operation.
+  $ xfs_io -c "truncate 2M" /mnt/bar2
+
+  # Now fsync foo2, this results in logging its parent inode (the root
+  # directory), and logging the parent results in logging the inode of
+  # file bar2 (its inode item and the new name). The inode of file bar2
+  # is logged with an i_size of 0 bytes since it's logged in
+  # LOG_INODE_EXISTS mode, meaning we are only logging its names (and
+  # xattrs if it had any) and the i_size of the inode will not be changed
+  # when the log is replayed.
+  $ xfs_io -c "fsync" /mnt/foo2
+
+  # Now explicitly fsync bar2. This resulted in doing nothing, not
+  # logging the inode with the new i_size of 2M and the hole from file
+  # offset 1M to 2M. Because the inode did not have the flag
+  # BTRFS_INODE_NEEDS_FULL_SYNC set, when it was logged through the
+  # fsync of file foo2, its last_log_commit field was updated,
+  # resulting in this explicit of file bar2 not doing anything.
+  $ xfs_io -c "fsync" /mnt/bar2
+
+  # File bar2 content and size before a power failure.
+  $ od -A d -t x1 /mnt/bar2
+  0000000 ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab
+  *
+  1048576 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  *
+  2097152
+
+  <power failure>
+
+  # Mount the filesystem to replay the log.
+  $ mount /dev/sdc /mnt
+
+  # Read the file again, should have the same content and size as before
+  # the power failure happened, but it doesn't, i_size is still at 1M.
+  $ od -A d -t x1 /mnt/bar2
+  0000000 ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab
+  *
+  1048576
+
+This started to happen after commit 209ecbb8585bf6 ("btrfs: remove stale
+comment and logic from btrfs_inode_in_log()"), since btrfs_inode_in_log()
+no longer checks if the inode's list of modified extents is not empty.
+However, checking that list is not the right way to address this case
+and the check was added long time ago in commit 125c4cf9f37c98
+("Btrfs: set inode's logged_trans/last_log_commit after ranged fsync")
+for a different purpose, to address consecutive ranged fsyncs.
+
+The reason that checking for the list emptiness makes this test pass is
+because during an expanding truncate we create an extent map to represent
+a hole from the old i_size to the new i_size, and add that extent map to
+the list of modified extents in the inode. However if we are low on
+available memory and we can not allocate a new extent map, then we don't
+treat it as an error and just set the full sync flag on the inode, so that
+the next fsync does not rely on the list of modified extents - so checking
+for the emptiness of the list to decide if the inode needs to be logged is
+not reliable, and results in not logging the inode if it was not possible
+to allocate the extent map for the hole.
+
+Fix this by ensuring that if we are only logging that an inode exists
+(inode item, names/references and xattrs), we don't update the inode's
+last_log_commit even if it does not have the full sync runtime flag set.
+
+A test case for fstests follows soon.
+
+CC: stable@vger.kernel.org # 5.13+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+
