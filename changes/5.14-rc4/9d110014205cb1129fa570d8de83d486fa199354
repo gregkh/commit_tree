@@ -1,0 +1,63 @@
+xfs: limit iclog tail updates
+
+From the department of "generic/482 keeps on giving", we bring you
+another tail update race condition:
+
+iclog:
+	S1			C1
+	+-----------------------+-----------------------+
+				 S2			EOIC
+
+Two checkpoints in a single iclog. One is complete, the other just
+contains the start record and overruns into a new iclog.
+
+Timeline:
+
+Before S1:	Cache flush, log tail = X
+At S1:		Metadata stable, write start record and checkpoint
+At C1:		Write commit record, set NEED_FUA
+		Single iclog checkpoint, so no need for NEED_FLUSH
+		Log tail still = X, so no need for NEED_FLUSH
+
+After C1,
+Before S2:	Cache flush, log tail = X
+At S2:		Metadata stable, write start record and checkpoint
+After S2:	Log tail moves to X+1
+At EOIC:	End of iclog, more journal data to write
+		Releases iclog
+		Not a commit iclog, so no need for NEED_FLUSH
+		Writes log tail X+1 into iclog.
+
+At this point, the iclog has tail X+1 and NEED_FUA set. There has
+been no cache flush for the metadata between X and X+1, and the
+iclog writes the new tail permanently to the log. THis is sufficient
+to violate on disk metadata/journal ordering.
+
+We have two options here. The first is to detect this case in some
+manner and ensure that the partial checkpoint write sets NEED_FLUSH
+when the iclog is already marked NEED_FUA and the log tail changes.
+This seems somewhat fragile and quite complex to get right, and it
+doesn't actually make it obvious what underlying problem it is
+actually addressing from reading the code.
+
+The second option seems much cleaner to me, because it is derived
+directly from the requirements of the C1 commit record in the iclog.
+That is, when we write this commit record to the iclog, we've
+guaranteed that the metadata/data ordering is correct for tail
+update purposes. Hence if we only write the log tail into the iclog
+for the *first* commit record rather than the log tail at the last
+release, we guarantee that the log tail does not move past where the
+the first commit record in the log expects it to be.
+
+IOWs, taking the first option means that replay of C1 becomes
+dependent on future operations doing the right thing, not just the
+C1 checkpoint itself doing the right thing. This makes log recovery
+almost impossible to reason about because now we have to take into
+account what might or might not have happened in the future when
+looking at checkpoints in the log rather than just having to
+reconstruct the past...
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+

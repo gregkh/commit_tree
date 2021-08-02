@@ -1,0 +1,132 @@
+xfs: logging the on disk inode LSN can make it go backwards
+
+When we log an inode, we format the "log inode" core and set an LSN
+in that inode core. We do that via xfs_inode_item_format_core(),
+which calls:
+
+	xfs_inode_to_log_dinode(ip, dic, ip->i_itemp->ili_item.li_lsn);
+
+to format the log inode. It writes the LSN from the inode item into
+the log inode, and if recovery decides the inode item needs to be
+replayed, it recovers the log inode LSN field and writes it into the
+on disk inode LSN field.
+
+Now this might seem like a reasonable thing to do, but it is wrong
+on multiple levels. Firstly, if the item is not yet in the AIL,
+item->li_lsn is zero. i.e. the first time the inode it is logged and
+formatted, the LSN we write into the log inode will be zero. If we
+only log it once, recovery will run and can write this zero LSN into
+the inode.
+
+This means that the next time the inode is logged and log recovery
+runs, it will *always* replay changes to the inode regardless of
+whether the inode is newer on disk than the version in the log and
+that violates the entire purpose of recording the LSN in the inode
+at writeback time (i.e. to stop it going backwards in time on disk
+during recovery).
+
+Secondly, if we commit the CIL to the journal so the inode item
+moves to the AIL, and then relog the inode, the LSN that gets
+stamped into the log inode will be the LSN of the inode's current
+location in the AIL, not it's age on disk. And it's not the LSN that
+will be associated with the current change. That means when log
+recovery replays this inode item, the LSN that ends up on disk is
+the LSN for the previous changes in the log, not the current
+changes being replayed. IOWs, after recovery the LSN on disk is not
+in sync with the LSN of the modifications that were replayed into
+the inode. This, again, violates the recovery ordering semantics
+that on-disk writeback LSNs provide.
+
+Hence the inode LSN in the log dinode is -always- invalid.
+
+Thirdly, recovery actually has the LSN of the log transaction it is
+replaying right at hand - it uses it to determine if it should
+replay the inode by comparing it to the on-disk inode's LSN. But it
+doesn't use that LSN to stamp the LSN into the inode which will be
+written back when the transaction is fully replayed. It uses the one
+in the log dinode, which we know is always going to be incorrect.
+
+Looking back at the change history, the inode logging was broken by
+commit 93f958f9c41f ("xfs: cull unnecessary icdinode fields") way
+back in 2016 by a stupid idiot who thought he knew how this code
+worked. i.e. me. That commit replaced an in memory di_lsn field that
+was updated only at inode writeback time from the inode item.li_lsn
+value - and hence always contained the same LSN that appeared in the
+on-disk inode - with a read of the inode item LSN at inode format
+time. CLearly these are not the same thing.
+
+Before 93f958f9c41f, the log recovery behaviour was irrelevant,
+because the LSN in the log inode always matched the on-disk LSN at
+the time the inode was logged, hence recovery of the transaction
+would never make the on-disk LSN in the inode go backwards or get
+out of sync.
+
+A symptom of the problem is this, caught from a failure of
+generic/482. Before log recovery, the inode has been allocated but
+never used:
+
+xfs_db> inode 393388
+xfs_db> p
+core.magic = 0x494e
+core.mode = 0
+....
+v3.crc = 0x99126961 (correct)
+v3.change_count = 0
+v3.lsn = 0
+v3.flags2 = 0
+v3.cowextsize = 0
+v3.crtime.sec = Thu Jan  1 10:00:00 1970
+v3.crtime.nsec = 0
+
+After log recovery:
+
+xfs_db> p
+core.magic = 0x494e
+core.mode = 020444
+....
+v3.crc = 0x23e68f23 (correct)
+v3.change_count = 2
+v3.lsn = 0
+v3.flags2 = 0
+v3.cowextsize = 0
+v3.crtime.sec = Thu Jul 22 17:03:03 2021
+v3.crtime.nsec = 751000000
+...
+
+You can see that the LSN of the on-disk inode is 0, even though it
+clearly has been written to disk. I point out this inode, because
+the generic/482 failure occurred because several adjacent inodes in
+this specific inode cluster were not replayed correctly and still
+appeared to be zero on disk when all the other metadata (inobt,
+finobt, directories, etc) indicated they should be allocated and
+written back.
+
+The fix for this is two-fold. The first is that we need to either
+revert the LSN changes in 93f958f9c41f or stop logging the inode LSN
+altogether. If we do the former, log recovery does not need to
+change but we add 8 bytes of memory per inode to store what is
+largely a write-only inode field. If we do the latter, log recovery
+needs to stamp the on-disk inode in the same manner that inode
+writeback does.
+
+I prefer the latter, because we shouldn't really be trying to log
+and replay changes to the on disk LSN as the on-disk value is the
+canonical source of the on-disk version of the inode. It also
+matches the way we recover buffer items - we create a buf_log_item
+that carries the current recovery transaction LSN that gets stamped
+into the buffer by the write verifier when it gets written back
+when the transaction is fully recovered.
+
+However, this might break log recovery on older kernels even more,
+so I'm going to simply ignore the logged value in recovery and stamp
+the on-disk inode with the LSN of the transaction being recovered
+that will trigger writeback on transaction recovery completion. This
+will ensure that the on-disk inode LSN always reflects the LSN of
+the last change that was written to disk, regardless of whether it
+comes from log recovery or runtime writeback.
+
+Fixes: 93f958f9c41f ("xfs: cull unnecessary icdinode fields")
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+
