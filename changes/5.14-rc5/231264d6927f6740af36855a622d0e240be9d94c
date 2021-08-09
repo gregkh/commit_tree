@@ -1,0 +1,71 @@
+tracepoint: Fix static call function vs data state mismatch
+
+On a 1->0->1 callbacks transition, there is an issue with the new
+callback using the old callback's data.
+
+Considering __DO_TRACE_CALL:
+
+        do {                                                            \
+                struct tracepoint_func *it_func_ptr;                    \
+                void *__data;                                           \
+                it_func_ptr =                                           \
+                        rcu_dereference_raw((&__tracepoint_##name)->funcs); \
+                if (it_func_ptr) {                                      \
+                        __data = (it_func_ptr)->data;                   \
+
+----> [ delayed here on one CPU (e.g. vcpu preempted by the host) ]
+
+                        static_call(tp_func_##name)(__data, args);      \
+                }                                                       \
+        } while (0)
+
+It has loaded the tp->funcs of the old callback, so it will try to use the old
+data. This can be fixed by adding a RCU sync anywhere in the 1->0->1
+transition chain.
+
+On a N->2->1 transition, we need an rcu-sync because you may have a
+sequence of 3->2->1 (or 1->2->1) where the element 0 data is unchanged
+between 2->1, but was changed from 3->2 (or from 1->2), which may be
+observed by the static call. This can be fixed by adding an
+unconditional RCU sync in transition 2->1.
+
+Note, this fixes a correctness issue at the cost of adding a tremendous
+performance regression to the disabling of tracepoints.
+
+Before this commit:
+
+  # trace-cmd start -e all
+  # time trace-cmd start -p nop
+
+  real	0m0.778s
+  user	0m0.000s
+  sys	0m0.061s
+
+After this commit:
+
+  # trace-cmd start -e all
+  # time trace-cmd start -p nop
+
+  real	0m10.593s
+  user	0m0.017s
+  sys	0m0.259s
+
+A follow up fix will introduce a more lightweight scheme based on RCU
+get_state and cond_sync, that will return the performance back to what it
+was. As both this change and the lightweight versions are complex on their
+own, for bisecting any issues that this may cause, they are kept as two
+separate changes.
+
+Link: https://lkml.kernel.org/r/20210805132717.23813-3-mathieu.desnoyers@efficios.com
+Link: https://lore.kernel.org/io-uring/4ebea8f0-58c9-e571-fd30-0ce4f6f09c70@samba.org/
+
+Cc: stable@vger.kernel.org
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: "Paul E. McKenney" <paulmck@kernel.org>
+Cc: Stefan Metzmacher <metze@samba.org>
+Fixes: d25e37d89dd2 ("tracepoint: Optimize using static_call()")
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+
