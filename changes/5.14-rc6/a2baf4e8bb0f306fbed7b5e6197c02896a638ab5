@@ -1,0 +1,87 @@
+bpf: Fix potentially incorrect results with bpf_get_local_storage()
+
+Commit b910eaaaa4b8 ("bpf: Fix NULL pointer dereference in bpf_get_local_storage()
+helper") fixed a bug for bpf_get_local_storage() helper so different tasks
+won't mess up with each other's percpu local storage.
+
+The percpu data contains 8 slots so it can hold up to 8 contexts (same or
+different tasks), for 8 different program runs, at the same time. This in
+general is sufficient. But our internal testing showed the following warning
+multiple times:
+
+  [...]
+  warning: WARNING: CPU: 13 PID: 41661 at include/linux/bpf-cgroup.h:193
+     __cgroup_bpf_run_filter_sock_ops+0x13e/0x180
+  RIP: 0010:__cgroup_bpf_run_filter_sock_ops+0x13e/0x180
+  <IRQ>
+   tcp_call_bpf.constprop.99+0x93/0xc0
+   tcp_conn_request+0x41e/0xa50
+   ? tcp_rcv_state_process+0x203/0xe00
+   tcp_rcv_state_process+0x203/0xe00
+   ? sk_filter_trim_cap+0xbc/0x210
+   ? tcp_v6_inbound_md5_hash.constprop.41+0x44/0x160
+   tcp_v6_do_rcv+0x181/0x3e0
+   tcp_v6_rcv+0xc65/0xcb0
+   ip6_protocol_deliver_rcu+0xbd/0x450
+   ip6_input_finish+0x11/0x20
+   ip6_input+0xb5/0xc0
+   ip6_sublist_rcv_finish+0x37/0x50
+   ip6_sublist_rcv+0x1dc/0x270
+   ipv6_list_rcv+0x113/0x140
+   __netif_receive_skb_list_core+0x1a0/0x210
+   netif_receive_skb_list_internal+0x186/0x2a0
+   gro_normal_list.part.170+0x19/0x40
+   napi_complete_done+0x65/0x150
+   mlx5e_napi_poll+0x1ae/0x680
+   __napi_poll+0x25/0x120
+   net_rx_action+0x11e/0x280
+   __do_softirq+0xbb/0x271
+   irq_exit_rcu+0x97/0xa0
+   common_interrupt+0x7f/0xa0
+   </IRQ>
+   asm_common_interrupt+0x1e/0x40
+  RIP: 0010:bpf_prog_1835a9241238291a_tw_egress+0x5/0xbac
+   ? __cgroup_bpf_run_filter_skb+0x378/0x4e0
+   ? do_softirq+0x34/0x70
+   ? ip6_finish_output2+0x266/0x590
+   ? ip6_finish_output+0x66/0xa0
+   ? ip6_output+0x6c/0x130
+   ? ip6_xmit+0x279/0x550
+   ? ip6_dst_check+0x61/0xd0
+  [...]
+
+Using drgn [0] to dump the percpu buffer contents showed that on this CPU
+slot 0 is still available, but slots 1-7 are occupied and those tasks in
+slots 1-7 mostly don't exist any more. So we might have issues in
+bpf_cgroup_storage_unset().
+
+Further debugging confirmed that there is a bug in bpf_cgroup_storage_unset().
+Currently, it tries to unset "current" slot with searching from the start.
+So the following sequence is possible:
+
+  1. A task is running and claims slot 0
+  2. Running BPF program is done, and it checked slot 0 has the "task"
+     and ready to reset it to NULL (not yet).
+  3. An interrupt happens, another BPF program runs and it claims slot 1
+     with the *same* task.
+  4. The unset() in interrupt context releases slot 0 since it matches "task".
+  5. Interrupt is done, the task in process context reset slot 0.
+
+At the end, slot 1 is not reset and the same process can continue to occupy
+slots 2-7 and finally, when the above step 1-5 is repeated again, step 3 BPF
+program won't be able to claim an empty slot and a warning will be issued.
+
+To fix the issue, for unset() function, we should traverse from the last slot
+to the first. This way, the above issue can be avoided.
+
+The same reverse traversal should also be done in bpf_get_local_storage() helper
+itself. Otherwise, incorrect local storage may be returned to BPF program.
+
+  [0] https://github.com/osandov/drgn
+
+Fixes: b910eaaaa4b8 ("bpf: Fix NULL pointer dereference in bpf_get_local_storage() helper")
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210810010413.1976277-1-yhs@fb.com
+

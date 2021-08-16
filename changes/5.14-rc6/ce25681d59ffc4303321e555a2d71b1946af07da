@@ -1,0 +1,59 @@
+KVM: x86/mmu: Protect marking SPs unsync when using TDP MMU with spinlock
+
+Add yet another spinlock for the TDP MMU and take it when marking indirect
+shadow pages unsync.  When using the TDP MMU and L1 is running L2(s) with
+nested TDP, KVM may encounter shadow pages for the TDP entries managed by
+L1 (controlling L2) when handling a TDP MMU page fault.  The unsync logic
+is not thread safe, e.g. the kvm_mmu_page fields are not atomic, and
+misbehaves when a shadow page is marked unsync via a TDP MMU page fault,
+which runs with mmu_lock held for read, not write.
+
+Lack of a critical section manifests most visibly as an underflow of
+unsync_children in clear_unsync_child_bit() due to unsync_children being
+corrupted when multiple CPUs write it without a critical section and
+without atomic operations.  But underflow is the best case scenario.  The
+worst case scenario is that unsync_children prematurely hits '0' and
+leads to guest memory corruption due to KVM neglecting to properly sync
+shadow pages.
+
+Use an entirely new spinlock even though piggybacking tdp_mmu_pages_lock
+would functionally be ok.  Usurping the lock could degrade performance when
+building upper level page tables on different vCPUs, especially since the
+unsync flow could hold the lock for a comparatively long time depending on
+the number of indirect shadow pages and the depth of the paging tree.
+
+For simplicity, take the lock for all MMUs, even though KVM could fairly
+easily know that mmu_lock is held for write.  If mmu_lock is held for
+write, there cannot be contention for the inner spinlock, and marking
+shadow pages unsync across multiple vCPUs will be slow enough that
+bouncing the kvm_arch cacheline should be in the noise.
+
+Note, even though L2 could theoretically be given access to its own EPT
+entries, a nested MMU must hold mmu_lock for write and thus cannot race
+against a TDP MMU page fault.  I.e. the additional spinlock only _needs_ to
+be taken by the TDP MMU, as opposed to being taken by any MMU for a VM
+that is running with the TDP MMU enabled.  Holding mmu_lock for read also
+prevents the indirect shadow page from being freed.  But as above, keep
+it simple and always take the lock.
+
+Alternative #1, the TDP MMU could simply pass "false" for can_unsync and
+effectively disable unsync behavior for nested TDP.  Write protecting leaf
+shadow pages is unlikely to noticeably impact traditional L1 VMMs, as such
+VMMs typically don't modify TDP entries, but the same may not hold true for
+non-standard use cases and/or VMMs that are migrating physical pages (from
+L1's perspective).
+
+Alternative #2, the unsync logic could be made thread safe.  In theory,
+simply converting all relevant kvm_mmu_page fields to atomics and using
+atomic bitops for the bitmap would suffice.  However, (a) an in-depth audit
+would be required, (b) the code churn would be substantial, and (c) legacy
+shadow paging would incur additional atomic operations in performance
+sensitive paths for no benefit (to legacy shadow paging).
+
+Fixes: a2855afc7ee8 ("KVM: x86/mmu: Allow parallel page faults for the TDP MMU")
+Cc: stable@vger.kernel.org
+Cc: Ben Gardon <bgardon@google.com>
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210812181815.3378104-1-seanjc@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+
