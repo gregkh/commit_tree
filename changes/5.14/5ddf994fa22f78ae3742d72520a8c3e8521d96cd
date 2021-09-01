@@ -1,0 +1,108 @@
+ucounts: Fix regression preventing increasing of rlimits in init_user_ns
+
+"Ma, XinjianX" <xinjianx.ma@intel.com> reported:
+
+> When lkp team run kernel selftests, we found after these series of patches, testcase mqueue: mq_perf_tests
+> in kselftest failed with following message.
+>
+> # selftests: mqueue: mq_perf_tests
+> #
+> # Initial system state:
+> #       Using queue path:                       /mq_perf_tests
+> #       RLIMIT_MSGQUEUE(soft):                  819200
+> #       RLIMIT_MSGQUEUE(hard):                  819200
+> #       Maximum Message Size:                   8192
+> #       Maximum Queue Size:                     10
+> #       Nice value:                             0
+> #
+> # Adjusted system state for testing:
+> #       RLIMIT_MSGQUEUE(soft):                  (unlimited)
+> #       RLIMIT_MSGQUEUE(hard):                  (unlimited)
+> #       Maximum Message Size:                   16777216
+> #       Maximum Queue Size:                     65530
+> #       Nice value:                             -20
+> #       Continuous mode:                        (disabled)
+> #       CPUs to pin:                            3
+> # ./mq_perf_tests: mq_open() at 296: Too many open files
+> not ok 2 selftests: mqueue: mq_perf_tests # exit=1
+> ```
+>
+> Test env:
+> rootfs: debian-10
+> gcc version: 9
+
+After investigation the problem turned out to be that ucount_max for
+the rlimits in init_user_ns was being set to the initial rlimit value.
+The practical problem is that ucount_max provides a limit that
+applications inside the user namespace can not exceed.  Which means in
+practice that rlimits that have been converted to use the ucount
+infrastructure were not able to exceend their initial rlimits.
+
+Solve this by setting the relevant values of ucount_max to
+RLIM_INIFINITY.  A limit in init_user_ns is pointless so the code
+should allow the values to grow as large as possible without riscking
+an underflow or an overflow.
+
+As the ltp test case was a bit of a pain I have reproduced the rlimit failure
+and tested the fix with the following little C program:
+> #include <stdio.h>
+> #include <fcntl.h>
+> #include <sys/stat.h>
+> #include <mqueue.h>
+> #include <sys/time.h>
+> #include <sys/resource.h>
+> #include <errno.h>
+> #include <string.h>
+> #include <stdlib.h>
+> #include <limits.h>
+> #include <unistd.h>
+>
+> int main(int argc, char **argv)
+> {
+> 	struct mq_attr mq_attr;
+> 	struct rlimit rlim;
+> 	mqd_t mqd;
+> 	int ret;
+>
+> 	ret = getrlimit(RLIMIT_MSGQUEUE, &rlim);
+> 	if (ret != 0) {
+> 		fprintf(stderr, "getrlimit(RLIMIT_MSGQUEUE) failed: %s\n", strerror(errno));
+> 		exit(EXIT_FAILURE);
+> 	}
+> 	printf("RLIMIT_MSGQUEUE %lu %lu\n",
+> 	       rlim.rlim_cur, rlim.rlim_max);
+> 	rlim.rlim_cur = RLIM_INFINITY;
+> 	rlim.rlim_max = RLIM_INFINITY;
+> 	ret = setrlimit(RLIMIT_MSGQUEUE, &rlim);
+> 	if (ret != 0) {
+> 		fprintf(stderr, "setrlimit(RLIMIT_MSGQUEUE, RLIM_INFINITY) failed: %s\n", strerror(errno));
+> 		exit(EXIT_FAILURE);
+> 	}
+>
+> 	memset(&mq_attr, 0, sizeof(struct mq_attr));
+> 	mq_attr.mq_maxmsg = 65536 - 1;
+> 	mq_attr.mq_msgsize = 16*1024*1024 - 1;
+>
+> 	mqd = mq_open("/mq_rlimit_test", O_RDONLY|O_CREAT, 0600, &mq_attr);
+> 	if (mqd == (mqd_t)-1) {
+> 		fprintf(stderr, "mq_open failed: %s\n", strerror(errno));
+> 		exit(EXIT_FAILURE);
+> 	}
+> 	ret = mq_close(mqd);
+> 	if (ret) {
+> 		fprintf(stderr, "mq_close failed; %s\n", strerror(errno));
+> 		exit(EXIT_FAILURE);
+> 	}
+>
+> 	return EXIT_SUCCESS;
+> }
+
+Fixes: 6e52a9f0532f ("Reimplement RLIMIT_MSGQUEUE on top of ucounts")
+Fixes: d7c9e99aee48 ("Reimplement RLIMIT_MEMLOCK on top of ucounts")
+Fixes: d64696905554 ("Reimplement RLIMIT_SIGPENDING on top of ucounts")
+Fixes: 21d1c5e386bc ("Reimplement RLIMIT_NPROC on top of ucounts")
+Reported-by: kernel test robot lkp@intel.com
+Acked-by: Alexey Gladkov <legion@kernel.org>
+Link: https://lkml.kernel.org/r/87eeajswfc.fsf_-_@disp2133
+Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+

@@ -1,0 +1,81 @@
+bpf: Add rcu_read_lock in bpf_get_current_[ancestor_]cgroup_id() helpers
+
+Currently, if bpf_get_current_cgroup_id() or
+bpf_get_current_ancestor_cgroup_id() helper is
+called with sleepable programs e.g., sleepable
+fentry/fmod_ret/fexit/lsm programs, a rcu warning
+may appear. For example, if I added the following
+hack to test_progs/test_lsm sleepable fentry program
+test_sys_setdomainname:
+
+  --- a/tools/testing/selftests/bpf/progs/lsm.c
+  +++ b/tools/testing/selftests/bpf/progs/lsm.c
+  @@ -168,6 +168,10 @@ int BPF_PROG(test_sys_setdomainname, struct pt_regs *regs)
+          int buf = 0;
+          long ret;
+
+  +       __u64 cg_id = bpf_get_current_cgroup_id();
+  +       if (cg_id == 1000)
+  +               copy_test++;
+  +
+          ret = bpf_copy_from_user(&buf, sizeof(buf), ptr);
+          if (len == -2 && ret == 0 && buf == 1234)
+                  copy_test++;
+
+I will hit the following rcu warning:
+
+  include/linux/cgroup.h:481 suspicious rcu_dereference_check() usage!
+  other info that might help us debug this:
+    rcu_scheduler_active = 2, debug_locks = 1
+    1 lock held by test_progs/260:
+      #0: ffffffffa5173360 (rcu_read_lock_trace){....}-{0:0}, at: __bpf_prog_enter_sleepable+0x0/0xa0
+    stack backtrace:
+    CPU: 1 PID: 260 Comm: test_progs Tainted: G           O      5.14.0-rc2+ #176
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.14.0-0-g155821a1990b-prebuilt.qemu.org 04/01/2014
+    Call Trace:
+      dump_stack_lvl+0x56/0x7b
+      bpf_get_current_cgroup_id+0x9c/0xb1
+      bpf_prog_a29888d1c6706e09_test_sys_setdomainname+0x3e/0x89c
+      bpf_trampoline_6442469132_0+0x2d/0x1000
+      __x64_sys_setdomainname+0x5/0x110
+      do_syscall_64+0x3a/0x80
+      entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+I can get similar warning using bpf_get_current_ancestor_cgroup_id() helper.
+syzbot reported a similar issue in [1] for syscall program. Helper
+bpf_get_current_cgroup_id() or bpf_get_current_ancestor_cgroup_id()
+has the following callchain:
+   task_dfl_cgroup
+     task_css_set
+       task_css_set_check
+and we have
+   #define task_css_set_check(task, __c)                                   \
+           rcu_dereference_check((task)->cgroups,                          \
+                   lockdep_is_held(&cgroup_mutex) ||                       \
+                   lockdep_is_held(&css_set_lock) ||                       \
+                   ((task)->flags & PF_EXITING) || (__c))
+Since cgroup_mutex/css_set_lock is not held and the task
+is not existing and rcu read_lock is not held, a warning
+will be issued. Note that bpf sleepable program is protected by
+rcu_read_lock_trace().
+
+The above sleepable bpf programs are already protected
+by migrate_disable(). Adding rcu_read_lock() in these
+two helpers will silence the above warning.
+I marked the patch fixing 95b861a7935b
+("bpf: Allow bpf_get_current_ancestor_cgroup_id for tracing")
+which added bpf_get_current_ancestor_cgroup_id() to tracing programs
+in 5.14. I think backporting 5.14 is probably good enough as sleepable
+progrems are not widely used.
+
+This patch should fix [1] as well since syscall program is a sleepable
+program protected with migrate_disable().
+
+ [1] https://lore.kernel.org/bpf/0000000000006d5cab05c7d9bb87@google.com/
+
+Fixes: 95b861a7935b ("bpf: Allow bpf_get_current_ancestor_cgroup_id for tracing")
+Reported-by: syzbot+7ee5c2c09c284495371f@syzkaller.appspotmail.com
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210810230537.2864668-1-yhs@fb.com
+
