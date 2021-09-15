@@ -1,0 +1,71 @@
+xfs: don't run shutdown callbacks on active iclogs
+
+When the log is shutdown, it currently walks all the iclogs and runs
+callbacks that are attached to the iclogs, regardless of whether the
+iclog is queued for IO completion or not. This creates a problem for
+contexts attaching callbacks to iclogs in that a racing shutdown can
+run the callbacks even before the attaching context has finished
+processing the iclog and releasing it for IO submission.
+
+If the callback processing of the iclog frees the structure that is
+attached to the iclog, then this leads to an UAF scenario that can
+only be protected against by holding the icloglock from the point
+callbacks are attached through to the release of the iclog. While we
+currently do this, it is not practical or sustainable.
+
+Hence we need to make shutdown processing the responsibility of the
+context that holds active references to the iclog. We know that the
+contexts attaching callbacks to the iclog must have active
+references to the iclog, and that means they must be in either
+ACTIVE or WANT_SYNC states. xlog_state_do_callback() will skip over
+iclogs in these states -except- when the log is shut down.
+
+xlog_state_do_callback() checks the state of the iclogs while
+holding the icloglock, therefore the reference count/state change
+that occurs in xlog_state_release_iclog() after the callbacks are
+atomic w.r.t. shutdown processing.
+
+We can't push the responsibility of callback cleanup onto the CIL
+context because we can have ACTIVE iclogs that have callbacks
+attached that have already been released. Hence we really need to
+internalise the cleanup of callbacks into xlog_state_release_iclog()
+processing.
+
+Indeed, we already have that internalisation via:
+
+xlog_state_release_iclog
+  drop last reference
+    ->SYNCING
+  xlog_sync
+    xlog_write_iclog
+      if (log_is_shutdown)
+        xlog_state_done_syncing()
+	  xlog_state_do_callback()
+	    <process shutdown on iclog that is now in SYNCING state>
+
+The problem is that xlog_state_release_iclog() aborts before doing
+anything if the log is already shut down. It assumes that the
+callbacks have already been cleaned up, and it doesn't need to do
+any cleanup.
+
+Hence the fix is to remove the xlog_is_shutdown() check from
+xlog_state_release_iclog() so that reference counts are correctly
+released from the iclogs, and when the reference count is zero we
+always transition to SYNCING if the log is shut down. Hence we'll
+always enter the xlog_sync() path in a shutdown and eventually end
+up erroring out the iclog IO and running xlog_state_do_callback() to
+process the callbacks attached to the iclog.
+
+This allows us to stop processing referenced ACTIVE/WANT_SYNC iclogs
+directly in the shutdown code, and in doing so gets rid of the UAF
+vector that currently exists. This then decouples the adding of
+callbacks to the iclogs from xlog_state_release_iclog() as we
+guarantee that xlog_state_release_iclog() will process the callbacks
+if the log has been shut down before xlog_state_release_iclog() has
+been called.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+

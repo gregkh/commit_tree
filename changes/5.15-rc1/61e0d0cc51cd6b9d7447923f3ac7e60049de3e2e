@@ -1,0 +1,74 @@
+xfs: fix perag structure refcounting error when scrub fails
+
+The kernel test robot found the following bug when running xfs/355 to
+scrub a bmap btree:
+
+XFS: Assertion failed: !sa->pag, file: fs/xfs/scrub/common.c, line: 412
+------------[ cut here ]------------
+kernel BUG at fs/xfs/xfs_message.c:110!
+invalid opcode: 0000 [#1] SMP PTI
+CPU: 2 PID: 1415 Comm: xfs_scrub Not tainted 5.14.0-rc4-00021-g48c6615cc557 #1
+Hardware name: Hewlett-Packard p6-1451cx/2ADA, BIOS 8.15 02/05/2013
+RIP: 0010:assfail+0x23/0x28 [xfs]
+RSP: 0018:ffffc9000aacb890 EFLAGS: 00010202
+RAX: 0000000000000000 RBX: ffffc9000aacbcc8 RCX: 0000000000000000
+RDX: 00000000ffffffc0 RSI: 000000000000000a RDI: ffffffffc09e7dcd
+RBP: ffffc9000aacbc80 R08: ffff8881fdf17d50 R09: 0000000000000000
+R10: 000000000000000a R11: f000000000000000 R12: 0000000000000000
+R13: ffff88820c7ed000 R14: 0000000000000001 R15: ffffc9000aacb980
+FS:  00007f185b955700(0000) GS:ffff8881fdf00000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00007f7f6ef43000 CR3: 000000020de38002 CR4: 00000000001706e0
+Call Trace:
+ xchk_ag_read_headers+0xda/0x100 [xfs]
+ xchk_ag_init+0x15/0x40 [xfs]
+ xchk_btree_check_block_owner+0x76/0x180 [xfs]
+ xchk_btree_get_block+0xd0/0x140 [xfs]
+ xchk_btree+0x32e/0x440 [xfs]
+ xchk_bmap_btree+0xd4/0x140 [xfs]
+ xchk_bmap+0x1eb/0x3c0 [xfs]
+ xfs_scrub_metadata+0x227/0x4c0 [xfs]
+ xfs_ioc_scrub_metadata+0x50/0xc0 [xfs]
+ xfs_file_ioctl+0x90c/0xc40 [xfs]
+ __x64_sys_ioctl+0x83/0xc0
+ do_syscall_64+0x3b/0xc0
+
+The unusual handling of errors while initializing struct xchk_ag is the
+root cause here.  Since the beginning of xfs_scrub, the goal of
+xchk_ag_read_headers has been to read all three AG header buffers and
+attach them both to the xchk_ag structure and the scrub transaction.
+Corruption errors on any of the three headers doesn't necessarily
+trigger an immediate return to userspace, because xfs_scrub can also
+tell us to /fix/ the problem.
+
+In other words, it's possible for the xchk_ag init functions to return
+an error code and a partially filled out structure so that scrub can use
+however much information it managed to pull.  Before 5.15, it was
+sufficient to cancel (or commit) the scrub transaction on the way out of
+the scrub code to release the buffers.
+
+Ccommit 48c6615cc557 added a reference to the perag structure to struct
+xchk_ag.  Since perag structures are not attached to transactions like
+buffers are, this adds the requirement that the perag ref be released
+explicitly.  The scrub teardown function xchk_teardown was amended to do
+this for the xchk_ag embedded in struct xfs_scrub.
+
+Unfortunately, I forgot that certain parts of the scrub code probe
+multiple AGs and therefore handle the initialization and cleanup on
+their own.  Specifically, the bmbt scrubber will initialize it long
+enough to cross-reference AG metadata for btree blocks and for the
+extent mappings in the bmbt.
+
+If one of the AG headers is corrupt, the init function returns with a
+live perag structure reference and some of the AG header buffers.  If an
+error occurs, the cross referencing will be noted as XCORRUPTion and
+skipped, but the main scrub process will move on to the next record.
+It is now necessary to release the perag reference before we try to
+analyze something from a different AG, or else we'll trip over the
+assertion noted above.
+
+Fixes: 48c6615cc557 ("xfs: grab active perag ref when reading AG headers")
+Reported-by: kernel test robot <oliver.sang@intel.com>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Chandan Babu R <chandanrlinux@gmail.com>
+

@@ -1,0 +1,197 @@
+net: bridge: switchdev: let drivers inform which bridge ports are offloaded
+
+On reception of an skb, the bridge checks if it was marked as 'already
+forwarded in hardware' (checks if skb->offload_fwd_mark == 1), and if it
+is, it assigns the source hardware domain of that skb based on the
+hardware domain of the ingress port. Then during forwarding, it enforces
+that the egress port must have a different hardware domain than the
+ingress one (this is done in nbp_switchdev_allowed_egress).
+
+Non-switchdev drivers don't report any physical switch id (neither
+through devlink nor .ndo_get_port_parent_id), therefore the bridge
+assigns them a hardware domain of 0, and packets coming from them will
+always have skb->offload_fwd_mark = 0. So there aren't any restrictions.
+
+Problems appear due to the fact that DSA would like to perform software
+fallback for bonding and team interfaces that the physical switch cannot
+offload.
+
+       +-- br0 ---+
+      / /   |      \
+     / /    |       \
+    /  |    |      bond0
+   /   |    |     /    \
+ swp0 swp1 swp2 swp3 swp4
+
+There, it is desirable that the presence of swp3 and swp4 under a
+non-offloaded LAG does not preclude us from doing hardware bridging
+beteen swp0, swp1 and swp2. The bandwidth of the CPU is often times high
+enough that software bridging between {swp0,swp1,swp2} and bond0 is not
+impractical.
+
+But this creates an impossible paradox given the current way in which
+port hardware domains are assigned. When the driver receives a packet
+from swp0 (say, due to flooding), it must set skb->offload_fwd_mark to
+something.
+
+- If we set it to 0, then the bridge will forward it towards swp1, swp2
+  and bond0. But the switch has already forwarded it towards swp1 and
+  swp2 (not to bond0, remember, that isn't offloaded, so as far as the
+  switch is concerned, ports swp3 and swp4 are not looking up the FDB,
+  and the entire bond0 is a destination that is strictly behind the
+  CPU). But we don't want duplicated traffic towards swp1 and swp2, so
+  it's not ok to set skb->offload_fwd_mark = 0.
+
+- If we set it to 1, then the bridge will not forward the skb towards
+  the ports with the same switchdev mark, i.e. not to swp1, swp2 and
+  bond0. Towards swp1 and swp2 that's ok, but towards bond0? It should
+  have forwarded the skb there.
+
+So the real issue is that bond0 will be assigned the same hardware
+domain as {swp0,swp1,swp2}, because the function that assigns hardware
+domains to bridge ports, nbp_switchdev_add(), recurses through bond0's
+lower interfaces until it finds something that implements devlink (calls
+dev_get_port_parent_id with bool recurse = true). This is a problem
+because the fact that bond0 can be offloaded by swp3 and swp4 in our
+example is merely an assumption.
+
+A solution is to give the bridge explicit hints as to what hardware
+domain it should use for each port.
+
+Currently, the bridging offload is very 'silent': a driver registers a
+netdevice notifier, which is put on the netns's notifier chain, and
+which sniffs around for NETDEV_CHANGEUPPER events where the upper is a
+bridge, and the lower is an interface it knows about (one registered by
+this driver, normally). Then, from within that notifier, it does a bunch
+of stuff behind the bridge's back, without the bridge necessarily
+knowing that there's somebody offloading that port. It looks like this:
+
+     ip link set swp0 master br0
+                  |
+                  v
+ br_add_if() calls netdev_master_upper_dev_link()
+                  |
+                  v
+        call_netdevice_notifiers
+                  |
+                  v
+       dsa_slave_netdevice_event
+                  |
+                  v
+        oh, hey! it's for me!
+                  |
+                  v
+           .port_bridge_join
+
+What we do to solve the conundrum is to be less silent, and change the
+switchdev drivers to present themselves to the bridge. Something like this:
+
+     ip link set swp0 master br0
+                  |
+                  v
+ br_add_if() calls netdev_master_upper_dev_link()
+                  |
+                  v                    bridge: Aye! I'll use this
+        call_netdevice_notifiers           ^  ppid as the
+                  |                        |  hardware domain for
+                  v                        |  this port, and zero
+       dsa_slave_netdevice_event           |  if I got nothing.
+                  |                        |
+                  v                        |
+        oh, hey! it's for me!              |
+                  |                        |
+                  v                        |
+           .port_bridge_join               |
+                  |                        |
+                  +------------------------+
+             switchdev_bridge_port_offload(swp0, swp0)
+
+Then stacked interfaces (like bond0 on top of swp3/swp4) would be
+treated differently in DSA, depending on whether we can or cannot
+offload them.
+
+The offload case:
+
+    ip link set bond0 master br0
+                  |
+                  v
+ br_add_if() calls netdev_master_upper_dev_link()
+                  |
+                  v                    bridge: Aye! I'll use this
+        call_netdevice_notifiers           ^  ppid as the
+                  |                        |  switchdev mark for
+                  v                        |        bond0.
+       dsa_slave_netdevice_event           | Coincidentally (or not),
+                  |                        | bond0 and swp0, swp1, swp2
+                  v                        | all have the same switchdev
+        hmm, it's not quite for me,        | mark now, since the ASIC
+         but my driver has already         | is able to forward towards
+           called .port_lag_join           | all these ports in hw.
+          for it, because I have           |
+      a port with dp->lag_dev == bond0.    |
+                  |                        |
+                  v                        |
+           .port_bridge_join               |
+           for swp3 and swp4               |
+                  |                        |
+                  +------------------------+
+            switchdev_bridge_port_offload(bond0, swp3)
+            switchdev_bridge_port_offload(bond0, swp4)
+
+And the non-offload case:
+
+    ip link set bond0 master br0
+                  |
+                  v
+ br_add_if() calls netdev_master_upper_dev_link()
+                  |
+                  v                    bridge waiting:
+        call_netdevice_notifiers           ^  huh, switchdev_bridge_port_offload
+                  |                        |  wasn't called, okay, I'll use a
+                  v                        |  hwdom of zero for this one.
+       dsa_slave_netdevice_event           :  Then packets received on swp0 will
+                  |                        :  not be software-forwarded towards
+                  v                        :  swp1, but they will towards bond0.
+         it's not for me, but
+       bond0 is an upper of swp3
+      and swp4, but their dp->lag_dev
+       is NULL because they couldn't
+            offload it.
+
+Basically we can draw the conclusion that the lowers of a bridge port
+can come and go, so depending on the configuration of lowers for a
+bridge port, it can dynamically toggle between offloaded and unoffloaded.
+Therefore, we need an equivalent switchdev_bridge_port_unoffload too.
+
+This patch changes the way any switchdev driver interacts with the
+bridge. From now on, everybody needs to call switchdev_bridge_port_offload
+and switchdev_bridge_port_unoffload, otherwise the bridge will treat the
+port as non-offloaded and allow software flooding to other ports from
+the same ASIC.
+
+Note that these functions lay the ground for a more complex handshake
+between switchdev drivers and the bridge in the future.
+
+For drivers that will request a replay of the switchdev objects when
+they offload and unoffload a bridge port (DSA, dpaa2-switch, ocelot), we
+place the call to switchdev_bridge_port_unoffload() strategically inside
+the NETDEV_PRECHANGEUPPER notifier's code path, and not inside
+NETDEV_CHANGEUPPER. This is because the switchdev object replay helpers
+need the netdev adjacency lists to be valid, and that is only true in
+NETDEV_PRECHANGEUPPER.
+
+Cc: Vadym Kochan <vkochan@marvell.com>
+Cc: Taras Chornyi <tchornyi@marvell.com>
+Cc: Ioana Ciornei <ioana.ciornei@nxp.com>
+Cc: Lars Povlsen <lars.povlsen@microchip.com>
+Cc: Steen Hegelund <Steen.Hegelund@microchip.com>
+Cc: UNGLinuxDriver@microchip.com
+Cc: Claudiu Manoil <claudiu.manoil@nxp.com>
+Cc: Alexandre Belloni <alexandre.belloni@bootlin.com>
+Cc: Grygorii Strashko <grygorii.strashko@ti.com>
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Tested-by: Ioana Ciornei <ioana.ciornei@nxp.com> # dpaa2-switch: regression
+Acked-by: Ioana Ciornei <ioana.ciornei@nxp.com> # dpaa2-switch
+Tested-by: Horatiu Vultur <horatiu.vultur@microchip.com> # ocelot-switch
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

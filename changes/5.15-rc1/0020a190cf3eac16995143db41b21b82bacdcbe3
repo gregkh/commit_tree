@@ -1,0 +1,98 @@
+xfs: AIL needs asynchronous CIL forcing
+
+The AIL pushing is stalling on log forces when it comes across
+pinned items. This is happening on removal workloads where the AIL
+is dominated by stale items that are removed from AIL when the
+checkpoint that marks the items stale is committed to the journal.
+This results is relatively few items in the AIL, but those that are
+are often pinned as directories items are being removed from are
+still being logged.
+
+As a result, many push cycles through the CIL will first issue a
+blocking log force to unpin the items. This can take some time to
+complete, with tracing regularly showing push delays of half a
+second and sometimes up into the range of several seconds. Sequences
+like this aren't uncommon:
+
+....
+ 399.829437:  xfsaild: last lsn 0x11002dd000 count 101 stuck 101 flushing 0 tout 20
+<wanted 20ms, got 270ms delay>
+ 400.099622:  xfsaild: target 0x11002f3600, prev 0x11002f3600, last lsn 0x0
+ 400.099623:  xfsaild: first lsn 0x11002f3600
+ 400.099679:  xfsaild: last lsn 0x1100305000 count 16 stuck 11 flushing 0 tout 50
+<wanted 50ms, got 500ms delay>
+ 400.589348:  xfsaild: target 0x110032e600, prev 0x11002f3600, last lsn 0x0
+ 400.589349:  xfsaild: first lsn 0x1100305000
+ 400.589595:  xfsaild: last lsn 0x110032e600 count 156 stuck 101 flushing 30 tout 50
+<wanted 50ms, got 460ms delay>
+ 400.950341:  xfsaild: target 0x1100353000, prev 0x110032e600, last lsn 0x0
+ 400.950343:  xfsaild: first lsn 0x1100317c00
+ 400.950436:  xfsaild: last lsn 0x110033d200 count 105 stuck 101 flushing 0 tout 20
+<wanted 20ms, got 200ms delay>
+ 401.142333:  xfsaild: target 0x1100361600, prev 0x1100353000, last lsn 0x0
+ 401.142334:  xfsaild: first lsn 0x110032e600
+ 401.142535:  xfsaild: last lsn 0x1100353000 count 122 stuck 101 flushing 8 tout 10
+<wanted 10ms, got 10ms delay>
+ 401.154323:  xfsaild: target 0x1100361600, prev 0x1100361600, last lsn 0x1100353000
+ 401.154328:  xfsaild: first lsn 0x1100353000
+ 401.154389:  xfsaild: last lsn 0x1100353000 count 101 stuck 101 flushing 0 tout 20
+<wanted 20ms, got 300ms delay>
+ 401.451525:  xfsaild: target 0x1100361600, prev 0x1100361600, last lsn 0x0
+ 401.451526:  xfsaild: first lsn 0x1100353000
+ 401.451804:  xfsaild: last lsn 0x1100377200 count 170 stuck 22 flushing 122 tout 50
+<wanted 50ms, got 500ms delay>
+ 401.933581:  xfsaild: target 0x1100361600, prev 0x1100361600, last lsn 0x0
+....
+
+In each of these cases, every AIL pass saw 101 log items stuck on
+the AIL (pinned) with very few other items being found. Each pass, a
+log force was issued, and delay between last/first is the sleep time
++ the sync log force time.
+
+Some of these 101 items pinned the tail of the log. The tail of the
+log does slowly creep forward (first lsn), but the problem is that
+the log is actually out of reservation space because it's been
+running so many transactions that stale items that never reach the
+AIL but consume log space. Hence we have a largely empty AIL, with
+long term pins on items that pin the tail of the log that don't get
+pushed frequently enough to keep log space available.
+
+The problem is the hundreds of milliseconds that we block in the log
+force pushing the CIL out to disk. The AIL should not be stalled
+like this - it needs to run and flush items that are at the tail of
+the log with minimal latency. What we really need to do is trigger a
+log flush, but then not wait for it at all - we've already done our
+waiting for stuff to complete when we backed off prior to the log
+force being issued.
+
+Even if we remove the XFS_LOG_SYNC from the xfs_log_force() call, we
+still do a blocking flush of the CIL and that is what is causing the
+issue. Hence we need a new interface for the CIL to trigger an
+immediate background push of the CIL to get it moving faster but not
+to wait on that to occur. While the CIL is pushing, the AIL can also
+be pushing.
+
+We already have an internal interface to do this -
+xlog_cil_push_now() - but we need a wrapper for it to be used
+externally. xlog_cil_force_seq() can easily be extended to do what
+we need as it already implements the synchronous CIL push via
+xlog_cil_push_now(). Add the necessary flags and "push current
+sequence" semantics to xlog_cil_force_seq() and convert the AIL
+pushing to use it.
+
+One of the complexities here is that the CIL push does not guarantee
+that the commit record for the CIL checkpoint is written to disk.
+The current log force ensures this by submitting the current ACTIVE
+iclog that the commit record was written to. We need the CIL to
+actually write this commit record to disk for an async push to
+ensure that the checkpoint actually makes it to disk and unpins the
+pinned items in the checkpoint on completion. Hence we need to pass
+down to the CIL push that we are doing an async flush so that it can
+switch out the commit_iclog if necessary to get written to disk when
+the commit iclog is finally released.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+

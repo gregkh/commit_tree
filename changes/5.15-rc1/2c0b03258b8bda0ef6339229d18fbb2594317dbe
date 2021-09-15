@@ -1,0 +1,104 @@
+net: dsa: give preference to local CPU ports
+
+Be there an "H" switch topology, where there are 2 switches connected as
+follows:
+
+         eth0                                                     eth1
+          |                                                        |
+       CPU port                                                CPU port
+          |                        DSA link                        |
+ sw0p0  sw0p1  sw0p2  sw0p3  sw0p4 -------- sw1p4  sw1p3  sw1p2  sw1p1  sw1p0
+   |             |      |                            |      |             |
+ user          user   user                         user   user          user
+ port          port   port                         port   port          port
+
+basically one where each switch has its own CPU port for termination,
+but there is also a DSA link in case packets need to be forwarded in
+hardware between one switch and another.
+
+DSA insists to see this as a daisy chain topology, basically registering
+all network interfaces as sw0p0@eth0, ... sw1p0@eth0 and disregarding
+eth1 as a valid DSA master.
+
+This is only half the story, since when asked using dsa_port_is_cpu(),
+DSA will respond that sw1p1 is a CPU port, however one which has no
+dp->cpu_dp pointing to it. So sw1p1 is enabled, but not used.
+
+Furthermore, be there a driver for switches which support only one
+upstream port. This driver iterates through its ports and checks using
+dsa_is_upstream_port() whether the current port is an upstream one.
+For switch 1, two ports pass the "is upstream port" checks:
+
+- sw1p4 is an upstream port because it is a routing port towards the
+  dedicated CPU port assigned using dsa_tree_setup_default_cpu()
+
+- sw1p1 is also an upstream port because it is a CPU port, albeit one
+  that is disabled. This is because dsa_upstream_port() returns:
+
+	if (!cpu_dp)
+		return port;
+
+  which means that if @dp does not have a ->cpu_dp pointer (which is a
+  characteristic of CPU ports themselves as well as unused ports), then
+  @dp is its own upstream port.
+
+So the driver for switch 1 rightfully says: I have two upstream ports,
+but I don't support multiple upstream ports! So let me error out, I
+don't know which one to choose and what to do with the other one.
+
+Generally I am against enforcing any default policy in the kernel in
+terms of user to CPU port assignment (like round robin or such) but this
+case is different. To solve the conundrum, one would have to:
+
+- Disable sw1p1 in the device tree or mark it as "not a CPU port" in
+  order to comply with DSA's view of this topology as a daisy chain,
+  where the termination traffic from switch 1 must pass through switch 0.
+  This is counter-productive because it wastes 1Gbps of termination
+  throughput in switch 1.
+- Disable the DSA link between sw0p4 and sw1p4 and do software
+  forwarding between switch 0 and 1, and basically treat the switches as
+  part of disjoint switch trees. This is counter-productive because it
+  wastes 1Gbps of autonomous forwarding throughput between switch 0 and 1.
+- Treat sw0p4 and sw1p4 as user ports instead of DSA links. This could
+  work, but it makes cross-chip bridging impossible. In this setup we
+  would need to have 2 separate bridges, br0 spanning the ports of
+  switch 0, and br1 spanning the ports of switch 1, and the "DSA links
+  treated as user ports" sw0p4 (part of br0) and sw1p4 (part of br1) are
+  the gateway ports between one bridge and another. This is hard to
+  manage from a user's perspective, who wants to have a unified view of
+  the switching fabric and the ability to transparently add ports to the
+  same bridge. VLANs would also need to be explicitly managed by the
+  user on these gateway ports.
+
+So it seems that the only reasonable thing to do is to make DSA prefer
+CPU ports that are local to the switch. Meaning that by default, the
+user and DSA ports of switch 0 will get assigned to the CPU port from
+switch 0 (sw0p1) and the user and DSA ports of switch 1 will get
+assigned to the CPU port from switch 1.
+
+The way this solves the problem is that sw1p4 is no longer an upstream
+port as far as switch 1 is concerned (it no longer views sw0p1 as its
+dedicated CPU port).
+
+So here we are, the first multi-CPU port that DSA supports is also
+perhaps the most uneventful one: the individual switches don't support
+multiple CPUs, however the DSA switch tree as a whole does have multiple
+CPU ports. No user space assignment of user ports to CPU ports is
+desirable, necessary, or possible.
+
+Ports that do not have a local CPU port (say there was an extra switch
+hanging off of sw0p0) default to the standard implementation of getting
+assigned to the first CPU port of the DSA switch tree. Is that good
+enough? Probably not (if the downstream switch was hanging off of switch
+1, we would most certainly prefer its CPU port to be sw1p1), but in
+order to support that use case too, we would need to traverse the
+dst->rtable in search of an optimum dedicated CPU port, one that has the
+smallest number of hops between dp->ds and dp->cpu_dp->ds. At the
+moment, the DSA routing table structure does not keep the number of hops
+between dl->dp and dl->link_dp, and while it is probably deducible,
+there is zero justification to write that code now. Let's hope DSA will
+never have to support that use case.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

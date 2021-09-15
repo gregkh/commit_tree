@@ -1,0 +1,121 @@
+powerpc/bug: Cast to unsigned long before passing to inline asm
+
+In commit 1e688dd2a3d6 ("powerpc/bug: Provide better flexibility to
+WARN_ON/__WARN_FLAGS() with asm goto") we changed WARN_ON(). Previously
+it would take the warning condition, x, and double negate it before
+converting the result to int, and passing that int to the underlying
+inline asm. ie:
+
+  #define WARN_ON(x) ({
+  	int __ret_warn_on = !!(x);
+  	if (__builtin_constant_p(__ret_warn_on)) {
+  	...
+  	} else {
+  		BUG_ENTRY(PPC_TLNEI " %4, 0",
+  			  BUGFLAG_WARNING | BUGFLAG_TAINT(TAINT_WARN),
+  			  "r" (__ret_warn_on));
+
+The asm then does a full register width comparison with zero and traps
+if it is non-zero (PPC_TLNEI).
+
+The new code instead passes the full expression, x, with some arbitrary
+type, to the inline asm:
+
+  #define WARN_ON(x) ({
+	...
+	do {
+		if (__builtin_constant_p((x))) {
+		...
+		} else {
+			...
+			WARN_ENTRY(PPC_TLNEI " %4, 0",
+				   BUGFLAG_WARNING | BUGFLAG_TAINT(TAINT_WARN),
+				   __label_warn_on, "r" (x));
+
+As reported[1] by Nathan, when building with clang this can cause
+spurious warnings to fire repeatedly at boot:
+
+  WARNING: CPU: 0 PID: 1 at lib/klist.c:62 .klist_add_tail+0x3c/0x110
+  Modules linked in:
+  CPU: 0 PID: 1 Comm: swapper/0 Tainted: G        W         5.14.0-rc7-next-20210825 #1
+  NIP:  c0000000007ff81c LR: c00000000090a038 CTR: 0000000000000000
+  REGS: c0000000073c32a0 TRAP: 0700   Tainted: G        W          (5.14.0-rc7-next-20210825)
+  MSR:  8000000002029032 <SF,VEC,EE,ME,IR,DR,RI>  CR: 22000a40  XER: 00000000
+  CFAR: c00000000090a034 IRQMASK: 0
+  GPR00: c00000000090a038 c0000000073c3540 c000000001be3200 0000000000000001
+  GPR04: c0000000072d65c0 0000000000000000 c0000000091ba798 c0000000091bb0a0
+  GPR08: 0000000000000001 0000000000000000 c000000008581918 fffffffffffffc00
+  GPR12: 0000000044000240 c000000001dd0000 c000000000012300 0000000000000000
+  GPR16: 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+  GPR20: 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+  GPR24: 0000000000000000 c0000000017e3200 0000000000000000 c000000001a0e778
+  GPR28: c0000000072d65b0 c0000000072d65a8 c000000007de72c8 c0000000073c35d0
+  NIP .klist_add_tail+0x3c/0x110
+  LR  .bus_add_driver+0x148/0x290
+  Call Trace:
+    0xc0000000073c35d0 (unreliable)
+    .bus_add_driver+0x148/0x290
+    .driver_register+0xb8/0x190
+    .__hid_register_driver+0x70/0xd0
+    .redragon_driver_init+0x34/0x58
+    .do_one_initcall+0x130/0x3b0
+    .do_initcall_level+0xd8/0x188
+    .do_initcalls+0x7c/0xdc
+    .kernel_init_freeable+0x178/0x21c
+    .kernel_init+0x34/0x220
+    .ret_from_kernel_thread+0x58/0x60
+  Instruction dump:
+  fba10078 7c7d1b78 38600001 fb810070 3b9d0008 fbc10080 7c9e2378 389d0018
+  fb9d0008 fb9d0010 90640000 fbdd0000 <0b1e0000> e87e0018 28230000 41820024
+
+The instruction dump shows that we are trapping because r30 is not zero:
+  tdnei   r30,0
+
+Where r30 = c000000007de72c8
+
+The WARN_ON() comes from:
+
+  static void knode_set_klist(struct klist_node *knode, struct klist *klist)
+  {
+  	knode->n_klist = klist;
+  	/* no knode deserves to start its life dead */
+  	WARN_ON(knode_dead(knode));
+  		      ^^^^^^^^^^^^^^^^^
+
+Where:
+
+  #define KNODE_DEAD		1LU
+
+  static bool knode_dead(struct klist_node *knode)
+  {
+  	return (unsigned long)knode->n_klist & KNODE_DEAD;
+  }
+
+The full disassembly shows that clang has not generated any code to
+apply the "& KNODE_DEAD" to the n_klist pointer, which is surprising.
+
+Nathan filed an LLVM bug [2], in which Eli Friedman explained that clang
+believes it is only passing a single bit to the asm (ie. a bool) and so
+the mask of bit 0 with 1 can be omitted, and suggested that if we want
+the full 64-bit value passed to the inline asm we should cast to a
+64-bit type (or 32-bit on 32-bits).
+
+In fact we already do that for BUG_ENTRY(), which was added to fix a
+possibly similar bug in 2005 in commit 32818c2eb6b8 ("[PATCH] ppc64: Fix
+issue with gcc 4.0 compiled kernels").
+
+So cast the value we pass to the inline asm to long.
+
+For GCC this appears to have no effect on code generation, other than
+causing sign extension in some cases.
+
+[1]: http://lore.kernel.org/r/YSa1O4fcX1nNKqN/@Ryzen-9-3900X.localdomain
+[2]: https://bugs.llvm.org/show_bug.cgi?id=51634
+
+Fixes: 1e688dd2a3d6 ("powerpc/bug: Provide better flexibility to WARN_ON/__WARN_FLAGS() with asm goto")
+Reported-by: Nathan Chancellor <nathan@kernel.org>
+Reviewed-by: Nathan Chancellor <nathan@kernel.org>
+Tested-by: Nathan Chancellor <nathan@kernel.org>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20210901112522.1085134-1-mpe@ellerman.id.au
+

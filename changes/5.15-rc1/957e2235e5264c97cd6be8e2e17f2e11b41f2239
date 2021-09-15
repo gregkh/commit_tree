@@ -1,0 +1,111 @@
+net: make switchdev_bridge_port_{,unoffload} loosely coupled with the bridge
+
+With the introduction of explicit offloading API in switchdev in commit
+2f5dc00f7a3e ("net: bridge: switchdev: let drivers inform which bridge
+ports are offloaded"), we started having Ethernet switch drivers calling
+directly into a function exported by net/bridge/br_switchdev.c, which is
+a function exported by the bridge driver.
+
+This means that drivers that did not have an explicit dependency on the
+bridge before, like cpsw and am65-cpsw, now do - otherwise it is not
+possible to call a symbol exported by a driver that can be built as
+module unless you are a module too.
+
+There was an attempt to solve the dependency issue in the form of commit
+b0e81817629a ("net: build all switchdev drivers as modules when the
+bridge is a module"). Grygorii Strashko, however, says about it:
+
+| In my opinion, the problem is a bit bigger here than just fixing the
+| build :(
+|
+| In case, of ^cpsw the switchdev mode is kinda optional and in many
+| cases (especially for testing purposes, NFS) the multi-mac mode is
+| still preferable mode.
+|
+| There were no such tight dependency between switchdev drivers and
+| bridge core before and switchdev serviced as independent, notification
+| based layer between them, so ^cpsw still can be "Y" and bridge can be
+| "M". Now for mostly every kernel build configuration the CONFIG_BRIDGE
+| will need to be set as "Y", or we will have to update drivers to
+| support build with BRIDGE=n and maintain separate builds for
+| networking vs non-networking testing.  But is this enough?  Wouldn't
+| it cause 'chain reaction' required to add more and more "Y" options
+| (like CONFIG_VLAN_8021Q)?
+|
+| PS. Just to be sure we on the same page - ARM builds will be forced
+| (with this patch) to have CONFIG_TI_CPSW_SWITCHDEV=m and so all our
+| automation testing will just fail with omap2plus_defconfig.
+
+In the light of this, it would be desirable for some configurations to
+avoid dependencies between switchdev drivers and the bridge, and have
+the switchdev mode as completely optional within the driver.
+
+Arnd Bergmann also tried to write a patch which better expressed the
+build time dependency for Ethernet switch drivers where the switchdev
+support is optional, like cpsw/am65-cpsw, and this made the drivers
+follow the bridge (compile as module if the bridge is a module) only if
+the optional switchdev support in the driver was enabled in the first
+place:
+https://patchwork.kernel.org/project/netdevbpf/patch/20210802144813.1152762-1-arnd@kernel.org/
+
+but this still did not solve the fact that cpsw and am65-cpsw now must
+be built as modules when the bridge is a module - it just expressed
+correctly that optional dependency. But the new behavior is an apparent
+regression from Grygorii's perspective.
+
+So to support the use case where the Ethernet driver is built-in,
+NET_SWITCHDEV (a bool option) is enabled, and the bridge is a module, we
+need a framework that can handle the possible absence of the bridge from
+the running system, i.e. runtime bloatware as opposed to build-time
+bloatware.
+
+Luckily we already have this framework, since switchdev has been using
+it extensively. Events from the bridge side are transmitted to the
+driver side using notifier chains - this was originally done so that
+unrelated drivers could snoop for events emitted by the bridge towards
+ports that are implemented by other drivers (think of a switch driver
+with LAG offload that listens for switchdev events on a bonding/team
+interface that it offloads).
+
+There are also events which are transmitted from the driver side to the
+bridge side, which again are modeled using notifiers.
+SWITCHDEV_FDB_ADD_TO_BRIDGE is an example of this, and deals with
+notifying the bridge that a MAC address has been dynamically learned.
+So there is a precedent we can use for modeling the new framework.
+
+The difference compared to SWITCHDEV_FDB_ADD_TO_BRIDGE is that the work
+that the bridge needs to do when a port becomes offloaded is blocking in
+its nature: replay VLANs, MDBs etc. The calling context is indeed
+blocking (we are under rtnl_mutex), but the existing switchdev
+notification chain that the bridge is subscribed to is only the atomic
+one. So we need to subscribe the bridge to the blocking switchdev
+notification chain too.
+
+This patch:
+- keeps the driver-side perception of the switchdev_bridge_port_{,un}offload
+  unchanged
+- moves the implementation of switchdev_bridge_port_{,un}offload from
+  the bridge module into the switchdev module.
+- makes everybody that is subscribed to the switchdev blocking notifier
+  chain "hear" offload & unoffload events
+- makes the bridge driver subscribe and handle those events
+- moves the bridge driver's handling of those events into 2 new
+  functions called br_switchdev_port_{,un}offload. These functions
+  contain in fact the core of the logic that was previously in
+  switchdev_bridge_port_{,un}offload, just that now we go through an
+  extra indirection layer to reach them.
+
+Unlike all the other switchdev notification structures, the structure
+used to carry the bridge port information, struct
+switchdev_notifier_brport_info, does not contain a "bool handled".
+This is because in the current usage pattern, we always know that a
+switchdev bridge port offloading event will be handled by the bridge,
+because the switchdev_bridge_port_offload() call was initiated by a
+NETDEV_CHANGEUPPER event in the first place, where info->upper_dev is a
+bridge. So if the bridge wasn't loaded, then the CHANGEUPPER event
+couldn't have happened.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Tested-by: Grygorii Strashko <grygorii.strashko@ti.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

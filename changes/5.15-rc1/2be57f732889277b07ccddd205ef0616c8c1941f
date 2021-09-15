@@ -1,0 +1,115 @@
+rcu: Weaken ->dynticks accesses and updates
+
+Accesses to the rcu_data structure's ->dynticks field have always been
+fully ordered because it was not possible to prove that weaker ordering
+was safe.  However, with the removal of the rcu_eqs_special_set() function
+and the advent of the Linux-kernel memory model, it is now easy to show
+that two of the four original full memory barriers can be weakened to
+acquire and release operations.  The remaining pair must remain full
+memory barriers.  This change makes the memory ordering requirements
+more evident, and it might well also speed up the to-idle and from-idle
+fastpaths on some architectures.
+
+The following litmus test, adapted from one supplied off-list by Frederic
+Weisbecker, models the RCU grace-period kthread detecting an idle CPU
+that is concurrently transitioning to non-idle:
+
+	C dynticks-from-idle
+
+	{
+		DYNTICKS=0; (* Initially idle. *)
+	}
+
+	P0(int *X, int *DYNTICKS)
+	{
+		int dynticks;
+		int x;
+
+		// Idle.
+		dynticks = READ_ONCE(*DYNTICKS);
+		smp_store_release(DYNTICKS, dynticks + 1);
+		smp_mb();
+		// Now non-idle
+		x = READ_ONCE(*X);
+	}
+
+	P1(int *X, int *DYNTICKS)
+	{
+		int dynticks;
+
+		WRITE_ONCE(*X, 1);
+		smp_mb();
+		dynticks = smp_load_acquire(DYNTICKS);
+	}
+
+	exists (1:dynticks=0 /\ 0:x=1)
+
+Running "herd7 -conf linux-kernel.cfg dynticks-from-idle.litmus" verifies
+this transition, namely, showing that if the RCU grace-period kthread (P1)
+sees another CPU as idle (P0), then any memory access prior to the start
+of the grace period (P1's write to X) will be seen by any RCU read-side
+critical section following the to-non-idle transition (P0's read from X).
+This is a straightforward use of full memory barriers to force ordering
+in a store-buffering (SB) litmus test.
+
+The following litmus test, also adapted from the one supplied off-list
+by Frederic Weisbecker, models the RCU grace-period kthread detecting
+a non-idle CPU that is concurrently transitioning to idle:
+
+	C dynticks-into-idle
+
+	{
+		DYNTICKS=1; (* Initially non-idle. *)
+	}
+
+	P0(int *X, int *DYNTICKS)
+	{
+		int dynticks;
+
+		// Non-idle.
+		WRITE_ONCE(*X, 1);
+		dynticks = READ_ONCE(*DYNTICKS);
+		smp_store_release(DYNTICKS, dynticks + 1);
+		smp_mb();
+		// Now idle.
+	}
+
+	P1(int *X, int *DYNTICKS)
+	{
+		int x;
+		int dynticks;
+
+		smp_mb();
+		dynticks = smp_load_acquire(DYNTICKS);
+		x = READ_ONCE(*X);
+	}
+
+	exists (1:dynticks=2 /\ 1:x=0)
+
+Running "herd7 -conf linux-kernel.cfg dynticks-into-idle.litmus" verifies
+this transition, namely, showing that if the RCU grace-period kthread
+(P1) sees another CPU as newly idle (P0), then any pre-idle memory access
+(P0's write to X) will be seen by any code following the grace period
+(P1's read from X).  This is a simple release-acquire pair forcing
+ordering in a message-passing (MP) litmus test.
+
+Of course, if the grace-period kthread detects the CPU as non-idle,
+it will refrain from reporting a quiescent state on behalf of that CPU,
+so there are no ordering requirements from the grace-period kthread in
+that case.  However, other subsystems call rcu_is_idle_cpu() to check
+for CPUs being non-idle from an RCU perspective.  That case is also
+verified by the above litmus tests with the proviso that the sense of
+the low-order bit of the DYNTICKS counter be inverted.
+
+Unfortunately, on x86 smp_mb() is as expensive as a cache-local atomic
+increment.  This commit therefore weakens only the read from ->dynticks.
+However, the updates are abstracted into a rcu_dynticks_inc() function
+to ease any future changes that might be needed.
+
+[ paulmck: Apply Linus Torvalds feedback. ]
+
+Link: https://lore.kernel.org/lkml/20210721202127.2129660-4-paulmck@kernel.org/
+Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+

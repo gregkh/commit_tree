@@ -1,0 +1,73 @@
+drm/i915: Use a table for i915_init/exit (v2)
+
+If the driver was not fully loaded, we may still have globals lying
+around.  If we don't tear those down in i915_exit(), we'll leak a bunch
+of memory slabs.  This can happen two ways: use_kms = false and if we've
+run mock selftests.  In either case, we have an early exit from
+i915_init which happens after i915_globals_init() and we need to clean
+up those globals.
+
+The mock selftests case is especially sticky.  The load isn't entirely
+a no-op.  We actually do quite a bit inside those selftests including
+allocating a bunch of mock objects and running tests on them.  Once all
+those tests are complete, we exit early from i915_init().  Perviously,
+i915_init() would return a non-zero error code on failure and a zero
+error code on success.  In the success case, we would get to i915_exit()
+and check i915_pci_driver.driver.owner to detect if i915_init exited early
+and do nothing.  In the failure case, we would fail i915_init() but
+there would be no opportunity to clean up globals.
+
+The most annoying part is that you don't actually notice the failure as
+part of the self-tests since leaking a bit of memory, while bad, doesn't
+result in anything observable from userspace.  Instead, the next time we
+load the driver (usually for next IGT test), i915_globals_init() gets
+invoked again, we go to allocate a bunch of new memory slabs, those
+implicitly create debugfs entries, and debugfs warns that we're trying
+to create directories and files that already exist.  Since this all
+happens as part of the next driver load, it shows up in the dmesg-warn
+of whatever IGT test ran after the mock selftests.
+
+While the obvious thing to do here might be to call i915_globals_exit()
+after selftests, that's not actually safe.  The dma-buf selftests call
+i915_gem_prime_export which creates a file.  We call dma_buf_put() on
+the resulting dmabuf which calls fput() on the file.  However, fput()
+isn't immediate and gets flushed right before syscall returns.  This
+means that all the fput()s from the selftests don't happen until right
+before the module load syscall used to fire off the selftests returns
+which is after i915_init().  If we call i915_globals_exit() in
+i915_init() after selftests, we end up freeing slabs out from under
+objects which won't get released until fput() is flushed at the end of
+the module load syscall.
+
+The solution here is to let i915_init() return success early and detect
+the early success in i915_exit() and only tear down globals and nothing
+else.  This way the module loads successfully, regardless of the success
+or failure of the tests.  Because we've not enumerated any PCI devices,
+no device nodes are created and it's entirely useless from userspace.
+The only thing the module does at that point is hold on to a bit of
+memory until we unload it and i915_exit() is called.  Importantly, this
+means that everything from our selftests has the ability to properly
+flush out between i915_init() and i915_exit() because there is at least
+one syscall boundary in between.
+
+In order to handle all the delicate init/exit cases, we convert the
+whole thing to a table of init/exit pairs and track the init status in
+the new init_progress global.  This allows us to ensure that i915_exit()
+always tears down exactly the things that i915_init() successfully
+initialized.  We also allow early-exit of i915_init() without failure by
+an init function returning > 0.  This is useful for nomodeset, and
+selftests.  For the mock selftests, we convert them to always return 1
+so we get the desired behavior of the driver always succeeding to load
+the driver and then properly tearing down the partially loaded driver.
+
+v2 (Tvrtko Ursulin):
+ - Guard init_funcs[i].exit with GEM_BUG_ON(i >= ARRAY_SIZE(init_funcs))
+v2 (Daniel Vetter):
+ - Update the docstring for i915.mock_selftests
+
+Signed-off-by: Jason Ekstrand <jason@jlekstrand.net>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210721152358.2893314-4-jason@jlekstrand.net
+

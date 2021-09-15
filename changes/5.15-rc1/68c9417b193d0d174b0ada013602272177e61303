@@ -1,0 +1,51 @@
+nbd: do del_gendisk() asynchronously for NBD_DESTROY_ON_DISCONNECT
+
+Now open_mutex is used to synchronize partition operations (e.g,
+blk_drop_partitions() and blkdev_reread_part()), however it makes
+nbd driver broken, because nbd may call del_gendisk() in nbd_release()
+or nbd_genl_disconnect() if NBD_CFLAG_DESTROY_ON_DISCONNECT is enabled,
+and deadlock occurs, as shown below:
+
+// AB-BA dead-lock
+nbd_genl_disconnect            blkdev_open
+  nbd_disconnect_and_put
+                                 lock bd_mutex
+  // last ref
+  nbd_put
+    lock nbd_index_mutex
+      del_gendisk
+                                   nbd_open
+                                     try lock nbd_index_mutex
+        try lock bd_mutex
+
+ or
+
+// AA dead-lock
+nbd_release
+  lock bd_mutex
+    nbd_put
+      try lock bd_mutex
+
+Instead of fixing block layer (e.g, introduce another lock), fixing
+the nbd driver to call del_gendisk() in a kworker when
+NBD_DESTROY_ON_DISCONNECT is enabled. When NBD_DESTROY_ON_DISCONNECT
+is disabled, nbd device will always be destroy through module removal,
+and there is no risky of deadlock.
+
+To ensure the reuse of nbd index succeeds, moving the calling of
+idr_remove() after del_gendisk(), so if the reused index is not found
+in nbd_index_idr, the old disk must have been deleted. And reusing
+the existing destroy_complete mechanism to ensure nbd_genl_connect()
+will wait for the completion of del_gendisk().
+
+Also adding a new workqueue for nbd removal, so nbd_cleanup()
+can ensure all removals complete before exits.
+
+Reported-by: syzbot+0fe7752e52337864d29b@syzkaller.appspotmail.com
+Fixes: c76f48eb5c08 ("block: take bd_mutex around delete_partitions in del_gendisk")
+Signed-off-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20210811124428.2368491-2-hch@lst.de
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

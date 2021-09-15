@@ -1,0 +1,82 @@
+net: ipa: fix TX queue race
+
+Jakub Kicinski pointed out a race condition in ipa_start_xmit() in a
+recently-accepted series of patches:
+  https://lore.kernel.org/netdev/20210812195035.2816276-1-elder@linaro.org/
+We are stopping the modem TX queue in that function if the power
+state is not active.  We restart the TX queue again once hardware
+resume is complete.
+
+  TX path                       Power Management
+  -------                       ----------------
+  pm_runtime_get(); no power    Start resume
+  Stop TX queue                      ...
+  pm_runtime_put()              Resume complete
+  return NETDEV_TX_BUSY         Start TX queue
+
+  pm_runtime_get()
+  Power present, transmit
+  pm_runtime_put()              (auto-suspend)
+
+The issue is that the power management (resume) activity and the
+network transmit activity can occur concurrently, and there's a
+chance the queue will be stopped *after* it has been started again.
+
+  TX path                       Power Management
+  -------                       ----------------
+                                Resume underway
+  pm_runtime_get(); no power         ...
+                                Resume complete
+                                Start TX queue
+  Stop TX queue       <-- No more transmits after this
+  pm_runtime_put()
+  return NETDEV_TX_BUSY
+
+We address this using a STARTED flag to indicate when the TX queue
+has been started from the resume path, and a spinlock to make the
+flag and queue updates happen atomically.
+
+  TX path                       Power Management
+  -------                       ----------------
+                                Resume underway
+  pm_runtime_get(); no power    Resume complete
+                                start TX queue     \
+  If STARTED flag is *not* set:                     > atomic
+      Stop TX queue             set STARTED flag   /
+  pm_runtime_put()
+  return NETDEV_TX_BUSY
+
+A second flag is used to address a different race that involves
+another path requesting power.
+
+  TX path            Other path              Power Management
+  -------            ----------              ----------------
+                     pm_runtime_get_sync()   Resume
+                                             Start TX queue   \ atomic
+                                             Set STARTED flag /
+                     (do its thing)
+                     pm_runtime_put()
+                                             (auto-suspend)
+  pm_runtime_get()                           Mark delayed resume
+  STARTED *is* set, so
+    do *not* stop TX queue  <-- Queue should be stopped here
+  pm_runtime_put()
+  return NETDEV_TX_BUSY                      Suspend done, resume
+                                             Resume complete
+  pm_runtime_get()
+  Stop TX queue
+    (STARTED is *not* set)                   Start TX queue   \ atomic
+  pm_runtime_put()                           Set STARTED flag /
+  return NETDEV_TX_BUSY
+
+So a STOPPED flag is set in the transmit path when it has stopped
+the TX queue, and this pair of operations is also protected by the
+spinlock.  The resume path only restarts the TX queue if the STOPPED
+flag is set.  This case isn't a major problem, but it avoids the
+"non-trivial amount of useless work" done by the networking stack
+when NETDEV_TX_BUSY is returned.
+
+Fixes: 6b51f802d652b ("net: ipa: ensure hardware has power in ipa_start_xmit()")
+Signed-off-by: Alex Elder <elder@linaro.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

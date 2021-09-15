@@ -1,0 +1,103 @@
+btrfs: improve the batch insertion of delayed items
+
+When we insert the delayed items of an inode, which corresponds to the
+directory index keys for a directory (key type BTRFS_DIR_INDEX_KEY), we
+do the following:
+
+1) Pick the first delayed item from the rbtree and insert it into the
+   fs/subvolume btree, using btrfs_insert_empty_item() for that;
+
+2) Without releasing the path returned by btrfs_insert_empty_item(),
+   keep collecting as many consecutive delayed items from the rbtree
+   as possible, as long as each one's BTRFS_DIR_INDEX_KEY key is the
+   immediate successor of the previously picked item and as long as
+   they fit in the available space of the leaf the path points to;
+
+3) Then insert all the collected items into the leaf;
+
+4) Release the reserve metadata space for each collected item and
+   release each item (implies deleting from the rbtree);
+
+5) Unlock the path.
+
+While this is much better than inserting items one by one, it can be
+improved in a few aspects:
+
+1) Instead of adding items based on the remaining free space of the
+   leaf, collect as many items that can fit in a leaf and bulk insert
+   them. This results in less and larger batches, reducing the total
+   amount of time to insert the delayed items. For example when adding
+   100K files to a directory, we ended up creating 1658 batches with
+   very variable sizes ranging from 1 item to 118 items, on a filesystem
+   with a node/leaf size of 16K. After this change, we end up with 839
+   batches, with the vast majority of them having exactly 120 items;
+
+2) We do the search for more items to batch, by iterating the rbtree,
+   while holding a write lock on the leaf;
+
+3) While still holding the leaf locked, we are releasing the reserved
+   metadata for each item and then deleting each item, keeping a write
+   lock on the leaf for longer than necessary. Releasing the delayed items
+   one by one can take a significant amount of time, because deleting
+   them from the rbtree can often be a bit slow when the deletion results
+   in rebalancing the rbtree.
+
+So change this so that we try to create larger batches, with a total
+item size up to the maximum a leaf can support, and by unlocking the leaf
+immediately after inserting the items, releasing the reserved metadata
+space of each item and releasing each item without holding the write lock
+on the leaf.
+
+The following script that runs fs_mark was used to test this change:
+
+  $ cat test.sh
+  #!/bin/bash
+
+  DEV=/dev/nvme0n1
+  MNT=/mnt/nvme0n1
+  MOUNT_OPTIONS="-o ssd"
+  MKFS_OPTIONS="-m single -d single"
+  FILES=1000000
+  THREADS=16
+  FILE_SIZE=0
+
+  echo "performance" | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+  umount $DEV &> /dev/null
+  mkfs.btrfs -f $MKFS_OPTIONS $DEV
+  mount $MOUNT_OPTIONS $DEV $MNT
+
+  OPTS="-S 0 -L 5 -n $FILES -s $FILE_SIZE -t 16"
+  for ((i = 1; i <= $THREADS; i++)); do
+      OPTS="$OPTS -d $MNT/d$i"
+  done
+
+  fs_mark $OPTS
+
+  umount $MNT
+
+It was run on machine with 12 cores, 64G of ram, using a NVMe device and
+using a non-debug kernel config (Debian's default config).
+
+Results before this change:
+
+FSUse%        Count         Size    Files/sec         App Overhead
+     1     16000000            0      76182.1             72223046
+     3     32000000            0      62746.9             80776528
+     5     48000000            0      77029.0             93022381
+     6     64000000            0      73691.6             95251075
+     8     80000000            0      66288.0             85089634
+
+Results after this change:
+
+FSUse%        Count         Size    Files/sec         App Overhead
+     1     16000000            0      79049.5 (+3.7%)     69700824
+     3     32000000            0      65248.9 (+3.9%)     80583693
+     5     48000000            0      77991.4 (+1.2%)     90040908
+     6     64000000            0      75096.8 (+1.9%)     89862241
+     8     80000000            0      66926.8 (+1.0%)     84429169
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

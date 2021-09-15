@@ -1,0 +1,99 @@
+posix-cpu-timers: Recalc next expiration when timer_settime() ends up not queueing
+
+There are several scenarios that can result in posix_cpu_timer_set()
+not queueing the timer but still leaving the threadgroup cputime counter
+running or keeping the tick dependency around for a random amount of time.
+
+1) If timer_settime() is called with a 0 expiration on a timer that is
+   already disabled, the process wide cputime counter will be started
+   and won't ever get a chance to be stopped by stop_process_timer()
+   since no timer is actually armed to be processed.
+
+   The following snippet is enough to trigger the issue.
+
+	void trigger_process_counter(void)
+	{
+		timer_t id;
+		struct itimerspec val = { };
+
+		timer_create(CLOCK_PROCESS_CPUTIME_ID, NULL, &id);
+		timer_settime(id, TIMER_ABSTIME, &val, NULL);
+		timer_delete(id);
+	}
+
+2) If timer_settime() is called with a 0 expiration on a timer that is
+   already armed, the timer is dequeued but not really disarmed. So the
+   process wide cputime counter and the tick dependency may still remain
+   a while around.
+
+   The following code snippet keeps this overhead around for one week after
+   the timer deletion:
+
+	void trigger_process_counter(void)
+	{
+		timer_t id;
+		struct itimerspec val = { };
+
+		val.it_value.tv_sec = 604800;
+		timer_create(CLOCK_PROCESS_CPUTIME_ID, NULL, &id);
+		timer_settime(id, 0, &val, NULL);
+		timer_delete(id);
+	}
+
+3) If the timer was initially deactivated, this call to timer_settime()
+   with an early expiration may have started the process wide cputime
+   counter even though the timer hasn't been queued and armed because it
+   has fired early and inline within posix_cpu_timer_set() itself. As a
+   result the process wide cputime counter may never stop until a new
+   timer is ever armed in the future.
+
+   The following code snippet can reproduce this:
+
+	void trigger_process_counter(void)
+	{
+		timer_t id;
+		struct itimerspec val = { };
+
+		signal(SIGALRM, SIG_IGN);
+		timer_create(CLOCK_PROCESS_CPUTIME_ID, NULL, &id);
+		val.it_value.tv_nsec = 1;
+		timer_settime(id, TIMER_ABSTIME, &val, NULL);
+	}
+
+4) If the timer was initially armed with a former expiration value
+   before this call to timer_settime() and the current call sets an
+   early deadline that has already expired, the timer fires inline
+   within posix_cpu_timer_set(). In this case it must have been dequeued
+   before firing inline with its new expiration value, yet it hasn't
+   been disarmed in this case. So the process wide cputime counter and
+   the tick dependency may still be around for a while even after the
+   timer fired.
+
+   The following code snippet can reproduce this:
+
+	void trigger_process_counter(void)
+	{
+		timer_t id;
+		struct itimerspec val = { };
+
+		signal(SIGALRM, SIG_IGN);
+		timer_create(CLOCK_PROCESS_CPUTIME_ID, NULL, &id);
+		val.it_value.tv_sec = 100;
+		timer_settime(id, TIMER_ABSTIME, &val, NULL);
+		val.it_value.tv_sec = 0;
+		val.it_value.tv_nsec = 1;
+		timer_settime(id, TIMER_ABSTIME, &val, NULL);
+	}
+
+Fix all these issues with triggering the related base next expiration
+recalculation on the next tick. This also implies to re-evaluate the need
+to keep around the process wide cputime counter and the tick dependency, in
+a similar fashion to disarm_timer().
+
+Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20210726125513.271824-7-frederic@kernel.org
+
+

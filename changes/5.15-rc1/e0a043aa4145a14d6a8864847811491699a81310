@@ -1,0 +1,44 @@
+mm, slub: protect put_cpu_partial() with disabled irqs instead of cmpxchg
+
+Jann Horn reported [1] the following theoretically possible race:
+
+  task A: put_cpu_partial() calls preempt_disable()
+  task A: oldpage = this_cpu_read(s->cpu_slab->partial)
+  interrupt: kfree() reaches unfreeze_partials() and discards the page
+  task B (on another CPU): reallocates page as page cache
+  task A: reads page->pages and page->pobjects, which are actually
+  halves of the pointer page->lru.prev
+  task B (on another CPU): frees page
+  interrupt: allocates page as SLUB page and places it on the percpu partial list
+  task A: this_cpu_cmpxchg() succeeds
+
+  which would cause page->pages and page->pobjects to end up containing
+  halves of pointers that would then influence when put_cpu_partial()
+  happens and show up in root-only sysfs files. Maybe that's acceptable,
+  I don't know. But there should probably at least be a comment for now
+  to point out that we're reading union fields of a page that might be
+  in a completely different state.
+
+Additionally, the this_cpu_cmpxchg() approach in put_cpu_partial() is only safe
+against s->cpu_slab->partial manipulation in ___slab_alloc() if the latter
+disables irqs, otherwise a __slab_free() in an irq handler could call
+put_cpu_partial() in the middle of ___slab_alloc() manipulating ->partial
+and corrupt it. This becomes an issue on RT after a local_lock is introduced
+in later patch. The fix means taking the local_lock also in put_cpu_partial()
+on RT.
+
+After debugging this issue, Mike Galbraith suggested [2] that to avoid
+different locking schemes on RT and !RT, we can just protect put_cpu_partial()
+with disabled irqs (to be converted to local_lock_irqsave() later) everywhere.
+This should be acceptable as it's not a fast path, and moving the actual
+partial unfreezing outside of the irq disabled section makes it short, and with
+the retry loop gone the code can be also simplified. In addition, the race
+reported by Jann should no longer be possible.
+
+[1] https://lore.kernel.org/lkml/CAG48ez1mvUuXwg0YPH5ANzhQLpbphqk-ZS+jbRz+H66fvm4FcA@mail.gmail.com/
+[2] https://lore.kernel.org/linux-rt-users/e3470ab357b48bccfbd1f5133b982178a7d2befb.camel@gmx.de/
+
+Reported-by: Jann Horn <jannh@google.com>
+Suggested-by: Mike Galbraith <efault@gmx.de>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+

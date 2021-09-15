@@ -1,0 +1,91 @@
+bpf: Introduce bpf timers.
+
+Introduce 'struct bpf_timer { __u64 :64; __u64 :64; };' that can be embedded
+in hash/array/lru maps as a regular field and helpers to operate on it:
+
+// Initialize the timer.
+// First 4 bits of 'flags' specify clockid.
+// Only CLOCK_MONOTONIC, CLOCK_REALTIME, CLOCK_BOOTTIME are allowed.
+long bpf_timer_init(struct bpf_timer *timer, struct bpf_map *map, int flags);
+
+// Configure the timer to call 'callback_fn' static function.
+long bpf_timer_set_callback(struct bpf_timer *timer, void *callback_fn);
+
+// Arm the timer to expire 'nsec' nanoseconds from the current time.
+long bpf_timer_start(struct bpf_timer *timer, u64 nsec, u64 flags);
+
+// Cancel the timer and wait for callback_fn to finish if it was running.
+long bpf_timer_cancel(struct bpf_timer *timer);
+
+Here is how BPF program might look like:
+struct map_elem {
+    int counter;
+    struct bpf_timer timer;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1000);
+    __type(key, int);
+    __type(value, struct map_elem);
+} hmap SEC(".maps");
+
+static int timer_cb(void *map, int *key, struct map_elem *val);
+/* val points to particular map element that contains bpf_timer. */
+
+SEC("fentry/bpf_fentry_test1")
+int BPF_PROG(test1, int a)
+{
+    struct map_elem *val;
+    int key = 0;
+
+    val = bpf_map_lookup_elem(&hmap, &key);
+    if (val) {
+        bpf_timer_init(&val->timer, &hmap, CLOCK_REALTIME);
+        bpf_timer_set_callback(&val->timer, timer_cb);
+        bpf_timer_start(&val->timer, 1000 /* call timer_cb2 in 1 usec */, 0);
+    }
+}
+
+This patch adds helper implementations that rely on hrtimers
+to call bpf functions as timers expire.
+The following patches add necessary safety checks.
+
+Only programs with CAP_BPF are allowed to use bpf_timer.
+
+The amount of timers used by the program is constrained by
+the memcg recorded at map creation time.
+
+The bpf_timer_init() helper needs explicit 'map' argument because inner maps
+are dynamic and not known at load time. While the bpf_timer_set_callback() is
+receiving hidden 'aux->prog' argument supplied by the verifier.
+
+The prog pointer is needed to do refcnting of bpf program to make sure that
+program doesn't get freed while the timer is armed. This approach relies on
+"user refcnt" scheme used in prog_array that stores bpf programs for
+bpf_tail_call. The bpf_timer_set_callback() will increment the prog refcnt which is
+paired with bpf_timer_cancel() that will drop the prog refcnt. The
+ops->map_release_uref is responsible for cancelling the timers and dropping
+prog refcnt when user space reference to a map reaches zero.
+This uref approach is done to make sure that Ctrl-C of user space process will
+not leave timers running forever unless the user space explicitly pinned a map
+that contained timers in bpffs.
+
+bpf_timer_init() and bpf_timer_set_callback() will return -EPERM if map doesn't
+have user references (is not held by open file descriptor from user space and
+not pinned in bpffs).
+
+The bpf_map_delete_elem() and bpf_map_update_elem() operations cancel
+and free the timer if given map element had it allocated.
+"bpftool map update" command can be used to cancel timers.
+
+The 'struct bpf_timer' is explicitly __attribute__((aligned(8))) because
+'__u64 :64' has 1 byte alignment of 8 byte padding.
+
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/20210715005417.78572-4-alexei.starovoitov@gmail.com
+

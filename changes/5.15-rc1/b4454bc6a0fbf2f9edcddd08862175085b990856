@@ -1,0 +1,56 @@
+net: bridge: switchdev: replay the entire FDB for each port
+
+Currently when a switchdev port joins a bridge, we replay all FDB
+entries pointing towards that port or towards the bridge.
+
+However, this is insufficient in certain situations:
+
+(a) DSA, through its assisted_learning_on_cpu_port logic, snoops
+    dynamically learned FDB entries on foreign interfaces.
+    These are FDB entries that are pointing neither towards the newly
+    joined switchdev port, nor towards the bridge. So these addresses
+    would be missed when joining a bridge where a foreign interface has
+    already learned some addresses, and they would also linger on if the
+    DSA port leaves the bridge before the foreign interface forgets them.
+    None of this happens if we replay the entire FDB when the port joins.
+
+(b) There is a desire to treat local FDB entries on a port (i.e. the
+    port's termination MAC address) identically to FDB entries pointing
+    towards the bridge itself. More details on the reason behind this in
+    the next patch. The point is that this cannot be done given the
+    current structure of br_fdb_replay() in this situation:
+      ip link set swp0 master br0  # br0 inherits its MAC address from swp0
+      ip link set swp1 master br0
+    What is desirable is that when swp1 joins the bridge, br_fdb_replay()
+    also notifies swp1 of br0's MAC address, but this won't in fact
+    happen because the MAC address of br0 does not have fdb->dst == NULL
+    (it doesn't point towards the bridge), but it has fdb->dst == swp0.
+    So our current logic makes it impossible for that address to be
+    replayed. But if we dump the entire FDB instead of just the entries
+    with fdb->dst == swp1 and fdb->dst == NULL, then the inherited MAC
+    address of br0 will be replayed too, which is what we need.
+
+A natural question arises: say there is an FDB entry to be replayed,
+like a MAC address dynamically learned on a foreign interface that
+belongs to a bridge where no switchdev port has joined yet. If 10
+switchdev ports belonging to the same driver join this bridge, one by
+one, won't every port get notified 10 times of the foreign FDB entry,
+amounting to a total of 100 notifications for this FDB entry in the
+switchdev driver?
+
+Well, yes, but this is where the "void *ctx" argument for br_fdb_replay
+is useful: every port of the switchdev driver is notified whenever any
+other port requests an FDB replay, but because the replay was initiated
+by a different port, its context is different from the initiating port's
+context, so it ignores those replays.
+
+So the foreign FDB entry will be installed only 10 times, once per port.
+This is done so that the following 4 code paths are always well balanced:
+(a) addition of foreign FDB entry is replayed when port joins bridge
+(b) deletion of foreign FDB entry is replayed when port leaves bridge
+(c) addition of foreign FDB entry is notified to all ports currently in bridge
+(c) deletion of foreign FDB entry is notified to all ports currently in bridge
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

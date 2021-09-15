@@ -1,0 +1,108 @@
+btrfs: avoid unnecessary lock and leaf splits when updating inode in the log
+
+During a fast fsync, if we have already fsynced the file before and in the
+current transaction, we can make the inode item update more efficient and
+avoid acquiring a write lock on the leaf's parent.
+
+To update the inode item we are always using btrfs_insert_empty_item() to
+get a path pointing to the inode item, which calls btrfs_search_slot()
+with an "ins_len" argument of 'sizeof(struct btrfs_inode_item) +
+sizeof(struct btrfs_item)', and that always results in the search taking
+a write lock on the level 1 node that is the parent of the leaf that
+contains the inode item. This adds unnecessary lock contention on log
+trees when we have multiple fsyncs in parallel against inodes in the same
+subvolume, which has a very significant impact due to the fact that log
+trees are short lived and their height very rarely goes beyond level 2.
+
+Also, by using btrfs_insert_empty_item() when we need to update the inode
+item, we also end up splitting the leaf of the existing inode item when
+the leaf has an amount of free space smaller than the size of an inode
+item.
+
+Improve this by using btrfs_seach_slot(), with a 0 "ins_len" argument,
+when we know the inode item already exists in the log. This avoids these
+two inefficiencies.
+
+The following script, using fio, was used to perform the tests:
+
+  $ cat fio-test.sh
+  #!/bin/bash
+
+  DEV=/dev/nvme0n1
+  MNT=/mnt/nvme0n1
+  MOUNT_OPTIONS="-o ssd"
+  MKFS_OPTIONS="-d single -m single"
+
+  if [ $# -ne 4 ]; then
+    echo "Use $0 NUM_JOBS FILE_SIZE FSYNC_FREQ BLOCK_SIZE"
+    exit 1
+  fi
+
+  NUM_JOBS=$1
+  FILE_SIZE=$2
+  FSYNC_FREQ=$3
+  BLOCK_SIZE=$4
+
+  cat <<EOF > /tmp/fio-job.ini
+  [writers]
+  rw=randwrite
+  fsync=$FSYNC_FREQ
+  fallocate=none
+  group_reporting=1
+  direct=0
+  bs=$BLOCK_SIZE
+  ioengine=sync
+  size=$FILE_SIZE
+  directory=$MNT
+  numjobs=$NUM_JOBS
+  EOF
+
+  echo "performance" | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+  echo
+  echo "Using config:"
+  echo
+  cat /tmp/fio-job.ini
+  echo
+  echo "mount options: $MOUNT_OPTIONS"
+  echo
+
+  umount $MNT &> /dev/null
+  mkfs.btrfs -f $MKFS_OPTIONS $DEV
+  mount $MOUNT_OPTIONS $DEV $MNT
+
+  fio /tmp/fio-job.ini
+  umount $MNT
+
+The tests were done on a physical machine, with 12 cores, 64G of RAM,
+using a NVMEe device and using a non-debug kernel config (the default one
+from Debian). The summary line from fio is provided below for each test
+run.
+
+With 8 jobs, file size 256M, fsync frequency of 4 and a block size of 4K:
+
+Before: WRITE: bw=28.3MiB/s (29.7MB/s), 28.3MiB/s-28.3MiB/s (29.7MB/s-29.7MB/s), io=2048MiB (2147MB), run=72297-72297msec
+After:  WRITE: bw=28.7MiB/s (30.1MB/s), 28.7MiB/s-28.7MiB/s (30.1MB/s-30.1MB/s), io=2048MiB (2147MB), run=71411-71411msec
+
++1.4% throughput, -1.2% runtime
+
+With 16 jobs, file size 256M, fsync frequency of 4 and a block size of 4K:
+
+Before: WRITE: bw=40.0MiB/s (42.0MB/s), 40.0MiB/s-40.0MiB/s (42.0MB/s-42.0MB/s), io=4096MiB (4295MB), run=99980-99980msec
+After:  WRITE: bw=40.9MiB/s (42.9MB/s), 40.9MiB/s-40.9MiB/s (42.9MB/s-42.9MB/s), io=4096MiB (4295MB), run=97933-97933msec
+
++2.2% throughput, -2.1% runtime
+
+The changes are small but it's possible to be better on faster hardware as
+in the test machine used disk utilization was pretty much 100% during the
+whole time the tests were running (observed with 'iostat -xz 1').
+
+The tests also included the previous patch with the subject of:
+"btrfs: avoid unnecessary log mutex contention when syncing log".
+So they compared a branch without that patch and without this patch versus
+a branch with these two patches applied.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

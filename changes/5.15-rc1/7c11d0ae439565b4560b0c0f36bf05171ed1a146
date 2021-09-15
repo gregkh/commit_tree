@@ -1,0 +1,57 @@
+btrfs: subpage: fix a potential use-after-free in writeback helper
+
+[BUG]
+There is a possible use-after-free bug when running generic/095.
+
+ BUG: Unable to handle kernel data access on write at 0x6b6b6b6b6b6b725b
+ Faulting instruction address: 0xc000000000283654
+ c000000000283078 do_raw_spin_unlock+0x88/0x230
+ c0000000012b1e14 _raw_spin_unlock_irqrestore+0x44/0x90
+ c000000000a918dc btrfs_subpage_clear_writeback+0xac/0xe0
+ c0000000009e0458 end_bio_extent_writepage+0x158/0x270
+ c000000000b6fd14 bio_endio+0x254/0x270
+ c0000000009fc0f0 btrfs_end_bio+0x1a0/0x200
+ c000000000b6fd14 bio_endio+0x254/0x270
+ c000000000b781fc blk_update_request+0x46c/0x670
+ c000000000b8b394 blk_mq_end_request+0x34/0x1d0
+ c000000000d82d1c lo_complete_rq+0x11c/0x140
+ c000000000b880a4 blk_complete_reqs+0x84/0xb0
+ c0000000012b2ca4 __do_softirq+0x334/0x680
+ c0000000001dd878 irq_exit+0x148/0x1d0
+ c000000000016f4c do_IRQ+0x20c/0x240
+ c000000000009240 hardware_interrupt_common_virt+0x1b0/0x1c0
+
+[CAUSE]
+There is very small race window like the following in generic/095.
+
+	Thread 1		|		Thread 2
+--------------------------------+------------------------------------
+  end_bio_extent_writepage()	| btrfs_releasepage()
+  |- spin_lock_irqsave()	| |
+  |- end_page_writeback()	| |
+  |				| |- if (PageWriteback() ||...)
+  |				| |- clear_page_extent_mapped()
+  |				|    |- kfree(subpage);
+  |- spin_unlock_irqrestore().
+
+The race can also happen between writeback and btrfs_invalidatepage(),
+although that would be much harder as btrfs_invalidatepage() has much
+more work to do before the clear_page_extent_mapped() call.
+
+[FIX]
+Here we "wait" for the subapge spinlock to be released before we detach
+subpage structure.
+So this patch will introduce a new function, wait_subpage_spinlock(), to
+do the "wait" by acquiring the spinlock and release it.
+
+Since the caller has ensured the page is not dirty nor writeback, and
+page is already locked, the only way to hold the subpage spinlock is
+from endio function.
+Thus we only need to acquire the spinlock to wait for any existing
+holder.
+
+Reported-by: Ritesh Harjani <riteshh@linux.ibm.com>
+Tested-by: Ritesh Harjani <riteshh@linux.ibm.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

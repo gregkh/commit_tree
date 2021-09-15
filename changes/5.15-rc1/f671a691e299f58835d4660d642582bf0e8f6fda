@@ -1,0 +1,63 @@
+fcntl: fix potential deadlocks for &fown_struct.lock
+
+Syzbot reports a potential deadlock in do_fcntl:
+
+========================================================
+WARNING: possible irq lock inversion dependency detected
+5.12.0-syzkaller #0 Not tainted
+--------------------------------------------------------
+syz-executor132/8391 just changed the state of lock:
+ffff888015967bf8 (&f->f_owner.lock){.+..}-{2:2}, at: f_getown_ex fs/fcntl.c:211 [inline]
+ffff888015967bf8 (&f->f_owner.lock){.+..}-{2:2}, at: do_fcntl+0x8b4/0x1200 fs/fcntl.c:395
+but this lock was taken by another, HARDIRQ-safe lock in the past:
+ (&dev->event_lock){-...}-{2:2}
+
+and interrupts could create inverse lock ordering between them.
+
+other info that might help us debug this:
+Chain exists of:
+  &dev->event_lock --> &new->fa_lock --> &f->f_owner.lock
+
+ Possible interrupt unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&f->f_owner.lock);
+                               local_irq_disable();
+                               lock(&dev->event_lock);
+                               lock(&new->fa_lock);
+  <Interrupt>
+    lock(&dev->event_lock);
+
+ *** DEADLOCK ***
+
+This happens because there is a lock hierarchy of
+&dev->event_lock --> &new->fa_lock --> &f->f_owner.lock
+from the following call chain:
+
+  input_inject_event():
+    spin_lock_irqsave(&dev->event_lock,...);
+    input_handle_event():
+      input_pass_values():
+        input_to_handler():
+          evdev_events():
+            evdev_pass_values():
+              spin_lock(&client->buffer_lock);
+              __pass_event():
+                kill_fasync():
+                  kill_fasync_rcu():
+                    read_lock(&fa->fa_lock);
+                    send_sigio():
+                      read_lock_irqsave(&fown->lock,...);
+
+However, since &dev->event_lock is HARDIRQ-safe, interrupts have to be
+disabled while grabbing &f->f_owner.lock, otherwise we invert the lock
+hierarchy.
+
+Hence, we replace calls to read_lock/read_unlock on &f->f_owner.lock,
+with read_lock_irq/read_unlock_irq.
+
+Reported-and-tested-by: syzbot+e6d5398a02c516ce5e70@syzkaller.appspotmail.com
+Signed-off-by: Desmond Cheong Zhi Xi <desmondcheongzx@gmail.com>
+Signed-off-by: Jeff Layton <jlayton@kernel.org>
+

@@ -1,0 +1,114 @@
+net: dsa: tag_8021q: add proper cross-chip notifier support
+
+The big problem which mandates cross-chip notifiers for tag_8021q is
+this:
+
+                                             |
+    sw0p0     sw0p1     sw0p2     sw0p3     sw0p4
+ [  user ] [  user ] [  user ] [  dsa  ] [  cpu  ]
+                                   |
+                                   +---------+
+                                             |
+    sw1p0     sw1p1     sw1p2     sw1p3     sw1p4
+ [  user ] [  user ] [  user ] [  dsa  ] [  dsa  ]
+                                   |
+                                   +---------+
+                                             |
+    sw2p0     sw2p1     sw2p2     sw2p3     sw2p4
+ [  user ] [  user ] [  user ] [  dsa  ] [  dsa  ]
+
+When the user runs:
+
+ip link add br0 type bridge
+ip link set sw0p0 master br0
+ip link set sw2p0 master br0
+
+It doesn't work.
+
+This is because dsa_8021q_crosschip_bridge_join() assumes that "ds" and
+"other_ds" are at most 1 hop away from each other, so it is sufficient
+to add the RX VLAN of {ds, port} into {other_ds, other_port} and vice
+versa and presto, the cross-chip link works. When there is another
+switch in the middle, such as in this case switch 1 with its DSA links
+sw1p3 and sw1p4, somebody needs to tell it about these VLANs too.
+
+Which is exactly why the problem is quadratic: when a port joins a
+bridge, for each port in the tree that's already in that same bridge we
+notify a tag_8021q VLAN addition of that port's RX VLAN to the entire
+tree. It is a very complicated web of VLANs.
+
+It must be mentioned that currently we install tag_8021q VLANs on too
+many ports (DSA links - to be precise, on all of them). For example,
+when sw2p0 joins br0, and assuming sw1p0 was part of br0 too, we add the
+RX VLAN of sw2p0 on the DSA links of switch 0 too, even though there
+isn't any port of switch 0 that is a member of br0 (at least yet).
+In theory we could notify only the switches which sit in between the
+port joining the bridge and the port reacting to that bridge_join event.
+But in practice that is impossible, because of the way 'link' properties
+are described in the device tree. The DSA bindings require DT writers to
+list out not only the real/physical DSA links, but in fact the entire
+routing table, like for example switch 0 above will have:
+
+	sw0p3: port@3 {
+		link = <&sw1p4 &sw2p4>;
+	};
+
+This was done because:
+
+/* TODO: ideally DSA ports would have a single dp->link_dp member,
+ * and no dst->rtable nor this struct dsa_link would be needed,
+ * but this would require some more complex tree walking,
+ * so keep it stupid at the moment and list them all.
+ */
+
+but it is a perfect example of a situation where too much information is
+actively detrimential, because we are now in the position where we
+cannot distinguish a real DSA link from one that is put there to avoid
+the 'complex tree walking'. And because DT is ABI, there is not much we
+can change.
+
+And because we do not know which DSA links are real and which ones
+aren't, we can't really know if DSA switch A is in the data path between
+switches B and C, in the general case.
+
+So this is why tag_8021q RX VLANs are added on all DSA links, and
+probably why it will never change.
+
+On the other hand, at least the number of additions/deletions is well
+balanced, and this means that once we implement reference counting at
+the cross-chip notifier level a la fdb/mdb, there is absolutely zero
+need for a struct dsa_8021q_crosschip_link, it's all self-managing.
+
+In fact, with the tag_8021q notifiers emitted from the bridge join
+notifiers, it becomes so generic that sja1105 does not need to do
+anything anymore, we can just delete its implementation of the
+.crosschip_bridge_{join,leave} methods.
+
+Among other things we can simply delete is the home-grown implementation
+of sja1105_notify_crosschip_switches(). The reason why that is wrong is
+because it is not quadratic - it only covers remote switches to which we
+have a cross-chip bridging link and that does not cover in-between
+switches. This deletion is part of the same patch because sja1105 used
+to poke deep inside the guts of the tag_8021q context in order to do
+that. Because the cross-chip links went away, so needs the sja1105 code.
+
+Last but not least, dsa_8021q_setup_port() is simplified (and also
+renamed). Because our TAG_8021Q_VLAN_ADD notifier is designed to react
+on the CPU port too, the four dsa_8021q_vid_apply() calls:
+- 1 for RX VLAN on user port
+- 1 for the user port's RX VLAN on the CPU port
+- 1 for TX VLAN on user port
+- 1 for the user port's TX VLAN on the CPU port
+
+now get squashed into only 2 notifier calls via
+dsa_port_tag_8021q_vlan_add.
+
+And because the notifiers to add and to delete a tag_8021q VLAN are
+distinct, now we finally break up the port setup and teardown into
+separate functions instead of relying on a "bool enabled" flag which
+tells us what to do. Arguably it should have been this way from the
+get go.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

@@ -1,0 +1,136 @@
+net: mscc: ocelot: convert to phylink
+
+The felix DSA driver, which is a wrapper over the same hardware class as
+ocelot, is integrated with phylink, but ocelot is using the plain PHY
+library. It makes sense to bring together the two implementations, which
+is what this patch achieves.
+
+This is a large patch and hard to break up, but it does the following:
+
+The existing ocelot_adjust_link writes some registers, and
+felix_phylink_mac_link_up writes some registers, some of them are
+common, but both functions write to some registers to which the other
+doesn't.
+
+The main reasons for this are:
+- Felix switches so far have used an NXP PCS so they had no need to
+  write the PCS1G registers that ocelot_adjust_link writes
+- Felix switches have the MAC fixed at 1G, so some of the MAC speed
+  changes actually break the link and must be avoided.
+
+The naming conventions for the functions introduced in this patch are:
+- vsc7514_phylink_{mac_config,validate} are specific to the Ocelot
+  instantiations and placed in ocelot_net.c which is built only for the
+  ocelot switchdev driver.
+- ocelot_phylink_mac_link_{up,down} are shared between the ocelot
+  switchdev driver and the felix DSA driver (they are put in the common
+  lib).
+
+One by one, the registers written by ocelot_adjust_link are:
+
+DEV_MAC_MODE_CFG - felix_phylink_mac_link_up had no need to write this
+                   register since its out-of-reset value was fine and
+                   did not need changing. The write is moved to the
+                   common ocelot_phylink_mac_link_up and on felix it is
+                   guarded by a quirk bit that makes the written value
+                   identical with the out-of-reset one
+DEV_PORT_MISC - runtime invariant, was moved to vsc7514_phylink_mac_config
+PCS1G_MODE_CFG - same as above
+PCS1G_SD_CFG - same as above
+PCS1G_CFG - same as above
+PCS1G_ANEG_CFG - same as above
+PCS1G_LB_CFG - same as above
+DEV_MAC_ENA_CFG - both ocelot_adjust_link and ocelot_port_disable
+                  touched this. felix_phylink_mac_link_{up,down} also
+                  do. We go with what felix does and put it in
+                  ocelot_phylink_mac_link_up.
+DEV_CLOCK_CFG - ocelot_adjust_link and felix_phylink_mac_link_up both
+                write this, but to different values. Move to the common
+                ocelot_phylink_mac_link_up and make sure via the quirk
+                that the old values are preserved for both.
+ANA_PFC_PFC_CFG - ocelot_adjust_link wrote this, felix_phylink_mac_link_up
+                  did not. Runtime invariant, speed does not matter since
+                  PFC is disabled via the RX_PFC_ENA bits which are cleared.
+                  Move to vsc7514_phylink_mac_config.
+QSYS_SWITCH_PORT_MODE_PORT_ENA - both ocelot_adjust_link and
+                                 felix_phylink_mac_link_{up,down} wrote
+                                 this. Ocelot also wrote this register
+                                 from ocelot_port_disable. Keep what
+                                 felix did, move in ocelot_phylink_mac_link_{up,down}
+                                 and delete ocelot_port_disable.
+ANA_POL_FLOWC - same as above
+SYS_MAC_FC_CFG - same as above, except slight behavior change. Whereas
+                 ocelot always enabled RX and TX flow control, felix
+                 listened to phylink (for the most part, at least - see
+                 the 2500base-X comment).
+
+The registers which only felix_phylink_mac_link_up wrote are:
+
+SYS_PAUSE_CFG_PAUSE_ENA - this is why I am not sure that flow control
+                          worked on ocelot. Not it should, since the
+                          code is shared with felix where it does.
+ANA_PORT_PORT_CFG - this is a Frame Analyzer block register, phylink
+                    should be the one touching them, deleted.
+
+Other changes:
+
+- The old phylib registration code was in mscc_ocelot_init_ports. It is
+  hard to work with 2 levels of indentation already in, and with hard to
+  follow teardown logic. The new phylink registration code was moved
+  inside ocelot_probe_port(), right between alloc_etherdev() and
+  register_netdev(). It could not be done before (=> outside of)
+  ocelot_probe_port() because ocelot_probe_port() allocates the struct
+  ocelot_port which we then use to assign ocelot_port->phy_mode to. It
+  is more preferable to me to have all PHY handling logic inside the
+  same function.
+- On the same topic: struct ocelot_port_private :: serdes is only used
+  in ocelot_port_open to set the SERDES protocol to Ethernet. This is
+  logically a runtime invariant and can be done just once, when the port
+  registers with phylink. We therefore don't even need to keep the
+  serdes reference inside struct ocelot_port_private, or to use the devm
+  variant of of_phy_get().
+- Phylink needs a valid phy-mode for phylink_create() to succeed, and
+  the existing device tree bindings in arch/mips/boot/dts/mscc/ocelot_pcb120.dts
+  don't define one for the internal PHY ports. So we patch
+  PHY_INTERFACE_MODE_NA into PHY_INTERFACE_MODE_INTERNAL.
+- There was a strategically placed:
+
+	switch (priv->phy_mode) {
+	case PHY_INTERFACE_MODE_NA:
+	        continue;
+
+  which made the code skip the serdes initialization for the internal
+  PHY ports. Frankly that is not all that obvious, so now we explicitly
+  initialize the serdes under an "if" condition and not rely on code
+  jumps, so everything is clearer.
+- There was a write of OCELOT_SPEED_1000 to DEV_CLOCK_CFG for QSGMII
+  ports. Since that is in fact the default value for the register field
+  DEV_CLOCK_CFG_LINK_SPEED, I can only guess the intention was to clear
+  the adjacent fields, MAC_TX_RST and MAC_RX_RST, aka take the port out
+  of reset, which does match the comment. I don't even want to know why
+  this code is placed there, but if there is indeed an issue that all
+  ports that share a QSGMII lane must all be up, then this logic is
+  already buggy, since mscc_ocelot_init_ports iterates using
+  for_each_available_child_of_node, so nobody prevents the user from
+  putting a 'status = "disabled";' for some QSGMII ports which would
+  break the driver's assumption.
+  In any case, in the eventuality that I'm right, we would have yet
+  another issue if ocelot_phylink_mac_link_down would reset those ports
+  and that would be forbidden, so since the ocelot_adjust_link logic did
+  not do that (maybe for a reason), add another quirk to preserve the
+  old logic.
+
+The ocelot driver teardown goes through all ports in one fell swoop.
+When initialization of one port fails, the ocelot->ports[port] pointer
+for that is reset to NULL, and teardown is done only for non-NULL ports,
+so there is no reason to do partial teardowns, let the central
+mscc_ocelot_release_ports() do its job.
+
+Tested bind, unbind, rebind, link up, link down, speed change on mock-up
+hardware (modified the driver to probe on Felix VSC9959). Also
+regression tested the felix DSA driver. Could not test the Ocelot
+specific bits (PCS1G, SERDES, device tree bindings).
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

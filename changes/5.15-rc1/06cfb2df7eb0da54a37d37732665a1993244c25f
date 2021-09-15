@@ -1,0 +1,150 @@
+net: dsa: don't advertise 'rx-vlan-filter' when not needed
+
+There have been multiple independent reports about
+dsa_slave_vlan_rx_add_vid being called (and consequently calling the
+drivers' .port_vlan_add) when it isn't needed, and sometimes (not
+always) causing problems in the process.
+
+Case 1:
+mv88e6xxx_port_vlan_prepare is stubborn and only accepts VLANs on
+bridged ports. That is understandably so, because standalone mv88e6xxx
+ports are VLAN-unaware, and VTU entries are said to be a scarce
+resource.
+
+Otherwise said, the following fails lamentably on mv88e6xxx:
+
+ip link add br0 type bridge vlan_filtering 1
+ip link set lan3 master br0
+ip link add link lan10 name lan10.1 type vlan id 1
+[485256.724147] mv88e6085 d0032004.mdio-mii:12: p10: hw VLAN 1 already used by port 3 in br0
+RTNETLINK answers: Operation not supported
+
+This has become a worse issue since commit 9b236d2a69da ("net: dsa:
+Advertise the VLAN offload netdev ability only if switch supports it").
+Up to that point, the driver was returning -EOPNOTSUPP and DSA was
+reconverting that error to 0, making the 8021q upper think all is ok
+(but obviously the error message was there even prior to this change).
+After that change the -EOPNOTSUPP is propagated to vlan_vid_add, and it
+is a hard error.
+
+Case 2:
+Ports that don't offload the Linux bridge (have a dp->bridge_dev = NULL
+because they don't implement .port_bridge_{join,leave}). Understandably,
+a standalone port should not offload VLANs either, it should remain VLAN
+unaware and any VLAN should be a software VLAN (as long as the hardware
+is not quirky, that is).
+
+In fact, dsa_slave_port_obj_add does do the right thing and rejects
+switchdev VLAN objects coming from the bridge when that bridge is not
+offloaded:
+
+	case SWITCHDEV_OBJ_ID_PORT_VLAN:
+		if (!dsa_port_offloads_bridge_port(dp, obj->orig_dev))
+			return -EOPNOTSUPP;
+
+		err = dsa_slave_vlan_add(dev, obj, extack);
+
+But it seems that the bridge is able to trick us. The __vlan_vid_add
+from br_vlan.c has:
+
+	/* Try switchdev op first. In case it is not supported, fallback to
+	 * 8021q add.
+	 */
+	err = br_switchdev_port_vlan_add(dev, v->vid, flags, extack);
+	if (err == -EOPNOTSUPP)
+		return vlan_vid_add(dev, br->vlan_proto, v->vid);
+
+So it says "no, no, you need this VLAN in your life!". And we, naive as
+we are, say "oh, this comes from the vlan_vid_add code path, it must be
+an 8021q upper, sure, I'll take that". And we end up with that bridge
+VLAN installed on our port anyway. But this time, it has the wrong flags:
+if the bridge was trying to install VLAN 1 as a pvid/untagged VLAN,
+failed via switchdev, retried via vlan_vid_add, we have this comment:
+
+	/* This API only allows programming tagged, non-PVID VIDs */
+
+So what we do makes absolutely no sense.
+
+Backtracing a bit, we see the common pattern. We allow the network stack
+to think that our standalone ports are VLAN-aware, but they aren't, for
+the vast majority of switches. The quirky ones should not dictate the
+norm. The dsa_slave_vlan_rx_add_vid and dsa_slave_vlan_rx_kill_vid
+methods exist for drivers that need the 'rx-vlan-filter: on' feature in
+ethtool -k, which can be due to any of the following reasons:
+
+1. vlan_filtering_is_global = true, and some ports are under a
+   VLAN-aware bridge while others are standalone, and the standalone
+   ports would otherwise drop VLAN-tagged traffic. This is described in
+   commit 061f6a505ac3 ("net: dsa: Add ndo_vlan_rx_{add, kill}_vid
+   implementation").
+
+2. the ports that are under a VLAN-aware bridge should also set this
+   feature, for 8021q uppers having a VID not claimed by the bridge.
+   In this case, the driver will essentially not even know that the VID
+   is coming from the 8021q layer and not the bridge.
+
+3. Hellcreek. This driver needs it because in standalone mode, it uses
+   unique VLANs per port to ensure separation. For separation of untagged
+   traffic, it uses different PVIDs for each port, and for separation of
+   VLAN-tagged traffic, it never accepts 8021q uppers with the same vid
+   on two ports.
+
+If a driver does not fall under any of the above 3 categories, there is
+no reason why it should advertise the 'rx-vlan-filter' feature, therefore
+no reason why it should offload the VLANs added through vlan_vid_add.
+
+This commit fixes the problem by removing the 'rx-vlan-filter' feature
+from the slave devices when they operate in standalone mode, and when
+they offload a VLAN-unaware bridge.
+
+The way it works is that vlan_vid_add will now stop its processing here:
+
+vlan_add_rx_filter_info:
+	if (!vlan_hw_filter_capable(dev, proto))
+		return 0;
+
+So the VLAN will still be saved in the interface's VLAN RX filtering
+list, but because it does not declare VLAN filtering in its features,
+the 8021q module will return zero without committing that VLAN to
+hardware.
+
+This gives the drivers what they want, since it keeps the 8021q VLANs
+away from the VLAN table until VLAN awareness is enabled (point at which
+the ports are no longer standalone, hence in the mv88e6xxx case, the
+check in mv88e6xxx_port_vlan_prepare passes).
+
+Since the issue predates the existence of the hellcreek driver, case 3
+will be dealt with in a separate patch.
+
+The main change that this patch makes is to no longer set
+NETIF_F_HW_VLAN_CTAG_FILTER unconditionally, but toggle it dynamically
+(for most switches, never).
+
+The second part of the patch addresses an issue that the first part
+introduces: because the 'rx-vlan-filter' feature is now dynamically
+toggled, and our .ndo_vlan_rx_add_vid does not get called when
+'rx-vlan-filter' is off, we need to avoid bugs such as the following by
+replaying the VLANs from 8021q uppers every time we enable VLAN
+filtering:
+
+ip link add link lan0 name lan0.100 type vlan id 100
+ip addr add 192.168.100.1/24 dev lan0.100
+ping 192.168.100.2 # should work
+ip link add br0 type bridge vlan_filtering 0
+ip link set lan0 master br0
+ping 192.168.100.2 # should still work
+ip link set br0 type bridge vlan_filtering 1
+ping 192.168.100.2 # should still work but doesn't
+
+As reported by Florian, some drivers look at ds->vlan_filtering in
+their .port_vlan_add() implementation. So this patch also makes sure
+that ds->vlan_filtering is committed before calling the driver. This is
+the reason why it is first committed, then restored on the failure path.
+
+Reported-by: Tobias Waldekranz <tobias@waldekranz.com>
+Reported-by: Alvin Šipraga <alsi@bang-olufsen.dk>
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+Tested-by: Florian Fainelli <f.fainelli@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

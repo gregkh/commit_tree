@@ -1,0 +1,81 @@
+workqueue: Assign a color to barrier work items
+
+There was no strong reason to or not to flush barrier work items in
+flush_workqueue().  And we have to make barrier work items not participate
+in nr_active so we had been using WORK_NO_COLOR for them which also makes
+them can't be flushed by flush_workqueue().
+
+And the users of flush_workqueue() often do not intend to wait barrier work
+items issued by flush_work().  That made the choice sound perfect.
+
+But barrier work items have reference to internal structure (pool_workqueue)
+and the worker thread[s] is/are still busy for the workqueue user when the
+barrrier work items are not done.  So it is reasonable to make flush_workqueue()
+also watch for flush_work() to make it more robust.
+
+And a problem[1] reported by Li Zhe shows that we need such robustness.
+The warning logs are listed below:
+
+WARNING: CPU: 0 PID: 19336 at kernel/workqueue.c:4430 destroy_workqueue+0x11a/0x2f0
+*****
+destroy_workqueue: test_workqueue9 has the following busy pwq
+  pwq 4: cpus=2 node=0 flags=0x0 nice=0 active=0/1 refcnt=2
+      in-flight: 5658:wq_barrier_func
+Showing busy workqueues and worker pools:
+*****
+
+It shows that even after drain_workqueue() returns, the barrier work item
+is still in flight and the pwq (and a worker) is still busy on it.
+
+The problem is caused by flush_workqueue() not watching flush_work():
+
+Thread A				Worker
+					/* normal work item with linked */
+					process_scheduled_works()
+destroy_workqueue()			  process_one_work()
+  drain_workqueue()			    /* run normal work item */
+				 /--	    pwq_dec_nr_in_flight()
+    flush_workqueue()	    <---/
+		/* the last normal work item is done */
+  sanity_check				  process_one_work()
+				       /--  raw_spin_unlock_irq(&pool->lock)
+    raw_spin_lock_irq(&pool->lock)  <-/     /* maybe preempt */
+    *WARNING*				    wq_barrier_func()
+					    /* maybe preempt by cond_resched() */
+
+Thread A can get the pool lock after the Worker unlocks the pool lock before
+running wq_barrier_func().  And if there is any preemption happen around
+wq_barrier_func(), destroy_workqueue()'s sanity check is more likely to
+get the lock and catch it.  (Note: preemption is not necessary to cause the bug,
+the unlocking is enough to possibly trigger the WARNING.)
+
+A simple solution might be just executing all linked barrier work items
+once without releasing pool lock after the head work item's
+pwq_dec_nr_in_flight().  But this solution has two problems:
+
+  1) the head work item might also be barrier work item when the user-queued
+     work item is cancelled. For example:
+	thread 1:		thread 2:
+	queue_work(wq, &my_work)
+	flush_work(&my_work)
+				cancel_work_sync(&my_work);
+	/* Neiter my_work nor the barrier work is scheduled. */
+				destroy_workqueue(wq);
+	/* This is an easier way to catch the WARNING. */
+
+  2) there might be too much linked barrier work items and running them
+     all once without releasing pool lock just causes trouble.
+
+The only solution is to make flush_workqueue() aslo watch barrier work
+items.  So we have to assign a color to these barrier work items which
+is the color of the head (user-queued) work item.
+
+Assigning a color doesn't cause any problem in ative management, because
+the prvious patch made barrier work items not participate in nr_active
+via WORK_STRUCT_INACTIVE rather than reliance on the (old) WORK_NO_COLOR.
+
+[1]: https://lore.kernel.org/lkml/20210812083814.32453-1-lizhe.67@bytedance.com/
+Reported-by: Li Zhe <lizhe.67@bytedance.com>
+Signed-off-by: Lai Jiangshan <laijs@linux.alibaba.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+

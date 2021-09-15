@@ -1,0 +1,134 @@
+net: bridge: move the switchdev object replay helpers to "push" mode
+
+Starting with commit 4f2673b3a2b6 ("net: bridge: add helper to replay
+port and host-joined mdb entries"), DSA has introduced some bridge
+helpers that replay switchdev events (FDB/MDB/VLAN additions and
+deletions) that can be lost by the switchdev drivers in a variety of
+circumstances:
+
+- an IP multicast group was host-joined on the bridge itself before any
+  switchdev port joined the bridge, leading to the host MDB entries
+  missing in the hardware database.
+- during the bridge creation process, the MAC address of the bridge was
+  added to the FDB as an entry pointing towards the bridge device
+  itself, but with no switchdev ports being part of the bridge yet, this
+  local FDB entry would remain unknown to the switchdev hardware
+  database.
+- a VLAN/FDB/MDB was added to a bridge port that is a LAG interface,
+  before any switchdev port joined that LAG, leading to the hardware
+  database missing those entries.
+- a switchdev port left a LAG that is a bridge port, while the LAG
+  remained part of the bridge, and all FDB/MDB/VLAN entries remained
+  installed in the hardware database of the switchdev port.
+
+Also, since commit 0d2cfbd41c4a ("net: bridge: ignore switchdev events
+for LAG ports which didn't request replay"), DSA introduced a method,
+based on a const void *ctx, to ensure that two switchdev ports under the
+same LAG that is a bridge port do not see the same MDB/VLAN entry being
+replayed twice by the bridge, once for every bridge port that joins the
+LAG.
+
+With so many ordering corner cases being possible, it seems unreasonable
+to expect a switchdev driver writer to get it right from the first try.
+Therefore, now that DSA has experimented with the bridge replay helpers
+for a little bit, we can move the code to the bridge driver where it is
+more readily available to all switchdev drivers.
+
+To convert the switchdev object replay helpers from "pull mode" (where
+the driver asks for them) to a "push mode" (where the bridge offers them
+automatically), the biggest problem is that the bridge needs to be aware
+when a switchdev port joins and leaves, even when the switchdev is only
+indirectly a bridge port (for example when the bridge port is a LAG
+upper of the switchdev).
+
+Luckily, we already have a hook for that, in the form of the newly
+introduced switchdev_bridge_port_offload() and
+switchdev_bridge_port_unoffload() calls. These offer a natural place for
+hooking the object addition and deletion replays.
+
+Extend the above 2 functions with:
+- pointers to the switchdev atomic notifier (for FDB replays) and the
+  blocking notifier (for MDB and VLAN replays).
+- the "const void *ctx" argument required for drivers to be able to
+  disambiguate between which port is targeted, when multiple ports are
+  lowers of the same LAG that is a bridge port. Most of the drivers pass
+  NULL to this argument, except the ones that support LAG offload and have
+  the proper context check already in place in the switchdev blocking
+  notifier handler.
+
+Also unexport the replay helpers, since nobody except the bridge calls
+them directly now.
+
+Note that:
+(a) we abuse the terminology slightly, because FDB entries are not
+    "switchdev objects", but we count them as objects nonetheless.
+    With no direct way to prove it, I think they are not modeled as
+    switchdev objects because those can only be installed by the bridge
+    to the hardware (as opposed to FDB entries which can be propagated
+    in the other direction too). This is merely an abuse of terms, FDB
+    entries are replayed too, despite not being objects.
+(b) the bridge does not attempt to sync port attributes to newly joined
+    ports, just the countable stuff (the objects). The reason for this
+    is simple: no universal and symmetric way to sync and unsync them is
+    known. For example, VLAN filtering: what to do on unsync, disable or
+    leave it enabled? Similarly, STP state, ageing timer, etc etc. What
+    a switchdev port does when it becomes standalone again is not really
+    up to the bridge's competence, and the driver should deal with it.
+    On the other hand, replaying deletions of switchdev objects can be
+    seen a matter of cleanup and therefore be treated by the bridge,
+    hence this patch.
+
+We make the replay helpers opt-in for drivers, because they might not
+bring immediate benefits for them:
+
+- nbp_vlan_init() is called _after_ netdev_master_upper_dev_link(),
+  so br_vlan_replay() should not do anything for the new drivers on
+  which we call it. The existing drivers where there was even a slight
+  possibility for there to exist a VLAN on a bridge port before they
+  join it are already guarded against this: mlxsw and prestera deny
+  joining LAG interfaces that are members of a bridge.
+
+- br_fdb_replay() should now notify of local FDB entries, but I patched
+  all drivers except DSA to ignore these new entries in commit
+  2c4eca3ef716 ("net: bridge: switchdev: include local flag in FDB
+  notifications"). Driver authors can lift this restriction as they
+  wish, and when they do, they can also opt into the FDB replay
+  functionality.
+
+- br_mdb_replay() should fix a real issue which is described in commit
+  4f2673b3a2b6 ("net: bridge: add helper to replay port and host-joined
+  mdb entries"). However most drivers do not offload the
+  SWITCHDEV_OBJ_ID_HOST_MDB to see this issue: only cpsw and am65_cpsw
+  offload this switchdev object, and I don't completely understand the
+  way in which they offload this switchdev object anyway. So I'll leave
+  it up to these drivers' respective maintainers to opt into
+  br_mdb_replay().
+
+So most of the drivers pass NULL notifier blocks for the replay helpers,
+except:
+- dpaa2-switch which was already acked/regression-tested with the
+  helpers enabled (and there isn't much of a downside in having them)
+- ocelot which already had replay logic in "pull" mode
+- DSA which already had replay logic in "pull" mode
+
+An important observation is that the drivers which don't currently
+request bridge event replays don't even have the
+switchdev_bridge_port_{offload,unoffload} calls placed in proper places
+right now. This was done to avoid unnecessary rework for drivers which
+might never even add support for this. For driver writers who wish to
+add replay support, this can be used as a tentative placement guide:
+https://patchwork.kernel.org/project/netdevbpf/patch/20210720134655.892334-11-vladimir.oltean@nxp.com/
+
+Cc: Vadym Kochan <vkochan@marvell.com>
+Cc: Taras Chornyi <tchornyi@marvell.com>
+Cc: Ioana Ciornei <ioana.ciornei@nxp.com>
+Cc: Lars Povlsen <lars.povlsen@microchip.com>
+Cc: Steen Hegelund <Steen.Hegelund@microchip.com>
+Cc: UNGLinuxDriver@microchip.com
+Cc: Claudiu Manoil <claudiu.manoil@nxp.com>
+Cc: Alexandre Belloni <alexandre.belloni@bootlin.com>
+Cc: Grygorii Strashko <grygorii.strashko@ti.com>
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Acked-by: Ioana Ciornei <ioana.ciornei@nxp.com> # dpaa2-switch
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

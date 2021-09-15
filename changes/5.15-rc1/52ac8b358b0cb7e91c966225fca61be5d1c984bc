@@ -1,0 +1,69 @@
+KVM: Block memslot updates across range_start() and range_end()
+
+We would like to avoid taking mmu_lock for .invalidate_range_{start,end}()
+notifications that are unrelated to KVM.  Because mmu_notifier_count
+must be modified while holding mmu_lock for write, and must always
+be paired across start->end to stay balanced, lock elision must
+happen in both or none.  Therefore, in preparation for this change,
+this patch prevents memslot updates across range_start() and range_end().
+
+Note, technically flag-only memslot updates could be allowed in parallel,
+but stalling a memslot update for a relatively short amount of time is
+not a scalability issue, and this is all more than complex enough.
+
+A long note on the locking: a previous version of the patch used an rwsem
+to block the memslot update while the MMU notifier run, but this resulted
+in the following deadlock involving the pseudo-lock tagged as
+"mmu_notifier_invalidate_range_start".
+
+   ======================================================
+   WARNING: possible circular locking dependency detected
+   5.12.0-rc3+ #6 Tainted: G           OE
+   ------------------------------------------------------
+   qemu-system-x86/3069 is trying to acquire lock:
+   ffffffff9c775ca0 (mmu_notifier_invalidate_range_start){+.+.}-{0:0}, at: __mmu_notifier_invalidate_range_end+0x5/0x190
+
+   but task is already holding lock:
+   ffffaff7410a9160 (&kvm->mmu_notifier_slots_lock){.+.+}-{3:3}, at: kvm_mmu_notifier_invalidate_range_start+0x36d/0x4f0 [kvm]
+
+   which lock already depends on the new lock.
+
+This corresponds to the following MMU notifier logic:
+
+    invalidate_range_start
+      take pseudo lock
+      down_read()           (*)
+      release pseudo lock
+    invalidate_range_end
+      take pseudo lock      (**)
+      up_read()
+      release pseudo lock
+
+At point (*) we take the mmu_notifiers_slots_lock inside the pseudo lock;
+at point (**) we take the pseudo lock inside the mmu_notifiers_slots_lock.
+
+This could cause a deadlock (ignoring for a second that the pseudo lock
+is not a lock):
+
+- invalidate_range_start waits on down_read(), because the rwsem is
+held by install_new_memslots
+
+- install_new_memslots waits on down_write(), because the rwsem is
+held till (another) invalidate_range_end finishes
+
+- invalidate_range_end sits waits on the pseudo lock, held by
+invalidate_range_start.
+
+Removing the fairness of the rwsem breaks the cycle (in lockdep terms,
+it would change the *shared* rwsem readers into *shared recursive*
+readers), so open-code the wait using a readers count and a
+spinlock.  This also allows handling blockable and non-blockable
+critical section in the same way.
+
+Losing the rwsem fairness does theoretically allow MMU notifiers to
+block install_new_memslots forever.  Note that mm/mmu_notifier.c's own
+retry scheme in mmu_interval_read_begin also uses wait/wake_up
+and is likewise not fair.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+

@@ -1,0 +1,82 @@
+net: dsa: tag_8021q: manage RX VLANs dynamically at bridge join/leave time
+
+There has been at least one wasted opportunity for tag_8021q to be used
+by a driver:
+
+https://patchwork.ozlabs.org/project/netdev/patch/20200710113611.3398-3-kurt@linutronix.de/#2484272
+
+because of a design decision: the declared purpose of tag_8021q is to
+offer source port/switch identification for a tagging driver for packets
+coming from a switch with no hardware DSA tagging support. It is not
+intended to provide VLAN-based port isolation, because its first user,
+sja1105, had another mechanism for bridging domain isolation, the L2
+Forwarding Table. So even if 2 ports are in the same VLAN but they are
+separated via the L2 Forwarding Table, they will not communicate with
+one another. The L2 Forwarding Table is managed by the
+sja1105_bridge_join() and sja1105_bridge_leave() methods.
+
+As a consequence, today tag_8021q does not bother too much with hooking
+into .port_bridge_join() and .port_bridge_leave() because that would
+introduce yet another degree of freedom, it just iterates statically
+through all ports of a switch and adds the RX VLAN of one port to all
+the others. In this way, whenever .port_bridge_join() is called,
+bridging will magically work because the RX VLANs are already installed
+everywhere they need to be.
+
+This is not to say that the reason for the change in this patch is to
+satisfy the hellcreek and similar use cases, that is merely a nice side
+effect. Instead it is to make sja1105 cross-chip links work properly
+over a DSA link.
+
+For context, sja1105 today supports a degenerate form of cross-chip
+bridging, where the switches are interconnected through their CPU ports
+("disjoint trees" topology). There is some code which has been
+generalized into dsa_8021q_crosschip_link_{add,del}, but it is not
+enough, and frankly it is impossible to build upon that.
+Real multi-switch DSA trees, like daisy chains or H trees, which have
+actual DSA links, do not work.
+
+The problem is that sja1105 is unlike mv88e6xxx, and does not have a PVT
+for cross-chip bridging, which is a table by which the local switch can
+select the forwarding domain for packets from a certain ingress switch
+ID and source port. The sja1105 switches cannot parse their own DSA
+tags, because, well, they don't really have support for DSA tags, it's
+all VLANs.
+
+So to make something like cross-chip bridging between sw0p0 and sw1p0 to
+work over the sw0p3/sw1p3 DSA link to work with sja1105 in the topology
+below:
+
+                         |                                  |
+    sw0p0     sw0p1     sw0p2     sw0p3          sw1p3     sw1p2     sw1p1     sw1p0
+ [  user ] [  user ] [  cpu  ] [  dsa  ] ---- [  dsa  ] [  cpu  ] [  user ] [  user ]
+
+we need to ask ourselves 2 questions:
+
+(1) how should the L2 Forwarding Table be managed?
+(2) how should the VLAN Lookup Table be managed?
+
+i.e. what should prevent packets from going to unwanted ports?
+
+Since as mentioned, there is no PVT, the L2 Forwarding Table only
+contains forwarding rules for local ports. So we can say "all user ports
+are allowed to forward to all CPU ports and all DSA links".
+
+If we allow forwarding to DSA links unconditionally, this means we must
+prevent forwarding using the VLAN Lookup Table. This is in fact
+asymmetric with what we do for tag_8021q on ports local to the same
+switch, and it matters because now that we are making tag_8021q a core
+DSA feature, we need to hook into .crosschip_bridge_join() to add/remove
+the tag_8021q VLANs. So for symmetry it makes sense to manage the VLANs
+for local forwarding in the same way as cross-chip forwarding.
+
+Note that there is a very precise reason why tag_8021q hooks into
+dsa_switch_bridge_join() which acts at the cross-chip notifier level,
+and not at a higher level such as dsa_port_bridge_join(). We need to
+install the RX VLAN of the newly joining port into the VLAN table of all
+the existing ports across the tree that are part of the same bridge, and
+the notifier already does the iteration through the switches for us.
+
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

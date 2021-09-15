@@ -1,0 +1,186 @@
+regulator: vctrl: Avoid lockdep warning in enable/disable ops
+
+vctrl_enable() and vctrl_disable() call regulator_enable() and
+regulator_disable(), respectively. However, vctrl_* are regulator ops
+and should not be calling the locked regulator APIs. Doing so results in
+a lockdep warning.
+
+Instead of exporting more internal regulator ops, model the ctrl supply
+as an actual supply to vctrl-regulator. At probe time this driver still
+needs to use the consumer API to fetch its constraints, but otherwise
+lets the regulator core handle the upstream supply for it.
+
+The enable/disable/is_enabled ops are not removed, but now only track
+state internally. This preserves the original behavior with the ops
+being available, but one could argue that the original behavior was
+already incorrect: the internal state would not match the upstream
+supply if that supply had another consumer that enabled the supply,
+while vctrl-regulator was not enabled.
+
+The lockdep warning is as follows:
+
+	WARNING: possible circular locking dependency detected
+	5.14.0-rc6 #2 Not tainted
+	------------------------------------------------------
+	swapper/0/1 is trying to acquire lock:
+	ffffffc011306d00 (regulator_list_mutex){+.+.}-{3:3}, at:
+		regulator_lock_dependent (arch/arm64/include/asm/current.h:19
+					  include/linux/ww_mutex.h:111
+					  drivers/regulator/core.c:329)
+
+	but task is already holding lock:
+	ffffff8004a77160 (regulator_ww_class_mutex){+.+.}-{3:3}, at:
+		regulator_lock_recursive (drivers/regulator/core.c:156
+					  drivers/regulator/core.c:263)
+
+	which lock already depends on the new lock.
+
+	the existing dependency chain (in reverse order) is:
+
+	-> #2 (regulator_ww_class_mutex){+.+.}-{3:3}:
+	__mutex_lock_common (include/asm-generic/atomic-instrumented.h:606
+			     include/asm-generic/atomic-long.h:29
+			     kernel/locking/mutex.c:103
+			     kernel/locking/mutex.c:144
+			     kernel/locking/mutex.c:963)
+	ww_mutex_lock (kernel/locking/mutex.c:1199)
+	regulator_lock_recursive (drivers/regulator/core.c:156
+				  drivers/regulator/core.c:263)
+	regulator_lock_dependent (drivers/regulator/core.c:343)
+	regulator_enable (drivers/regulator/core.c:2808)
+	set_machine_constraints (drivers/regulator/core.c:1536)
+	regulator_register (drivers/regulator/core.c:5486)
+	devm_regulator_register (drivers/regulator/devres.c:196)
+	reg_fixed_voltage_probe (drivers/regulator/fixed.c:289)
+	platform_probe (drivers/base/platform.c:1427)
+	[...]
+
+	-> #1 (regulator_ww_class_acquire){+.+.}-{0:0}:
+	regulator_lock_dependent (include/linux/ww_mutex.h:129
+				  drivers/regulator/core.c:329)
+	regulator_enable (drivers/regulator/core.c:2808)
+	set_machine_constraints (drivers/regulator/core.c:1536)
+	regulator_register (drivers/regulator/core.c:5486)
+	devm_regulator_register (drivers/regulator/devres.c:196)
+	reg_fixed_voltage_probe (drivers/regulator/fixed.c:289)
+	[...]
+
+	-> #0 (regulator_list_mutex){+.+.}-{3:3}:
+	__lock_acquire (kernel/locking/lockdep.c:3052 (discriminator 4)
+			kernel/locking/lockdep.c:3174 (discriminator 4)
+			kernel/locking/lockdep.c:3789 (discriminator 4)
+			kernel/locking/lockdep.c:5015 (discriminator 4))
+	lock_acquire (arch/arm64/include/asm/percpu.h:39
+		      kernel/locking/lockdep.c:438
+		      kernel/locking/lockdep.c:5627)
+	__mutex_lock_common (include/asm-generic/atomic-instrumented.h:606
+			     include/asm-generic/atomic-long.h:29
+			     kernel/locking/mutex.c:103
+			     kernel/locking/mutex.c:144
+			     kernel/locking/mutex.c:963)
+	mutex_lock_nested (kernel/locking/mutex.c:1125)
+	regulator_lock_dependent (arch/arm64/include/asm/current.h:19
+				  include/linux/ww_mutex.h:111
+				  drivers/regulator/core.c:329)
+	regulator_enable (drivers/regulator/core.c:2808)
+	vctrl_enable (drivers/regulator/vctrl-regulator.c:400)
+	_regulator_do_enable (drivers/regulator/core.c:2617)
+	_regulator_enable (drivers/regulator/core.c:2764)
+	regulator_enable (drivers/regulator/core.c:308
+			  drivers/regulator/core.c:2809)
+	_set_opp (drivers/opp/core.c:819 drivers/opp/core.c:1072)
+	dev_pm_opp_set_rate (drivers/opp/core.c:1164)
+	set_target (drivers/cpufreq/cpufreq-dt.c:62)
+	__cpufreq_driver_target (drivers/cpufreq/cpufreq.c:2216
+				 drivers/cpufreq/cpufreq.c:2271)
+	cpufreq_online (drivers/cpufreq/cpufreq.c:1488 (discriminator 2))
+	cpufreq_add_dev (drivers/cpufreq/cpufreq.c:1563)
+	subsys_interface_register (drivers/base/bus.c:?)
+	cpufreq_register_driver (drivers/cpufreq/cpufreq.c:2819)
+	dt_cpufreq_probe (drivers/cpufreq/cpufreq-dt.c:344)
+	[...]
+
+	other info that might help us debug this:
+
+	Chain exists of:
+	  regulator_list_mutex --> regulator_ww_class_acquire --> regulator_ww_class_mutex
+
+	 Possible unsafe locking scenario:
+
+	       CPU0                    CPU1
+	       ----                    ----
+	  lock(regulator_ww_class_mutex);
+				       lock(regulator_ww_class_acquire);
+				       lock(regulator_ww_class_mutex);
+	  lock(regulator_list_mutex);
+
+	 *** DEADLOCK ***
+
+	6 locks held by swapper/0/1:
+	#0: ffffff8002d32188 (&dev->mutex){....}-{3:3}, at:
+		__device_driver_lock (drivers/base/dd.c:1030)
+	#1: ffffffc0111a0520 (cpu_hotplug_lock){++++}-{0:0}, at:
+		cpufreq_register_driver (drivers/cpufreq/cpufreq.c:2792 (discriminator 2))
+	#2: ffffff8002a8d918 (subsys mutex#9){+.+.}-{3:3}, at:
+		subsys_interface_register (drivers/base/bus.c:1033)
+	#3: ffffff800341bb90 (&policy->rwsem){+.+.}-{3:3}, at:
+		cpufreq_online (include/linux/bitmap.h:285
+				include/linux/cpumask.h:405
+				drivers/cpufreq/cpufreq.c:1399)
+	#4: ffffffc011f0b7b8 (regulator_ww_class_acquire){+.+.}-{0:0}, at:
+		regulator_enable (drivers/regulator/core.c:2808)
+	#5: ffffff8004a77160 (regulator_ww_class_mutex){+.+.}-{3:3}, at:
+		regulator_lock_recursive (drivers/regulator/core.c:156
+		drivers/regulator/core.c:263)
+
+	stack backtrace:
+	CPU: 1 PID: 1 Comm: swapper/0 Not tainted 5.14.0-rc6 #2 7c8f8996d021ed0f65271e6aeebf7999de74a9fa
+	Hardware name: Google Scarlet (DT)
+	Call trace:
+	dump_backtrace (arch/arm64/kernel/stacktrace.c:161)
+	show_stack (arch/arm64/kernel/stacktrace.c:218)
+	dump_stack_lvl (lib/dump_stack.c:106 (discriminator 2))
+	dump_stack (lib/dump_stack.c:113)
+	print_circular_bug (kernel/locking/lockdep.c:?)
+	check_noncircular (kernel/locking/lockdep.c:?)
+	__lock_acquire (kernel/locking/lockdep.c:3052 (discriminator 4)
+			kernel/locking/lockdep.c:3174 (discriminator 4)
+			kernel/locking/lockdep.c:3789 (discriminator 4)
+			kernel/locking/lockdep.c:5015 (discriminator 4))
+	lock_acquire (arch/arm64/include/asm/percpu.h:39
+		      kernel/locking/lockdep.c:438
+		      kernel/locking/lockdep.c:5627)
+	__mutex_lock_common (include/asm-generic/atomic-instrumented.h:606
+			     include/asm-generic/atomic-long.h:29
+			     kernel/locking/mutex.c:103
+			     kernel/locking/mutex.c:144
+			     kernel/locking/mutex.c:963)
+	mutex_lock_nested (kernel/locking/mutex.c:1125)
+	regulator_lock_dependent (arch/arm64/include/asm/current.h:19
+				  include/linux/ww_mutex.h:111
+				  drivers/regulator/core.c:329)
+	regulator_enable (drivers/regulator/core.c:2808)
+	vctrl_enable (drivers/regulator/vctrl-regulator.c:400)
+	_regulator_do_enable (drivers/regulator/core.c:2617)
+	_regulator_enable (drivers/regulator/core.c:2764)
+	regulator_enable (drivers/regulator/core.c:308
+			  drivers/regulator/core.c:2809)
+	_set_opp (drivers/opp/core.c:819 drivers/opp/core.c:1072)
+	dev_pm_opp_set_rate (drivers/opp/core.c:1164)
+	set_target (drivers/cpufreq/cpufreq-dt.c:62)
+	__cpufreq_driver_target (drivers/cpufreq/cpufreq.c:2216
+				 drivers/cpufreq/cpufreq.c:2271)
+	cpufreq_online (drivers/cpufreq/cpufreq.c:1488 (discriminator 2))
+	cpufreq_add_dev (drivers/cpufreq/cpufreq.c:1563)
+	subsys_interface_register (drivers/base/bus.c:?)
+	cpufreq_register_driver (drivers/cpufreq/cpufreq.c:2819)
+	dt_cpufreq_probe (drivers/cpufreq/cpufreq-dt.c:344)
+	[...]
+
+Reported-by: Brian Norris <briannorris@chromium.org>
+Fixes: f8702f9e4aa7 ("regulator: core: Use ww_mutex for regulators locking")
+Fixes: e9153311491d ("regulator: vctrl-regulator: Avoid deadlock getting and setting the voltage")
+Signed-off-by: Chen-Yu Tsai <wenst@chromium.org>
+Link: https://lore.kernel.org/r/20210825033704.3307263-3-wenst@chromium.org
+Signed-off-by: Mark Brown <broonie@kernel.org>
+
