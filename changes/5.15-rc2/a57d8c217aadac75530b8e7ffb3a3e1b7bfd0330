@@ -1,0 +1,47 @@
+net: dsa: flush switchdev workqueue before tearing down CPU/DSA ports
+
+Sometimes when unbinding the mv88e6xxx driver on Turris MOX, these error
+messages appear:
+
+mv88e6085 d0032004.mdio-mii:12: port 1 failed to delete be:79:b4:9e:9e:96 vid 1 from fdb: -2
+mv88e6085 d0032004.mdio-mii:12: port 1 failed to delete be:79:b4:9e:9e:96 vid 0 from fdb: -2
+mv88e6085 d0032004.mdio-mii:12: port 1 failed to delete d8:58:d7:00:ca:6d vid 100 from fdb: -2
+mv88e6085 d0032004.mdio-mii:12: port 1 failed to delete d8:58:d7:00:ca:6d vid 1 from fdb: -2
+mv88e6085 d0032004.mdio-mii:12: port 1 failed to delete d8:58:d7:00:ca:6d vid 0 from fdb: -2
+
+(and similarly for other ports)
+
+What happens is that DSA has a policy "even if there are bugs, let's at
+least not leak memory" and dsa_port_teardown() clears the dp->fdbs and
+dp->mdbs lists, which are supposed to be empty.
+
+But deleting that cleanup code, the warnings go away.
+
+=> the FDB and MDB lists (used for refcounting on shared ports, aka CPU
+and DSA ports) will eventually be empty, but are not empty by the time
+we tear down those ports. Aka we are deleting them too soon.
+
+The addresses that DSA complains about are host-trapped addresses: the
+local addresses of the ports, and the MAC address of the bridge device.
+
+The problem is that offloading those entries happens from a deferred
+work item scheduled by the SWITCHDEV_FDB_DEL_TO_DEVICE handler, and this
+races with the teardown of the CPU and DSA ports where the refcounting
+is kept.
+
+In fact, not only it races, but fundamentally speaking, if we iterate
+through the port list linearly, we might end up tearing down the shared
+ports even before we delete a DSA user port which has a bridge upper.
+
+So as it turns out, we need to first tear down the user ports (and the
+unused ones, for no better place of doing that), then the shared ports
+(the CPU and DSA ports). In between, we need to ensure that all work
+items scheduled by our switchdev handlers (which only run for user
+ports, hence the reason why we tear them down first) have finished.
+
+Fixes: 161ca59d39e9 ("net: dsa: reference count the MDB entries at the cross-chip notifier level")
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+Link: https://lore.kernel.org/r/20210914134726.2305133-1-vladimir.oltean@nxp.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+

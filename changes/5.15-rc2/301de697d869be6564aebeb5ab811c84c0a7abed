@@ -1,0 +1,82 @@
+Revert "net: phy: Uniform PHY driver access"
+
+This reverts commit 3ac8eed62596387214869319379c1fcba264d8c6, which did
+more than it said on the box, and not only it replaced to_phy_driver
+with phydev->drv, but it also removed the "!drv" check, without actually
+explaining why that is fine.
+
+That patch in fact breaks suspend/resume on any system which has PHY
+devices with no drivers bound.
+
+The stack trace is:
+
+Unable to handle kernel NULL pointer dereference at virtual address 00000000000000e8
+pc : mdio_bus_phy_suspend+0xd8/0xec
+lr : dpm_run_callback+0x38/0x90
+Call trace:
+ mdio_bus_phy_suspend+0xd8/0xec
+ dpm_run_callback+0x38/0x90
+ __device_suspend+0x108/0x3cc
+ dpm_suspend+0x140/0x210
+ dpm_suspend_start+0x7c/0xa0
+ suspend_devices_and_enter+0x13c/0x540
+ pm_suspend+0x2a4/0x330
+
+Examples why that assumption is not fine:
+
+- There is an MDIO bus with a PHY device that doesn't have a specific
+  PHY driver loaded, because mdiobus_register() automatically creates a
+  PHY device for it but there is no specific PHY driver in the system.
+  Normally under those circumstances, the generic PHY driver will be
+  bound lazily to it (at phy_attach_direct time). But some Ethernet
+  drivers attach to their PHY at .ndo_open time. Until then it, the
+  to-be-driven-by-genphy PHY device will not have a driver. The blamed
+  patch amounts to saying "you need to open all net devices before the
+  system can suspend, to avoid the NULL pointer dereference".
+
+- There is any raw MDIO device which has 'plausible' values in the PHY
+  ID registers 2 and 3, which is located on an MDIO bus whose driver
+  does not set bus->phy_mask = ~0 (which prevents auto-scanning of PHY
+  devices). An example could be a MAC's internal MDIO bus with PCS
+  devices on it, for serial links such as SGMII. PHY devices will get
+  created for those PCSes too, due to that MDIO bus auto-scanning, and
+  although those PHY devices are not used, they do not bother anybody
+  either. PCS devices are usually managed in Linux as raw MDIO devices.
+  Nonetheless, they do not have a PHY driver, nor does anybody attempt
+  to connect to them (because they are not a PHY), and therefore this
+  patch breaks that.
+
+The goal itself of the patch is questionable, so I am going for a
+straight revert. to_phy_driver does not seem to have a need to be
+replaced by phydev->drv, in fact that might even trigger code paths
+which were not given too deep of a thought.
+
+For instance:
+
+phy_probe populates phydev->drv at the beginning, but does not clean it
+up on any error (including EPROBE_DEFER). So if the phydev driver
+requests probe deferral, phydev->drv will remain populated despite there
+being no driver bound.
+
+If a system suspend starts in between the initial probe deferral request
+and the subsequent probe retry, we will be calling the phydev->drv->suspend
+method, but _before_ any phydev->drv->probe call has succeeded.
+
+That is to say, if the phydev->drv is allocating any driver-private data
+structure in ->probe, it pretty much expects that data structure to be
+available in ->suspend. But it may not. That is a pretty insane
+environment to present to PHY drivers.
+
+In the code structure before the blamed patch, mdio_bus_phy_may_suspend
+would just say "no, don't suspend" to any PHY device which does not have
+a driver pointer _in_the_device_structure_ (not the phydev->drv). That
+would essentially ensure that ->suspend will never get called for a
+device that has not yet successfully completed probe. This is the code
+structure the patch is returning to, via the revert.
+
+Fixes: 3ac8eed62596 ("net: phy: Uniform PHY driver access")
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Acked-by: Florian Fainelli <f.fainelli@gmail.com>
+Link: https://lore.kernel.org/r/20210914140515.2311548-1-vladimir.oltean@nxp.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+
