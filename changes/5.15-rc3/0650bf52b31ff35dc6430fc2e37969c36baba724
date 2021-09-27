@@ -1,0 +1,109 @@
+net: dsa: be compatible with masters which unregister on shutdown
+
+Lino reports that on his system with bcmgenet as DSA master and KSZ9897
+as a switch, rebooting or shutting down never works properly.
+
+What does the bcmgenet driver have special to trigger this, that other
+DSA masters do not? It has an implementation of ->shutdown which simply
+calls its ->remove implementation. Otherwise said, it unregisters its
+network interface on shutdown.
+
+This message can be seen in a loop, and it hangs the reboot process there:
+
+unregister_netdevice: waiting for eth0 to become free. Usage count = 3
+
+So why 3?
+
+A usage count of 1 is normal for a registered network interface, and any
+virtual interface which links itself as an upper of that will increment
+it via dev_hold. In the case of DSA, this is the call path:
+
+dsa_slave_create
+-> netdev_upper_dev_link
+   -> __netdev_upper_dev_link
+      -> __netdev_adjacent_dev_insert
+         -> dev_hold
+
+So a DSA switch with 3 interfaces will result in a usage count elevated
+by two, and netdev_wait_allrefs will wait until they have gone away.
+
+Other stacked interfaces, like VLAN, watch NETDEV_UNREGISTER events and
+delete themselves, but DSA cannot just vanish and go poof, at most it
+can unbind itself from the switch devices, but that must happen strictly
+earlier compared to when the DSA master unregisters its net_device, so
+reacting on the NETDEV_UNREGISTER event is way too late.
+
+It seems that it is a pretty established pattern to have a driver's
+->shutdown hook redirect to its ->remove hook, so the same code is
+executed regardless of whether the driver is unbound from the device, or
+the system is just shutting down. As Florian puts it, it is quite a big
+hammer for bcmgenet to unregister its net_device during shutdown, but
+having a common code path with the driver unbind helps ensure it is well
+tested.
+
+So DSA, for better or for worse, has to live with that and engage in an
+arms race of implementing the ->shutdown hook too, from all individual
+drivers, and do something sane when paired with masters that unregister
+their net_device there. The only sane thing to do, of course, is to
+unlink from the master.
+
+However, complications arise really quickly.
+
+The pattern of redirecting ->shutdown to ->remove is not unique to
+bcmgenet or even to net_device drivers. In fact, SPI controllers do it
+too (see dspi_shutdown -> dspi_remove), and presumably, I2C controllers
+and MDIO controllers do it too (this is something I have not researched
+too deeply, but even if this is not the case today, it is certainly
+plausible to happen in the future, and must be taken into consideration).
+
+Since DSA switches might be SPI devices, I2C devices, MDIO devices, the
+insane implication is that for the exact same DSA switch device, we
+might have both ->shutdown and ->remove getting called.
+
+So we need to do something with that insane environment. The pattern
+I've come up with is "if this, then not that", so if either ->shutdown
+or ->remove gets called, we set the device's drvdata to NULL, and in the
+other hook, we check whether the drvdata is NULL and just do nothing.
+This is probably not necessary for platform devices, just for devices on
+buses, but I would really insist for consistency among drivers, because
+when code is copy-pasted, it is not always copy-pasted from the best
+sources.
+
+So depending on whether the DSA switch's ->remove or ->shutdown will get
+called first, we cannot really guarantee even for the same driver if
+rebooting will result in the same code path on all platforms. But
+nonetheless, we need to do something minimally reasonable on ->shutdown
+too to fix the bug. Of course, the ->remove will do more (a full
+teardown of the tree, with all data structures freed, and this is why
+the bug was not caught for so long). The new ->shutdown method is kept
+separate from dsa_unregister_switch not because we couldn't have
+unregistered the switch, but simply in the interest of doing something
+quick and to the point.
+
+The big question is: does the DSA switch's ->shutdown get called earlier
+than the DSA master's ->shutdown? If not, there is still a risk that we
+might still trigger the WARN_ON in unregister_netdevice that says we are
+attempting to unregister a net_device which has uppers. That's no good.
+Although the reference to the master net_device won't physically go away
+even if DSA's ->shutdown comes afterwards, remember we have a dev_hold
+on it.
+
+The answer to that question lies in this comment above device_link_add:
+
+ * A side effect of the link creation is re-ordering of dpm_list and the
+ * devices_kset list by moving the consumer device and all devices depending
+ * on it to the ends of these lists (that does not happen to devices that have
+ * not been registered when this function is called).
+
+so the fact that DSA uses device_link_add towards its master is not
+exactly for nothing. device_shutdown() walks devices_kset from the back,
+so this is our guarantee that DSA's shutdown happens before the master's
+shutdown.
+
+Fixes: 2f1e8ea726e9 ("net: dsa: link interfaces with the DSA master to get rid of lockdep warnings")
+Link: https://lore.kernel.org/netdev/20210909095324.12978-1-LinoSanfilippo@gmx.de/
+Reported-by: Lino Sanfilippo <LinoSanfilippo@gmx.de>
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Tested-by: Andrew Lunn <andrew@lunn.ch>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

@@ -1,0 +1,110 @@
+afs: Fix mmap coherency vs 3rd-party changes
+
+Fix the coherency management of mmap'd data such that 3rd-party changes
+become visible as soon as possible after the callback notification is
+delivered by the fileserver.  This is done by the following means:
+
+ (1) When we break a callback on a vnode specified by the CB.CallBack call
+     from the server, we queue a work item (vnode->cb_work) to go and
+     clobber all the PTEs mapping to that inode.
+
+     This causes the CPU to trip through the ->map_pages() and
+     ->page_mkwrite() handlers if userspace attempts to access the page(s)
+     again.
+
+     (Ideally, this would be done in the service handler for CB.CallBack,
+     but the server is waiting for our reply before considering, and we
+     have a list of vnodes, all of which need breaking - and the process of
+     getting the mmap_lock and stripping the PTEs on all CPUs could be
+     quite slow.)
+
+ (2) Call afs_validate() from the ->map_pages() handler to check to see if
+     the file has changed and to get a new callback promise from the
+     server.
+
+Also handle the fileserver telling us that it's dropping all callbacks,
+possibly after it's been restarted by sending us a CB.InitCallBackState*
+call by the following means:
+
+ (3) Maintain a per-cell list of afs files that are currently mmap'd
+     (cell->fs_open_mmaps).
+
+ (4) Add a work item to each server that is invoked if there are any open
+     mmaps when CB.InitCallBackState happens.  This work item goes through
+     the aforementioned list and invokes the vnode->cb_work work item for
+     each one that is currently using this server.
+
+     This causes the PTEs to be cleared, causing ->map_pages() or
+     ->page_mkwrite() to be called again, thereby calling afs_validate()
+     again.
+
+I've chosen to simply strip the PTEs at the point of notification reception
+rather than invalidate all the pages as well because (a) it's faster, (b)
+we may get a notification for other reasons than the data being altered (in
+which case we don't want to clobber the pagecache) and (c) we need to ask
+the server to find out - and I don't want to wait for the reply before
+holding up userspace.
+
+This was tested using the attached test program:
+
+	#include <stdbool.h>
+	#include <stdio.h>
+	#include <stdlib.h>
+	#include <unistd.h>
+	#include <fcntl.h>
+	#include <sys/mman.h>
+	int main(int argc, char *argv[])
+	{
+		size_t size = getpagesize();
+		unsigned char *p;
+		bool mod = (argc == 3);
+		int fd;
+		if (argc != 2 && argc != 3) {
+			fprintf(stderr, "Format: %s <file> [mod]\n", argv[0]);
+			exit(2);
+		}
+		fd = open(argv[1], mod ? O_RDWR : O_RDONLY);
+		if (fd < 0) {
+			perror(argv[1]);
+			exit(1);
+		}
+
+		p = mmap(NULL, size, mod ? PROT_READ|PROT_WRITE : PROT_READ,
+			 MAP_SHARED, fd, 0);
+		if (p == MAP_FAILED) {
+			perror("mmap");
+			exit(1);
+		}
+		for (;;) {
+			if (mod) {
+				p[0]++;
+				msync(p, size, MS_ASYNC);
+				fsync(fd);
+			}
+			printf("%02x", p[0]);
+			fflush(stdout);
+			sleep(1);
+		}
+	}
+
+It runs in two modes: in one mode, it mmaps a file, then sits in a loop
+reading the first byte, printing it and sleeping for a second; in the
+second mode it mmaps a file, then sits in a loop incrementing the first
+byte and flushing, then printing and sleeping.
+
+Two instances of this program can be run on different machines, one doing
+the reading and one doing the writing.  The reader should see the changes
+made by the writer, but without this patch, they aren't because validity
+checking is being done lazily - only on entry to the filesystem.
+
+Testing the InitCallBackState change is more complicated.  The server has
+to be taken offline, the saved callback state file removed and then the
+server restarted whilst the reading-mode program continues to run.  The
+client machine then has to poke the server to trigger the InitCallBackState
+call.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Tested-by: Markus Suvanto <markus.suvanto@gmail.com>
+cc: linux-afs@lists.infradead.org
+Link: https://lore.kernel.org/r/163111668833.283156.382633263709075739.stgit@warthog.procyon.org.uk/
+

@@ -1,0 +1,50 @@
+napi: fix race inside napi_enable
+
+The process will cause napi.state to contain NAPI_STATE_SCHED and
+not in the poll_list, which will cause napi_disable() to get stuck.
+
+The prefix "NAPI_STATE_" is removed in the figure below, and
+NAPI_STATE_HASHED is ignored in napi.state.
+
+                      CPU0       |                   CPU1       | napi.state
+===============================================================================
+napi_disable()                   |                              | SCHED | NPSVC
+napi_enable()                    |                              |
+{                                |                              |
+    smp_mb__before_atomic();     |                              |
+    clear_bit(SCHED, &n->state); |                              | NPSVC
+                                 | napi_schedule_prep()         | SCHED | NPSVC
+                                 | napi_poll()                  |
+                                 |   napi_complete_done()       |
+                                 |   {                          |
+                                 |      if (n->state & (NPSVC | | (1)
+                                 |               _BUSY_POLL)))  |
+                                 |           return false;      |
+                                 |     ................         |
+                                 |   }                          | SCHED | NPSVC
+                                 |                              |
+    clear_bit(NPSVC, &n->state); |                              | SCHED
+}                                |                              |
+                                 |                              |
+napi_schedule_prep()             |                              | SCHED | MISSED (2)
+
+(1) Here return direct. Because of NAPI_STATE_NPSVC exists.
+(2) NAPI_STATE_SCHED exists. So not add napi.poll_list to sd->poll_list
+
+Since NAPI_STATE_SCHED already exists and napi is not in the
+sd->poll_list queue, NAPI_STATE_SCHED cannot be cleared and will always
+exist.
+
+1. This will cause this queue to no longer receive packets.
+2. If you encounter napi_disable under the protection of rtnl_lock, it
+   will cause the entire rtnl_lock to be locked, affecting the overall
+   system.
+
+This patch uses cmpxchg to implement napi_enable(), which ensures that
+there will be no race due to the separation of clear two bits.
+
+Fixes: 2d8bff12699abc ("netpoll: Close race condition between poll_one_napi and napi_disable")
+Signed-off-by: Xuan Zhuo <xuanzhuo@linux.alibaba.com>
+Reviewed-by: Dust Li <dust.li@linux.alibaba.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
