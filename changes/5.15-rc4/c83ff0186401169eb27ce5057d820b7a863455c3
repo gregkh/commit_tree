@@ -1,0 +1,75 @@
+drm/i915/request: fix early tracepoints
+
+Currently we blow up in trace_dma_fence_init, when calling into
+get_driver_name or get_timeline_name, since both the engine and context
+might be NULL(or contain some garbage address) in the case of newly
+allocated slab objects via the request ctor. Note that we also use
+SLAB_TYPESAFE_BY_RCU here, which allows requests to be immediately
+freed, but delay freeing the underlying page by an RCU grace period.
+With this scheme requests can be re-allocated, at the same time as they
+are also being read by some lockless RCU lookup mechanism.
+
+In the ctor case, which is only called for new slab objects(i.e allocate
+new page and call the ctor for each object) it's safe to reset the
+context/engine prior to calling into dma_fence_init, since we can be
+certain that no one is doing an RCU lookup which might depend on peeking
+at the engine/context, like in active_engine(), since the object can't
+yet be externally visible.
+
+In the recycled case(which might also be externally visible) the request
+refcount always transitions from 0->1 after we set the context/engine
+etc, which should ensure it's valid to dereference the engine for
+example, when doing an RCU list-walk, so long as we can also increment
+the refcount first. If the refcount is already zero, then the request is
+considered complete/released.  If it's non-zero, then the request might
+be in the process of being re-allocated, or potentially still in flight,
+however after successfully incrementing the refcount, it's possible to
+carefully inspect the request state, to determine if the request is
+still what we were looking for. Note that all externally visible
+requests returned to the cache must have zero refcount.
+
+One possible fix then is to move dma_fence_init out from the request
+ctor. Originally this was how it was done, but it was moved in:
+
+commit 855e39e65cfc33a73724f1cc644ffc5754864a20
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Mon Feb 3 09:41:48 2020 +0000
+
+    drm/i915: Initialise basic fence before acquiring seqno
+
+where it looks like intel_timeline_get_seqno() relied on some of the
+rq->fence state, but that is no longer the case since:
+
+commit 12ca695d2c1ed26b2dcbb528b42813bd0f216cfc
+Author: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date:   Tue Mar 23 16:49:50 2021 +0100
+
+    drm/i915: Do not share hwsp across contexts any more, v8.
+
+intel_timeline_get_seqno() could also be cleaned up slightly by dropping
+the request argument.
+
+Moving dma_fence_init back out of the ctor, should ensure we have enough
+of the request initialised in case of trace_dma_fence_init.
+Functionally this should be the same, and is effectively what we were
+already open coding before, except now we also assign the fence->lock
+and fence->ops, but since these are invariant for recycled
+requests(which might be externally visible), and will therefore already
+hold the same value, it shouldn't matter.
+
+An alternative fix, since we don't yet have a fully initialised request
+when in the ctor, is just setting the context/engine as NULL, but this
+does require adding some extra handling in get_driver_name etc.
+
+v2(Daniel):
+  - Try to make the commit message less confusing
+
+Fixes: 855e39e65cfc ("drm/i915: Initialise basic fence before acquiring seqno")
+Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+Cc: Michael Mason <michael.w.mason@intel.com>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210921134202.3803151-1-matthew.auld@intel.com
+(cherry picked from commit be988eaee1cb208c4445db46bc3ceaf75f586f0b)
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+
