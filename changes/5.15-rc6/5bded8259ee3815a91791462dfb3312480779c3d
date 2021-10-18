@@ -1,0 +1,145 @@
+net: dsa: mv88e6xxx: isolate the ATU databases of standalone and bridged ports
+
+Similar to commit 6087175b7991 ("net: dsa: mt7530: use independent VLAN
+learning on VLAN-unaware bridges"), software forwarding between an
+unoffloaded LAG port (a bonding interface with an unsupported policy)
+and a mv88e6xxx user port directly under a bridge is broken.
+
+We adopt the same strategy, which is to make the standalone ports not
+find any ATU entry learned on a bridge port.
+
+Theory: the mv88e6xxx ATU is looked up by FID and MAC address. There are
+as many FIDs as VIDs (4096). The FID is derived from the VID when
+possible (the VTU maps a VID to a FID), with a fallback to the port
+based default FID value when not (802.1Q Mode is disabled on the port,
+or the classified VID isn't present in the VTU).
+
+The mv88e6xxx driver makes the following use of FIDs and VIDs:
+
+- the port's DefaultVID (to which untagged & pvid-tagged packets get
+  classified) is 0 and is absent from the VTU, so this kind of packets is
+  processed in FID 0, the default FID assigned by mv88e6xxx_setup_port.
+
+- every time a bridge VLAN is created, mv88e6xxx_port_vlan_join() ->
+  mv88e6xxx_atu_new() associates a FID with that VID which increases
+  linearly starting from 1. Like this:
+
+  bridge vlan add dev lan0 vid 100 # FID 1
+  bridge vlan add dev lan1 vid 100 # still FID 1
+  bridge vlan add dev lan2 vid 1024 # FID 2
+
+The FID allocation made by the driver is sub-optimal for the following
+reasons:
+
+(a) A standalone port has a DefaultPVID of 0 and a default FID of 0 too.
+    A VLAN-unaware bridged port has a DefaultPVID of 0 and a default FID
+    of 0 too. The difference is that the bridged ports may learn ATU
+    entries, while the standalone port has the requirement that it must
+    not, and must not find them either. Standalone ports must not use
+    the same FID as ports belonging to a bridge. All standalone ports
+    can use the same FID, since the ATU will never have an entry in
+    that FID.
+
+(b) Multiple VLAN-unaware bridges will all use a DefaultPVID of 0 and a
+    default FID of 0 on all their ports. The FDBs will not be isolated
+    between these bridges. Every VLAN-unaware bridge must use the same
+    FID on all its ports, different from the FID of other bridge ports.
+
+(c) Each bridge VLAN uses a unique FID which is useful for Independent
+    VLAN Learning, but the same VLAN ID on multiple VLAN-aware bridges
+    will result in the same FID being used by mv88e6xxx_atu_new().
+    The correct behavior is for VLAN 1 in br0 to have a different FID
+    compared to VLAN 1 in br1.
+
+This patch cannot fix all the above. Traditionally the DSA framework did
+not care about this, and the reality is that DSA core involvement is
+needed for the aforementioned issues to be solved. The only thing we can
+solve here is an issue which does not require API changes, and that is
+issue (a), aka use a different FID for standalone ports vs ports under
+VLAN-unaware bridges.
+
+The first step is deciding what VID and FID to use for standalone ports,
+and what VID and FID for bridged ports. The 0/0 pair for standalone
+ports is what they used up till now, let's keep using that. For bridged
+ports, there are 2 cases:
+
+- VLAN-aware ports will never end up using the port default FID, because
+  packets will always be classified to a VID in the VTU or dropped
+  otherwise. The FID is the one associated with the VID in the VTU.
+
+- On VLAN-unaware ports, we _could_ leave their DefaultVID (pvid) at
+  zero (just as in the case of standalone ports), and just change the
+  port's default FID from 0 to a different number (say 1).
+
+However, Tobias points out that there is one more requirement to cater to:
+cross-chip bridging. The Marvell DSA header does not carry the FID in
+it, only the VID. So once a packet crosses a DSA link, if it has a VID
+of zero it will get classified to the default FID of that cascade port.
+Relying on a port default FID for upstream cascade ports results in
+contradictions: a default FID of 0 breaks ATU isolation of bridged ports
+on the downstream switch, a default FID of 1 breaks standalone ports on
+the downstream switch.
+
+So not only must standalone ports have different FIDs compared to
+bridged ports, they must also have different DefaultVID values.
+IEEE 802.1Q defines two reserved VID values: 0 and 4095. So we simply
+choose 4095 as the DefaultVID of ports belonging to VLAN-unaware
+bridges, and VID 4095 maps to FID 1.
+
+For the xmit operation to look up the same ATU database, we need to put
+VID 4095 in DSA tags sent to ports belonging to VLAN-unaware bridges
+too. All shared ports are configured to map this VID to the bridging
+FID, because they are members of that VLAN in the VTU. Shared ports
+don't need to have 802.1QMode enabled in any way, they always parse the
+VID from the DSA header, they don't need to look at the 802.1Q header.
+
+We install VID 4095 to the VTU in mv88e6xxx_setup_port(), with the
+mention that mv88e6xxx_vtu_setup() which was located right below that
+call was flushing the VTU so those entries wouldn't be preserved.
+So we need to relocate the VTU flushing prior to the port initialization
+during ->setup(). Also note that this is why it is safe to assume that
+VID 4095 will get associated with FID 1: the user ports haven't been
+created, so there is no avenue for the user to create a bridge VLAN
+which could otherwise race with the creation of another FID which would
+otherwise use up the non-reserved FID value of 1.
+
+[ Currently mv88e6xxx_port_vlan_join() doesn't have the option of
+  specifying a preferred FID, it always calls mv88e6xxx_atu_new(). ]
+
+mv88e6xxx_port_db_load_purge() is the function to access the ATU for
+FDB/MDB entries, and it used to determine the FID to use for
+VLAN-unaware FDB entries (VID=0) using mv88e6xxx_port_get_fid().
+But the driver only called mv88e6xxx_port_set_fid() once, during probe,
+so no surprises, the port FID was always 0, the call to get_fid() was
+redundant. As much as I would have wanted to not touch that code, the
+logic is broken when we add a new FID which is not the port-based
+default. Now the port-based default FID only corresponds to standalone
+ports, and FDB/MDB entries belong to the bridging service. So while in
+the future, when the DSA API will support FDB isolation, we will have to
+figure out the FID based on the bridge number, for now there's a single
+bridging FID, so hardcode that.
+
+Lastly, the tagger needs to check, when it is transmitting a VLAN
+untagged skb, whether it is sending it towards a bridged or a standalone
+port. When we see it is bridged we assume the bridge is VLAN-unaware.
+Not because it cannot be VLAN-aware but:
+
+- if we are transmitting from a VLAN-aware bridge we are likely doing so
+  using TX forwarding offload. That code path guarantees that skbs have
+  a vlan hwaccel tag in them, so we would not enter the "else" branch
+  of the "if (skb->protocol == htons(ETH_P_8021Q))" condition.
+
+- if we are transmitting on behalf of a VLAN-aware bridge but with no TX
+  forwarding offload (no PVT support, out of space in the PVT, whatever),
+  we would indeed be transmitting with VLAN 4095 instead of the bridge
+  device's pvid. However we would be injecting a "From CPU" frame, and
+  the switch won't learn from that - it only learns from "Forward" frames.
+  So it is inconsequential for address learning. And VLAN 4095 is
+  absolutely enough for the frame to exit the switch, since we never
+  remove that VLAN from any port.
+
+Fixes: 57e661aae6a8 ("net: dsa: mv88e6xxx: Link aggregation support")
+Reported-by: Tobias Waldekranz <tobias@waldekranz.com>
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+
