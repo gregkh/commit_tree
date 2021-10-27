@@ -1,0 +1,116 @@
+tracing: Have all levels of checks prevent recursion
+
+While writing an email explaining the "bit = 0" logic for a discussion on
+making ftrace_test_recursion_trylock() disable preemption, I discovered a
+path that makes the "not do the logic if bit is zero" unsafe.
+
+The recursion logic is done in hot paths like the function tracer. Thus,
+any code executed causes noticeable overhead. Thus, tricks are done to try
+to limit the amount of code executed. This included the recursion testing
+logic.
+
+Having recursion testing is important, as there are many paths that can
+end up in an infinite recursion cycle when tracing every function in the
+kernel. Thus protection is needed to prevent that from happening.
+
+Because it is OK to recurse due to different running context levels (e.g.
+an interrupt preempts a trace, and then a trace occurs in the interrupt
+handler), a set of bits are used to know which context one is in (normal,
+softirq, irq and NMI). If a recursion occurs in the same level, it is
+prevented*.
+
+Then there are infrastructure levels of recursion as well. When more than
+one callback is attached to the same function to trace, it calls a loop
+function to iterate over all the callbacks. Both the callbacks and the
+loop function have recursion protection. The callbacks use the
+"ftrace_test_recursion_trylock()" which has a "function" set of context
+bits to test, and the loop function calls the internal
+trace_test_and_set_recursion() directly, with an "internal" set of bits.
+
+If an architecture does not implement all the features supported by ftrace
+then the callbacks are never called directly, and the loop function is
+called instead, which will implement the features of ftrace.
+
+Since both the loop function and the callbacks do recursion protection, it
+was seemed unnecessary to do it in both locations. Thus, a trick was made
+to have the internal set of recursion bits at a more significant bit
+location than the function bits. Then, if any of the higher bits were set,
+the logic of the function bits could be skipped, as any new recursion
+would first have to go through the loop function.
+
+This is true for architectures that do not support all the ftrace
+features, because all functions being traced must first go through the
+loop function before going to the callbacks. But this is not true for
+architectures that support all the ftrace features. That's because the
+loop function could be called due to two callbacks attached to the same
+function, but then a recursion function inside the callback could be
+called that does not share any other callback, and it will be called
+directly.
+
+i.e.
+
+ traced_function_1: [ more than one callback tracing it ]
+   call loop_func
+
+ loop_func:
+   trace_recursion set internal bit
+   call callback
+
+ callback:
+   trace_recursion [ skipped because internal bit is set, return 0 ]
+   call traced_function_2
+
+ traced_function_2: [ only traced by above callback ]
+   call callback
+
+ callback:
+   trace_recursion [ skipped because internal bit is set, return 0 ]
+   call traced_function_2
+
+ [ wash, rinse, repeat, BOOM! out of shampoo! ]
+
+Thus, the "bit == 0 skip" trick is not safe, unless the loop function is
+call for all functions.
+
+Since we want to encourage architectures to implement all ftrace features,
+having them slow down due to this extra logic may encourage the
+maintainers to update to the latest ftrace features. And because this
+logic is only safe for them, remove it completely.
+
+ [*] There is on layer of recursion that is allowed, and that is to allow
+     for the transition between interrupt context (normal -> softirq ->
+     irq -> NMI), because a trace may occur before the context update is
+     visible to the trace recursion logic.
+
+Link: https://lore.kernel.org/all/609b565a-ed6e-a1da-f025-166691b5d994@linux.alibaba.com/
+Link: https://lkml.kernel.org/r/20211018154412.09fcad3c@gandalf.local.home
+
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Petr Mladek <pmladek@suse.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: "James E.J. Bottomley" <James.Bottomley@hansenpartnership.com>
+Cc: Helge Deller <deller@gmx.de>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: Paul Mackerras <paulus@samba.org>
+Cc: Paul Walmsley <paul.walmsley@sifive.com>
+Cc: Palmer Dabbelt <palmer@dabbelt.com>
+Cc: Albert Ou <aou@eecs.berkeley.edu>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+Cc: Jiri Kosina <jikos@kernel.org>
+Cc: Miroslav Benes <mbenes@suse.cz>
+Cc: Joe Lawrence <joe.lawrence@redhat.com>
+Cc: Colin Ian King <colin.king@canonical.com>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: "Peter Zijlstra (Intel)" <peterz@infradead.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Jisheng Zhang <jszhang@kernel.org>
+Cc: =?utf-8?b?546L6LSH?= <yun.wang@linux.alibaba.com>
+Cc: Guo Ren <guoren@kernel.org>
+Cc: stable@vger.kernel.org
+Fixes: edc15cafcbfa3 ("tracing: Avoid unnecessary multiple recursion checks")
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+
