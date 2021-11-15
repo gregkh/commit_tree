@@ -1,0 +1,77 @@
+btrfs: subpage: make add_ra_bio_pages() compatible
+
+[BUG]
+If we remove the subpage limitation in add_ra_bio_pages(), then read a
+compressed extent which has part of its range in next page, like the
+following inode layout:
+
+	0	32K	64K	96K	128K
+	|<--------------|-------------->|
+
+Btrfs will trigger ASSERT() in endio function:
+
+  assertion failed: atomic_read(&subpage->readers) >= nbits
+  ------------[ cut here ]------------
+  kernel BUG at fs/btrfs/ctree.h:3431!
+  Internal error: Oops - BUG: 0 [#1] SMP
+  Workqueue: btrfs-endio btrfs_work_helper [btrfs]
+  Call trace:
+   assertfail.constprop.0+0x28/0x2c [btrfs]
+   btrfs_subpage_end_reader+0x148/0x14c [btrfs]
+   end_page_read+0x8c/0x100 [btrfs]
+   end_bio_extent_readpage+0x320/0x6b0 [btrfs]
+   bio_endio+0x15c/0x1dc
+   end_workqueue_fn+0x44/0x64 [btrfs]
+   btrfs_work_helper+0x74/0x250 [btrfs]
+   process_one_work+0x1d4/0x47c
+   worker_thread+0x180/0x400
+   kthread+0x11c/0x120
+   ret_from_fork+0x10/0x30
+  ---[ end trace c8b7b552d3bb408c ]---
+
+[CAUSE]
+When we read the page range [0, 64K), we find it's a compressed extent,
+and we will try to add extra pages in add_ra_bio_pages() to avoid
+reading the same compressed extent.
+
+But when we add such page into the read bio, it doesn't follow the
+behavior of btrfs_do_readpage() to properly set subpage::readers.
+
+This means, for page [64K, 128K), its subpage::readers is still 0.
+
+And when endio is executed on both pages, since page [64K, 128K) has 0
+subpage::readers, it triggers above ASSERT()
+
+[FIX]
+Function add_ra_bio_pages() is far from subpage compatible, it always
+assume PAGE_SIZE == sectorsize, thus when it skip to next range it
+always just skip PAGE_SIZE.
+
+Make it subpage compatible by:
+
+- Skip to next page properly when needed
+  If we find there is already a page cache, we need to skip to next page.
+  For that case, we shouldn't just skip PAGE_SIZE bytes, but use
+  @pg_index to calculate the next bytenr and continue.
+
+- Only add the page range covered by current extent map
+  We need to calculate which range is covered by current extent map and
+  only add that part into the read bio.
+
+- Update subpage::readers before submitting the bio
+
+- Use proper cursor other than confusing @last_offset
+
+- Calculate the missed threshold based on sector size
+  It's no longer using missed pages, as for 64K page size, we have at
+  most 3 pages to skip. (If aligned only 2 pages)
+
+- Add ASSERT() to make sure our bytenr is always aligned
+
+- Add comment for the function
+  Add a special note for subpage case, as the function won't really
+  work well for subpage cases.
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

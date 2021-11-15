@@ -1,0 +1,73 @@
+btrfs: introduce compressed_bio::pending_sectors to trace compressed bio
+
+For btrfs_submit_compressed_read() and btrfs_submit_compressed_write(),
+we have a pretty weird dance around compressed_bio::pending_bios:
+
+  btrfs_submit_compressed_read/write()
+  {
+	cb = kmalloc()
+	refcount_set(&cb->pending_bios, 0);
+	bio = btrfs_alloc_bio();
+
+	/* NOTE here, we haven't yet submitted any bio */
+	refcount_set(&cb->pending_bios, 1);
+
+	for (pg_index = 0; pg_index < cb->nr_pages; pg_index++) {
+		if (submit) {
+			/* Here we submit bio, but we always have one
+			 * extra pending_bios */
+			refcount_inc(&cb->pending_bios);
+			ret = btrfs_map_bio();
+		}
+	}
+
+	/* Submit the last bio */
+	ret = btrfs_map_bio();
+  }
+
+There are two reasons why we do this:
+
+- compressed_bio::pending_bios is a refcount
+  Thus if it's reduced to 0, it can not be increased again.
+
+- To ensure the compressed_bio is not freed by some submitted bios
+  If the submitted bio is finished before the next bio submitted,
+  we can free the compressed_bio completely.
+
+But the above code is sometimes confusing, and we can do it better by
+introducing a new member, compressed_bio::pending_sectors.
+
+Now we use compressed_bio::pending_sectors to indicate whether we have
+any pending sectors under IO or not yet submitted.
+
+If pending_sectors == 0, we're definitely the last bio of compressed_bio,
+and is OK to release the compressed bio.
+
+Now the workflow looks like this:
+
+  btrfs_submit_compressed_read/write()
+  {
+	cb = kmalloc()
+	atomic_set(&cb->pending_bios, 0);
+	refcount_set(&cb->pending_sectors,
+		     compressed_len >> sectorsize_bits);
+	bio = btrfs_alloc_bio();
+
+	for (pg_index = 0; pg_index < cb->nr_pages; pg_index++) {
+		if (submit) {
+			refcount_inc(&cb->pending_bios);
+			ret = btrfs_map_bio();
+		}
+	}
+
+	/* Submit the last bio */
+	refcount_inc(&cb->pending_bios);
+	ret = btrfs_map_bio();
+  }
+
+For now we still need pending_bios for later error handling, but will
+remove pending_bios eventually after properly handling the errors.
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

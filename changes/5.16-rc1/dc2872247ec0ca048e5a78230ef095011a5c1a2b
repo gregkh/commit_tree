@@ -1,0 +1,100 @@
+btrfs: keep track of the last logged keys when logging a directory
+
+After the first time we log a directory in the current transaction, for
+each directory item in a changed leaf of the subvolume tree, we have to
+check if we previously logged the item, in order to overwrite it in case
+its data changed or skip it in case its data hasn't changed.
+
+Checking if we have logged each item before not only wastes times, but it
+also adds lock contention on the log tree. So in order to minimize the
+number of times we do such checks, keep track of the offset of the last
+key we logged for a directory and, on the next time we log the directory,
+skip the checks for any new keys that have an offset greater than the
+offset we have previously saved. This is specially effective for index
+keys, because the offset for these keys comes from a monotonically
+increasing counter.
+
+This patch is part of a patchset comprised of the following 5 patches:
+
+  btrfs: remove root argument from btrfs_log_inode() and its callees
+  btrfs: remove redundant log root assignment from log_dir_items()
+  btrfs: factor out the copying loop of dir items from log_dir_items()
+  btrfs: insert items in batches when logging a directory when possible
+  btrfs: keep track of the last logged keys when logging a directory
+
+This is patch 5/5.
+
+The following test was used on a non-debug kernel to measure the impact
+it has on a directory fsync:
+
+  $ cat test-dir-fsync.sh
+  #!/bin/bash
+
+  DEV=/dev/nvme0n1
+  MNT=/mnt/nvme0n1
+
+  NUM_NEW_FILES=100000
+  NUM_FILE_DELETES=1000
+
+  mkfs.btrfs -f $DEV
+  mount -o ssd $DEV $MNT
+
+  mkdir $MNT/testdir
+
+  for ((i = 1; i <= $NUM_NEW_FILES; i++)); do
+      echo -n > $MNT/testdir/file_$i
+  done
+
+  # fsync the directory, this will log the new dir items and the inodes
+  # they point to, because these are new inodes.
+  start=$(date +%s%N)
+  xfs_io -c "fsync" $MNT/testdir
+  end=$(date +%s%N)
+
+  dur=$(( (end - start) / 1000000 ))
+  echo "dir fsync took $dur ms after adding $NUM_NEW_FILES files"
+
+  # sync to force transaction commit and wipeout the log.
+  sync
+
+  del_inc=$(( $NUM_NEW_FILES / $NUM_FILE_DELETES ))
+  for ((i = 1; i <= $NUM_NEW_FILES; i += $del_inc)); do
+      rm -f $MNT/testdir/file_$i
+  done
+
+  # fsync the directory, this will only log dir items, there are no
+  # dentries pointing to new inodes.
+  start=$(date +%s%N)
+  xfs_io -c "fsync" $MNT/testdir
+  end=$(date +%s%N)
+
+  dur=$(( (end - start) / 1000000 ))
+  echo "dir fsync took $dur ms after deleting $NUM_FILE_DELETES files"
+
+  umount $MNT
+
+Test results with NUM_NEW_FILES set to 100 000 and 1 000 000:
+
+**** before patchset, 100 000 files, 1000 deletes ****
+
+dir fsync took 848 ms after adding 100000 files
+dir fsync took 175 ms after deleting 1000 files
+
+**** after patchset, 100 000 files, 1000 deletes ****
+
+dir fsync took 758 ms after adding 100000 files  (-11.2%)
+dir fsync took 63 ms after deleting 1000 files   (-94.1%)
+
+**** before patchset, 1 000 000 files, 1000 deletes ****
+
+dir fsync took 9945 ms after adding 1000000 files
+dir fsync took 473 ms after deleting 1000 files
+
+**** after patchset, 1 000 000 files, 1000 deletes ****
+
+dir fsync took 8677 ms after adding 1000000 files (-13.6%)
+dir fsync took 146 ms after deleting 1000 files   (-105.6%)
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

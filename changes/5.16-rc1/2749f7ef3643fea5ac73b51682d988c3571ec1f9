@@ -1,0 +1,81 @@
+btrfs: subpage: avoid potential deadlock with compression and delalloc
+
+[BUG]
+With experimental subpage compression enabled, a simple fsstress can
+lead to self deadlock on page 720896:
+
+        mkfs.btrfs -f -s 4k $dev > /dev/null
+        mount $dev -o compress $mnt
+        $fsstress -p 1 -n 100 -w -d $mnt -v -s 1625511156
+
+[CAUSE]
+If we have a file layout looks like below:
+
+	0	32K	64K	96K	128K
+	|//|		|///////////////|
+	   4K
+
+Then we run delalloc range for the inode, it will:
+
+- Call find_lock_delalloc_range() with @delalloc_start = 0
+  Then we got a delalloc range [0, 4K).
+
+  This range will be COWed.
+
+- Call find_lock_delalloc_range() again with @delalloc_start = 4K
+  Since find_lock_delalloc_range() never cares whether the range
+  is still inside page range [0, 64K), it will return range [64K, 128K).
+
+  This range meets the condition for subpage compression, will go
+  through async COW path.
+
+  And async COW path will return @page_started.
+
+  But that @page_started is now for range [64K, 128K), not for range
+  [0, 64K).
+
+- writepage_dellloc() returned 1 for page [0, 64K)
+  Thus page [0, 64K) will not be unlocked, nor its page dirty status
+  will be cleared.
+
+Next time when we try to lock page [0, 64K) we will deadlock, as there
+is no one to release page [0, 64K).
+
+This problem will never happen for regular page size as one page only
+contains one sector.  After the first find_lock_delalloc_range() call,
+the @delalloc_end will go beyond @page_end no matter if we found a
+delalloc range or not
+
+Thus this bug only happens for subpage, as now we need multiple runs to
+exhaust the delalloc range of a page.
+
+[FIX]
+Fix the problem by ensuring the delalloc range we ran at least started
+inside @locked_page.
+
+So that we will never get incorrect @page_started.
+
+And to prevent such problem from happening again:
+
+- Make find_lock_delalloc_range() return false if the found range is
+  beyond @end value passed in.
+
+  Since @end will be utilized now, add an ASSERT() to ensure we pass
+  correct @end into find_lock_delalloc_range().
+
+  This also means, for selftests we needs to populate @end before calling
+  find_lock_delalloc_range().
+
+- New ASSERT() in find_lock_delalloc_range()
+  Now we will make sure the @start/@end passed in at least covers part
+  of the page.
+
+- New ASSERT() in run_delalloc_range()
+  To make sure the range at least starts inside @locked page.
+
+- Use @delalloc_start as proper cursor, while @delalloc_end is always
+  reset to @page_end.
+
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

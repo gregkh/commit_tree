@@ -1,0 +1,121 @@
+btrfs: fix deadlock between chunk allocation and chunk btree modifications
+
+When a task is doing some modification to the chunk btree and it is not in
+the context of a chunk allocation or a chunk removal, it can deadlock with
+another task that is currently allocating a new data or metadata chunk.
+
+These contexts are the following:
+
+* When relocating a system chunk, when we need to COW the extent buffers
+  that belong to the chunk btree;
+
+* When adding a new device (ioctl), where we need to add a new device item
+  to the chunk btree;
+
+* When removing a device (ioctl), where we need to remove a device item
+  from the chunk btree;
+
+* When resizing a device (ioctl), where we need to update a device item in
+  the chunk btree and may need to relocate a system chunk that lies beyond
+  the new device size when shrinking a device.
+
+The problem happens due to a sequence of steps like the following:
+
+1) Task A starts a data or metadata chunk allocation and it locks the
+   chunk mutex;
+
+2) Task B is relocating a system chunk, and when it needs to COW an extent
+   buffer of the chunk btree, it has locked both that extent buffer as
+   well as its parent extent buffer;
+
+3) Since there is not enough available system space, either because none
+   of the existing system block groups have enough free space or because
+   the only one with enough free space is in RO mode due to the relocation,
+   task B triggers a new system chunk allocation. It blocks when trying to
+   acquire the chunk mutex, currently held by task A;
+
+4) Task A enters btrfs_chunk_alloc_add_chunk_item(), in order to insert
+   the new chunk item into the chunk btree and update the existing device
+   items there. But in order to do that, it has to lock the extent buffer
+   that task B locked at step 2, or its parent extent buffer, but task B
+   is waiting on the chunk mutex, which is currently locked by task A,
+   therefore resulting in a deadlock.
+
+One example report when the deadlock happens with system chunk relocation:
+
+  INFO: task kworker/u9:5:546 blocked for more than 143 seconds.
+        Not tainted 5.15.0-rc3+ #1
+  "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+  task:kworker/u9:5    state:D stack:25936 pid:  546 ppid:     2 flags:0x00004000
+  Workqueue: events_unbound btrfs_async_reclaim_metadata_space
+  Call Trace:
+   context_switch kernel/sched/core.c:4940 [inline]
+   __schedule+0xcd9/0x2530 kernel/sched/core.c:6287
+   schedule+0xd3/0x270 kernel/sched/core.c:6366
+   rwsem_down_read_slowpath+0x4ee/0x9d0 kernel/locking/rwsem.c:993
+   __down_read_common kernel/locking/rwsem.c:1214 [inline]
+   __down_read kernel/locking/rwsem.c:1223 [inline]
+   down_read_nested+0xe6/0x440 kernel/locking/rwsem.c:1590
+   __btrfs_tree_read_lock+0x31/0x350 fs/btrfs/locking.c:47
+   btrfs_tree_read_lock fs/btrfs/locking.c:54 [inline]
+   btrfs_read_lock_root_node+0x8a/0x320 fs/btrfs/locking.c:191
+   btrfs_search_slot_get_root fs/btrfs/ctree.c:1623 [inline]
+   btrfs_search_slot+0x13b4/0x2140 fs/btrfs/ctree.c:1728
+   btrfs_update_device+0x11f/0x500 fs/btrfs/volumes.c:2794
+   btrfs_chunk_alloc_add_chunk_item+0x34d/0xea0 fs/btrfs/volumes.c:5504
+   do_chunk_alloc fs/btrfs/block-group.c:3408 [inline]
+   btrfs_chunk_alloc+0x84d/0xf50 fs/btrfs/block-group.c:3653
+   flush_space+0x54e/0xd80 fs/btrfs/space-info.c:670
+   btrfs_async_reclaim_metadata_space+0x396/0xa90 fs/btrfs/space-info.c:953
+   process_one_work+0x9df/0x16d0 kernel/workqueue.c:2297
+   worker_thread+0x90/0xed0 kernel/workqueue.c:2444
+   kthread+0x3e5/0x4d0 kernel/kthread.c:319
+   ret_from_fork+0x1f/0x30 arch/x86/entry/entry_64.S:295
+  INFO: task syz-executor:9107 blocked for more than 143 seconds.
+        Not tainted 5.15.0-rc3+ #1
+  "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+  task:syz-executor    state:D stack:23200 pid: 9107 ppid:  7792 flags:0x00004004
+  Call Trace:
+   context_switch kernel/sched/core.c:4940 [inline]
+   __schedule+0xcd9/0x2530 kernel/sched/core.c:6287
+   schedule+0xd3/0x270 kernel/sched/core.c:6366
+   schedule_preempt_disabled+0xf/0x20 kernel/sched/core.c:6425
+   __mutex_lock_common kernel/locking/mutex.c:669 [inline]
+   __mutex_lock+0xc96/0x1680 kernel/locking/mutex.c:729
+   btrfs_chunk_alloc+0x31a/0xf50 fs/btrfs/block-group.c:3631
+   find_free_extent_update_loop fs/btrfs/extent-tree.c:3986 [inline]
+   find_free_extent+0x25cb/0x3a30 fs/btrfs/extent-tree.c:4335
+   btrfs_reserve_extent+0x1f1/0x500 fs/btrfs/extent-tree.c:4415
+   btrfs_alloc_tree_block+0x203/0x1120 fs/btrfs/extent-tree.c:4813
+   __btrfs_cow_block+0x412/0x1620 fs/btrfs/ctree.c:415
+   btrfs_cow_block+0x2f6/0x8c0 fs/btrfs/ctree.c:570
+   btrfs_search_slot+0x1094/0x2140 fs/btrfs/ctree.c:1768
+   relocate_tree_block fs/btrfs/relocation.c:2694 [inline]
+   relocate_tree_blocks+0xf73/0x1770 fs/btrfs/relocation.c:2757
+   relocate_block_group+0x47e/0xc70 fs/btrfs/relocation.c:3673
+   btrfs_relocate_block_group+0x48a/0xc60 fs/btrfs/relocation.c:4070
+   btrfs_relocate_chunk+0x96/0x280 fs/btrfs/volumes.c:3181
+   __btrfs_balance fs/btrfs/volumes.c:3911 [inline]
+   btrfs_balance+0x1f03/0x3cd0 fs/btrfs/volumes.c:4301
+   btrfs_ioctl_balance+0x61e/0x800 fs/btrfs/ioctl.c:4137
+   btrfs_ioctl+0x39ea/0x7b70 fs/btrfs/ioctl.c:4949
+   vfs_ioctl fs/ioctl.c:51 [inline]
+   __do_sys_ioctl fs/ioctl.c:874 [inline]
+   __se_sys_ioctl fs/ioctl.c:860 [inline]
+   __x64_sys_ioctl+0x193/0x200 fs/ioctl.c:860
+   do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+   do_syscall_64+0x35/0xb0 arch/x86/entry/common.c:80
+   entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+So fix this by making sure that whenever we try to modify the chunk btree
+and we are neither in a chunk allocation context nor in a chunk remove
+context, we reserve system space before modifying the chunk btree.
+
+Reported-by: Hao Sun <sunhao.th@gmail.com>
+Link: https://lore.kernel.org/linux-btrfs/CACkBjsax51i4mu6C0C3vJqQN3NR_iVuucoeG3U1HXjrgzn5FFQ@mail.gmail.com/
+Fixes: 79bd37120b1495 ("btrfs: rework chunk allocation to avoid exhaustion of the system chunk array")
+CC: stable@vger.kernel.org # 5.14+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

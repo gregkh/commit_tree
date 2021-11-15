@@ -1,0 +1,212 @@
+dyndbg: refine verbosity 1-4 summary-detail
+
+adjust current v*pr_info() calls to fit an overview..detail scheme:
+
+1- module level activity: add/remove, etc
+2- command ingest, splitting, summary of effects.
+   per >control write
+3- command parsing: op, flags, search terms
+4- per-site change msg
+   can yield ~3k x 2 logs per echo "+p;-p" > command.
+
+Summarize these 4 levels in MODULE_PARM_DESC, and update verbose=3 in Doc.
+
+2- is new, to isolate a problem where a stress-test script (which
+feeds ~4kb multi-command strings) would produce short writes,
+truncating last command and causing parsing errors, which confused
+test results.  The script fix was to use syswrite, to deliver full
+proper commands.
+
+4- gets per-callsite "changed:" pr-infos, which are very noisy during
+stress tests, and formerly obscured v1-3 messages, and overwhelmed the
+static-key workload being tested.
+
+The verbose parameter has previously seen adjustment:
+commit 481c0e33f1e7 ("dyndbg: refine debug verbosity; 1 is basic, 2 more chatty")
+
+The script driving these adjustments is:
+
+ !/usr/bin/perl -w
+
+=for Doc
+
+1st purpose was to benchmark the effect of wildcard queries on query
+performance; if wildcards are risk free cheap enough, we can deploy
+them in the (floating) format search.  1st finding: wildcards take 2x
+as long to process.
+
+2nd purpose was to benchmark real static-key changes VS simple flag
+changes.  Found ~100x decrease for the hard work.
+
+The script maximizes workload per >control by packing it a ~4kb
+string of "+p; -p;" commands; this uncovered some broken stuff.
+
+The 85th query failed, and appears to be truncated, so is gramatically
+incorrect.  Its either an error here, or in the kernel.  Its not
+happening atm, retest.
+
+Plot thickens: fail only happens doing +-p, not +-mf, likely load
+dependent.  Error remains consistent.  Looks like a short write,
+longer on writer than kernel-reader.  Try syswrite on handle to
+control this.  That fixed short write.
+
+=cut
+
+use Getopt::Std;
+
+getopts('vN:k:', \my %opts) or die <<EOH;
+$0 options:
+    -v		verbose
+    -k=n	kernel dyndbg verbosity
+    -N=n	number of loops.. tbrc
+EOH
+$opts{N} //= 10; # !undef, 0 tests too long.
+
+my $ctrl = '/proc/dynamic_debug/control';
+
+vx($opts{k}) if defined $opts{k}; # works on -k0
+
+open(my $CTL, '>', $ctrl) or die "cant open $ctrl for writing: $!\n";
+
+sub vx {
+    my $arg = shift;
+    my $cmd = "echo $arg > /sys/module/dynamic_debug/parameters/verbose";
+    system($cmd);
+    warn("vx problem: rc:$? err:$! qry: $cmd\n") if ($?);
+}
+
+sub qryOK {
+    my $qry = shift;
+
+    print "syntax test: <\n$qry>\n" if $opts{v};
+    my $bytes = syswrite $CTL, $qry;
+    printf "short read: $bytes / %d\n", length $qry if $bytes < length $qry;
+    if ($?) {
+	warn "rc:$? err:$! qry: $qry\n";
+	return 0;
+    }
+    return 1;
+}
+
+sub build_queries {
+    my ($cmd, $flags, $ct) = @_;
+
+    # build experiment and reference queries
+
+    my $cycle = " $cmd +$flags # on ; $cmd -$flags # off \n";
+    my $ref   = " +$flags ; -$flags \n";
+
+    my $len = length $cycle;
+    my $max = int(4096 / $len); # break/fit to buffer size
+    $ct |= $max;
+    print "qry: ct:$max x << \n$cycle >>\n";
+
+    return unless qryOK($ref);
+    return unless qryOK($cycle);
+
+    my $wild = $cycle x $ct;
+    my $empty = $ref x $ct;
+
+    printf "len: %d, %d\n", length $wild, length $empty;
+
+    return { trial => $wild,
+	     ref => $empty,
+	     probe => $cycle,
+	     zero => $ref,
+	     count => $ct,
+	     max => $max
+    };
+}
+
+my $query_set = build_queries(' file "*" module "*" func "*" ', "mf");
+
+qryOK($query_set->{zero});
+qryOK($query_set->{probe});
+
+qryOK($query_set->{ref});
+qryOK($query_set->{trial});
+
+use Benchmark;
+sub dobatch {
+    my ($cmd, $flags, $reps, $ct) = @_;
+    $reps ||= $opts{N};
+
+    my $qs = build_queries($cmd, $flags, $ct);
+
+    timethese($reps,
+	      {
+		  wildcards => sub {
+		      syswrite $CTL, $qs->{trial};
+		  },
+		  no_search => sub {
+		      syswrite $CTL, $qs->{ref};
+		  }
+	      }
+	);
+}
+
+sub bench_static_key_toggle {
+    vx 0;
+    dobatch(' file "*" module "*" func "*" ', "mf");
+    dobatch(' file "*" module "*" func "*" ', "p");
+}
+
+sub bench_verbose_levels {
+    for my $i (0..4) {
+	vx $i;
+	dobatch(' file "*" module "*" func "*" ', "mf");
+    }
+}
+
+bench_static_key_toggle();
+
+__END__
+
+Heres how the test-script runs:
+
+:: verbose=3 parsing info
+
+[   48.401646] dyndbg: query 95: "file "*" module "*" func "*"  -mf # off " mod:*
+[   48.402040] dyndbg: split into words: "file" "*" "module" "*" "func" "*" "-mf"
+[   48.402456] dyndbg: op='-'
+[   48.402615] dyndbg: flags=0x6
+[   48.402779] dyndbg: *flagsp=0x0 *maskp=0xfffffff9
+[   48.403033] dyndbg: parsed: func="*" file="*" module="*" format="" lineno=0-0
+[   48.403674] dyndbg: applied: func="*" file="*" module="*" format="" lineno=0-0
+
+:: verbose=2 >control summary.
+   ~300k site matches/changes per 4kb command
+
+[   48.404063] dyndbg: processed 96 queries, with 296160 matches, 0 errs
+
+:: 2 queries against each other, no-search vs all-wildcard-search
+
+qry: ct:48 x <<
+  file "*" module "*" func "*"  +mf # on ;  file "*" module "*" func "*"  -mf # off
+ >>
+len: 4080, 576
+Benchmark: timing 10 iterations of no_search, wildcards...
+ no_search:  0 wallclock secs ( 0.00 usr +  0.03 sys =  0.03 CPU) @ 333.33/s (n=10)
+            (warning: too few iterations for a reliable count)
+ wildcards:  0 wallclock secs ( 0.00 usr +  0.09 sys =  0.09 CPU) @ 111.11/s (n=10)
+            (warning: too few iterations for a reliable count)
+
+:: 2 queries, both doing real work / changing stati-key states.
+
+qry: ct:49 x <<
+  file "*" module "*" func "*"  +p # on ;  file "*" module "*" func "*"  -p # off
+ >>
+len: 4067, 490
+Benchmark: timing 10 iterations of no_search, wildcards...
+ no_search: 20 wallclock secs ( 0.00 usr + 20.36 sys = 20.36 CPU) @  0.49/s (n=10)
+ wildcards: 21 wallclock secs ( 0.00 usr + 21.08 sys = 21.08 CPU) @  0.47/s (n=10)
+bash-5.1#
+
+Thats 150k static-key-toggles / sec
+  ~600x slower than simple flags
+  on qemu --smp 3 run
+
+Signed-off-by: Jim Cromie <jim.cromie@gmail.com>
+Link: https://lore.kernel.org/r/20211019210746.185307-1-jim.cromie@gmail.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

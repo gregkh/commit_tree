@@ -1,0 +1,63 @@
+nbd: Fix hungtask when nbd_config_put
+
+I got follow issue:
+[  247.381177] INFO: task kworker/u10:0:47 blocked for more than 120 seconds.
+[  247.382644]       Not tainted 4.19.90-dirty #140
+[  247.383502] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[  247.385027] Call Trace:
+[  247.388384]  schedule+0xb8/0x3c0
+[  247.388966]  schedule_timeout+0x2b4/0x380
+[  247.392815]  wait_for_completion+0x367/0x510
+[  247.397713]  flush_workqueue+0x32b/0x1340
+[  247.402700]  drain_workqueue+0xda/0x3c0
+[  247.403442]  destroy_workqueue+0x7b/0x690
+[  247.405014]  nbd_config_put.cold+0x2f9/0x5b6
+[  247.405823]  recv_work+0x1fd/0x2b0
+[  247.406485]  process_one_work+0x70b/0x1610
+[  247.407262]  worker_thread+0x5a9/0x1060
+[  247.408699]  kthread+0x35e/0x430
+[  247.410918]  ret_from_fork+0x1f/0x30
+
+We can reproduce issue as follows:
+1. Inject memory fault in nbd_start_device
+-1244,10 +1248,18 @@ static int nbd_start_device(struct nbd_device *nbd)
+        nbd_dev_dbg_init(nbd);
+        for (i = 0; i < num_connections; i++) {
+                struct recv_thread_args *args;
+-
+-               args = kzalloc(sizeof(*args), GFP_KERNEL);
++
++               if (i == 1) {
++                       args = NULL;
++                       printk("%s: inject malloc error\n", __func__);
++               }
++               else
++                       args = kzalloc(sizeof(*args), GFP_KERNEL);
+2. Inject delay in recv_work
+-757,6 +760,8 @@ static void recv_work(struct work_struct *work)
+
+                blk_mq_complete_request(blk_mq_rq_from_pdu(cmd));
+        }
++       printk("%s: comm=%s pid=%d\n", __func__, current->comm, current->pid);
++       mdelay(5 * 1000);
+        nbd_config_put(nbd);
+        atomic_dec(&config->recv_threads);
+        wake_up(&config->recv_wq);
+3. Create nbd server
+nbd-server 8000 /tmp/disk
+4. Create nbd client
+nbd-client localhost 8000 /dev/nbd1
+Then will trigger above issue.
+
+Reason is when add delay in recv_work, lead to release the last reference
+of 'nbd->config_refs'. nbd_config_put will call flush_workqueue to make
+all work finish. Obviously, it will lead to deadloop.
+To solve this issue, according to Josef's suggestion move 'recv_work'
+init from start device to nbd_dev_add, then destroy 'recv_work'when
+nbd device teardown.
+
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Link: https://lore.kernel.org/r/20211102015237.2309763-5-yebin10@huawei.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+

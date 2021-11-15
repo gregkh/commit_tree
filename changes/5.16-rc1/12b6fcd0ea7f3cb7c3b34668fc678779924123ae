@@ -1,0 +1,58 @@
+scsi: target: core: Remove from tmr_list during LUN unlink
+
+Currently TMF commands are removed from de_device.dev_tmf_list at the very
+end of se_cmd lifecycle. However, se_lun unlinks from se_cmd upon a command
+status (response) being queued in transport layer. This means that LUN and
+backend device can be deleted in the meantime and a panic will occur:
+
+target_tmr_work()
+	cmd->se_tfo->queue_tm_rsp(cmd); // send abort_rsp to a wire
+	transport_lun_remove_cmd(cmd) // unlink se_cmd from se_lun
+- // - // - // -
+<<<--- lun remove
+<<<--- core backend device remove
+- // - // - // -
+qlt_handle_abts_completion()
+  tfo->free_mcmd()
+    transport_generic_free_cmd()
+      target_put_sess_cmd()
+        core_tmr_release_req() {
+          if (dev) { // backend device, can not be null
+            spin_lock_irqsave(&dev->se_tmr_lock, flags); //<<<--- CRASH
+
+Call Trace:
+NIP [c000000000e1683c] _raw_spin_lock_irqsave+0x2c/0xc0
+LR [c00800000e433338] core_tmr_release_req+0x40/0xa0 [target_core_mod]
+Call Trace:
+(unreliable)
+0x0
+target_put_sess_cmd+0x2a0/0x370 [target_core_mod]
+transport_generic_free_cmd+0x6c/0x1b0 [target_core_mod]
+tcm_qla2xxx_complete_mcmd+0x28/0x50 [tcm_qla2xxx]
+process_one_work+0x2c4/0x5c0
+worker_thread+0x88/0x690
+
+For the iSCSI protocol this is easily reproduced:
+
+ - Send some SCSI sommand
+
+ - Send Abort of that command over iSCSI
+
+ - Remove LUN on target
+
+ - Send next iSCSI command to acknowledge the Abort_Response
+
+ - Target panics
+
+There is no need to keep the command in tmr_list until response completion,
+so move the removal from tmr_list from the response completion to the
+response queueing when the LUN is unlinked.  Move the removal from state
+list too as it is a subject to the same race condition.
+
+Link: https://lore.kernel.org/r/20211018135753.15297-1-d.bogdanov@yadro.com
+Fixes: c66ac9db8d4a ("[SCSI] target: Add LIO target core v4.0.0-rc6")
+Reviewed-by: Roman Bolshakov <r.bolshakov@yadro.com>
+Reviewed-by: Mike Christie <michael.christie@oracle.com>
+Signed-off-by: Dmitry Bogdanov <d.bogdanov@yadro.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+

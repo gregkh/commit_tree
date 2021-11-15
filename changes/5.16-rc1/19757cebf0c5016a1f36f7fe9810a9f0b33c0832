@@ -1,0 +1,72 @@
+tcp: switch orphan_count to bare per-cpu counters
+
+Use of percpu_counter structure to track count of orphaned
+sockets is causing problems on modern hosts with 256 cpus
+or more.
+
+Stefan Bach reported a serious spinlock contention in real workloads,
+that I was able to reproduce with a netfilter rule dropping
+incoming FIN packets.
+
+    53.56%  server  [kernel.kallsyms]      [k] queued_spin_lock_slowpath
+            |
+            ---queued_spin_lock_slowpath
+               |
+                --53.51%--_raw_spin_lock_irqsave
+                          |
+                           --53.51%--__percpu_counter_sum
+                                     tcp_check_oom
+                                     |
+                                     |--39.03%--__tcp_close
+                                     |          tcp_close
+                                     |          inet_release
+                                     |          inet6_release
+                                     |          sock_close
+                                     |          __fput
+                                     |          ____fput
+                                     |          task_work_run
+                                     |          exit_to_usermode_loop
+                                     |          do_syscall_64
+                                     |          entry_SYSCALL_64_after_hwframe
+                                     |          __GI___libc_close
+                                     |
+                                      --14.48%--tcp_out_of_resources
+                                                tcp_write_timeout
+                                                tcp_retransmit_timer
+                                                tcp_write_timer_handler
+                                                tcp_write_timer
+                                                call_timer_fn
+                                                expire_timers
+                                                __run_timers
+                                                run_timer_softirq
+                                                __softirqentry_text_start
+
+As explained in commit cf86a086a180 ("net/dst: use a smaller percpu_counter
+batch for dst entries accounting"), default batch size is too big
+for the default value of tcp_max_orphans (262144).
+
+But even if we reduce batch sizes, there would still be cases
+where the estimated count of orphans is beyond the limit,
+and where tcp_too_many_orphans() has to call the expensive
+percpu_counter_sum_positive().
+
+One solution is to use plain per-cpu counters, and have
+a timer to periodically refresh this cache.
+
+Updating this cache every 100ms seems about right, tcp pressure
+state is not radically changing over shorter periods.
+
+percpu_counter was nice 15 years ago while hosts had less
+than 16 cpus, not anymore by current standards.
+
+v2: Fix the build issue for CONFIG_CRYPTO_DEV_CHELSIO_TLS=m,
+    reported by kernel test robot <lkp@intel.com>
+    Remove unused socket argument from tcp_too_many_orphans()
+
+Fixes: dd24c00191d5 ("net: Use a percpu_counter for orphan_count")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Stefan Bach <sfb@google.com>
+Cc: Neal Cardwell <ncardwell@google.com>
+Acked-by: Neal Cardwell <ncardwell@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+

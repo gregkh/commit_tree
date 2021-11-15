@@ -1,0 +1,67 @@
+vfs: keep inodes with page cache off the inode shrinker LRU
+
+Historically (pre-2.5), the inode shrinker used to reclaim only empty
+inodes and skip over those that still contained page cache.  This caused
+problems on highmem hosts: struct inode could put fill lowmem zones
+before the cache was getting reclaimed in the highmem zones.
+
+To address this, the inode shrinker started to strip page cache to
+facilitate reclaiming lowmem.  However, this comes with its own set of
+problems: the shrinkers may drop actively used page cache just because
+the inodes are not currently open or dirty - think working with a large
+git tree.  It further doesn't respect cgroup memory protection settings
+and can cause priority inversions between containers.
+
+Nowadays, the page cache also holds non-resident info for evicted cache
+pages in order to detect refaults.  We've come to rely heavily on this
+data inside reclaim for protecting the cache workingset and driving swap
+behavior.  We also use it to quantify and report workload health through
+psi.  The latter in turn is used for fleet health monitoring, as well as
+driving automated memory sizing of workloads and containers, proactive
+reclaim and memory offloading schemes.
+
+The consequences of dropping page cache prematurely is that we're seeing
+subtle and not-so-subtle failures in all of the above-mentioned
+scenarios, with the workload generally entering unexpected thrashing
+states while losing the ability to reliably detect it.
+
+To fix this on non-highmem systems at least, going back to rotating
+inodes on the LRU isn't feasible.  We've tried (commit a76cf1a474d7
+("mm: don't reclaim inodes with many attached pages")) and failed
+(commit 69056ee6a8a3 ("Revert "mm: don't reclaim inodes with many
+attached pages"")).
+
+The issue is mostly that shrinker pools attract pressure based on their
+size, and when objects get skipped the shrinkers remember this as
+deferred reclaim work.  This accumulates excessive pressure on the
+remaining inodes, and we can quickly eat into heavily used ones, or
+dirty ones that require IO to reclaim, when there potentially is plenty
+of cold, clean cache around still.
+
+Instead, this patch keeps populated inodes off the inode LRU in the
+first place - just like an open file or dirty state would.  An otherwise
+clean and unused inode then gets queued when the last cache entry
+disappears.  This solves the problem without reintroducing the reclaim
+issues, and generally is a bit more scalable than having to wade through
+potentially hundreds of thousands of busy inodes.
+
+Locking is a bit tricky because the locks protecting the inode state
+(i_lock) and the inode LRU (lru_list.lock) don't nest inside the
+irq-safe page cache lock (i_pages.xa_lock).  Page cache deletions are
+serialized through i_lock, taken before the i_pages lock, to make sure
+depopulated inodes are queued reliably.  Additions may race with
+deletions, but we'll check again in the shrinker.  If additions race
+with the shrinker itself, we're protected by the i_lock: if find_inode()
+or iput() win, the shrinker will bail on the elevated i_count or
+I_REFERENCED; if the shrinker wins and goes ahead with the inode, it
+will set I_FREEING and inhibit further igets(), which will cause the
+other side to create a new instance of the inode instead.
+
+Link: https://lkml.kernel.org/r/20210614211904.14420-4-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Roman Gushchin <guro@fb.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+

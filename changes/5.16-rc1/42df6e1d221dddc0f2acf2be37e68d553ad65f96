@@ -1,0 +1,95 @@
+netfilter: Introduce egress hook
+
+Support classifying packets with netfilter on egress to satisfy user
+requirements such as:
+* outbound security policies for containers (Laura)
+* filtering and mangling intra-node Direct Server Return (DSR) traffic
+  on a load balancer (Laura)
+* filtering locally generated traffic coming in through AF_PACKET,
+  such as local ARP traffic generated for clustering purposes or DHCP
+  (Laura; the AF_PACKET plumbing is contained in a follow-up commit)
+* L2 filtering from ingress and egress for AVB (Audio Video Bridging)
+  and gPTP with nftables (Pablo)
+* in the future: in-kernel NAT64/NAT46 (Pablo)
+
+The egress hook introduced herein complements the ingress hook added by
+commit e687ad60af09 ("netfilter: add netfilter ingress hook after
+handle_ing() under unique static key").  A patch for nftables to hook up
+egress rules from user space has been submitted separately, so users may
+immediately take advantage of the feature.
+
+Alternatively or in addition to netfilter, packets can be classified
+with traffic control (tc).  On ingress, packets are classified first by
+tc, then by netfilter.  On egress, the order is reversed for symmetry.
+Conceptually, tc and netfilter can be thought of as layers, with
+netfilter layered above tc.
+
+Traffic control is capable of redirecting packets to another interface
+(man 8 tc-mirred).  E.g., an ingress packet may be redirected from the
+host namespace to a container via a veth connection:
+tc ingress (host) -> tc egress (veth host) -> tc ingress (veth container)
+
+In this case, netfilter egress classifying is not performed when leaving
+the host namespace!  That's because the packet is still on the tc layer.
+If tc redirects the packet to a physical interface in the host namespace
+such that it leaves the system, the packet is never subjected to
+netfilter egress classifying.  That is only logical since it hasn't
+passed through netfilter ingress classifying either.
+
+Packets can alternatively be redirected at the netfilter layer using
+nft fwd.  Such a packet *is* subjected to netfilter egress classifying
+since it has reached the netfilter layer.
+
+Internally, the skb->nf_skip_egress flag controls whether netfilter is
+invoked on egress by __dev_queue_xmit().  Because __dev_queue_xmit() may
+be called recursively by tunnel drivers such as vxlan, the flag is
+reverted to false after sch_handle_egress().  This ensures that
+netfilter is applied both on the overlay and underlying network.
+
+Interaction between tc and netfilter is possible by setting and querying
+skb->mark.
+
+If netfilter egress classifying is not enabled on any interface, it is
+patched out of the data path by way of a static_key and doesn't make a
+performance difference that is discernible from noise:
+
+Before:             1537 1538 1538 1537 1538 1537 Mb/sec
+After:              1536 1534 1539 1539 1539 1540 Mb/sec
+Before + tc accept: 1418 1418 1418 1419 1419 1418 Mb/sec
+After  + tc accept: 1419 1424 1418 1419 1422 1420 Mb/sec
+Before + tc drop:   1620 1619 1619 1619 1620 1620 Mb/sec
+After  + tc drop:   1616 1624 1625 1624 1622 1619 Mb/sec
+
+When netfilter egress classifying is enabled on at least one interface,
+a minimal performance penalty is incurred for every egress packet, even
+if the interface it's transmitted over doesn't have any netfilter egress
+rules configured.  That is caused by checking dev->nf_hooks_egress
+against NULL.
+
+Measurements were performed on a Core i7-3615QM.  Commands to reproduce:
+ip link add dev foo type dummy
+ip link set dev foo up
+modprobe pktgen
+echo "add_device foo" > /proc/net/pktgen/kpktgend_3
+samples/pktgen/pktgen_bench_xmit_mode_queue_xmit.sh -i foo -n 400000000 -m "11:11:11:11:11:11" -d 1.1.1.1
+
+Accept all traffic with tc:
+tc qdisc add dev foo clsact
+tc filter add dev foo egress bpf da bytecode '1,6 0 0 0,'
+
+Drop all traffic with tc:
+tc qdisc add dev foo clsact
+tc filter add dev foo egress bpf da bytecode '1,6 0 0 2,'
+
+Apply this patch when measuring packet drops to avoid errors in dmesg:
+https://lore.kernel.org/netdev/a73dda33-57f4-95d8-ea51-ed483abd6a7a@iogearbox.net/
+
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Cc: Laura García Liébana <nevola@gmail.com>
+Cc: John Fastabend <john.fastabend@gmail.com>
+Cc: Daniel Borkmann <daniel@iogearbox.net>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Thomas Graf <tgraf@suug.ch>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
