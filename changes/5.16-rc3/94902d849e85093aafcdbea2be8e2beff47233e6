@@ -1,0 +1,74 @@
+arm64: uaccess: avoid blocking within critical sections
+
+As Vincent reports in:
+
+  https://lore.kernel.org/r/20211118163417.21617-1-vincent.whitchurch@axis.com
+
+The put_user() in schedule_tail() can get stuck in a livelock, similar
+to a problem recently fixed on riscv in commit:
+
+  285a76bb2cf51b0c ("riscv: evaluate put_user() arg before enabling user access")
+
+In __raw_put_user() we have a critical section between
+uaccess_ttbr0_enable() and uaccess_ttbr0_disable() where we cannot
+safely call into the scheduler without having taken an exception, as
+schedule() and other scheduling functions will not save/restore the
+TTBR0 state. If either of the `x` or `ptr` arguments to __raw_put_user()
+contain a blocking call, we may call into the scheduler within the
+critical section. This can result in two problems:
+
+1) The access within the critical section will occur without the
+   required TTBR0 tables installed. This will fault, and where the
+   required tables permit access, the access will be retried without the
+   required tables, resulting in a livelock.
+
+2) When TTBR0 SW PAN is in use, check_and_switch_context() does not
+   modify TTBR0, leaving a stale value installed. The mappings of the
+   blocked task will erroneously be accessible to regular accesses in
+   the context of the new task. Additionally, if the tables are
+   subsequently freed, local TLB maintenance required to reuse the ASID
+   may be lost, potentially resulting in TLB corruption (e.g. in the
+   presence of CnP).
+
+The same issue exists for __raw_get_user() in the critical section
+between uaccess_ttbr0_enable() and uaccess_ttbr0_disable().
+
+A similar issue exists for __get_kernel_nofault() and
+__put_kernel_nofault() for the critical section between
+__uaccess_enable_tco_async() and __uaccess_disable_tco_async(), as the
+TCO state is not context-switched by direct calls into the scheduler.
+Here the TCO state may be lost from the context of the current task,
+resulting in unexpected asynchronous tag check faults. It may also be
+leaked to another task, suppressing expected tag check faults.
+
+To fix all of these cases, we must ensure that we do not directly call
+into the scheduler in their respective critical sections. This patch
+reworks __raw_put_user(), __raw_get_user(), __get_kernel_nofault(), and
+__put_kernel_nofault(), ensuring that parameters are evaluated outside
+of the critical sections. To make this requirement clear, comments are
+added describing the problem, and line spaces added to separate the
+critical sections from other portions of the macros.
+
+For __raw_get_user() and __raw_put_user() the `err` parameter is
+conditionally assigned to, and we must currently evaluate this in the
+critical section. This behaviour is relied upon by the signal code,
+which uses chains of put_user_error() and get_user_error(), checking the
+return value at the end. In all cases, the `err` parameter is a plain
+int rather than a more complex expression with a blocking call, so this
+is safe.
+
+In future we should try to clean up the `err` usage to remove the
+potential for this to be a problem.
+
+Aside from the changes to time of evaluation, there should be no
+functional change as a result of this patch.
+
+Reported-by: Vincent Whitchurch <vincent.whitchurch@axis.com>
+Link: https://lore.kernel.org/r/20211118163417.21617-1-vincent.whitchurch@axis.com
+Fixes: f253d827f33c ("arm64: uaccess: refactor __{get,put}_user")
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Link: https://lore.kernel.org/r/20211122125820.55286-1-mark.rutland@arm.com
+Signed-off-by: Will Deacon <will@kernel.org>
+
