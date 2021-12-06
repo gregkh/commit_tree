@@ -1,0 +1,79 @@
+arm64: kexec: use __pa_symbol(empty_zero_page)
+
+In machine_kexec_post_load() we use __pa() on `empty_zero_page`, so that
+we can use the physical address during arm64_relocate_new_kernel() to
+switch TTBR1 to a new set of tables. While `empty_zero_page` is part of
+the old kernel, we won't clobber it until after this switch, so using it
+is benign.
+
+However, `empty_zero_page` is part of the kernel image rather than a
+linear map address, so it is not correct to use __pa(x), and we should
+instead use __pa_symbol(x) or __pa(lm_alias(x)). Otherwise, when the
+kernel is built with DEBUG_VIRTUAL, we'll encounter splats as below, as
+I've seen when fuzzing v5.16-rc3 with Syzkaller:
+
+| ------------[ cut here ]------------
+| virt_to_phys used for non-linear address: 000000008492561a (empty_zero_page+0x0/0x1000)
+| WARNING: CPU: 3 PID: 11492 at arch/arm64/mm/physaddr.c:15 __virt_to_phys+0x120/0x1c0 arch/arm64/mm/physaddr.c:12
+| CPU: 3 PID: 11492 Comm: syz-executor.0 Not tainted 5.16.0-rc3-00001-g48bd452a045c #1
+| Hardware name: linux,dummy-virt (DT)
+| pstate: 60400005 (nZCv daif +PAN -UAO -TCO -DIT -SSBS BTYPE=--)
+| pc : __virt_to_phys+0x120/0x1c0 arch/arm64/mm/physaddr.c:12
+| lr : __virt_to_phys+0x120/0x1c0 arch/arm64/mm/physaddr.c:12
+| sp : ffff80001af17bb0
+| x29: ffff80001af17bb0 x28: ffff1cc65207b400 x27: ffffb7828730b120
+| x26: 0000000000000e11 x25: 0000000000000000 x24: 0000000000000001
+| x23: ffffb7828963e000 x22: ffffb78289644000 x21: 0000600000000000
+| x20: 000000000000002d x19: 0000b78289644000 x18: 0000000000000000
+| x17: 74706d6528206131 x16: 3635323934383030 x15: 303030303030203a
+| x14: 1ffff000035e2eb8 x13: ffff6398d53f4f0f x12: 1fffe398d53f4f0e
+| x11: 1fffe398d53f4f0e x10: ffff6398d53f4f0e x9 : ffffb7827c6f76dc
+| x8 : ffff1cc6a9fa7877 x7 : 0000000000000001 x6 : ffff6398d53f4f0f
+| x5 : 0000000000000000 x4 : 0000000000000000 x3 : ffff1cc66f2a99c0
+| x2 : 0000000000040000 x1 : d7ce7775b09b5d00 x0 : 0000000000000000
+| Call trace:
+|  __virt_to_phys+0x120/0x1c0 arch/arm64/mm/physaddr.c:12
+|  machine_kexec_post_load+0x284/0x670 arch/arm64/kernel/machine_kexec.c:150
+|  do_kexec_load+0x570/0x670 kernel/kexec.c:155
+|  __do_sys_kexec_load kernel/kexec.c:250 [inline]
+|  __se_sys_kexec_load kernel/kexec.c:231 [inline]
+|  __arm64_sys_kexec_load+0x1d8/0x268 kernel/kexec.c:231
+|  __invoke_syscall arch/arm64/kernel/syscall.c:38 [inline]
+|  invoke_syscall+0x90/0x2e0 arch/arm64/kernel/syscall.c:52
+|  el0_svc_common.constprop.2+0x1e4/0x2f8 arch/arm64/kernel/syscall.c:142
+|  do_el0_svc+0xf8/0x150 arch/arm64/kernel/syscall.c:181
+|  el0_svc+0x60/0x248 arch/arm64/kernel/entry-common.c:603
+|  el0t_64_sync_handler+0x90/0xb8 arch/arm64/kernel/entry-common.c:621
+|  el0t_64_sync+0x180/0x184 arch/arm64/kernel/entry.S:572
+| irq event stamp: 2428
+| hardirqs last  enabled at (2427): [<ffffb7827c6f2308>] __up_console_sem+0xf0/0x118 kernel/printk/printk.c:255
+| hardirqs last disabled at (2428): [<ffffb7828223df98>] el1_dbg+0x28/0x80 arch/arm64/kernel/entry-common.c:375
+| softirqs last  enabled at (2424): [<ffffb7827c411c00>] softirq_handle_end kernel/softirq.c:401 [inline]
+| softirqs last  enabled at (2424): [<ffffb7827c411c00>] __do_softirq+0xa28/0x11e4 kernel/softirq.c:587
+| softirqs last disabled at (2417): [<ffffb7827c59015c>] do_softirq_own_stack include/asm-generic/softirq_stack.h:10 [inline]
+| softirqs last disabled at (2417): [<ffffb7827c59015c>] invoke_softirq kernel/softirq.c:439 [inline]
+| softirqs last disabled at (2417): [<ffffb7827c59015c>] __irq_exit_rcu kernel/softirq.c:636 [inline]
+| softirqs last disabled at (2417): [<ffffb7827c59015c>] irq_exit_rcu+0x53c/0x688 kernel/softirq.c:648
+| ---[ end trace 0ca578534e7ca938 ]---
+
+With or without DEBUG_VIRTUAL __pa() will fall back to __kimg_to_phys()
+for non-linear addresses, and will happen to do the right thing in this
+case, even with the warning. But we should not depend upon this, and to
+keep the warning useful we should fix this case.
+
+Fix this issue by using __pa_symbol(), which handles kernel image
+addresses (and checks its input is a kernel image address). This matches
+what we do elsewhere, e.g. in arch/arm64/include/asm/pgtable.h:
+
+| #define ZERO_PAGE(vaddr)       phys_to_page(__pa_symbol(empty_zero_page))
+
+Fixes: 3744b5280e67 ("arm64: kexec: install a copy of the linear-map")
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: James Morse <james.morse@arm.com>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Will Deacon <will@kernel.org>
+Reviewed-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Link: https://lore.kernel.org/r/20211130121849.3319010-1-mark.rutland@arm.com
+Signed-off-by: Will Deacon <will@kernel.org>
+
