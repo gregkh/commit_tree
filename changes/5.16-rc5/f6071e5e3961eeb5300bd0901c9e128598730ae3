@@ -1,0 +1,80 @@
+selftests/fib_tests: Rework fib_rp_filter_test()
+
+Currently rp_filter tests in fib_tests.sh:fib_rp_filter_test() are
+failing.  ping sockets are bound to dummy1 using the "-I" option
+(SO_BINDTODEVICE), but socket lookup is failing when receiving ping
+replies, since the routing table thinks they belong to dummy0.
+
+For example, suppose ping is using a SOCK_RAW socket for ICMP messages.
+When receiving ping replies, in __raw_v4_lookup(), sk->sk_bound_dev_if
+is 3 (dummy1), but dif (skb_rtable(skb)->rt_iif) says 2 (dummy0), so the
+raw_sk_bound_dev_eq() check fails.  Similar things happen in
+ping_lookup() for SOCK_DGRAM sockets.
+
+These tests used to pass due to a bug [1] in iputils, where "ping -I"
+actually did not bind ICMP message sockets to device.  The bug has been
+fixed by iputils commit f455fee41c07 ("ping: also bind the ICMP socket
+to the specific device") in 2016, which is why our rp_filter tests
+started to fail.  See [2] .
+
+Fixing the tests while keeping everything in one netns turns out to be
+nontrivial.  Rework the tests and build the following topology:
+
+ ┌─────────────────────────────┐    ┌─────────────────────────────┐
+ │  network namespace 1 (ns1)  │    │  network namespace 2 (ns2)  │
+ │                             │    │                             │
+ │  ┌────┐     ┌─────┐         │    │  ┌─────┐            ┌────┐  │
+ │  │ lo │<───>│veth1│<────────┼────┼─>│veth2│<──────────>│ lo │  │
+ │  └────┘     ├─────┴──────┐  │    │  ├─────┴──────┐     └────┘  │
+ │             │192.0.2.1/24│  │    │  │192.0.2.1/24│             │
+ │             └────────────┘  │    │  └────────────┘             │
+ └─────────────────────────────┘    └─────────────────────────────┘
+
+Consider sending an ICMP_ECHO packet A in ns2.  Both source and
+destination IP addresses are 192.0.2.1, and we use strict mode rp_filter
+in both ns1 and ns2:
+
+  1. A is routed to lo since its destination IP address is one of ns2's
+     local addresses (veth2);
+  2. A is redirected from lo's egress to veth2's egress using mirred;
+  3. A arrives at veth1's ingress in ns1;
+  4. A is redirected from veth1's ingress to lo's ingress, again, using
+     mirred;
+  5. In __fib_validate_source(), fib_info_nh_uses_dev() returns false,
+     since A was received on lo, but reverse path lookup says veth1;
+  6. However A is not dropped since we have relaxed this check for lo in
+     commit 66f8209547cc ("fib: relax source validation check for loopback
+     packets");
+
+Making sure A is not dropped here in this corner case is the whole point
+of having this test.
+
+  7. As A reaches the ICMP layer, an ICMP_ECHOREPLY packet, B, is
+     generated;
+  8. Similarly, B is redirected from lo's egress to veth1's egress (in
+     ns1), then redirected once again from veth2's ingress to lo's
+     ingress (in ns2), using mirred.
+
+Also test "ping 127.0.0.1" from ns2.  It does not trigger the relaxed
+check in __fib_validate_source(), but just to make sure the topology
+works with loopback addresses.
+
+Tested with ping from iputils 20210722-41-gf9fb573:
+
+$ ./fib_tests.sh -t rp_filter
+
+IPv4 rp_filter tests
+    TEST: rp_filter passes local packets		[ OK ]
+    TEST: rp_filter passes loopback packets		[ OK ]
+
+[1] https://github.com/iputils/iputils/issues/55
+[2] https://github.com/iputils/iputils/commit/f455fee41c077d4b700a473b2f5b3487b8febc1d
+
+Reported-by: Hangbin Liu <liuhangbin@gmail.com>
+Fixes: adb701d6cfa4 ("selftests: add a test case for rp_filter")
+Reviewed-by: Cong Wang <cong.wang@bytedance.com>
+Signed-off-by: Peilin Ye <peilin.ye@bytedance.com>
+Acked-by: David Ahern <dsahern@kernel.org>
+Link: https://lore.kernel.org/r/20211201004720.6357-1-yepeilin.cs@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+
