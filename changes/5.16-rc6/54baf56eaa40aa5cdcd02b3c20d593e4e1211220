@@ -1,0 +1,64 @@
+clk: Don't parent clks until the parent is fully registered
+
+Before commit fc0c209c147f ("clk: Allow parents to be specified without
+string names") child clks couldn't find their parent until the parent
+clk was added to a list in __clk_core_init(). After that commit, child
+clks can reference their parent clks directly via a clk_hw pointer, or
+they can lookup that clk_hw pointer via DT if the parent clk is
+registered with an OF clk provider.
+
+The common clk framework treats hw->core being non-NULL as "the clk is
+registered" per the logic within clk_core_fill_parent_index():
+
+	parent = entry->hw->core;
+	/*
+	 * We have a direct reference but it isn't registered yet?
+	 * Orphan it and let clk_reparent() update the orphan status
+	 * when the parent is registered.
+	 */
+	if (!parent)
+
+Therefore we need to be extra careful to not set hw->core until the clk
+is fully registered with the clk framework. Otherwise we can get into a
+situation where a child finds a parent clk and we move the child clk off
+the orphan list when the parent isn't actually registered, wrecking our
+enable accounting and breaking critical clks.
+
+Consider the following scenario:
+
+  CPU0                                     CPU1
+  ----                                     ----
+  struct clk_hw clkBad;
+  struct clk_hw clkA;
+
+  clkA.init.parent_hws = { &clkBad };
+
+  clk_hw_register(&clkA)                   clk_hw_register(&clkBad)
+   ...                                      __clk_register()
+					     hw->core = core
+					     ...
+   __clk_register()
+    __clk_core_init()
+     clk_prepare_lock()
+     __clk_init_parent()
+      clk_core_get_parent_by_index()
+       clk_core_fill_parent_index()
+        if (entry->hw) {
+	 parent = entry->hw->core;
+
+At this point, 'parent' points to clkBad even though clkBad hasn't been
+fully registered yet. Ouch! A similar problem can happen if a clk
+controller registers orphan clks that are referenced in the DT node of
+another clk controller.
+
+Let's fix all this by only setting the hw->core pointer underneath the
+clk prepare lock in __clk_core_init(). This way we know that
+clk_core_fill_parent_index() can't see hw->core be non-NULL until the
+clk is fully registered.
+
+Fixes: fc0c209c147f ("clk: Allow parents to be specified without string names")
+Signed-off-by: Mike Tipton <quic_mdtipton@quicinc.com>
+Link: https://lore.kernel.org/r/20211109043438.4639-1-quic_mdtipton@quicinc.com
+[sboyd@kernel.org: Reword commit text, update comment]
+Signed-off-by: Stephen Boyd <sboyd@kernel.org>
+
