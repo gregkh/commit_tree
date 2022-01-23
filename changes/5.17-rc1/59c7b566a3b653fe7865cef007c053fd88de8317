@@ -1,0 +1,96 @@
+btrfs: index free space entries on size
+
+Currently we index free space on offset only, because usually we have a
+hint from the allocator that we want to honor for locality reasons.
+However if we fail to use this hint we have to go back to a brute force
+search through the free space entries to find a large enough extent.
+
+With sufficiently fragmented free space this becomes quite expensive, as
+we have to linearly search all of the free space entries to find if we
+have a part that's long enough.
+
+To fix this add a cached rb tree to index based on free space entry
+bytes.  This will allow us to quickly look up the largest chunk in the
+free space tree for this block group, and stop searching once we've
+found an entry that is too small to satisfy our allocation.  We simply
+choose to use this tree if we're searching from the beginning of the
+block group, as we know we do not care about locality at that point.
+
+I wrote an allocator test that creates a 10TiB ram backed null block
+device and then fallocates random files until the file system is full.
+I think go through and delete all of the odd files.  Then I spawn 8
+threads that fallocate 64MiB files (1/2 our extent size cap) until the
+file system is full again.  I use bcc's funclatency to measure the
+latency of find_free_extent.  The baseline results are
+
+     nsecs               : count     distribution
+         0 -> 1          : 0        |                                        |
+         2 -> 3          : 0        |                                        |
+         4 -> 7          : 0        |                                        |
+         8 -> 15         : 0        |                                        |
+        16 -> 31         : 0        |                                        |
+        32 -> 63         : 0        |                                        |
+        64 -> 127        : 0        |                                        |
+       128 -> 255        : 0        |                                        |
+       256 -> 511        : 10356    |****                                    |
+       512 -> 1023       : 58242    |*************************               |
+      1024 -> 2047       : 74418    |********************************        |
+      2048 -> 4095       : 90393    |****************************************|
+      4096 -> 8191       : 79119    |***********************************     |
+      8192 -> 16383      : 35614    |***************                         |
+     16384 -> 32767      : 13418    |*****                                   |
+     32768 -> 65535      : 12811    |*****                                   |
+     65536 -> 131071     : 17090    |*******                                 |
+    131072 -> 262143     : 26465    |***********                             |
+    262144 -> 524287     : 40179    |*****************                       |
+    524288 -> 1048575    : 55469    |************************                |
+   1048576 -> 2097151    : 48807    |*********************                   |
+   2097152 -> 4194303    : 26744    |***********                             |
+   4194304 -> 8388607    : 35351    |***************                         |
+   8388608 -> 16777215   : 13918    |******                                  |
+  16777216 -> 33554431   : 21       |                                        |
+
+avg = 908079 nsecs, total: 580889071441 nsecs, count: 639690
+
+And the patch results are
+
+     nsecs               : count     distribution
+         0 -> 1          : 0        |                                        |
+         2 -> 3          : 0        |                                        |
+         4 -> 7          : 0        |                                        |
+         8 -> 15         : 0        |                                        |
+        16 -> 31         : 0        |                                        |
+        32 -> 63         : 0        |                                        |
+        64 -> 127        : 0        |                                        |
+       128 -> 255        : 0        |                                        |
+       256 -> 511        : 6883     |**                                      |
+       512 -> 1023       : 54346    |*********************                   |
+      1024 -> 2047       : 79170    |********************************        |
+      2048 -> 4095       : 98890    |****************************************|
+      4096 -> 8191       : 81911    |*********************************       |
+      8192 -> 16383      : 27075    |**********                              |
+     16384 -> 32767      : 14668    |*****                                   |
+     32768 -> 65535      : 13251    |*****                                   |
+     65536 -> 131071     : 15340    |******                                  |
+    131072 -> 262143     : 26715    |**********                              |
+    262144 -> 524287     : 43274    |*****************                       |
+    524288 -> 1048575    : 53870    |*********************                   |
+   1048576 -> 2097151    : 55368    |**********************                  |
+   2097152 -> 4194303    : 41036    |****************                        |
+   4194304 -> 8388607    : 24927    |**********                              |
+   8388608 -> 16777215   : 33       |                                        |
+  16777216 -> 33554431   : 9        |                                        |
+
+avg = 623599 nsecs, total: 397259314759 nsecs, count: 637042
+
+There's a little variation in the amount of calls done because of timing
+of the threads with metadata requirements, but the avg, total, and
+count's are relatively consistent between runs (usually within 2-5% of
+each other).  As you can see here we have around a 30% decrease in
+average latency with a 30% decrease in overall time spent in
+find_free_extent.
+
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

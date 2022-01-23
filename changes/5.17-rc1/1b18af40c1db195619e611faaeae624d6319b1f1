@@ -1,0 +1,90 @@
+spmi: spmi-pmic-arb: fix irq_set_type race condition
+
+The qpnpint_irq_set_type() callback function configures the type
+(edge vs level) and polarity (high, low, or both) of a particular
+PMIC interrupt within a given peripheral.  To do this, it reads
+the three consecutive IRQ configuration registers, modifies the
+specified IRQ bit within the register values, and finally writes
+the three modified register values back to the PMIC.  While a
+spinlock is used to provide mutual exclusion on the SPMI bus
+during the register read and write calls, there is no locking
+around the overall read, modify, write sequence.  This opens up
+the possibility of a race condition if two tasks set the type of
+a PMIC IRQ within the same peripheral simultaneously.
+
+When the race condition is encountered, both tasks will read the
+old value of the registers and IRQ bits set by one of the tasks
+will be dropped upon the register write of the other task.  This
+then leads to PMIC IRQs being enabled with an incorrect type and
+polarity configured.  Such misconfiguration can lead to an IRQ
+storm that overwhelms the system and causes it to crash.
+
+This race condition and IRQ storm have been observed when using
+a pair of pm8941-pwrkey devices to handle PMK8350 pwrkey and
+resin interrupts.  The independent devices probe asynchronously
+in parallel and can simultaneously request and configure PMIC
+IRQs in the same PMIC peripheral.
+
+For a good case, the IRQ configuration calls end up serialized
+due to timing deltas and the register read/write sequence looks
+like this:
+
+1. pwrkey probe: SPMI  read(0x1311): 0x00, 0x00, 0x00
+2. pwrkey probe: SPMI write(0x1311): 0x80, 0x80, 0x80
+3. resin probe:  SPMI  read(0x1311): 0x80, 0x80, 0x80
+4. resin probe:  SPMI write(0x1311): 0xC0, 0xC0, 0xC0
+
+The final register states after both devices have requested and
+enabled their respective IRQs is thus:
+
+0x1311: 0xC0
+0x1312: 0xC0
+0x1313: 0xC0
+0x1314: 0x00
+0x1315: 0xC0
+
+For a bad case, the IRQ configuration calls end up occurring
+simultaneously and the race condition is encountered.  The
+register read/write sequence then looks like this:
+
+1. pwrkey probe: SPMI  read(0x1311): 0x00, 0x00, 0x00
+2. resin probe:  SPMI  read(0x1311): 0x00, 0x00, 0x00
+3. pwrkey probe: SPMI write(0x1311): 0x80, 0x80, 0x80
+4. resin probe:  SPMI write(0x1311): 0x40, 0x40, 0x40
+
+In this case, the final register states after both devices have
+requested and enabled their respective IRQs is thus:
+
+0x1311: 0x40
+0x1312: 0x40
+0x1313: 0x40
+0x1314: 0x00
+0x1315: 0xC0
+
+This corresponds to the resin IRQ being configured for both
+rising and falling edges, as expected.  However, the pwrkey IRQ
+is misconfigured as level type with both polarity high and low
+set to disabled.  The PMIC IRQ triggering hardware treats this
+particular register configuration as if level low triggering is
+enabled.
+
+The raw pwrkey IRQ signal is low when the power key is not being
+pressed.  Thus, the pwrkey IRQ begins firing continuously in an
+IRQ storm.
+
+Fix the race condition by holding the spmi-pmic-arb spinlock for
+the duration of the read, modify, write sequence performed in the
+qpnpint_irq_set_type() function.  Split the pmic_arb_read_cmd()
+and pmic_arb_write_cmd() functions each into three parts so that
+hardware register IO is decoupled from spinlock locking.  This
+allows a new function pmic_arb_masked_write() to be added which
+locks the spinlock and then calls register IO functions to
+perform SPMI read and write commands in a single atomic
+operation.
+
+Link: https://lore.kernel.org/r/20211118034719.28971-1-quic_collinsd@quicinc.com
+Signed-off-by: David Collins <quic_collinsd@quicinc.com>
+Signed-off-by: Stephen Boyd <sboyd@kernel.org>
+Link: https://lore.kernel.org/r/20211216190812.1574801-7-sboyd@kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+

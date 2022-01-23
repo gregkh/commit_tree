@@ -1,0 +1,77 @@
+kcsan: Avoid nested contexts reading inconsistent reorder_access
+
+Nested contexts, such as nested interrupts or scheduler code, share the
+same kcsan_ctx. When such a nested context reads an inconsistent
+reorder_access due to an interrupt during set_reorder_access(), we can
+observe the following warning:
+
+ | ------------[ cut here ]------------
+ | Cannot find frame for torture_random kernel/torture.c:456 in stack trace
+ | WARNING: CPU: 13 PID: 147 at kernel/kcsan/report.c:343 replace_stack_entry kernel/kcsan/report.c:343
+ | ...
+ | Call Trace:
+ |  <TASK>
+ |  sanitize_stack_entries kernel/kcsan/report.c:351 [inline]
+ |  print_report kernel/kcsan/report.c:409
+ |  kcsan_report_known_origin kernel/kcsan/report.c:693
+ |  kcsan_setup_watchpoint kernel/kcsan/core.c:658
+ |  rcutorture_one_extend kernel/rcu/rcutorture.c:1475
+ |  rcutorture_loop_extend kernel/rcu/rcutorture.c:1558 [inline]
+ |  ...
+ |  </TASK>
+ | ---[ end trace ee5299cb933115f5 ]---
+ | ==================================================================
+ | BUG: KCSAN: data-race in _raw_spin_lock_irqsave / rcutorture_one_extend
+ |
+ | write (reordered) to 0xffffffff8c93b300 of 8 bytes by task 154 on cpu 12:
+ |  queued_spin_lock                include/asm-generic/qspinlock.h:80 [inline]
+ |  do_raw_spin_lock                include/linux/spinlock.h:185 [inline]
+ |  __raw_spin_lock_irqsave         include/linux/spinlock_api_smp.h:111 [inline]
+ |  _raw_spin_lock_irqsave          kernel/locking/spinlock.c:162
+ |  try_to_wake_up                  kernel/sched/core.c:4003
+ |  sysvec_apic_timer_interrupt     arch/x86/kernel/apic/apic.c:1097
+ |  asm_sysvec_apic_timer_interrupt arch/x86/include/asm/idtentry.h:638
+ |  set_reorder_access              kernel/kcsan/core.c:416 [inline]    <-- inconsistent reorder_access
+ |  kcsan_setup_watchpoint          kernel/kcsan/core.c:693
+ |  rcutorture_one_extend           kernel/rcu/rcutorture.c:1475
+ |  rcutorture_loop_extend          kernel/rcu/rcutorture.c:1558 [inline]
+ |  rcu_torture_one_read            kernel/rcu/rcutorture.c:1600
+ |  rcu_torture_reader              kernel/rcu/rcutorture.c:1692
+ |  kthread                         kernel/kthread.c:327
+ |  ret_from_fork                   arch/x86/entry/entry_64.S:295
+ |
+ | read to 0xffffffff8c93b300 of 8 bytes by task 147 on cpu 13:
+ |  rcutorture_one_extend           kernel/rcu/rcutorture.c:1475
+ |  rcutorture_loop_extend          kernel/rcu/rcutorture.c:1558 [inline]
+ |  ...
+
+The warning is telling us that there was a data race which KCSAN wants
+to report, but the function where the original access (that is now
+reordered) happened cannot be found in the stack trace, which prevents
+KCSAN from generating the right stack trace. The stack trace of "write
+(reordered)" now only shows where the access was reordered to, but
+should instead show the stack trace of the original write, with a final
+line saying "reordered to".
+
+At the point where set_reorder_access() is interrupted, it just set
+reorder_access->ptr and size, at which point size is non-zero. This is
+sufficient (if ctx->disable_scoped is zero) for further accesses from
+nested contexts to perform checking of this reorder_access.
+
+That then happened in _raw_spin_lock_irqsave(), which is called by
+scheduler code. However, since reorder_access->ip is still stale (ptr
+and size belong to a different ip not yet set) this finally leads to
+replace_stack_entry() not finding the frame in reorder_access->ip and
+generating the above warning.
+
+Fix it by ensuring that a nested context cannot access reorder_access
+while we update it in set_reorder_access(): set ctx->disable_scoped for
+the duration that reorder_access is updated, which effectively locks
+reorder_access and prevents concurrent use by nested contexts. Note,
+set_reorder_access() can do the update only if disabled_scoped is zero
+on entry, and must therefore set disable_scoped back to non-zero after
+the initial check in set_reorder_access().
+
+Signed-off-by: Marco Elver <elver@google.com>
+Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+

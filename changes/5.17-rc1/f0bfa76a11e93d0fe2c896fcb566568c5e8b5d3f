@@ -1,0 +1,90 @@
+btrfs: fix ENOSPC failure when attempting direct IO write into NOCOW range
+
+When doing a direct IO write against a file range that either has
+preallocated extents in that range or has regular extents and the file
+has the NOCOW attribute set, the write fails with -ENOSPC when all of
+the following conditions are met:
+
+1) There are no data blocks groups with enough free space matching
+   the size of the write;
+
+2) There's not enough unallocated space for allocating a new data block
+   group;
+
+3) The extents in the target file range are not shared, neither through
+   snapshots nor through reflinks.
+
+This is wrong because a NOCOW write can be done in such case, and in fact
+it's possible to do it using a buffered IO write, since when failing to
+allocate data space, the buffered IO path checks if a NOCOW write is
+possible.
+
+The failure in direct IO write path comes from the fact that early on,
+at btrfs_dio_iomap_begin(), we try to allocate data space for the write
+and if it that fails we return the error and stop - we never check if we
+can do NOCOW. But later, at btrfs_get_blocks_direct_write(), we check
+if we can do a NOCOW write into the range, or a subset of the range, and
+then release the previously reserved data space.
+
+Fix this by doing the data reservation only if needed, when we must COW,
+at btrfs_get_blocks_direct_write() instead of doing it at
+btrfs_dio_iomap_begin(). This also simplifies a bit the logic and removes
+the inneficiency of doing unnecessary data reservations.
+
+The following example test script reproduces the problem:
+
+  $ cat dio-nocow-enospc.sh
+  #!/bin/bash
+
+  DEV=/dev/sdj
+  MNT=/mnt/sdj
+
+  # Use a small fixed size (1G) filesystem so that it's quick to fill
+  # it up.
+  # Make sure the mixed block groups feature is not enabled because we
+  # later want to not have more space available for allocating data
+  # extents but still have enough metadata space free for the file writes.
+  mkfs.btrfs -f -b $((1024 * 1024 * 1024)) -O ^mixed-bg $DEV
+  mount $DEV $MNT
+
+  # Create our test file with the NOCOW attribute set.
+  touch $MNT/foobar
+  chattr +C $MNT/foobar
+
+  # Now fill in all unallocated space with data for our test file.
+  # This will allocate a data block group that will be full and leave
+  # no (or a very small amount of) unallocated space in the device, so
+  # that it will not be possible to allocate a new block group later.
+  echo
+  echo "Creating test file with initial data..."
+  xfs_io -c "pwrite -S 0xab -b 1M 0 900M" $MNT/foobar
+
+  # Now try a direct IO write against file range [0, 10M[.
+  # This should succeed since this is a NOCOW file and an extent for the
+  # range was previously allocated.
+  echo
+  echo "Trying direct IO write over allocated space..."
+  xfs_io -d -c "pwrite -S 0xcd -b 10M 0 10M" $MNT/foobar
+
+  umount $MNT
+
+When running the test:
+
+  $ ./dio-nocow-enospc.sh
+  (...)
+
+  Creating test file with initial data...
+  wrote 943718400/943718400 bytes at offset 0
+  900 MiB, 900 ops; 0:00:01.43 (625.526 MiB/sec and 625.5265 ops/sec)
+
+  Trying direct IO write over allocated space...
+  pwrite: No space left on device
+
+A test case for fstests will follow, testing both this direct IO write
+scenario as well as the buffered IO write scenario to make it less likely
+to get future regressions on the buffered IO case.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

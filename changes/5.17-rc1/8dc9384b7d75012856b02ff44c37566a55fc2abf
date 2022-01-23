@@ -1,0 +1,148 @@
+xfs: reduce kvmalloc overhead for CIL shadow buffers
+
+Oh, let me count the ways that the kvmalloc API sucks dog eggs.
+
+The problem is when we are logging lots of large objects, we hit
+kvmalloc really damn hard with costly order allocations, and
+behaviour utterly sucks:
+
+     - 49.73% xlog_cil_commit
+	 - 31.62% kvmalloc_node
+	    - 29.96% __kmalloc_node
+	       - 29.38% kmalloc_large_node
+		  - 29.33% __alloc_pages
+		     - 24.33% __alloc_pages_slowpath.constprop.0
+			- 18.35% __alloc_pages_direct_compact
+			   - 17.39% try_to_compact_pages
+			      - compact_zone_order
+				 - 15.26% compact_zone
+				      5.29% __pageblock_pfn_to_page
+				      3.71% PageHuge
+				    - 1.44% isolate_migratepages_block
+					 0.71% set_pfnblock_flags_mask
+				   1.11% get_pfnblock_flags_mask
+			   - 0.81% get_page_from_freelist
+			      - 0.59% _raw_spin_lock_irqsave
+				 - do_raw_spin_lock
+				      __pv_queued_spin_lock_slowpath
+			- 3.24% try_to_free_pages
+			   - 3.14% shrink_node
+			      - 2.94% shrink_slab.constprop.0
+				 - 0.89% super_cache_count
+				    - 0.66% xfs_fs_nr_cached_objects
+				       - 0.65% xfs_reclaim_inodes_count
+					    0.55% xfs_perag_get_tag
+				   0.58% kfree_rcu_shrink_count
+			- 2.09% get_page_from_freelist
+			   - 1.03% _raw_spin_lock_irqsave
+			      - do_raw_spin_lock
+				   __pv_queued_spin_lock_slowpath
+		     - 4.88% get_page_from_freelist
+			- 3.66% _raw_spin_lock_irqsave
+			   - do_raw_spin_lock
+				__pv_queued_spin_lock_slowpath
+	    - 1.63% __vmalloc_node
+	       - __vmalloc_node_range
+		  - 1.10% __alloc_pages_bulk
+		     - 0.93% __alloc_pages
+			- 0.92% get_page_from_freelist
+			   - 0.89% rmqueue_bulk
+			      - 0.69% _raw_spin_lock
+				 - do_raw_spin_lock
+				      __pv_queued_spin_lock_slowpath
+	   13.73% memcpy_erms
+	 - 2.22% kvfree
+
+On this workload, that's almost a dozen CPUs all trying to compact
+and reclaim memory inside kvmalloc_node at the same time. Yet it is
+regularly falling back to vmalloc despite all that compaction, page
+and shrinker reclaim that direct reclaim is doing. Copying all the
+metadata is taking far less CPU time than allocating the storage!
+
+Direct reclaim should be considered extremely harmful.
+
+This is a high frequency, high throughput, CPU usage and latency
+sensitive allocation. We've got memory there, and we're using
+kvmalloc to allow memory allocation to avoid doing lots of work to
+try to do contiguous allocations.
+
+Except it still does *lots of costly work* that is unnecessary.
+
+Worse: the only way to avoid the slowpath page allocation trying to
+do compaction on costly allocations is to turn off direct reclaim
+(i.e. remove __GFP_RECLAIM_DIRECT from the gfp flags).
+
+Unfortunately, the stupid kvmalloc API then says "oh, this isn't a
+GFP_KERNEL allocation context, so you only get kmalloc!". This
+cuts off the vmalloc fallback, and this leads to almost instant OOM
+problems which ends up in filesystems deadlocks, shutdowns and/or
+kernel crashes.
+
+I want some basic kvmalloc behaviour:
+
+- kmalloc for a contiguous range with fail fast semantics - no
+  compaction direct reclaim if the allocation enters the slow path.
+- run normal vmalloc (i.e. GFP_KERNEL) if kmalloc fails
+
+The really, really stupid part about this is these kvmalloc() calls
+are run under memalloc_nofs task context, so all the allocations are
+always reduced to GFP_NOFS regardless of the fact that kvmalloc
+requires GFP_KERNEL to be passed in. IOWs, we're already telling
+kvmalloc to behave differently to the gfp flags we pass in, but it
+still won't allow vmalloc to be run with anything other than
+GFP_KERNEL.
+
+So, this patch open codes the kvmalloc() in the commit path to have
+the above described behaviour. The result is we more than halve the
+CPU time spend doing kvmalloc() in this path and transaction commits
+with 64kB objects in them more than doubles. i.e. we get ~5x
+reduction in CPU usage per costly-sized kvmalloc() invocation and
+the profile looks like this:
+
+  - 37.60% xlog_cil_commit
+	16.01% memcpy_erms
+      - 8.45% __kmalloc
+	 - 8.04% kmalloc_order_trace
+	    - 8.03% kmalloc_order
+	       - 7.93% alloc_pages
+		  - 7.90% __alloc_pages
+		     - 4.05% __alloc_pages_slowpath.constprop.0
+			- 2.18% get_page_from_freelist
+			- 1.77% wake_all_kswapds
+....
+				    - __wake_up_common_lock
+				       - 0.94% _raw_spin_lock_irqsave
+		     - 3.72% get_page_from_freelist
+			- 2.43% _raw_spin_lock_irqsave
+      - 5.72% vmalloc
+	 - 5.72% __vmalloc_node_range
+	    - 4.81% __get_vm_area_node.constprop.0
+	       - 3.26% alloc_vmap_area
+		  - 2.52% _raw_spin_lock
+	       - 1.46% _raw_spin_lock
+	      0.56% __alloc_pages_bulk
+      - 4.66% kvfree
+	 - 3.25% vfree
+	    - __vfree
+	       - 3.23% __vunmap
+		  - 1.95% remove_vm_area
+		     - 1.06% free_vmap_area_noflush
+			- 0.82% _raw_spin_lock
+		     - 0.68% _raw_spin_lock
+		  - 0.92% _raw_spin_lock
+	 - 1.40% kfree
+	    - 1.36% __free_pages
+	       - 1.35% __free_pages_ok
+		  - 1.02% _raw_spin_lock_irqsave
+
+It's worth noting that over 50% of the CPU time spent allocating
+these shadow buffers is now spent on spinlocks. So the shadow buffer
+allocation overhead is greatly reduced by getting rid of direct
+reclaim from kmalloc, and could probably be made even less costly if
+vmalloc() didn't use global spinlocks to protect it's structures.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+

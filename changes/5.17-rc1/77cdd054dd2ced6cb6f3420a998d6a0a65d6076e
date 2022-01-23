@@ -1,0 +1,113 @@
+drm/i915/pmu: Connect engine busyness stats from GuC to pmu
+
+With GuC handling scheduling, i915 is not aware of the time that a
+context is scheduled in and out of the engine. Since i915 pmu relies on
+this info to provide engine busyness to the user, GuC shares this info
+with i915 for all engines using shared memory. For each engine, this
+info contains:
+
+- total busyness: total time that the context was running (total)
+- id: id of the running context (id)
+- start timestamp: timestamp when the context started running (start)
+
+At the time (now) of sampling the engine busyness, if the id is valid
+(!= ~0), and start is non-zero, then the context is considered to be
+active and the engine busyness is calculated using the below equation
+
+	engine busyness = total + (now - start)
+
+All times are obtained from the gt clock base. For inactive contexts,
+engine busyness is just equal to the total.
+
+The start and total values provided by GuC are 32 bits and wrap around
+in a few minutes. Since perf pmu provides busyness as 64 bit
+monotonically increasing values, there is a need for this implementation
+to account for overflows and extend the time to 64 bits before returning
+busyness to the user. In order to do that, a worker runs periodically at
+frequency = 1/8th the time it takes for the timestamp to wrap. As an
+example, that would be once in 27 seconds for a gt clock frequency of
+19.2 MHz.
+
+Note:
+There might be an over-accounting of busyness due to the fact that GuC
+may be updating the total and start values while kmd is reading them.
+(i.e kmd may read the updated total and the stale start). In such a
+case, user may see higher busyness value followed by smaller ones which
+would eventually catch up to the higher value.
+
+v2: (Tvrtko)
+- Include details in commit message
+- Move intel engine busyness function into execlist code
+- Use union inside engine->stats
+- Use natural type for ping delay jiffies
+- Drop active_work condition checks
+- Use for_each_engine if iterating all engines
+- Drop seq locking, use spinlock at GuC level to update engine stats
+- Document worker specific details
+
+v3: (Tvrtko/Umesh)
+- Demarcate GuC and execlist stat objects with comments
+- Document known over-accounting issue in commit
+- Provide a consistent view of GuC state
+- Add hooks to gt park/unpark for GuC busyness
+- Stop/start worker in gt park/unpark path
+- Drop inline
+- Move spinlock and worker inits to GuC initialization
+- Drop helpers that are called only once
+
+v4: (Tvrtko/Matt/Umesh)
+- Drop addressed opens from commit message
+- Get runtime pm in ping, remove from the park path
+- Use cancel_delayed_work_sync in disable_submission path
+- Update stats during reset prepare
+- Skip ping if reset in progress
+- Explicitly name execlists and GuC stats objects
+- Since disable_submission is called from many places, move resetting
+  stats to intel_guc_submission_reset_prepare
+
+v5: (Tvrtko)
+- Add a trylock helper that does not sleep and synchronize PMU event
+  callbacks and worker with gt reset
+
+v6: (CI BAT failures)
+- DUTs using execlist submission failed to boot since __gt_unpark is
+  called during i915 load. This ends up calling the GuC busyness unpark
+  hook and results in kick-starting an uninitialized worker. Let
+  park/unpark hooks check if GuC submission has been initialized.
+- drop cant_sleep() from trylock helper since rcu_read_lock takes care
+  of that.
+
+v7: (CI) Fix igt@i915_selftest@live@gt_engines
+- For GuC mode of submission the engine busyness is derived from gt time
+  domain. Use gt time elapsed as reference in the selftest.
+- Increase busyness calculation to 10ms duration to ensure batch runs
+  longer and falls within the busyness tolerances in selftest.
+
+v8:
+- Use ktime_get in selftest as before
+- intel_reset_trylock_no_wait results in a lockdep splat that is not
+  trivial to fix since the PMU callback runs in irq context and the
+  reset paths are tightly knit into the driver. The test that uncovers
+  this is igt@perf_pmu@faulting-read. Drop intel_reset_trylock_no_wait,
+  instead use the reset_count to synchronize with gt reset during pmu
+  callback. For the ping, continue to use intel_reset_trylock since ping
+  is not run in irq context.
+
+- GuC PM timestamp does not tick when GuC is idle. This can potentially
+  result in wrong busyness values when a context is active on the
+  engine, but GuC is idle. Use the RING TIMESTAMP as GPU timestamp to
+  process the GuC busyness stats. This works since both GuC timestamp and
+  RING timestamp are synced with the same clock.
+
+- The busyness stats may get updated after the batch starts running.
+  This delay causes the busyness reported for 100us duration to fall
+  below 95% in the selftest. The only option at this time is to wait for
+  GuC busyness to change from idle to active before we sample busyness
+  over a 100us period.
+
+Signed-off-by: John Harrison <John.C.Harrison@Intel.com>
+Signed-off-by: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+Acked-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20211027004821.66097-2-umesh.nerlige.ramappa@intel.com
+

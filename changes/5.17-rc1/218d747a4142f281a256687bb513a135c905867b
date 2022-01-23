@@ -1,0 +1,55 @@
+bpf, sockmap: Fix double bpf_prog_put on error case in map_link
+
+sock_map_link() is called to update a sockmap entry with a sk. But, if the
+sock_map_init_proto() call fails then we return an error to the map_update
+op against the sockmap. In the error path though we need to cleanup psock
+and dec the refcnt on any programs associated with the map, because we
+refcnt them early in the update process to ensure they are pinned for the
+psock. (This avoids a race where user deletes programs while also updating
+the map with new socks.)
+
+In current code we do the prog refcnt dec explicitely by calling
+bpf_prog_put() when the program was found in the map. But, after commit
+'38207a5e81230' in this error path we've already done the prog to psock
+assignment so the programs have a reference from the psock as well. This
+then causes the psock tear down logic, invoked by sk_psock_put() in the
+error path, to similarly call bpf_prog_put on the programs there.
+
+To be explicit this logic does the prog->psock assignment:
+
+  if (msg_*)
+    psock_set_prog(...)
+
+Then the error path under the out_progs label does a similar check and
+dec with:
+
+  if (msg_*)
+     bpf_prog_put(...)
+
+And the teardown logic sk_psock_put() does ...
+
+  psock_set_prog(msg_*, NULL)
+
+... triggering another bpf_prog_put(...). Then KASAN gives us this splat,
+found by syzbot because we've created an inbalance between bpf_prog_inc and
+bpf_prog_put calling put twice on the program.
+
+  BUG: KASAN: vmalloc-out-of-bounds in __bpf_prog_put kernel/bpf/syscall.c:1812 [inline]
+  BUG: KASAN: vmalloc-out-of-bounds in __bpf_prog_put kernel/bpf/syscall.c:1812 [inline] kernel/bpf/syscall.c:1829
+  BUG: KASAN: vmalloc-out-of-bounds in bpf_prog_put+0x8c/0x4f0 kernel/bpf/syscall.c:1829 kernel/bpf/syscall.c:1829
+  Read of size 8 at addr ffffc90000e76038 by task syz-executor020/3641
+
+To fix clean up error path so it doesn't try to do the bpf_prog_put in the
+error path once progs are assigned then it relies on the normal psock
+tear down logic to do complete cleanup.
+
+For completness we also cover the case whereh sk_psock_init_strp() fails,
+but this is not expected because it indicates an incorrect socket type
+and should be caught earlier.
+
+Fixes: 38207a5e8123 ("bpf, sockmap: Attach map progs to psock early for feature probes")
+Reported-by: syzbot+bb73e71cf4b8fd376a4f@syzkaller.appspotmail.com
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20220104214645.290900-1-john.fastabend@gmail.com
+

@@ -1,0 +1,88 @@
+btrfs: make send work with concurrent block group relocation
+
+We don't allow send and balance/relocation to run in parallel in order
+to prevent send failing or silently producing some bad stream. This is
+because while send is using an extent (specially metadata) or about to
+read a metadata extent and expecting it belongs to a specific parent
+node, relocation can run, the transaction used for the relocation is
+committed and the extent gets reallocated while send is still using the
+extent, so it ends up with a different content than expected. This can
+result in just failing to read a metadata extent due to failure of the
+validation checks (parent transid, level, etc), failure to find a
+backreference for a data extent, and other unexpected failures. Besides
+reallocation, there's also a similar problem of an extent getting
+discarded when it's unpinned after the transaction used for block group
+relocation is committed.
+
+The restriction between balance and send was added in commit 9e967495e0e0
+("Btrfs: prevent send failures and crashes due to concurrent relocation"),
+kernel 5.3, while the more general restriction between send and relocation
+was added in commit 1cea5cf0e664 ("btrfs: ensure relocation never runs
+while we have send operations running"), kernel 5.14.
+
+Both send and relocation can be very long running operations. Relocation
+because it has to do a lot of IO and expensive backreference lookups in
+case there are many snapshots, and send due to read IO when operating on
+very large trees. This makes it inconvenient for users and tools to deal
+with scheduling both operations.
+
+For zoned filesystem we also have automatic block group relocation, so
+send can fail with -EAGAIN when users least expect it or send can end up
+delaying the block group relocation for too long. In the future we might
+also get the automatic block group relocation for non zoned filesystems.
+
+This change makes it possible for send and relocation to run in parallel.
+This is achieved the following way:
+
+1) For all tree searches, send acquires a read lock on the commit root
+   semaphore;
+
+2) After each tree search, and before releasing the commit root semaphore,
+   the leaf is cloned and placed in the search path (struct btrfs_path);
+
+3) After releasing the commit root semaphore, the changed_cb() callback
+   is invoked, which operates on the leaf and writes commands to the pipe
+   (or file in case send/receive is not used with a pipe). It's important
+   here to not hold a lock on the commit root semaphore, because if we did
+   we could deadlock when sending and receiving to the same filesystem
+   using a pipe - the send task blocks on the pipe because it's full, the
+   receive task, which is the only consumer of the pipe, triggers a
+   transaction commit when attempting to create a subvolume or reserve
+   space for a write operation for example, but the transaction commit
+   blocks trying to write lock the commit root semaphore, resulting in a
+   deadlock;
+
+4) Before moving to the next key, or advancing to the next change in case
+   of an incremental send, check if a transaction used for relocation was
+   committed (or is about to finish its commit). If so, release the search
+   path(s) and restart the search, to where we were before, so that we
+   don't operate on stale extent buffers. The search restarts are always
+   possible because both the send and parent roots are RO, and no one can
+   add, remove of update keys (change their offset) in RO trees - the
+   only exception is deduplication, but that is still not allowed to run
+   in parallel with send;
+
+5) Periodically check if there is contention on the commit root semaphore,
+   which means there is a transaction commit trying to write lock it, and
+   release the semaphore and reschedule if there is contention, so as to
+   avoid causing any significant delays to transaction commits.
+
+This leaves some room for optimizations for send to have less path
+releases and re searching the trees when there's relocation running, but
+for now it's kept simple as it performs quite well (on very large trees
+with resulting send streams in the order of a few hundred gigabytes).
+
+Test case btrfs/187, from fstests, stresses relocation, send and
+deduplication attempting to run in parallel, but without verifying if send
+succeeds and if it produces correct streams. A new test case will be added
+that exercises relocation happening in parallel with send and then checks
+that send succeeds and the resulting streams are correct.
+
+A final note is that for now this still leaves the mutual exclusion
+between send operations and deduplication on files belonging to a root
+used by send operations. A solution for that will be slightly more complex
+but it will eventually be built on top of this change.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

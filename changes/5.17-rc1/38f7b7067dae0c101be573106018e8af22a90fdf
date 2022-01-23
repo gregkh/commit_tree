@@ -1,0 +1,127 @@
+powerpc/rtas: rtas_busy_delay() improvements
+
+Generally RTAS cannot block, and in PAPR it is required to return control
+to the OS within a few tens of microseconds. In order to support operations
+which may take longer to complete, many RTAS primitives can return
+intermediate -2 ("busy") or 990x ("extended delay") values, which indicate
+that the OS should reattempt the same call with the same arguments at some
+point in the future.
+
+Current versions of PAPR are less than clear about this, but the intended
+meanings of these values in more detail are:
+
+RTAS_BUSY (-2): RTAS has suspended a potentially long-running operation in
+order to meet its latency obligation and give the OS the opportunity to
+perform other work. RTAS can resume making progress as soon as the OS
+reattempts the call.
+
+RTAS_EXTENDED_DELAY_{MIN...MAX} (9900-9905): RTAS must wait for an external
+event to occur or for internal contention to resolve before it can complete
+the requested operation. The value encodes a non-binding hint as to roughly
+how long the OS should wait before calling again, but the OS is allowed to
+reattempt the call sooner or even immediately.
+
+Linux of course must take its own CPU scheduling obligations into account
+when handling these statuses; e.g. a task which receives an RTAS_BUSY
+status should check whether to reschedule before it attempts the RTAS call
+again to avoid starving other tasks.
+
+rtas_busy_delay() is a helper function that "consumes" a busy or extended
+delay status. Common usage:
+
+    int rc;
+
+    do {
+        rc = rtas_call(rtas_token("some-function"), ...);
+    } while (rtas_busy_delay(rc));
+
+    /* convert rc to Linux error value, etc */
+
+If rc is a busy or extended delay status, the caller can rely on
+rtas_busy_delay() to perform an appropriate sleep or reschedule and return
+nonzero. Other statuses are handled normally by the caller.
+
+The current implementation of rtas_busy_delay() both oversleeps and
+overuses the CPU:
+
+*  It performs msleep() for all 990x and even when no delay is
+   suggested (-2), but this is understood to actually sleep for two jiffies
+   minimum in practice (20ms with HZ=100). 9900 (1ms) and 9901 (10ms)
+   appear to be the most common extended delay statuses, and the
+   oversleeping measurably lengthens DLPAR operations, which perform
+   many RTAS calls.
+
+*  It does not sleep on 990x unless need_resched() is true, causing code
+   like the loop above to needlessly retry, wasting CPU time.
+
+Alter the logic to align better with the intended meanings:
+
+*  When passed RTAS_BUSY, perform cond_resched() and return without
+   sleeping. The caller should reattempt immediately
+
+*  Always sleep when passed an extended delay status, using usleep_range()
+   for precise shorter sleeps. Limit the sleep time to one second even
+   though there are higher architected values.
+
+Change rtas_busy_delay()'s return type to bool to better reflect its usage,
+and add kernel-doc.
+
+rtas_busy_delay_time() is unchanged, even though it "incorrectly" returns 1
+for RTAS_BUSY. There are users of that API with open-coded delay loops in
+sensitive contexts that will have to be taken on an individual basis.
+
+Brief results for addition and removal of 5GB memory on a small P9 PowerVM
+partition follow. Load was generated with stress-ng --cpu N. For add,
+elapsed time is greatly reduced without significant change in the number of
+RTAS calls or time spent on CPU. For remove, elapsed time is modestly
+reduced, with significant reductions in RTAS calls and time spent on CPU.
+
+With no competing workload (- before, + after):
+
+  Performance counter stats for 'bash -c echo "memory add count 20" > /sys/kernel/dlpar' (10 runs):
+
+-             1,935      probe:rtas_call           #    0.003 M/sec                    ( +-  0.22% )
+-            609.99 msec task-clock                #    0.183 CPUs utilized            ( +-  0.19% )
++             1,956      probe:rtas_call           #    0.003 M/sec                    ( +-  0.17% )
++            618.56 msec task-clock                #    0.278 CPUs utilized            ( +-  0.11% )
+
+-            3.3322 +- 0.0670 seconds time elapsed  ( +-  2.01% )
++            2.2222 +- 0.0416 seconds time elapsed  ( +-  1.87% )
+
+  Performance counter stats for 'bash -c echo "memory remove count 20" > /sys/kernel/dlpar' (10 runs):
+
+-             6,224      probe:rtas_call           #    0.008 M/sec                    ( +-  2.57% )
+-            750.36 msec task-clock                #    0.190 CPUs utilized            ( +-  2.01% )
++               843      probe:rtas_call           #    0.003 M/sec                    ( +-  0.12% )
++            250.66 msec task-clock                #    0.068 CPUs utilized            ( +-  0.17% )
+
+-            3.9394 +- 0.0890 seconds time elapsed  ( +-  2.26% )
++             3.678 +- 0.113 seconds time elapsed  ( +-  3.07% )
+
+With all CPUs 100% busy (- before, + after):
+
+  Performance counter stats for 'bash -c echo "memory add count 20" > /sys/kernel/dlpar' (10 runs):
+
+-             2,979      probe:rtas_call           #    0.003 M/sec                    ( +-  0.12% )
+-          1,096.62 msec task-clock                #    0.105 CPUs utilized            ( +-  0.10% )
++             2,981      probe:rtas_call           #    0.003 M/sec                    ( +-  0.22% )
++          1,095.26 msec task-clock                #    0.154 CPUs utilized            ( +-  0.21% )
+
+-            10.476 +- 0.104 seconds time elapsed  ( +-  1.00% )
++            7.1124 +- 0.0865 seconds time elapsed  ( +-  1.22% )
+
+  Performance counter stats for 'bash -c echo "memory remove count 20" > /sys/kernel/dlpar' (10 runs):
+
+-             2,702      probe:rtas_call           #    0.004 M/sec                    ( +-  4.00% )
+-            722.71 msec task-clock                #    0.067 CPUs utilized            ( +-  2.41% )
++             1,246      probe:rtas_call           #    0.003 M/sec                    ( +-  0.25% )
++            487.73 msec task-clock                #    0.049 CPUs utilized            ( +-  0.20% )
+
+-            10.829 +- 0.163 seconds time elapsed  ( +-  1.51% )
++            9.9887 +- 0.0866 seconds time elapsed  ( +-  0.87% )
+
+Signed-off-by: Nathan Lynch <nathanl@linux.ibm.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20211117060259.957178-2-nathanl@linux.ibm.com
+
+

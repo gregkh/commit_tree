@@ -1,0 +1,101 @@
+btrfs: try to unlock parent nodes earlier when inserting a key
+
+When inserting a new key, we release the write lock on the leaf's parent
+only after doing the binary search on the leaf. This is because if the
+key ends up at slot 0, we will have to update the key at slot 0 of the
+parent node. The same reasoning applies to any other upper level nodes
+when their slot is 0. We also need to keep the parent locked in case the
+leaf does not have enough free space to insert the new key/item, because
+in that case we will split the leaf and we will need to add a new key to
+the parent due to a new leaf resulting from the split operation.
+
+However if the leaf has enough space for the new key and the key does not
+end up at slot 0 of the leaf we could release our write lock on the parent
+before doing the binary search on the leaf to figure out the destination
+slot. That leads to reducing the amount of time other tasks are blocked
+waiting to lock the parent, therefore increasing parallelism when there
+are other tasks that are trying to access other leaves accessible through
+the same parent. This also applies to other upper nodes besides the
+immediate parent, when their slot is 0, since we keep locks on them until
+we figure out if the leaf slot is slot 0 or not.
+
+In fact, having the key ending at up slot 0 when is rare. Typically it
+only happens when the key is less than or equals to the smallest, the
+"left most", key of the entire btree, during a split attempt when we try
+to push to the right sibling leaf or when the caller just wants to update
+the item of an existing key. It's also very common that a leaf has enough
+space to insert a new key, since after a split we move about half of the
+keys from one into the new leaf.
+
+So unlock the parent, and any other upper level nodes, when during a key
+insertion we notice the key is greater then the first key in the leaf and
+the leaf has enough free space. After unlocking the upper level nodes, do
+the binary search using a low boundary of slot 1 and not slot 0, to figure
+out the slot where the key will be inserted (or where the key already is
+in case it exists and the caller wants to modify its item data).
+This extra comparison, with the first key, is cheap and the key is very
+likely already in a cache line because it immediately follows the header
+of the extent buffer and we have recently read the level field of the
+header (which in fact is the last field of the header).
+
+The following fs_mark test was run on a non-debug kernel (debian's default
+kernel config), with a 12 cores intel CPU, and using a NVMe device:
+
+  $ cat run-fsmark.sh
+  #!/bin/bash
+
+  DEV=/dev/nvme0n1
+  MNT=/mnt/nvme0n1
+  MOUNT_OPTIONS="-o ssd"
+  MKFS_OPTIONS="-O no-holes -R free-space-tree"
+  FILES=100000
+  THREADS=$(nproc --all)
+  FILE_SIZE=0
+
+  echo "performance" | \
+	tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+  mkfs.btrfs -f $MKFS_OPTIONS $DEV
+  mount $MOUNT_OPTIONS $DEV $MNT
+
+  OPTS="-S 0 -L 10 -n $FILES -s $FILE_SIZE -t $THREADS -k"
+  for ((i = 1; i <= $THREADS; i++)); do
+      OPTS="$OPTS -d $MNT/d$i"
+  done
+
+  fs_mark $OPTS
+
+  umount $MNT
+
+Before this change:
+
+FSUse%        Count         Size    Files/sec     App Overhead
+     0      1200000            0     165273.6          5958381
+     0      2400000            0     190938.3          6284477
+     0      3600000            0     181429.1          6044059
+     0      4800000            0     173979.2          6223418
+     0      6000000            0     139288.0          6384560
+     0      7200000            0     163000.4          6520083
+     1      8400000            0      57799.2          5388544
+     1      9600000            0      66461.6          5552969
+     2     10800000            0      49593.5          5163675
+     2     12000000            0      57672.1          4889398
+
+After this change:
+
+FSUse%        Count         Size    Files/sec            App Overhead
+     0      1200000            0     167987.3 (+1.6%)         6272730
+     0      2400000            0     198563.9 (+4.0%)         6048847
+     0      3600000            0     197436.6 (+8.8%)         6163637
+     0      4800000            0     202880.7 (+16.6%)        6371771
+     1      6000000            0     167275.9 (+20.1%)        6556733
+     1      7200000            0     204051.2 (+25.2%)        6817091
+     1      8400000            0      69622.8 (+20.5%)        5525675
+     1      9600000            0      69384.5 (+4.4%)         5700723
+     1     10800000            0      61454.1 (+23.9%)        5363754
+     3     12000000            0      61908.7 (+7.3%)         5370196
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+

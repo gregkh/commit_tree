@@ -1,0 +1,85 @@
+net/smc: Resolve the race between link group access and termination
+
+We encountered some crashes caused by the race between the access
+and the termination of link groups.
+
+Here are some of panic stacks we met:
+
+1) Race between smc_clc_wait_msg() and __smc_lgr_terminate()
+
+ BUG: kernel NULL pointer dereference, address: 00000000000002f0
+ Workqueue: smc_hs_wq smc_listen_work [smc]
+ RIP: 0010:smc_clc_wait_msg+0x3eb/0x5c0 [smc]
+ Call Trace:
+  <TASK>
+  ? smc_clc_send_accept+0x45/0xa0 [smc]
+  ? smc_clc_send_accept+0x45/0xa0 [smc]
+  smc_listen_work+0x783/0x1220 [smc]
+  ? finish_task_switch+0xc4/0x2e0
+  ? process_one_work+0x1ad/0x3c0
+  process_one_work+0x1ad/0x3c0
+  worker_thread+0x4c/0x390
+  ? rescuer_thread+0x320/0x320
+  kthread+0x149/0x190
+  ? set_kthread_struct+0x40/0x40
+  ret_from_fork+0x1f/0x30
+  </TASK>
+
+smc_listen_work()                abnormal case like port error
+---------------------------------------------------------------
+                                | __smc_lgr_terminate()
+                                |  |- smc_conn_kill()
+                                |      |- smc_lgr_unregister_conn()
+                                |          |- set conn->lgr = NULL
+smc_clc_wait_msg()              |
+ |- access conn->lgr (panic)    |
+
+2) Race between smc_setsockopt() and __smc_lgr_terminate()
+
+ BUG: kernel NULL pointer dereference, address: 00000000000002e8
+ RIP: 0010:smc_setsockopt+0x17a/0x280 [smc]
+ Call Trace:
+  <TASK>
+  __sys_setsockopt+0xfc/0x190
+  __x64_sys_setsockopt+0x20/0x30
+  do_syscall_64+0x34/0x90
+  entry_SYSCALL_64_after_hwframe+0x44/0xae
+  </TASK>
+
+smc_setsockopt()                 abnormal case like port error
+--------------------------------------------------------------
+                                | __smc_lgr_terminate()
+                                |  |- smc_conn_kill()
+                                |      |- smc_lgr_unregister_conn()
+                                |          |- set conn->lgr = NULL
+mod_delayed_work()              |
+ |- access conn->lgr (panic)    |
+
+There are some other panic places and they are caused by the
+similar reason as described above, which is accessing link
+group after termination, thus getting a NULL pointer or invalid
+resource.
+
+Currently, there seems to be no synchronization between the
+link group access and a sudden termination of it. This patch
+tries to fix this by introducing reference count of link group
+and not freeing link group until reference count is zero.
+
+Link group might be referred to by links or smc connections. So
+the operation to the link group reference count can be concluded
+as follows:
+
+object          [hold or initialized as 1]       [put]
+-------------------------------------------------------------------
+link group      smc_lgr_create()                 smc_lgr_free()
+connections     smc_conn_create()                smc_conn_free()
+links           smcr_link_init()                 smcr_link_clear()
+
+Througth this way, we extend the life cycle of link group and
+ensure it is longer than the life cycle of connections and links
+above it, so that avoid invalid access to link group after its
+termination.
+
+Signed-off-by: Wen Gu <guwen@linux.alibaba.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
