@@ -1,0 +1,75 @@
+perf: Fix perf_event_read_local() time
+
+Time readers that cannot take locks (due to NMI etc..) currently make
+use of perf_event::shadow_ctx_time, which, for that event gives:
+
+  time' = now + (time - timestamp)
+
+or, alternatively arranged:
+
+  time' = time + (now - timestamp)
+
+IOW, the progression of time since the last time the shadow_ctx_time
+was updated.
+
+There's problems with this:
+
+ A) the shadow_ctx_time is per-event, even though the ctx_time it
+    reflects is obviously per context. The direct concequence of this
+    is that the context needs to iterate all events all the time to
+    keep the shadow_ctx_time in sync.
+
+ B) even with the prior point, the context itself might not be active
+    meaning its time should not advance to begin with.
+
+ C) shadow_ctx_time isn't consistently updated when ctx_time is
+
+There are 3 users of this stuff, that suffer differently from this:
+
+ - calc_timer_values()
+   - perf_output_read()
+   - perf_event_update_userpage()	/* A */
+
+ - perf_event_read_local()		/* A,B */
+
+In particular, perf_output_read() doesn't suffer at all, because it's
+sample driven and hence only relevant when the event is actually
+running.
+
+This same was supposed to be true for perf_event_update_userpage(),
+after all self-monitoring implies the context is active *HOWEVER*, as
+per commit f79256532682 ("perf/core: fix userpage->time_enabled of
+inactive events") this goes wrong when combined with counter
+overcommit, in that case those events that do not get scheduled when
+the context becomes active (task events typically) miss out on the
+EVENT_TIME update and ENABLED time is inflated (for a little while)
+with the time the context was inactive. Once the event gets rotated
+in, this gets corrected, leading to a non-monotonic timeflow.
+
+perf_event_read_local() made things even worse, it can request time at
+any point, suffering all the problems perf_event_update_userpage()
+does and more. Because while perf_event_update_userpage() is limited
+by the context being active, perf_event_read_local() users have no
+such constraint.
+
+Therefore, completely overhaul things and do away with
+perf_event::shadow_ctx_time. Instead have regular context time updates
+keep track of this offset directly and provide perf_event_time_now()
+to complement perf_event_time().
+
+perf_event_time_now() will, in adition to being context wide, also
+take into account if the context is active. For inactive context, it
+will not advance time.
+
+This latter property means the cgroup perf_cgroup_info context needs
+to grow addition state to track this.
+
+Additionally, since all this is strictly per-cpu, we can use barrier()
+to order context activity vs context time.
+
+Fixes: 7d9285e82db5 ("perf/bpf: Extend the perf_event_read_local() interface, a.k.a. "bpf: perf event change needed for subsequent bpf helpers"")
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Song Liu <song@kernel.org>
+Tested-by: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/r/YcB06DasOBtU0b00@hirez.programming.kicks-ass.net
+
