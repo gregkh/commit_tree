@@ -1,0 +1,90 @@
+HID: i2c-hid: goodix: Fix a lockdep splat
+
+I'm was on the receiving end of a lockdep splat from this driver and after
+scratching my head I couldn't be entirely sure it was a false positive
+given we would also have to think about whether the regulator locking is
+safe (since the notifier is called whilst holding regulator locks which
+are also needed for regulator_is_enabled() ).
+
+Regardless of whether it is a real bug or not, the mutex isn't needed.
+We can use reference counting tricks instead to avoid races with the
+notifier calls.
+
+The observed splat follows:
+
+------------------------------------------------------
+kworker/u16:3/127 is trying to acquire lock:
+ffff00008021fb20 (&ihid_goodix->regulator_mutex){+.+.}-{4:4}, at: ihid_goodix_vdd_notify+0x30/0x94
+
+but task is already holding lock:
+ffff0000835c60c0 (&(&rdev->notifier)->rwsem){++++}-{4:4}, at: blocking_notifier_call_chain+0x30/0x70
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #1 (&(&rdev->notifier)->rwsem){++++}-{4:4}:
+       down_write+0x68/0x8c
+       blocking_notifier_chain_register+0x54/0x70
+       regulator_register_notifier+0x1c/0x24
+       devm_regulator_register_notifier+0x58/0x98
+       i2c_hid_of_goodix_probe+0xdc/0x158
+       i2c_device_probe+0x25d/0x270
+       really_probe+0x174/0x2cc
+       __driver_probe_device+0xc0/0xd8
+       driver_probe_device+0x50/0xe4
+       __device_attach_driver+0xa8/0xc0
+       bus_for_each_drv+0x9c/0xc0
+       __device_attach_async_helper+0x6c/0xbc
+       async_run_entry_fn+0x38/0x100
+       process_one_work+0x294/0x438
+       worker_thread+0x180/0x258
+       kthread+0x120/0x130
+       ret_from_fork+0x10/0x20
+
+-> #0 (&ihid_goodix->regulator_mutex){+.+.}-{4:4}:
+       __lock_acquire+0xd24/0xfe8
+       lock_acquire+0x288/0x2f4
+       __mutex_lock+0xa0/0x338
+       mutex_lock_nested+0x3c/0x5c
+       ihid_goodix_vdd_notify+0x30/0x94
+       notifier_call_chain+0x6c/0x8c
+       blocking_notifier_call_chain+0x48/0x70
+       _notifier_call_chain.isra.0+0x18/0x20
+       _regulator_enable+0xc0/0x178
+       regulator_enable+0x40/0x7c
+       goodix_i2c_hid_power_up+0x18/0x20
+       i2c_hid_core_power_up.isra.0+0x1c/0x2c
+       i2c_hid_core_probe+0xd8/0x3d4
+       i2c_hid_of_goodix_probe+0x14c/0x158
+       i2c_device_probe+0x25c/0x270
+       really_probe+0x174/0x2cc
+       __driver_probe_device+0xc0/0xd8
+       driver_probe_device+0x50/0xe4
+       __device_attach_driver+0xa8/0xc0
+       bus_for_each_drv+0x9c/0xc0
+       __device_attach_async_helper+0x6c/0xbc
+       async_run_entry_fn+0x38/0x100
+       process_one_work+0x294/0x438
+       worker_thread+0x180/0x258
+       kthread+0x120/0x130
+       ret_from_fork+0x10/0x20
+
+other info that might help us debug this:
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&(&rdev->notifier)->rwsem);
+                               lock(&ihid_goodix->regulator_mutex);
+                               lock(&(&rdev->notifier)->rwsem);
+  lock(&ihid_goodix->regulator_mutex);
+
+ *** DEADLOCK ***
+
+Signed-off-by: Daniel Thompson <daniel.thompson@linaro.org>
+Fixes: 18eeef46d359 ("HID: i2c-hid: goodix: Tie the reset line to true state of the regulator")
+Reviewed-by: Douglas Anderson <dianders@chromium.org>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+
