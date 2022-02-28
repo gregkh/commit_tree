@@ -1,0 +1,66 @@
+btrfs: defrag: allow defrag_one_cluster() to skip large extent which is not a target
+
+In the rework of btrfs_defrag_file(), we always call
+defrag_one_cluster() and increase the offset by cluster size, which is
+only 256K.
+
+But there are cases where we have a large extent (e.g. 128M) which
+doesn't need to be defragged at all.
+
+Before the refactor, we can directly skip the range, but now we have to
+scan that extent map again and again until the cluster moves after the
+non-target extent.
+
+Fix the problem by allow defrag_one_cluster() to increase
+btrfs_defrag_ctrl::last_scanned to the end of an extent, if and only if
+the last extent of the cluster is not a target.
+
+The test script looks like this:
+
+	mkfs.btrfs -f $dev > /dev/null
+
+	mount $dev $mnt
+
+	# As btrfs ioctl uses 32M as extent_threshold
+	xfs_io -f -c "pwrite 0 64M" $mnt/file1
+	sync
+	# Some fragemented range to defrag
+	xfs_io -s -c "pwrite 65548k 4k" \
+		  -c "pwrite 65544k 4k" \
+		  -c "pwrite 65540k 4k" \
+		  -c "pwrite 65536k 4k" \
+		  $mnt/file1
+	sync
+
+	echo "=== before ==="
+	xfs_io -c "fiemap -v" $mnt/file1
+	echo "=== after ==="
+	btrfs fi defrag $mnt/file1
+	sync
+	xfs_io -c "fiemap -v" $mnt/file1
+	umount $mnt
+
+With extra ftrace put into defrag_one_cluster(), before the patch it
+would result tons of loops:
+
+(As defrag_one_cluster() is inlined, the function name is its caller)
+
+  btrfs-126062  [005] .....  4682.816026: btrfs_defrag_file: r/i=5/257 start=0 len=262144
+  btrfs-126062  [005] .....  4682.816027: btrfs_defrag_file: r/i=5/257 start=262144 len=262144
+  btrfs-126062  [005] .....  4682.816028: btrfs_defrag_file: r/i=5/257 start=524288 len=262144
+  btrfs-126062  [005] .....  4682.816028: btrfs_defrag_file: r/i=5/257 start=786432 len=262144
+  btrfs-126062  [005] .....  4682.816028: btrfs_defrag_file: r/i=5/257 start=1048576 len=262144
+  ...
+  btrfs-126062  [005] .....  4682.816043: btrfs_defrag_file: r/i=5/257 start=67108864 len=262144
+
+But with this patch there will be just one loop, then directly to the
+end of the extent:
+
+  btrfs-130471  [014] .....  5434.029558: defrag_one_cluster: r/i=5/257 start=0 len=262144
+  btrfs-130471  [014] .....  5434.029559: defrag_one_cluster: r/i=5/257 start=67108864 len=16384
+
+CC: stable@vger.kernel.org # 5.16
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+
