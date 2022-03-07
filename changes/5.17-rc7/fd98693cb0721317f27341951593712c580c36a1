@@ -1,0 +1,73 @@
+ibmvnic: Allow queueing resets during probe
+
+We currently don't allow queuing resets when adapter is in VNIC_PROBING
+state - instead we throw away the reset and return EBUSY. The reasoning
+is probably that during ibmvnic_probe() the ibmvnic_adapter itself is
+being initialized so performing a reset during this time can lead us to
+accessing fields in the ibmvnic_adapter that are not fully initialized.
+A review of the code shows that all the adapter state neede to process a
+reset is initialized before registering the CRQ so that should no longer
+be a concern.
+
+Further the expectation is that if we do get a reset (transport event)
+during probe, the do..while() loop in ibmvnic_probe() will handle this
+by reinitializing the CRQ.
+
+While that is true to some extent, it is possible that the reset might
+occur _after_ the CRQ is registered and CRQ_INIT message was exchanged
+but _before_ the adapter state is set to VNIC_PROBED. As mentioned above,
+such a reset will be thrown away. While the client assumes that the
+adapter is functional, the vnic server will wait for the client to reinit
+the adapter. This disconnect between the two leaves the adapter down
+needing manual intervention.
+
+Because ibmvnic_probe() has other work to do after initializing the CRQ
+(such as registering the netdev at a minimum) and because the reset event
+can occur at any instant after the CRQ is initialized, there will always
+be a window between initializing the CRQ and considering the adapter
+ready for resets (ie state == PROBED).
+
+So rather than discarding resets during this window, allow queueing them
+- but only process them after the adapter is fully initialized.
+
+To do this, introduce a new completion state ->probe_done and have the
+reset worker thread wait on this before processing resets.
+
+This change brings up two new situations in or just after ibmvnic_probe().
+First after one or more resets were queued, we encounter an error and
+decide to retry the initialization.  At that point the queued resets are
+no longer relevant since we could be talking to a new vnic server. So we
+must purge/flush the queued resets before restarting the initialization.
+As a side note, since we are still in the probing stage and we have not
+registered the netdev, it will not be CHANGE_PARAM reset.
+
+Second this change opens up a potential race between the worker thread
+in __ibmvnic_reset(), the tasklet and the ibmvnic_open() due to the
+following sequence of events:
+
+	1. Register CRQ
+	2. Get transport event before CRQ_INIT completes.
+	3. Tasklet schedules reset:
+		a) add rwi to list
+		b) schedule_work() to start worker thread which runs
+		   and waits for ->probe_done.
+	4. ibmvnic_probe() decides to retry, purges rwi_list
+	5. Re-register crq and this time rest of probe succeeds - register
+	   netdev and complete(->probe_done).
+	6. Worker thread resumes in __ibmvnic_reset() from 3b.
+	7. Worker thread sets ->resetting bit
+	8. ibmvnic_open() comes in, notices ->resetting bit, sets state
+	   to IBMVNIC_OPEN and returns early expecting worker thread to
+	   finish the open.
+	9. Worker thread finds rwi_list empty and returns without
+	   opening the interface.
+
+If this happens, the ->ndo_open() call is effectively lost and the
+interface remains down. To address this, ensure that ->rwi_list is
+not empty before setting the ->resetting  bit. See also comments in
+__ibmvnic_reset().
+
+Fixes: 6a2fb0e99f9c ("ibmvnic: driver initialization for kdump/kexec")
+Signed-off-by: Sukadev Bhattiprolu <sukadev@linux.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
